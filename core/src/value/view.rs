@@ -248,7 +248,6 @@ impl<'ctx, 'str: 'ctx> QCodeView<'ctx, 'str> for BodyView<'ctx, 'str> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        builder::Builder,
         context::Context,
         space::{LocalMemorySpaceId, MemorySpaceId},
         value::{
@@ -265,9 +264,7 @@ mod tests {
         let function = FunctionBody::make(&mut ctx, "f".into()).unwrap().id;
         let block = BasicBlock::make(&mut ctx, function).id;
         let value = ctx.get_const(7, 8).id();
-        let insn = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block))
-            .push_return(value)
-            .id;
+        let insn = (&mut ctx).builder(block).push_return(value).id;
 
         let module = ModuleView::new(&ctx);
         let body = BodyView::new(&ctx.bodies[function], &ctx.shared, &ctx.interfaces);

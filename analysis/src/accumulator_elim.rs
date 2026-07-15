@@ -45,7 +45,6 @@ use std::borrow::Cow;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{
-    builder::Builder,
     types::TypeId,
     value::{
         FunctionId, FunctionKind, QCodeView, ValueId,
@@ -336,7 +335,7 @@ fn transform<'str>(
             g_head,
         );
         {
-            let mut b = Builder::from_block(BaseRef::new(minted.reborrow(), g_head));
+            let mut b = minted.builder(g_head);
             if p.cond_true_is_exit {
                 b.push_cbranch(cond, base, rec);
             } else {
@@ -353,7 +352,7 @@ fn transform<'str>(
                 .iter()
                 .map(|&i| const_at_size(minted.shr(), model.init_args[i], p.head_sizes[i]))
                 .collect();
-            let mut b = Builder::from_block(BaseRef::new(minted.reborrow(), base));
+            let mut b = minted.builder(base);
             let tuple = b.push_tuple(base_fields);
             let ty = tuple.type_id();
             let tuple = tuple.id();
@@ -396,7 +395,7 @@ fn transform<'str>(
                 tuple_ty,
             );
             let acc_vals: Vec<ValueId> = {
-                let mut b = Builder::from_block(BaseRef::new(minted.reborrow(), rec));
+                let mut b = minted.builder(rec);
                 (0..p.a_slots.len())
                     .map(|pos| b.push_extract(deep, pos).id())
                     .collect()
@@ -422,7 +421,7 @@ fn transform<'str>(
                 })
                 .collect();
 
-            let mut b = Builder::from_block(BaseRef::new(minted.reborrow(), rec));
+            let mut b = minted.builder(rec);
             let tuple = b.push_tuple(new_acc).id();
             b.push_return_value(tuple);
         }
@@ -479,7 +478,7 @@ fn transform<'str>(
         root,
     );
     {
-        let mut b = Builder::from_block(BaseRef::new(host.reborrow(), root));
+        let mut b = host.builder(root);
         b.push_return_value(result);
     }
 

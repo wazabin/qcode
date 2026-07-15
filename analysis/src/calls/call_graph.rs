@@ -237,7 +237,6 @@ impl CallGraph {
 #[cfg(test)]
 mod tests {
     use qcode::{
-        builder::Builder,
         context::Context,
         value::{BasicBlock, FunctionBody},
     };
@@ -262,25 +261,15 @@ mod tests {
         let (second, _) = function(&mut ctx, "second");
         let ptr = ctx.get_const(0x1234, 8).id();
 
-        let direct_second = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block))
-            .push_call(second)
-            .id;
+        let direct_second = (&mut ctx).builder(block).push_call(second).id;
         let site = new_block(&mut ctx, caller);
-        let direct_first = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, site))
-            .push_call(first)
-            .id;
+        let direct_first = (&mut ctx).builder(site).push_call(first).id;
         let site = new_block(&mut ctx, caller);
-        let duplicate_first = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, site))
-            .push_call(first)
-            .id;
+        let duplicate_first = (&mut ctx).builder(site).push_call(first).id;
         let site = new_block(&mut ctx, caller);
-        let tail = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, site))
-            .push_tail_call(second)
-            .id;
+        let tail = (&mut ctx).builder(site).push_tail_call(second).id;
         let site = new_block(&mut ctx, caller);
-        let indirect = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, site))
-            .push_call_ind(ptr)
-            .id;
+        let indirect = (&mut ctx).builder(site).push_call_ind(ptr).id;
 
         let graph = CallGraph::analyze(&ctx);
 
@@ -331,13 +320,16 @@ mod tests {
         let (scan_body, _) = function(&mut ctx, "scan_body");
         let value = ctx.get_const(1, 8).id();
 
-        let apply = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block))
+        let apply = (&mut ctx)
+            .builder(block)
             .push_apply(apply_body, vec![value])
             .id;
-        let map = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block))
+        let map = (&mut ctx)
+            .builder(block)
             .push_map(map_body, value, Vec::new())
             .id;
-        let scan = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block))
+        let scan = (&mut ctx)
+            .builder(block)
             .push_scan(scan_body, value, value, Vec::new())
             .id;
 
@@ -379,14 +371,14 @@ mod tests {
         let (middle, middle_block) = function(&mut ctx, "middle");
         let (high, _) = function(&mut ctx, "high");
 
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, middle_block)).push_call(high);
+        (&mut ctx).builder(middle_block).push_call(high);
         let site = new_block(&mut ctx, middle);
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, site)).push_call(low);
+        (&mut ctx).builder(site).push_call(low);
         let site = new_block(&mut ctx, middle);
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, site)).push_call(high);
+        (&mut ctx).builder(site).push_call(high);
         let site = new_block(&mut ctx, middle);
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, site)).push_call(middle);
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, low_block)).push_call(high);
+        (&mut ctx).builder(site).push_call(middle);
+        (&mut ctx).builder(low_block).push_call(high);
 
         let graph = CallGraph::analyze(&ctx);
         assert_eq!(graph.callees(middle), vec![low, middle, high]);
@@ -401,7 +393,7 @@ mod tests {
         let (callee, _) = function(&mut ctx, "callee");
         let before = CallGraph::analyze(&ctx);
 
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block)).push_call(callee);
+        (&mut ctx).builder(block).push_call(callee);
 
         assert!(before.callees(caller).is_empty());
         assert_eq!(CallGraph::analyze(&ctx).callees(caller), vec![callee]);
@@ -415,7 +407,7 @@ mod tests {
 
         let mut ctx = Context::new();
         let (_, block) = function(&mut ctx, "caller");
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block)).push_call(Callee::Minted(0));
+        (&mut ctx).builder(block).push_call(Callee::Minted(0));
 
         let _ = CallGraph::analyze(&ctx);
     }

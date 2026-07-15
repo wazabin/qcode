@@ -49,7 +49,7 @@ mod tests {
 
     #[test]
     fn result_type_is_one_element_array() {
-        let mut types = TypeManager::default();
+        let types = TypeManager::default();
         let i32 = types.get_or_make_int(4);
         let id = IntrinsicId::from_name("singleton").unwrap();
         let ty = id.desc().result_type(&types, &[i32]);

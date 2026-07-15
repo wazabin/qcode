@@ -54,7 +54,7 @@ mod tests {
         FunctionBody::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
-        let mut builder = Builder::from_context(&mut tc.ctx, 0x1000);
+        let mut builder = (&mut tc.ctx).builder_at(0x1000);
         f(&mut builder);
         unsafe { builder.dont_finalize() };
         drop(builder);
@@ -64,9 +64,9 @@ mod tests {
     #[test]
     fn single_store_is_clobbered() {
         let (tc, fun_id) = build_fn(|b| {
-            let r0 = b.context().get_named("r0").unwrap().as_varnode().unwrap();
-            let reg_space = b.context().try_get_space("register").unwrap();
-            let val = b.context_mut().get_const(1u64, 8).id();
+            let r0 = b.shr().get_named("r0").unwrap().as_varnode().unwrap();
+            let reg_space = b.shr().named_spaces["register"];
+            let val = b.shr().get_const(1u64, 8);
             b.push_store(val, ValueId::Varnode(r0), reg_space);
         });
         let regs = compute_clobbered_regs(&tc.ctx, fun_id);
@@ -76,8 +76,8 @@ mod tests {
     #[test]
     fn load_only_not_clobbered() {
         let (tc, fun_id) = build_fn(|b| {
-            let r0 = b.context().get_named("r0").unwrap().as_varnode().unwrap();
-            let reg_space = b.context().try_get_space("register").unwrap();
+            let r0 = b.shr().get_named("r0").unwrap().as_varnode().unwrap();
+            let reg_space = b.shr().named_spaces["register"];
             b.push_load::<false>(ValueId::Varnode(r0), 8, reg_space);
         });
         let regs = compute_clobbered_regs(&tc.ctx, fun_id);
@@ -87,11 +87,11 @@ mod tests {
     #[test]
     fn each_varnode_appears_once() {
         let (tc, fun_id) = build_fn(|b| {
-            let r0 = b.context().get_named("r0").unwrap().as_varnode().unwrap();
-            let reg_space = b.context().try_get_space("register").unwrap();
-            let v1 = b.context_mut().get_const(1u64, 8).id();
+            let r0 = b.shr().get_named("r0").unwrap().as_varnode().unwrap();
+            let reg_space = b.shr().named_spaces["register"];
+            let v1 = b.shr().get_const(1u64, 8);
             b.push_store(v1, ValueId::Varnode(r0), reg_space);
-            let v2 = b.context_mut().get_const(2u64, 8).id();
+            let v2 = b.shr().get_const(2u64, 8);
             b.push_store(v2, ValueId::Varnode(r0), reg_space);
         });
         let regs = compute_clobbered_regs(&tc.ctx, fun_id);
@@ -105,10 +105,10 @@ mod tests {
     #[test]
     fn multiple_distinct_regs_all_collected() {
         let (tc, fun_id) = build_fn(|b| {
-            let r0 = b.context().get_named("r0").unwrap().as_varnode().unwrap();
-            let r1 = b.context().get_named("r1").unwrap().as_varnode().unwrap();
-            let reg_space = b.context().try_get_space("register").unwrap();
-            let v = b.context_mut().get_const(0u64, 8).id();
+            let r0 = b.shr().get_named("r0").unwrap().as_varnode().unwrap();
+            let r1 = b.shr().get_named("r1").unwrap().as_varnode().unwrap();
+            let reg_space = b.shr().named_spaces["register"];
+            let v = b.shr().get_const(0u64, 8);
             b.push_store(v, ValueId::Varnode(r0), reg_space);
             b.push_store(v, ValueId::Varnode(r1), reg_space);
         });
@@ -121,9 +121,9 @@ mod tests {
     #[test]
     fn set_clobbered_regs_populates_signature() {
         let (mut tc, fun_id) = build_fn(|b| {
-            let r0 = b.context().get_named("r0").unwrap().as_varnode().unwrap();
-            let reg_space = b.context().try_get_space("register").unwrap();
-            let val = b.context_mut().get_const(42u64, 8).id();
+            let r0 = b.shr().get_named("r0").unwrap().as_varnode().unwrap();
+            let reg_space = b.shr().named_spaces["register"];
+            let val = b.shr().get_const(42u64, 8);
             b.push_store(val, ValueId::Varnode(r0), reg_space);
         });
         set_clobbered_regs(&mut tc.ctx, fun_id);
@@ -136,9 +136,9 @@ mod tests {
     #[test]
     fn preserves_existing_signature_fields() {
         let (mut tc, fun_id) = build_fn(|b| {
-            let r0 = b.context().get_named("r0").unwrap().as_varnode().unwrap();
-            let reg_space = b.context().try_get_space("register").unwrap();
-            let val = b.context_mut().get_const(1u64, 8).id();
+            let r0 = b.shr().get_named("r0").unwrap().as_varnode().unwrap();
+            let reg_space = b.shr().named_spaces["register"];
+            let val = b.shr().get_const(1u64, 8);
             b.push_store(val, ValueId::Varnode(r0), reg_space);
         });
         let r1_id: VarnodeId = tc.r1;

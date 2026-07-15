@@ -649,7 +649,6 @@ mod tests {
     #[test]
     fn frame_freshness_local_disjoint_from_incoming_pointer() {
         use qcode::{
-            builder::Builder,
             testing::TestContext,
             value::{BasicBlock, FunctionBody},
         };
@@ -673,8 +672,8 @@ mod tests {
         let arg = ValueId::BlockParam(arg_pid);
 
         let (local, caller_arg, arg_plus) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-            let c8 = b.context_mut().get_const(8, 8).id();
+            let mut b = (&mut tc.ctx).builder(root);
+            let c8 = b.shr().get_const(8, 8);
             let local = b.push_sub(sp, c8).id(); // @SP - 8  (own-frame local)
             let caller_arg = b.push_add(sp, c8).id(); // @SP + 8  (caller frame)
             let arg_plus = b.push_add(arg, c8).id(); // arg + 8  (input-derived)
@@ -724,7 +723,6 @@ mod tests {
     #[test]
     fn stack_is_disjoint_from_global_statics() {
         use qcode::{
-            builder::Builder,
             testing::TestContext,
             value::{BasicBlock, FunctionBody},
         };
@@ -748,13 +746,13 @@ mod tests {
         let glob = ValueId::BlockParam(glob_pid);
 
         let (local, caller_arg, glob_plus, lit_addr, glob_addr) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-            let c8 = b.context_mut().get_const(8, 8).id();
+            let mut b = (&mut tc.ctx).builder(root);
+            let c8 = b.shr().get_const(8, 8);
             let local = b.push_sub(sp, c8).id(); // @SP - 8  (own-frame local)
             let caller_arg = b.push_add(sp, c8).id(); // @SP + 8  (caller frame)
             let glob_plus = b.push_add(glob, c8).id(); // @glob + 8
-            let lit_addr = b.context_mut().get_const(0x401000, 8).id(); // bare global address
-            let glob_addr = b.context_mut().get_const(0x454df8, 8).id();
+            let lit_addr = b.shr().get_const(0x401000, 8); // bare global address
+            let glob_addr = b.shr().get_const(0x454df8, 8);
             unsafe { b.dont_finalize() };
             (local, caller_arg, glob_plus, lit_addr, glob_addr)
         };
@@ -813,7 +811,6 @@ mod tests {
     fn globalized_slot_disjoint_from_loaded_pointer_under_assumption() {
         use qcode::{
             assumption::Proposition,
-            builder::Builder,
             testing::TestContext,
             value::{BasicBlock, FunctionBody, Value},
         };
@@ -843,12 +840,12 @@ mod tests {
 
         let ram = tc.ctx.shared.default_space;
         let (store_addr, snap_addr, glob_addr) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let mut b = (&mut tc.ctx).builder(root);
             let p = b.push_load::<false>(glob, 4, ram).id(); // P = *@glob (the buffer pointer)
-            let c4 = b.context_mut().get_const(4, 4).id();
+            let c4 = b.shr().get_const(4, 4);
             let store_addr = b.push_add(p, c4).id(); // P + 4 (a write through the loaded pointer)
             let snap_addr = b.push_add(snap, c4).id(); // snapshot + 4 (write through the by-value pointer)
-            let glob_addr = b.context_mut().get_const(0x454df8, 4).id();
+            let glob_addr = b.shr().get_const(0x454df8, 4);
             unsafe { b.dont_finalize() };
             (store_addr, snap_addr, glob_addr)
         };
@@ -903,7 +900,6 @@ mod tests {
     fn loaded_pointer_disjoint_from_slot_only_under_assumption() {
         use qcode::{
             assumption::Proposition,
-            builder::Builder,
             testing::TestContext,
             value::{BasicBlock, FunctionBody, Value},
         };
@@ -925,8 +921,8 @@ mod tests {
 
         let ram = tc.ctx.shared.default_space;
         let addr = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-            let c4 = b.context_mut().get_const(4, 8).id();
+            let mut b = (&mut tc.ctx).builder(root);
+            let c4 = b.shr().get_const(4, 8);
             let slot = b.push_add(sp, c4).id(); // @SP + 4 (caller-frame slot)
             let cc = b.push_load::<false>(slot, 8, ram).id(); // buf = load(@SP+4)
             let addr = b.push_add(cc, c4).id(); // buf + 4
@@ -973,7 +969,6 @@ mod tests {
     fn caller_frame_disjoint_only_under_assumption() {
         use qcode::{
             assumption::Proposition,
-            builder::Builder,
             testing::TestContext,
             value::{BasicBlock, FunctionBody},
         };
@@ -996,8 +991,8 @@ mod tests {
         let arg = ValueId::BlockParam(arg_pid);
 
         let (caller_arg, arg_plus) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-            let c8 = b.context_mut().get_const(8, 8).id();
+            let mut b = (&mut tc.ctx).builder(root);
+            let c8 = b.shr().get_const(8, 8);
             let caller_arg = b.push_add(sp, c8).id(); // @SP + 8  (caller-frame slot)
             let arg_plus = b.push_add(arg, c8).id(); // arg + 8  (input-derived)
             unsafe { b.dont_finalize() };
@@ -1046,7 +1041,6 @@ mod tests {
     #[test]
     fn mixed_input_and_stack_is_not_input_derived() {
         use qcode::{
-            builder::Builder,
             testing::TestContext,
             value::{BasicBlock, FunctionBody},
         };
@@ -1069,8 +1063,8 @@ mod tests {
         let arg = ValueId::BlockParam(arg_pid);
 
         let (local, mix, arg_plus) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-            let c8 = b.context_mut().get_const(8, 8).id();
+            let mut b = (&mut tc.ctx).builder(root);
+            let c8 = b.shr().get_const(8, 8);
             let local = b.push_sub(sp, c8).id(); // @SP - 8  (own-frame local)
             let sp_minus_arg = b.push_sub(sp, arg).id(); // sp - arg  (mixed)
             let mix = b.push_add(arg, sp_minus_arg).id(); // arg + (sp - arg)
@@ -1103,7 +1097,6 @@ mod tests {
     fn input_plus_load_needs_both_assumptions() {
         use qcode::{
             assumption::Proposition,
-            builder::Builder,
             testing::TestContext,
             value::{BasicBlock, FunctionBody, Value},
         };
@@ -1129,8 +1122,8 @@ mod tests {
 
         let ram = tc.ctx.shared.default_space;
         let (local, caller_arg, mix) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-            let c8 = b.context_mut().get_const(8, 8).id();
+            let mut b = (&mut tc.ctx).builder(root);
+            let c8 = b.shr().get_const(8, 8);
             let local = b.push_sub(sp, c8).id(); // @SP - 8 (own-frame local)
             let caller_arg = b.push_add(sp, c8).id(); // @SP + 8 (caller frame)
             let loaded = b.push_load::<false>(p, 8, ram).id(); // load(p)
@@ -1186,7 +1179,6 @@ mod tests {
     #[test]
     fn provenance_is_memoized() {
         use qcode::{
-            builder::Builder,
             testing::TestContext,
             value::{BasicBlock, FunctionBody},
         };
@@ -1209,8 +1201,8 @@ mod tests {
         let arg = ValueId::BlockParam(arg_pid);
 
         let (local, deep) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-            let c8 = b.context_mut().get_const(8, 8).id();
+            let mut b = (&mut tc.ctx).builder(root);
+            let c8 = b.shr().get_const(8, 8);
             let local = b.push_sub(sp, c8).id();
             // A deep peel chain over the incoming arg.
             let mut deep = arg;
@@ -1289,17 +1281,16 @@ mod tests {
     /// but here nothing escaped).
     #[test]
     fn uncaptured_own_frame_disjoint_from_loaded_pointer() {
-        use qcode::builder::Builder;
         let mut tc = qcode::testing::TestContext::new();
         let sp_reg = tc.r0;
         let (fid, root, sp) = fn_with_sp(&mut tc, "f", 0x1000, sp_reg);
         let ram = tc.ctx.shared.default_space;
 
         let (local, loaded) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-            let c8 = b.context_mut().get_const(8, 8).id();
+            let mut b = (&mut tc.ctx).builder(root);
+            let c8 = b.shr().get_const(8, 8);
             let local = b.push_sub(sp, c8).id(); // @SP - 8 (own-frame local)
-            let g = b.context_mut().get_const(0x404040, 8).id();
+            let g = b.shr().get_const(0x404040, 8);
             let loaded = b.push_load::<false>(g, 8, ram).id(); // load(global) -> LOADED
             unsafe { b.dont_finalize() };
             (local, loaded)
@@ -1329,17 +1320,16 @@ mod tests {
     /// (which could now be the escaped address reloaded).
     #[test]
     fn captured_by_store_makes_refinement_a_inert() {
-        use qcode::builder::Builder;
         let mut tc = qcode::testing::TestContext::new();
         let sp_reg = tc.r0;
         let (fid, root, sp) = fn_with_sp(&mut tc, "f", 0x1000, sp_reg);
         let ram = tc.ctx.shared.default_space;
 
         let (local, loaded) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-            let c8 = b.context_mut().get_const(8, 8).id();
+            let mut b = (&mut tc.ctx).builder(root);
+            let c8 = b.shr().get_const(8, 8);
             let local = b.push_sub(sp, c8).id(); // @SP - 8
-            let g = b.context_mut().get_const(0x404040, 8).id();
+            let g = b.shr().get_const(0x404040, 8);
             b.push_store(local, g, ram); // *global = local  (frame address escapes)
             let loaded = b.push_load::<false>(g, 8, ram).id();
             unsafe { b.dont_finalize() };
@@ -1365,8 +1355,6 @@ mod tests {
     /// passing it to a capturing (or signatureless) callee, or to `CallInd`, does.
     #[test]
     fn call_capture_respects_nocapture_bit() {
-        use qcode::builder::Builder;
-
         // Helper: build `f` that calls `configure` to emit a call taking `@SP-8`,
         // then report `frame_uncaptured`.
         fn uncaptured_after(
@@ -1378,11 +1366,11 @@ mod tests {
             let (fid, root, sp) = fn_with_sp(&mut tc, "f", 0x1000, sp_reg);
             let callee = configure(&mut tc, fid);
             let cid = {
-                let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-                let c8 = b.context_mut().get_const(8, 8).id();
+                let mut b = (&mut tc.ctx).builder(root);
+                let c8 = b.shr().get_const(8, 8);
                 let local = b.push_sub(sp, c8).id(); // @SP - 8
                 let cid = if indirect {
-                    let t = b.context_mut().get_const(0x9000, 8).id();
+                    let t = b.shr().get_const(0x9000, 8);
                     b.push_call_ind(t).id
                 } else {
                     b.push_call(callee).id
@@ -1443,8 +1431,6 @@ mod tests {
     /// disjoint.
     #[test]
     fn all_nocapture_call_result_classified_from_args() {
-        use qcode::builder::Builder;
-
         fn local_disjoint_from_call_result(attrs: Vec<ParamAttrs>) -> bool {
             let mut tc = qcode::testing::TestContext::new();
             let sp_reg = tc.r0;
@@ -1455,8 +1441,8 @@ mod tests {
             let callee = callee_with_attrs(&mut tc, "g", attrs);
 
             let (local, call_result) = {
-                let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-                let c8 = b.context_mut().get_const(8, 8).id();
+                let mut b = (&mut tc.ctx).builder(root);
+                let c8 = b.shr().get_const(8, 8);
                 let local = b.push_sub(sp, c8).id(); // @SP - 8
                 let cr = b.push_call(callee).id;
                 unsafe { b.dont_finalize() };
@@ -1508,7 +1494,7 @@ mod tests {
     #[test]
     fn widened_rule2_caller_frame_disjoint_from_input_global_mix() {
         use qcode::assumption::Proposition;
-        use qcode::builder::Builder;
+
         let mut tc = qcode::testing::TestContext::new();
         let sp_reg = tc.r0;
         let (fid, root, sp) = fn_with_sp(&mut tc, "f", 0x1000, sp_reg);
@@ -1519,11 +1505,11 @@ mod tests {
         let glob = ValueId::BlockParam(glob_pid);
 
         let (caller_slot, mixed, glob_addr) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-            let c8 = b.context_mut().get_const(8, 8).id();
+            let mut b = (&mut tc.ctx).builder(root);
+            let c8 = b.shr().get_const(8, 8);
             let caller_slot = b.push_add(sp, c8).id(); // @SP + 8 (caller frame)
             let mixed = b.push_add(input, glob).id(); // INPUT ∪ GLOBAL_STATIC
-            let glob_addr = b.context_mut().get_const(0x454df8, 8).id();
+            let glob_addr = b.shr().get_const(0x454df8, 8);
             unsafe { b.dont_finalize() };
             (caller_slot, mixed, glob_addr)
         };

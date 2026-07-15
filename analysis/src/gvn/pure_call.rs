@@ -170,7 +170,6 @@ fn emulate_field(
 mod tests {
     use super::*;
     use qcode::{
-        builder::Builder,
         testing::TestContext,
         value::{
             BasicBlock, FunctionBody, LocalValueId,
@@ -190,15 +189,15 @@ mod tests {
         }
         let (ret, ptr, tuple);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             let a = b.push_param(8).id();
             let bp = b.push_param(8).id();
-            let c69 = b.context_mut().get_const(69, 8).id();
-            let c42 = b.context_mut().get_const(42, 8).id();
+            let c69 = b.shr().get_const(69, 8);
+            let c42 = b.shr().get_const(42, 8);
             let b69 = b.push_mul(bp, c69).id();
             let body = b.push_add(b69, c42).id();
             tuple = b.push_tuple(vec![a, body]).id();
-            ptr = b.context_mut().get_const(0x2000, 8).id();
+            ptr = b.shr().get_const(0x2000, 8);
             ret = b.push_return(ptr).id();
             unsafe { b.dont_finalize() };
         }
@@ -246,10 +245,10 @@ mod tests {
         }
         let (a_in, b_arg, call_id);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             a_in = b.push_param(8).id();
             b_arg = match b_const {
-                Some(v) => b.context_mut().get_const(v, 8).id(),
+                Some(v) => b.shr().get_const(v, 8),
                 None => b.push_param(8).id(),
             };
             let ValueId::Instruction(id) = b.push_call(foo).id() else {
@@ -270,13 +269,13 @@ mod tests {
         tc.ctx.add_cfg_edge(entry, cont);
         let (r0, r1, reg_space) = (tc.r0, tc.r1, tc.reg_space);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, cont));
+            let mut b = (&mut tc.ctx).builder(cont);
             let cr = ValueId::Instruction(call_id);
             let e0 = b.push_extract(cr, 0).id();
             let e1 = b.push_extract(cr, 1).id();
             b.push_store(e0, ValueId::Varnode(r0), reg_space);
             b.push_store(e1, ValueId::Varnode(r1), reg_space);
-            let ptr = b.context_mut().get_const(0, 8).id();
+            let ptr = b.shr().get_const(0, 8);
             b.push_return(ptr);
         }
         (gid, cont)
@@ -358,16 +357,16 @@ mod tests {
         let at_id = qcode::value::insn::IntrinsicId::from_name("at").expect("at registered");
         let (ret, ptr, tuple);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             let sp = ValueId::BlockParam(sp_pid);
             let arr = ValueId::BlockParam(arr_pid);
             // `at(arr, 0)` bridges the array param to a scalar lane (byte 0),
             // routing the read through `resolve_array`'s new `BlockParam` arm.
-            let zero = b.context_mut().get_const(0, 8).id();
+            let zero = b.shr().get_const(0, 8);
             let b0 = b.push_intrinsic(at_id, vec![arr, zero]).id();
             let z = b.push_zext(b0, 4).id();
             tuple = b.push_tuple(vec![sp, z]).id();
-            ptr = b.context_mut().get_const(0x2000, 8).id();
+            ptr = b.shr().get_const(0x2000, 8);
             ret = b.push_return(ptr).id();
             unsafe { b.dont_finalize() };
         }
@@ -413,9 +412,9 @@ mod tests {
         }
         let (sp_arg, arr_arg, call_id);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            sp_arg = b.context_mut().get_const(0x40ea20, 4).id();
-            arr_arg = b.context_mut().get_const(0x2f76bfc2, 4).id();
+            let mut b = (&mut tc.ctx).builder(entry);
+            sp_arg = b.shr().get_const(0x40ea20, 4);
+            arr_arg = b.shr().get_const(0x2f76bfc2, 4);
             let ValueId::Instruction(id) = b.push_call(dec).id() else {
                 unreachable!()
             };
@@ -434,11 +433,11 @@ mod tests {
         tc.ctx.add_cfg_edge(entry, cont);
         let (r1, reg_space) = (tc.r1, tc.reg_space);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, cont));
+            let mut b = (&mut tc.ctx).builder(cont);
             let cr = ValueId::Instruction(call_id);
             let e1 = b.push_extract(cr, 1).id();
             b.push_store(e1, ValueId::Varnode(r1), reg_space);
-            let ptr = b.context_mut().get_const(0, 8).id();
+            let ptr = b.shr().get_const(0, 8);
             b.push_return(ptr);
         }
         (gid, cont)

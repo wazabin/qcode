@@ -847,7 +847,6 @@ mod spike {
     //! give `@SP - const` stable slot identity without the `@stack_base` literal?
     use super::*;
     use qcode::{
-        builder::Builder,
         testing::TestContext,
         value::{BasicBlock, FunctionBody, Value},
     };
@@ -866,10 +865,10 @@ mod spike {
         let sp = ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
 
         let (s1, s2, threaded, aligned, al) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            let c8 = b.context_mut().get_const(8, 8).id();
-            let c20 = b.context_mut().get_const(0x20, 8).id();
-            let neg16 = b.context_mut().get_const((-16i64) as u64, 8).id();
+            let mut b = (&mut tc.ctx).builder(entry);
+            let c8 = b.shr().get_const(8, 8);
+            let c20 = b.shr().get_const(0x20, 8);
+            let neg16 = b.shr().get_const((-16i64) as u64, 8);
             // Two independent occurrences of `@SP - 8` (distinct ValueIds).
             let s1 = b.push_sub(sp, c8).id();
             let s2 = b.push_sub(sp, c8).id();
@@ -921,16 +920,16 @@ mod spike {
         let sp = ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
 
         let (fixed, indexed, aligned_slot, unrelated) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            let c8 = b.context_mut().get_const(8, 8).id();
-            let neg16 = b.context_mut().get_const((-16i64) as u64, 8).id();
+            let mut b = (&mut tc.ctx).builder(entry);
+            let c8 = b.shr().get_const(8, 8);
+            let neg16 = b.shr().get_const((-16i64) as u64, 8);
             // A non-constant index loaded from a register.
             let idx = b.push_load::<false>(ValueId::Varnode(tc.r1), 8, reg).id();
             let fixed = b.push_sub(sp, c8).id(); // @SP - 8   (fixed slot)
             let indexed = b.push_add(sp, idx).id(); // @SP + reg (dynamic)
             let aligned = b.push_bit_and(sp, neg16).id();
             let aligned_slot = b.push_add(aligned, c8).id(); // (@SP & -16) + 8
-            let other = b.context_mut().get_const(0x4000, 8).id();
+            let other = b.shr().get_const(0x4000, 8);
             let unrelated = b.push_add(other, idx).id(); // base + reg, no @SP
             let _ = b.push_load::<false>(indexed, 1, ram);
             unsafe { b.dont_finalize() };
@@ -983,8 +982,8 @@ mod spike {
         let p = ValueId::BlockParam(pid);
 
         let (gep, add) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            let c60 = b.context_mut().get_const(0x60, 8).id();
+            let mut b = (&mut tc.ctx).builder(entry);
+            let c60 = b.shr().get_const(0x60, 8);
             let gep = b.push_gep(p, 0x60).id(); // gep(p + 0x60)
             let add = b.push_add(p, c60).id(); // p + 0x60
             unsafe { b.dont_finalize() };

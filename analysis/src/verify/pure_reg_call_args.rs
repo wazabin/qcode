@@ -128,7 +128,6 @@ mod tests {
     use super::*;
 
     use qcode::{
-        builder::Builder,
         testing::TestContext,
         value::{
             FunctionBody,
@@ -160,7 +159,7 @@ mod tests {
             .set_root(block)
             .unwrap();
         let call_id = {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x2000);
+            let mut b = (&mut tc.ctx).builder_at(0x2000);
             let id = b.push_call(callee).id;
             unsafe { b.dont_finalize() };
             id

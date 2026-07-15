@@ -69,7 +69,6 @@ pub fn verify_intra_function_ssa(ctx: &Context) -> Vec<String> {
 mod tests {
     use super::verify_intra_function_ssa;
     use qcode::{
-        builder::Builder,
         context::Context,
         value::{BasicBlock, FunctionBody},
     };
@@ -105,9 +104,9 @@ mod tests {
             .unwrap();
         {
             let zero = ctx.get_const(0, 8).id();
-            Builder::from_block(BasicBlock::from_id_mut(&mut ctx, tail)).push_return(zero);
+            (&mut ctx).builder(tail).push_return(zero);
         }
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry)).push_branch(tail);
+        (&mut ctx).builder(entry).push_branch(tail);
 
         assert!(verify_intra_function_ssa(&ctx).is_empty());
     }

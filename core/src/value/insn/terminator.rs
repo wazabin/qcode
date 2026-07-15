@@ -263,7 +263,6 @@ mod tests {
     use qcode_macro::qcode;
 
     use crate::{
-        builder::Builder,
         context::Context,
         testing::TestContext,
         value::{
@@ -312,9 +311,7 @@ mod tests {
             let f = ctx.anon_function();
             BasicBlock::make(&mut ctx, f).id
         };
-        let insn = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block))
-            .push_tail_call(callee)
-            .id;
+        let insn = (&mut ctx).builder(block).push_tail_call(callee).id;
 
         let insn = Instruction::from_id(&ctx, insn);
         assert!(insn.is_terminator());
@@ -414,7 +411,7 @@ mod tests {
         }
         .id;
         let call_id = {
-            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            let mut builder = (&mut tc.ctx).builder(block);
             builder.push_call(callee).id
         };
 
@@ -455,7 +452,7 @@ mod tests {
         }
         .id;
         let call_id = {
-            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            let mut builder = (&mut tc.ctx).builder(block);
             builder.push_call(callee).id
         };
 

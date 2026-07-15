@@ -876,7 +876,7 @@ fn apply(
                     pname,
                 );
                 let caller_base = call.args[arg_idx].qualify(call_id.func);
-                let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, block));
+                let mut b = (ctx).builder(block);
                 b.set_insert_point_before(call_id);
                 let addr = seed_addr(&mut b, caller_base, base_size, offset);
                 b.push_load::<false>(addr, size, ram).id()
@@ -938,7 +938,7 @@ fn seed_addr(b: &mut Builder<'_, '_>, base: ValueId, base_size: usize, offset: i
     if offset == 0 {
         base
     } else {
-        let k = b.context_mut().get_const(offset as u64, base_size).id();
+        let k = b.shr().get_const(offset as u64, base_size);
         b.push_add(base, k).id()
     }
 }
@@ -1039,13 +1039,13 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
         ));
     }
     {
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
+        let mut b = (ctx).builder(root);
         b.set_insert_point_to_start();
         for (base, base_size, offset, snap) in &seeds {
             let addr = if *offset == 0 {
                 *base
             } else {
-                let k = b.context_mut().get_const(*offset, *base_size).id();
+                let k = b.shr().get_const(*offset, *base_size);
                 b.push_add(*base, k).id()
             };
             b.push_store(*snap, addr, ram);
@@ -1071,7 +1071,7 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
             .unwrap_or_else(|| "<unknown>".to_string());
         let mut new_args = args.clone();
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, call_block));
+            let mut b = (ctx).builder(call_block);
             b.set_insert_point_before(call_id);
             for ns in &new_snaps {
                 // Invariant: call args are in lockstep with callee root params (see
@@ -1089,7 +1089,7 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
                 let addr = if ns.offset == 0 {
                     base
                 } else {
-                    let k = b.context_mut().get_const(ns.offset, ns.base_size).id();
+                    let k = b.shr().get_const(ns.offset, ns.base_size);
                     b.push_add(base, k).id()
                 };
                 let snap = b.push_load::<false>(addr, ns.size, ram).id();

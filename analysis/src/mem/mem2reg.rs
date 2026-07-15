@@ -1,4 +1,5 @@
 use jstd::graph::analysis::compute_dominators;
+use qcode::context::Context;
 use qcode::space::SpaceType;
 #[cfg(test)]
 use qcode::value::block::BlockRef;
@@ -6,9 +7,7 @@ use qcode::value::{
     BlockId, BlockParam, BlockParamId, BodyView, FunctionBody, FunctionId, QCodeView, Value,
     ValueId, ValueRef, Varnode, VarnodeId,
     insn::{Branch, CBranch, InstructionId, Load, Mnemonic, Range, Sext, Store, Zext},
-    util::base_ref::BaseRef,
 };
-use qcode::{builder::Builder, context::Context};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 
@@ -1394,7 +1393,7 @@ impl<'str> Mem2Reg<'_, 'str> {
             (vn.space().id, vn.size())
         };
         let mut host = self.cx.host(self.body);
-        let mut builder = Builder::from_block(BaseRef::new(host.reborrow(), branch_block));
+        let mut builder = host.builder(branch_block);
         builder.set_insert_point_before(branch_insn);
         let id = builder
             .push_load::<false>(ValueId::Varnode(vn_id), size, space)
@@ -2291,7 +2290,7 @@ mod tests {
 
     #[test]
     fn overlapping_full_register_seed_does_not_create_subregister_entry_param() {
-        use qcode::{builder::Builder, testing::TestContext};
+        use qcode::testing::TestContext;
 
         let mut tc = TestContext::new();
         let fun_id = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
@@ -2307,7 +2306,7 @@ mod tests {
         tc.ctx.block_param_mut(full_param).name = Some("r0".into());
 
         {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            let mut b = (&mut tc.ctx).builder_at(0x1000);
             b.push_store(
                 ValueId::BlockParam(full_param),
                 ValueId::Varnode(tc.r0),
@@ -2338,7 +2337,6 @@ mod tests {
     /// param (origin = `sp_reg`). The two `@SP-8` addresses are distinct `Sub`
     /// values until canonicalized. Returns `(fun_id, block, sp_param, sp_reg)`.
     fn sp_slot_function(tc: &mut qcode::testing::TestContext) -> (FunctionId, ValueId, VarnodeId) {
-        use qcode::builder::Builder;
         let sp_reg = tc.r0;
         let ram = tc.ctx.shared.default_space;
         let fun_id = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
@@ -2353,9 +2351,9 @@ mod tests {
         tc.ctx.block_param_mut(pid).name = Some("RSP".into());
         let sp = ValueId::BlockParam(pid);
 
-        let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-        let v = b.context_mut().get_const(0x1234, 8).id();
-        let c8 = b.context_mut().get_const(8, 8).id();
+        let mut b = (&mut tc.ctx).builder_at(0x1000);
+        let v = b.shr().get_const(0x1234, 8);
+        let c8 = b.shr().get_const(8, 8);
         let addr_store = b.push_sub(sp, c8).id();
         b.push_store(v, addr_store, ram);
         let addr_load = b.push_sub(sp, c8).id();
@@ -2412,7 +2410,6 @@ mod tests {
     #[test]
     fn dynamic_sp_indexed_access_disables_promotion() {
         use crate::stack::canonicalize::canonicalize_sp_slots;
-        use qcode::builder::Builder;
 
         let mut tc = qcode::testing::TestContext::new();
         let sp_reg = tc.r0;
@@ -2429,9 +2426,9 @@ mod tests {
         let sp = ValueId::BlockParam(pid);
 
         {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-            let v = b.context_mut().get_const(0x1234, 8).id();
-            let c8 = b.context_mut().get_const(8, 8).id();
+            let mut b = (&mut tc.ctx).builder_at(0x1000);
+            let v = b.shr().get_const(0x1234, 8);
+            let c8 = b.shr().get_const(8, 8);
             // A promotable local: store then reload `@SP - 8`.
             let addr_store = b.push_sub(sp, c8).id();
             b.push_store(v, addr_store, ram);
@@ -2469,7 +2466,7 @@ mod tests {
 
     #[test]
     fn partial_register_store_clobbers_promoted_full_register_value() {
-        use qcode::{builder::Builder, testing::TestContext};
+        use qcode::testing::TestContext;
 
         let mut tc = TestContext::new();
         let full = ValueId::Varnode(tc.r0_lo32);
@@ -2486,9 +2483,9 @@ mod tests {
         let zero_store;
         let full_load;
         {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-            let zero = b.context_mut().get_const(0, 4).id();
-            let one = b.context_mut().get_const(1, 1).id();
+            let mut b = (&mut tc.ctx).builder_at(0x1000);
+            let zero = b.shr().get_const(0, 4);
+            let one = b.shr().get_const(1, 1);
             zero_store = b.push_store(zero, full, tc.reg_space).id;
             let pre_clobber_load = b.push_load::<false>(full, 4, tc.reg_space).id();
             b.push_store(pre_clobber_load, pre_clobber_sink, tc.reg_space);
@@ -2526,7 +2523,7 @@ mod tests {
     /// kept and deferred to the GVN memory pass.
     #[test]
     fn subregister_load_is_sliced_from_overlapping_full_store() {
-        use qcode::{builder::Builder, testing::TestContext};
+        use qcode::testing::TestContext;
 
         let mut tc = TestContext::new();
         let full = ValueId::Varnode(tc.r0_lo32);
@@ -2543,8 +2540,8 @@ mod tests {
         let byte_store;
         let byte_load;
         {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-            let value = b.context_mut().get_const(0x12345678, 4).id();
+            let mut b = (&mut tc.ctx).builder_at(0x1000);
+            let value = b.shr().get_const(0x12345678, 4);
             b.push_store(value, full, tc.reg_space);
             let full_load = b.push_load::<false>(full, 4, tc.reg_space).id();
             b.push_store(full_load, full_sink, tc.reg_space);
@@ -2747,7 +2744,7 @@ mod tests {
     /// read is the call's output and must stay a register load.
     #[test]
     fn call_clobbered_register_read_not_forwarded_across_call() {
-        use qcode::{builder::Builder, testing::TestContext};
+        use qcode::testing::TestContext;
 
         let mut tc = TestContext::new();
         let (r0, r1, reg) = (tc.r0, tc.r1, tc.reg_space);
@@ -2759,10 +2756,10 @@ mod tests {
             .set_root(cbody)
             .unwrap();
         {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x2000);
-            let v = b.context_mut().get_const(0x99u64, 8).id();
+            let mut b = (&mut tc.ctx).builder_at(0x2000);
+            let v = b.shr().get_const(0x99u64, 8);
             b.push_store(v, ValueId::Varnode(r0), reg);
-            let ret = b.context_mut().get_const(0u64, 8).id();
+            let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
             unsafe { b.dont_finalize() };
         }
@@ -2785,15 +2782,15 @@ mod tests {
         FunctionBody::from_id_mut(&mut tc.ctx, caller).add_block(cont);
         let post_load;
         {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-            let pre = b.context_mut().get_const(0x1u64, 8).id();
+            let mut b = (&mut tc.ctx).builder_at(0x1000);
+            let pre = b.shr().get_const(0x1u64, 8);
             b.push_store(pre, ValueId::Varnode(r0), reg);
             b.push_call(callee);
             b.switch_to_block(cont);
             post_load = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
             // Use the loaded value so it is not trivially dead.
             b.push_store(post_load, ValueId::Varnode(r1), reg);
-            let ret = b.context_mut().get_const(0u64, 8).id();
+            let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
             unsafe { b.dont_finalize() };
         }
@@ -2835,7 +2832,7 @@ mod tests {
     /// argpromote `fn_40b970` investigation.
     #[test]
     fn narrow_subregister_read_is_not_orphaned_by_wide_store_removal() {
-        use qcode::{builder::Builder, testing::TestContext};
+        use qcode::testing::TestContext;
 
         let mut tc = TestContext::new();
         let (r0, r0_byte0, r2, r3, reg) = (tc.r0, tc.r0_byte0, tc.r2, tc.r3, tc.reg_space);
@@ -2848,10 +2845,10 @@ mod tests {
 
         let (c1_store, byte_load);
         {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            let mut b = (&mut tc.ctx).builder_at(0x1000);
             // Compute a wide value into r0 (the `ECX` build).
             let v = b.push_load::<false>(ValueId::Varnode(r2), 8, reg).id();
-            let one = b.context_mut().get_const(1u64, 8).id();
+            let one = b.shr().get_const(1u64, 8);
             let c1 = b.push_add(v, one).id();
             c1_store = b.push_store(c1, ValueId::Varnode(r0), reg).id;
             // Read the low byte (the `mov [mem], cl` source) and make it observable.
@@ -2864,9 +2861,9 @@ mod tests {
             byte_load = byte_load_id;
             b.push_store(byte_val, ValueId::Varnode(r3), reg);
             // Overwrite r0, making the c1 store a dead overwrite that mem2reg drops.
-            let c2 = b.context_mut().get_const(0u64, 8).id();
+            let c2 = b.shr().get_const(0u64, 8);
             b.push_store(c2, ValueId::Varnode(r0), reg);
-            let ret = b.context_mut().get_const(0u64, 8).id();
+            let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
             unsafe { b.dont_finalize() };
         }
@@ -2892,7 +2889,7 @@ mod tests {
     /// analogue of a store-overwrites-store).
     #[test]
     fn dead_pre_call_store_to_clobbered_register_is_removed() {
-        use qcode::{builder::Builder, testing::TestContext};
+        use qcode::testing::TestContext;
 
         let mut tc = TestContext::new();
         let (r0, r1, reg) = (tc.r0, tc.r1, tc.reg_space);
@@ -2904,10 +2901,10 @@ mod tests {
             .set_root(cbody)
             .unwrap();
         {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x2000);
-            let v = b.context_mut().get_const(0x99u64, 8).id();
+            let mut b = (&mut tc.ctx).builder_at(0x2000);
+            let v = b.shr().get_const(0x99u64, 8);
             b.push_store(v, ValueId::Varnode(r0), reg);
-            let ret = b.context_mut().get_const(0u64, 8).id();
+            let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
             unsafe { b.dont_finalize() };
         }
@@ -2924,14 +2921,14 @@ mod tests {
         FunctionBody::from_id_mut(&mut tc.ctx, caller).add_block(cont);
         let pre_store;
         {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-            let pre = b.context_mut().get_const(0x1u64, 8).id();
+            let mut b = (&mut tc.ctx).builder_at(0x1000);
+            let pre = b.shr().get_const(0x1u64, 8);
             pre_store = b.push_store(pre, ValueId::Varnode(r0), reg).id;
             b.push_call(callee);
             b.switch_to_block(cont);
             let post = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
             b.push_store(post, ValueId::Varnode(r1), reg);
-            let ret = b.context_mut().get_const(0u64, 8).id();
+            let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
             unsafe { b.dont_finalize() };
         }
@@ -2952,7 +2949,7 @@ mod tests {
     /// store removed; the call clobbers it with no intervening read.
     #[test]
     fn dead_pre_call_store_to_write_only_clobbered_register_is_removed() {
-        use qcode::{builder::Builder, testing::TestContext};
+        use qcode::testing::TestContext;
 
         let mut tc = TestContext::new();
         let (r0, reg) = (tc.r0, tc.reg_space);
@@ -2963,10 +2960,10 @@ mod tests {
             .set_root(cbody)
             .unwrap();
         {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x2000);
-            let v = b.context_mut().get_const(0x99u64, 8).id();
+            let mut b = (&mut tc.ctx).builder_at(0x2000);
+            let v = b.shr().get_const(0x99u64, 8);
             b.push_store(v, ValueId::Varnode(r0), reg);
-            let ret = b.context_mut().get_const(0u64, 8).id();
+            let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
             unsafe { b.dont_finalize() };
         }
@@ -2981,16 +2978,16 @@ mod tests {
         FunctionBody::from_id_mut(&mut tc.ctx, caller).add_block(cont);
         let pre_store;
         {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-            let v1 = b.context_mut().get_const(0x1u64, 8).id();
+            let mut b = (&mut tc.ctx).builder_at(0x1000);
+            let v1 = b.shr().get_const(0x1u64, 8);
             pre_store = b.push_store(v1, ValueId::Varnode(r0), reg).id; // dead
             b.push_call(callee);
             b.switch_to_block(cont);
             // A second store after the call — never read — making r0 store-only
             // with 2 stores (promoted), as the obfuscated junk does.
-            let v2 = b.context_mut().get_const(0x2u64, 8).id();
+            let v2 = b.shr().get_const(0x2u64, 8);
             b.push_store(v2, ValueId::Varnode(r0), reg);
-            let ret = b.context_mut().get_const(0u64, 8).id();
+            let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
             unsafe { b.dont_finalize() };
         }
@@ -3008,7 +3005,7 @@ mod tests {
 
     #[test]
     fn clobbered_register_branch_arg_is_loaded_before_branch() {
-        use qcode::{builder::Builder, testing::TestContext};
+        use qcode::testing::TestContext;
 
         let mut tc = TestContext::new();
         let (r0, r1, reg) = (tc.r0, tc.r1, tc.reg_space);
@@ -3019,10 +3016,10 @@ mod tests {
             .set_root(callee_body)
             .unwrap();
         {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x2000);
-            let v = b.context_mut().get_const(0x99u64, 8).id();
+            let mut b = (&mut tc.ctx).builder_at(0x2000);
+            let v = b.shr().get_const(0x99u64, 8);
             b.push_store(v, ValueId::Varnode(r0), reg);
-            let ret = b.context_mut().get_const(0u64, 8).id();
+            let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
             unsafe { b.dont_finalize() };
         }
@@ -3044,32 +3041,32 @@ mod tests {
         }
 
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            let one = b.context_mut().get_const(1u64, 8).id();
-            let cond = b.context_mut().get_const(1u64, 1).id();
+            let mut b = (&mut tc.ctx).builder(entry);
+            let one = b.shr().get_const(1u64, 8);
+            let cond = b.shr().get_const(1u64, 1);
             b.push_store(one, ValueId::Varnode(r0), reg);
             b.push_cbranch(cond, left, right);
         }
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, left));
+            let mut b = (&mut tc.ctx).builder(left);
             b.push_call(callee);
         }
         tc.ctx.add_cfg_edge(left, left_cont);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, left_cont));
+            let mut b = (&mut tc.ctx).builder(left_cont);
             b.push_branch(join);
         }
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, right));
-            let two = b.context_mut().get_const(2u64, 8).id();
+            let mut b = (&mut tc.ctx).builder(right);
+            let two = b.shr().get_const(2u64, 8);
             b.push_store(two, ValueId::Varnode(r0), reg);
             b.push_branch(join);
         }
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, join));
+            let mut b = (&mut tc.ctx).builder(join);
             let loaded = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
             b.push_store(loaded, ValueId::Varnode(r1), reg);
-            let ret = b.context_mut().get_const(0u64, 8).id();
+            let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
         }
 
@@ -3286,7 +3283,7 @@ mod tests {
     /// live-out register value. (Bug 1: path-insensitive dead-store marking.)
     #[test]
     fn store_on_one_arm_does_not_kill_live_out_store_on_sibling() {
-        use qcode::{builder::Builder, testing::TestContext};
+        use qcode::testing::TestContext;
 
         let mut tc = TestContext::new();
         let (r0, reg) = (tc.r0, tc.reg_space);
@@ -3306,27 +3303,27 @@ mod tests {
 
         let entry_store;
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            let one = b.context_mut().get_const(1u64, 8).id();
-            let cond = b.context_mut().get_const(1u64, 1).id();
+            let mut b = (&mut tc.ctx).builder(entry);
+            let one = b.shr().get_const(1u64, 8);
+            let cond = b.shr().get_const(1u64, 1);
             entry_store = b.push_store(one, ValueId::Varnode(r0), reg).id;
             b.push_cbranch(cond, left, right);
         }
         {
             // Left arm overwrites r0 before reading it.
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, left));
-            let two = b.context_mut().get_const(2u64, 8).id();
+            let mut b = (&mut tc.ctx).builder(left);
+            let two = b.shr().get_const(2u64, 8);
             b.push_store(two, ValueId::Varnode(r0), reg);
             b.push_branch(join);
         }
         {
             // Right arm never touches r0: it leaves the function with the entry value.
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, right));
+            let mut b = (&mut tc.ctx).builder(right);
             b.push_branch(join);
         }
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, join));
-            let ret = b.context_mut().get_const(0u64, 8).id();
+            let mut b = (&mut tc.ctx).builder(join);
+            let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
         }
 
@@ -3352,7 +3349,7 @@ mod tests {
     /// order.
     #[test]
     fn branchind_sibling_successors_do_not_share_reaching_value() {
-        use qcode::{builder::Builder, testing::TestContext};
+        use qcode::testing::TestContext;
 
         let mut tc = TestContext::new();
         let (r0, r1, r2, reg) = (tc.r0, tc.r1, tc.r2, tc.reg_space);
@@ -3372,9 +3369,9 @@ mod tests {
 
         let zero;
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            zero = b.context_mut().get_const(0u64, 8).id();
-            let target = b.context_mut().get_const(0x1100u64, 8).id();
+            let mut b = (&mut tc.ctx).builder(entry);
+            zero = b.shr().get_const(0u64, 8);
+            let target = b.shr().get_const(0x1100u64, 8);
             b.push_store(zero, ValueId::Varnode(r0), reg);
             b.push_branchind(target);
         }
@@ -3385,25 +3382,25 @@ mod tests {
         // redefines r0 to a distinct value that must not leak to its sibling.
         let sink1;
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, s1));
+            let mut b = (&mut tc.ctx).builder(s1);
             let loaded = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
             sink1 = b.push_store(loaded, ValueId::Varnode(r1), reg).id;
-            let one = b.context_mut().get_const(1u64, 8).id();
+            let one = b.shr().get_const(1u64, 8);
             b.push_store(one, ValueId::Varnode(r0), reg);
             b.push_branch(exit);
         }
         let sink2;
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, s2));
+            let mut b = (&mut tc.ctx).builder(s2);
             let loaded = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
             sink2 = b.push_store(loaded, ValueId::Varnode(r2), reg).id;
-            let two = b.context_mut().get_const(2u64, 8).id();
+            let two = b.shr().get_const(2u64, 8);
             b.push_store(two, ValueId::Varnode(r0), reg);
             b.push_branch(exit);
         }
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, exit));
-            let ret = b.context_mut().get_const(0u64, 8).id();
+            let mut b = (&mut tc.ctx).builder(exit);
+            let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
         }
 
@@ -3429,7 +3426,7 @@ mod tests {
     /// mis-size the result. (Hardening: varnode access-size consistency.)
     #[test]
     fn varnode_access_size_mismatch_blocks_promotion() {
-        use qcode::{builder::Builder, testing::TestContext};
+        use qcode::testing::TestContext;
 
         let mut tc = TestContext::new();
         let (r0, r1, reg) = (tc.r0, tc.r1, tc.reg_space); // r0 is 8 bytes wide
@@ -3442,14 +3439,14 @@ mod tests {
 
         let mismatched_load;
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            let val = b.context_mut().get_const(0x1122_3344_5566_7788u64, 8).id();
+            let mut b = (&mut tc.ctx).builder(entry);
+            let val = b.shr().get_const(0x1122_3344_5566_7788u64, 8);
             b.push_store(val, ValueId::Varnode(r0), reg); // 8-byte store: matches r0
             // 4-byte load through the 8-byte r0 — a width mismatch that must
             // disqualify r0 from promotion.
             mismatched_load = b.push_load::<false>(ValueId::Varnode(r0), 4, reg).id();
             b.push_store(mismatched_load, ValueId::Varnode(r1), reg);
-            let ret = b.context_mut().get_const(0u64, 8).id();
+            let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
         }
 
@@ -3473,7 +3470,7 @@ mod tests {
     /// rather than yielding a param with an unbound edge. (Gap 3.)
     #[test]
     fn var_live_into_implicit_edge_join_is_not_promoted() {
-        use qcode::{builder::Builder, testing::TestContext};
+        use qcode::testing::TestContext;
 
         let mut tc = TestContext::new();
         let (r0, r1, reg) = (tc.r0, tc.r1, tc.reg_space);
@@ -3492,26 +3489,26 @@ mod tests {
         // entry stores r0, then an indirect jump that can land on `join` directly
         // (an argument-less edge) or on `other`.
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            let zero = b.context_mut().get_const(0u64, 8).id();
-            let target = b.context_mut().get_const(0x1200u64, 8).id();
+            let mut b = (&mut tc.ctx).builder(entry);
+            let zero = b.shr().get_const(0u64, 8);
+            let target = b.shr().get_const(0x1200u64, 8);
             b.push_store(zero, ValueId::Varnode(r0), reg);
             b.push_branchind(target);
         }
         tc.ctx.add_cfg_edge(entry, join); // implicit (BranchInd) edge into the join
         tc.ctx.add_cfg_edge(entry, other);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, other));
-            let one = b.context_mut().get_const(1u64, 8).id();
+            let mut b = (&mut tc.ctx).builder(other);
+            let one = b.shr().get_const(1u64, 8);
             b.push_store(one, ValueId::Varnode(r0), reg);
             b.push_branch(join); // arg-carrying edge into the join
         }
         let join_load;
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, join));
+            let mut b = (&mut tc.ctx).builder(join);
             join_load = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
             b.push_store(join_load, ValueId::Varnode(r1), reg);
-            let ret = b.context_mut().get_const(0u64, 8).id();
+            let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
         }
 
@@ -3541,7 +3538,7 @@ mod tests {
         // DFS never reaches, so the load is left in place. The store must NOT be
         // removed — dropping it while the load survives stranded an undefined
         // unique-space read (the SLEIGH `v0`/`v1` leak in indirect-call lifts).
-        use qcode::{builder::Builder, testing::TestContext};
+        use qcode::testing::TestContext;
 
         let mut tc = TestContext::new();
         let f = FunctionBody::make(&mut tc.ctx, "test".into()).unwrap().id;
@@ -3556,24 +3553,24 @@ mod tests {
         }
 
         let temp = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             let temp = b.make_temp(4);
-            let val = b.context_mut().get_const(7u64, 4).id();
+            let val = b.shr().get_const(7u64, 4);
             let space = qcode::space::LocalMemorySpaceId::Temp(
                 TempRef::new(b.view(), temp).space().id.localize(f),
             );
             b.push_store(val, ValueId::Temp(temp), space);
-            let ret = b.context_mut().get_const(0u64, 4).id();
+            let ret = b.shr().get_const(0u64, 4);
             b.push_return(ret);
             temp
         };
         let load_id = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, orphan));
+            let mut b = (&mut tc.ctx).builder(orphan);
             let space = qcode::space::LocalMemorySpaceId::Temp(
                 TempRef::new(b.view(), temp).space().id.localize(f),
             );
             let load = b.push_load::<false>(ValueId::Temp(temp), 4, space).id();
-            let ret = b.context_mut().get_const(0u64, 4).id();
+            let ret = b.shr().get_const(0u64, 4);
             b.push_return(ret);
             load
         };

@@ -1213,7 +1213,7 @@ mod tests {
 
     #[test]
     fn param_value_id_usable_in_instruction() {
-        use crate::{builder::Builder, value::ValueId};
+        use crate::value::ValueId;
         let mut ctx = Context::new();
         let block_id = {
             let __f = ctx.anon_function();
@@ -1226,7 +1226,7 @@ mod tests {
             block.push_param(8).id()
         };
 
-        let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+        let mut builder = (&mut ctx).builder(block_id);
         let sum = builder.push_add(param_id, param_id);
         assert_eq!(sum.size(), 8);
         unsafe { builder.dont_finalize() };

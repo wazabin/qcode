@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn result_type_is_a_list_with_the_source_bound() {
-        let mut types = crate::types::TypeManager::default();
+        let types = crate::types::TypeManager::default();
         let i8 = types.get_or_make_int(1);
         let arr = types.get_or_make_array(i8, 7);
 
@@ -109,7 +109,7 @@ mod tests {
     /// length) yields an **unbounded** `List<i8>` with no static footprint.
     #[test]
     fn result_type_of_a_pointer_is_an_unbounded_list() {
-        let mut types = crate::types::TypeManager::default();
+        let types = crate::types::TypeManager::default();
         let i8 = types.get_or_make_int(1);
         let ptr = types.get_or_make_int(8); // a raw pointer, not a sequence
 
@@ -126,7 +126,7 @@ mod tests {
     /// `take_while(List<T>) = List<T>`, same bound.
     #[test]
     fn take_while_accepts_a_list() {
-        let mut types = crate::types::TypeManager::default();
+        let types = crate::types::TypeManager::default();
         let i8 = types.get_or_make_int(1);
         let list = types.get_or_make_list(i8, 5);
 

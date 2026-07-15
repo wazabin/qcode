@@ -106,7 +106,7 @@ pub fn verify_bool_typing(ctx: &Context) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use qcode::builder::Builder;
+
     use qcode::context::Context;
 
     use super::verify_bool_typing;
@@ -117,11 +117,13 @@ mod tests {
         let a = ctx.get_bool_const(true).id();
         let b = ctx.get_const(3, 1).id();
         {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
+            let source = ctx.builder_at(0x1000).current_block();
+            let target = ctx.get_or_make_block(0x1001, source.func);
+            let mut builder = ctx.builder(source);
             builder.push_add(a, b); // Add(bool, i8): rejected
             builder.push_bit_and(a, b); // And(bool, i8): mixed, rejected
             builder.push_bit_negate(a); // IntNot(bool): rejected
-            builder.finalize(0x1001);
+            builder.finalize(target);
         }
         let diags = verify_bool_typing(&ctx);
         assert_eq!(diags.len(), 3, "expected 3 diagnostics, got {diags:?}");
@@ -133,10 +135,12 @@ mod tests {
         let a = ctx.get_bool_const(true).id();
         let b = ctx.get_bool_const(false).id();
         {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
+            let source = ctx.builder_at(0x1000).current_block();
+            let target = ctx.get_or_make_block(0x1001, source.func);
+            let mut builder = ctx.builder(source);
             builder.push_bit_and(a, b); // And(bool, bool): logical, ok
             builder.push_eq(a, b); // Equal(bool, bool): negation idiom, ok
-            builder.finalize(0x1001);
+            builder.finalize(target);
         }
         assert!(verify_bool_typing(&ctx).is_empty());
     }

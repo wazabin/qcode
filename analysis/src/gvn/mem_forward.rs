@@ -990,10 +990,7 @@ mod tests {
     #[test]
     fn realigned_own_frame_slot_survives_call() {
         use crate::gvn::affine::precompute_forms;
-        use qcode::{
-            builder::Builder,
-            value::{BasicBlock, FunctionBody},
-        };
+        use qcode::value::{BasicBlock, FunctionBody};
 
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
@@ -1013,11 +1010,11 @@ mod tests {
         // `slot = ((@SP - 0x10) & -8) - 0x78`; spill an 8-byte value into it, then
         // end the block with a direct call carrying no arguments (nothing escapes).
         let (aligned, slot_store, val) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-            let c10 = b.context_mut().get_const(0x10, 8).id();
-            let neg8 = b.context_mut().get_const((-8i64) as u64, 8).id();
-            let c78 = b.context_mut().get_const(0x78, 8).id();
-            let val = b.context_mut().get_const(0xdead_beef, 8).id();
+            let mut b = (&mut tc.ctx).builder(root);
+            let c10 = b.shr().get_const(0x10, 8);
+            let neg8 = b.shr().get_const((-8i64) as u64, 8);
+            let c78 = b.shr().get_const(0x78, 8);
+            let val = b.shr().get_const(0xdead_beef, 8);
             let s = b.push_sub(sp, c10).id();
             let aligned = b.push_bit_and(s, neg8).id();
             let slot = b.push_sub(aligned, c78).id();
@@ -1147,8 +1144,6 @@ mod tests {
     /// is unaffected by register clobbers and survives.
     #[test]
     fn call_drops_symbolic_ram_cells_keeps_pinned() {
-        use qcode::builder::Builder;
-
         let mut tc = TestContext::new();
         let fun_id = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let block = { tc.ctx.get_or_make_block(0x1000, fun_id) };
@@ -1159,7 +1154,7 @@ mod tests {
         }
         // The block ends in a (direct) call.
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            let mut b = (&mut tc.ctx).builder(block);
             b.push_call(fun_id);
             unsafe { b.dont_finalize() };
         }
@@ -1191,7 +1186,6 @@ mod tests {
     /// RAM interval covering the cell (else the argument is symbolic — no
     /// resolvable reach).
     fn pinned_cell_survives_call(readonly: bool, pin_arg: bool) -> bool {
-        use qcode::builder::Builder;
         use qcode::value::ParamAttrs;
         use qcode::value::insn::Call;
 
@@ -1216,7 +1210,7 @@ mod tests {
         }
         let arg = ValueId::Varnode(tc.r1);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            let mut b = (&mut tc.ctx).builder(block);
             b.push_call(callee);
             unsafe { b.dont_finalize() };
         }
@@ -1296,8 +1290,6 @@ mod tests {
     /// the caller's real-`ram` spill.
     #[test]
     fn call_keeps_cells_in_spaces_callee_never_writes() {
-        use qcode::builder::Builder;
-
         let mut tc = TestContext::new();
         let caller = FunctionBody::make(&mut tc.ctx, "caller".into()).unwrap().id;
         let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
@@ -1321,7 +1313,7 @@ mod tests {
         // The caller block ends in a direct call to `callee`, passing a frame
         // pointer (so a pointer escapes — the no-summary path would drop the cell).
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            let mut b = (&mut tc.ctx).builder(block);
             b.push_call_with_args(callee, vec![ValueId::Varnode(tc.r1)]);
             unsafe { b.dont_finalize() };
         }

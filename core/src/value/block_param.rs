@@ -26,6 +26,13 @@ pub struct LocalParamId(u32);
 
 crate::composite_id!(BlockParamId, LocalParamId);
 
+impl BlockParamId {
+    /// Qualified value form used directly as a Builder operand.
+    pub fn id(self) -> ValueId {
+        ValueId::BlockParam(self)
+    }
+}
+
 /// A typed parameter declared at the entry of a basic block.
 ///
 /// Block parameters are the receiving side of block arguments: when a

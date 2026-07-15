@@ -35,13 +35,9 @@
 //! remove. The recognizer trusts `array_promote`'s coverage proof — the array's
 //! full length `N` comes straight from the exit store's element type.
 
-use qcode::{
-    builder::Builder,
-    value::{
-        BlockId, FunctionId, QCodeView, ValueId,
-        insn::{InstructionId, IntrinsicApp, IntrinsicId, Mnemonic},
-        util::base_ref::BaseRef,
-    },
+use qcode::value::{
+    BlockId, FunctionId, QCodeView, ValueId,
+    insn::{InstructionId, IntrinsicApp, IntrinsicId, Mnemonic},
 };
 
 use super::carried_array::{classify_body_reads, exit_view, find_carried_array};
@@ -360,7 +356,7 @@ fn apply<'str>(
     };
     let full = {
         let mut host = mv.host(body);
-        let mut b = Builder::from_block(BaseRef::new(host.reborrow(), m.exit));
+        let mut b = host.builder(m.exit);
         b.set_insert_point_before(anchor);
         let sing = b.push_intrinsic(singleton_id, vec![m.seed_val]).id();
         b.push_intrinsic(concat_id, vec![sing, scan]).id()

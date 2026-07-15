@@ -111,11 +111,7 @@ fn find_libc_main_arg(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qcode::{
-        builder::Builder,
-        testing::TestContext,
-        value::{BasicBlock, FunctionBody},
-    };
+    use qcode::{testing::TestContext, value::FunctionBody};
 
     use crate::{ArchConfig, CallingConvention, GpReg};
 
@@ -130,10 +126,10 @@ mod tests {
             FunctionBody::from_id_mut(&mut tc.ctx, start)
                 .set_root(block)
                 .unwrap();
-            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
-            let main = builder.context_mut().get_const(0x2000, 8).id();
+            let mut builder = (&mut tc.ctx).builder(block);
+            let main = builder.shr().get_const(0x2000, 8);
             builder.push_store(main, ValueId::Varnode(tc.r0), tc.reg_space);
-            let target = builder.context_mut().get_const(0x3000, 8).id();
+            let target = builder.shr().get_const(0x3000, 8);
             builder.push_call_ind(target);
         }
 
@@ -169,10 +165,10 @@ mod tests {
             FunctionBody::from_id_mut(&mut tc.ctx, start)
                 .set_root(block)
                 .unwrap();
-            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
-            let main = builder.context_mut().get_const(0x2000, 8).id();
+            let mut builder = (&mut tc.ctx).builder(block);
+            let main = builder.shr().get_const(0x2000, 8);
             builder.push_store(main, ValueId::Varnode(tc.r0), tc.reg_space);
-            let target = builder.context_mut().get_const(0x3000, 8).id();
+            let target = builder.shr().get_const(0x3000, 8);
             builder.push_call_ind(target);
         }
 

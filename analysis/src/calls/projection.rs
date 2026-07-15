@@ -283,9 +283,8 @@ fn reaches_any(ctx: &Context, from: BlockId, targets: &HashSet<BlockId>) -> bool
 mod tests {
     use super::*;
     use qcode::{
-        builder::Builder,
         testing::TestContext,
-        value::{BasicBlock, FunctionBody, insn::Return},
+        value::{FunctionBody, insn::Return},
     };
 
     /// Set a return instruction's value channel to `value` (the builder's
@@ -326,15 +325,15 @@ mod tests {
         let (a, b);
         let (ret, ptr, tuple);
         {
-            let mut bld = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut bld = (&mut tc.ctx).builder(entry);
             a = bld.push_param(8).id();
             b = bld.push_param(8).id();
-            let c69 = bld.context_mut().get_const(69, 8).id();
-            let c42 = bld.context_mut().get_const(42, 8).id();
+            let c69 = bld.shr().get_const(69, 8);
+            let c42 = bld.shr().get_const(42, 8);
             let b69 = bld.push_mul(b, c69).id();
             let body = bld.push_add(b69, c42).id();
             tuple = bld.push_tuple(vec![a, body]).id();
-            ptr = bld.context_mut().get_const(0x2000, 8).id();
+            ptr = bld.shr().get_const(0x2000, 8);
             ret = bld.push_return(ptr).id();
             unsafe { bld.dont_finalize() };
         }
@@ -381,32 +380,32 @@ mod tests {
 
         let a;
         {
-            let mut bld = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut bld = (&mut tc.ctx).builder(entry);
             a = bld.push_param(8).id();
             let _b = bld.push_param(8).id();
-            let zero = bld.context_mut().get_const(0, 8).id();
+            let zero = bld.shr().get_const(0, 8);
             let cond = bld.push_ne(a, zero).id();
             bld.push_cbranch(cond, t, fb);
             unsafe { bld.dont_finalize() };
         }
         {
-            let mut bld = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, t));
-            let one = bld.context_mut().get_const(1, 8).id();
+            let mut bld = (&mut tc.ctx).builder(t);
+            let one = bld.shr().get_const(1, 8);
             bld.push_branch_with_args(m, vec![one]);
             unsafe { bld.dont_finalize() };
         }
         {
-            let mut bld = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, fb));
-            let two = bld.context_mut().get_const(2, 8).id();
+            let mut bld = (&mut tc.ctx).builder(fb);
+            let two = bld.shr().get_const(2, 8);
             bld.push_branch_with_args(m, vec![two]);
             unsafe { bld.dont_finalize() };
         }
         let (ret, ptr, tuple);
         {
-            let mut bld = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, m));
+            let mut bld = (&mut tc.ctx).builder(m);
             let x = bld.push_param(8).id();
             tuple = bld.push_tuple(vec![x]).id();
-            ptr = bld.context_mut().get_const(0x2000, 8).id();
+            ptr = bld.shr().get_const(0x2000, 8);
             ret = bld.push_return(ptr).id();
             unsafe { bld.dont_finalize() };
         }
@@ -436,9 +435,9 @@ mod tests {
         let reg = ValueId::Varnode(tc.r0);
         let (ret, ptr, tuple);
         {
-            let mut bld = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut bld = (&mut tc.ctx).builder(entry);
             tuple = bld.push_tuple(vec![reg]).id();
-            ptr = bld.context_mut().get_const(0x2000, 8).id();
+            ptr = bld.shr().get_const(0x2000, 8);
             ret = bld.push_return(ptr).id();
             unsafe { bld.dont_finalize() };
         }

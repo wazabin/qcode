@@ -346,7 +346,7 @@ mod tests {
             let __f = ctx.anon_function();
             ctx.get_or_make_block(0x1000, __f)
         };
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
+        let mut builder = (&mut ctx).builder_at(0x1000);
         f(&mut builder);
         unsafe { builder.dont_finalize() };
         drop(builder);
@@ -356,8 +356,8 @@ mod tests {
     #[test]
     fn test_pure_binop_no_users_removed() {
         let (mut ctx, block_id) = build_block(|b| {
-            let a = b.context_mut().get_const(1u64, 8).id();
-            let c = b.context_mut().get_const(2u64, 8).id();
+            let a = b.shr().get_const(1u64, 8);
+            let c = b.shr().get_const(2u64, 8);
             b.push_add(a, c);
         });
 
@@ -373,10 +373,10 @@ mod tests {
     #[test]
     fn test_pure_binop_with_users_kept() {
         let (ctx, block_id) = build_block(|b| {
-            let a = b.context_mut().get_const(1u64, 8).id();
-            let c = b.context_mut().get_const(2u64, 8).id();
+            let a = b.shr().get_const(1u64, 8);
+            let c = b.shr().get_const(2u64, 8);
             let sum = b.push_add(a, c).id();
-            let d = b.context_mut().get_const(3u64, 8).id();
+            let d = b.shr().get_const(3u64, 8);
             b.push_add(sum, d);
         });
 
@@ -407,10 +407,10 @@ mod tests {
     fn test_chain_both_removed() {
         // c = a + b, d = c * 2, neither used → both removed after iterating.
         let (mut ctx, block_id) = build_block(|b| {
-            let a = b.context_mut().get_const(1u64, 8).id();
-            let bv = b.context_mut().get_const(2u64, 8).id();
+            let a = b.shr().get_const(1u64, 8);
+            let bv = b.shr().get_const(2u64, 8);
             let c = b.push_add(a, bv).id();
-            let two = b.context_mut().get_const(2u64, 8).id();
+            let two = b.shr().get_const(2u64, 8);
             b.push_mul(c, two);
         });
 
@@ -426,10 +426,10 @@ mod tests {
     #[test]
     fn test_store_kept() {
         let (mut ctx, block_id) = build_block(|b| {
-            let rax_vn = b.context().get_named("r0").unwrap().as_varnode().unwrap();
+            let rax_vn = b.shr().get_named("r0").unwrap().as_varnode().unwrap();
             let rax_ptr = ValueId::Varnode(rax_vn);
-            let space = reg_space(b.context());
-            let v = b.context_mut().get_const(42u64, 8).id();
+            let space = b.shr().named_spaces["register"];
+            let v = b.shr().get_const(42u64, 8);
             b.push_store(v, rax_ptr, space);
         });
 
@@ -450,10 +450,13 @@ mod tests {
     #[test]
     fn test_pcode_op_kept() {
         let dead = {
-            let (ctx, block_id) = build_block(|b| {
-                let op_id: PCodeOpId = b.context_mut().shared.pcode_ops.push(Box::from("syscall"));
-                b.push_pcode_op(op_id, vec![], None, 0);
-            });
+            let mut ctx = Context::new();
+            let op_id: PCodeOpId = ctx.shared.pcode_ops.push(Box::from("syscall"));
+            let block_id = ctx.builder_at(0x1000).current_block();
+            let mut b = ctx.builder(block_id);
+            b.push_pcode_op(op_id, vec![], None, 0);
+            unsafe { b.dont_finalize() };
+            drop(b);
             dead_insns(ModuleView::new(&ctx), block_id)
         };
         assert!(dead.is_empty(), "PCodeOp must not be marked dead");
@@ -463,7 +466,7 @@ mod tests {
     fn test_terminator_kept() {
         let dead = {
             let (ctx, block_id) = build_block(|b| {
-                let zero = b.context_mut().get_const(0u64, 8).id();
+                let zero = b.shr().get_const(0u64, 8);
                 b.push_return(zero);
             });
             dead_insns(ModuleView::new(&ctx), block_id)
@@ -498,7 +501,7 @@ mod tests {
             .unwrap();
 
         let call_id = {
-            let mut b = Builder::from_context(ctx, 0x1000);
+            let mut b = (ctx).builder_at(0x1000);
             let id = b.push_call(callee).id();
             unsafe { b.dont_finalize() };
             id
@@ -511,7 +514,7 @@ mod tests {
             // Give the call's return value a user so it is no longer dead.
             let reg = ctx.try_get_space("register").unwrap();
             let rax = ctx.get_named("r0").unwrap().as_varnode().unwrap();
-            let mut b = Builder::from_context(ctx, 0x2000);
+            let mut b = (ctx).builder_at(0x2000);
             b.push_store(call_id, ValueId::Varnode(rax), reg);
             unsafe { b.dont_finalize() };
         }

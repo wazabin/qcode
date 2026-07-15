@@ -22,13 +22,12 @@
 //! then unconditionally sound.
 
 use qcode::{
-    builder::{Builder, BuilderBacking},
+    builder::Builder,
     space::LocalMemorySpaceId,
     types::TypeId,
     value::{
         FunctionId, QCodeView, ValueId,
         insn::{InstructionId, IntrinsicApp, IntrinsicId, Mnemonic},
-        util::base_ref::BaseRef,
     },
 };
 
@@ -234,7 +233,7 @@ fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &Rea
         // Materialize the word index (pass builder: const/add only).
         let idx = {
             let mut host = cx.host(body);
-            let mut b = Builder::from_block(BaseRef::new(host.reborrow(), block));
+            let mut b = host.builder(block);
             b.set_insert_point_before(*load_id);
             let idx = build_index(&mut b, lane);
             unsafe { b.dont_finalize() };
@@ -259,10 +258,7 @@ fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &Rea
 
 /// Materialize the word index of a lane load: a literal for a constant word, or
 /// `idx (+ od)` at the index's own width for a dynamic lane.
-fn build_index<'str, 'ctx, Ctx: BuilderBacking<'str>>(
-    b: &mut Builder<'str, 'ctx, Ctx>,
-    lane: &LaneIdx,
-) -> ValueId {
+fn build_index(b: &mut Builder<'_, '_>, lane: &LaneIdx) -> ValueId {
     match *lane {
         LaneIdx::Const(w) => b.shr().get_const(w as u64, 8),
         LaneIdx::Strided(idx, 0) => idx,
@@ -314,7 +310,6 @@ crate::register_function_pass!(ArrayReads);
 mod tests {
     use super::*;
     use qcode::{
-        builder::Builder,
         context::Context,
         testing::TestContext,
         value::{BasicBlock, FunctionBody, Value},
@@ -364,10 +359,10 @@ mod tests {
             ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
         let i = ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
 
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+        let mut b = (&mut tc.ctx).builder(entry);
         b.push_store(arr, base, space); // seed
         // const-index lane `base + 2`.
-        let two = b.context_mut().get_const(2, 8).id();
+        let two = b.shr().get_const(2, 8);
         let a_const = b.push_add(base, two).id();
         b.push_load::<false>(a_const, 1, space);
         // dynamic-index lane `base + @i`.
@@ -376,7 +371,7 @@ mod tests {
         match extra {
             Extra::None => {}
             Extra::Store => {
-                let z = b.context_mut().get_const(0, 1).id();
+                let z = b.shr().get_const(0, 1);
                 b.push_store(z, a_dyn, space);
             }
             Extra::Unknown => {
@@ -385,7 +380,7 @@ mod tests {
                 b.push_load::<false>(p, 1, space);
             }
         }
-        let ret = b.context_mut().get_const(0, 8).id();
+        let ret = b.shr().get_const(0, 8);
         b.push_return(ret);
         drop(b);
 

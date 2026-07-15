@@ -609,6 +609,39 @@ impl<'str> Context<'str> {
         }
     }
 
+    /// Borrows one function body and creates the concrete body-local builder
+    /// positioned at `block`.
+    pub fn builder(&mut self, block: BlockId) -> crate::builder::Builder<'str, '_> {
+        let body = &mut self.bodies[block.func];
+        crate::builder::Builder::new(body, &self.shared, &self.interfaces, block)
+    }
+
+    /// Test/API convenience for preparing a machine-address block before
+    /// narrowing construction to its body-local builder.
+    pub fn builder_at(&mut self, address: u64) -> crate::builder::Builder<'str, '_> {
+        use crate::address_index::AddressTarget;
+
+        let mut addresses = crate::address_index::AddressIndex::analyze(self);
+        let block = match addresses.get(address) {
+            Some(AddressTarget::Function(function)) => self.bodies[function]
+                .root_id()
+                .map(|local| BlockId::new(function, local))
+                .unwrap_or_else(|| {
+                    self.get_or_make_block_indexed(&mut addresses, address, function)
+                }),
+            Some(AddressTarget::Block(block)) => block,
+            None => {
+                let function = FunctionBody::make(self, Cow::Owned(format!("blk_{address:x}")))
+                    .expect("anonymous host function")
+                    .id;
+                self.get_or_make_block_indexed(&mut addresses, address, function)
+            }
+        };
+        let mut builder = self.builder(block);
+        builder.set_address(address);
+        builder
+    }
+
     /// The forced rendering mode for a `Bytes` blob, or
     /// [`BytesDisplay::Auto`](crate::value::BytesDisplay::Auto) if unset.
     pub fn bytes_display(&self, id: crate::value::BytesId) -> crate::value::BytesDisplay {
@@ -991,7 +1024,6 @@ impl<'str> Context<'str> {
         addresses: &mut crate::address_index::AddressIndex,
         block: BlockId,
     ) -> FunctionId {
-        use crate::builder::Builder;
         use crate::value::insn::{Branch, CBranch, Callee, TailCall};
 
         let addr = self
@@ -1107,7 +1139,7 @@ impl<'str> Context<'str> {
                 .parent
                 .expect("cbranch block has an owner");
             let tramp = BasicBlock::make(self, owner).id;
-            Builder::from_block(BasicBlock::from_id_mut(self, tramp)).push_tail_call(callee);
+            (self).builder(tramp).push_tail_call(callee);
             self.add_cfg_edge(owner_block, tramp);
 
             let Mnemonic::CBranch(mut cb) = self.instruction(insn).mnemonic().clone() else {
@@ -3421,7 +3453,7 @@ mod tests {
 
     mod split_function_at {
         use super::*;
-        use crate::builder::Builder;
+
         use crate::value::insn::{Callee, Mnemonic, TailCall};
         use crate::value::{BasicBlock, FunctionBody, Instruction};
         use std::borrow::Cow;
@@ -3431,9 +3463,7 @@ mod tests {
         }
 
         fn branch_at(ctx: &mut Context<'static>, block: BlockId, target: BlockId, addr: u64) {
-            let id = Builder::from_block(BasicBlock::from_id_mut(ctx, block))
-                .push_branch(target)
-                .id;
+            let id = (ctx).builder(block).push_branch(target).id;
             Instruction::from_id_mut(ctx, id).set_address(addr);
         }
 
@@ -3445,17 +3475,13 @@ mod tests {
             addr: u64,
         ) {
             let cond = ctx.get_const(1, 1).id();
-            let id = Builder::from_block(BasicBlock::from_id_mut(ctx, block))
-                .push_cbranch(cond, success, failure)
-                .id;
+            let id = (ctx).builder(block).push_cbranch(cond, success, failure).id;
             Instruction::from_id_mut(ctx, id).set_address(addr);
         }
 
         fn return_at(ctx: &mut Context<'static>, block: BlockId, addr: u64) {
             let zero = ctx.get_const(0, 8).id();
-            let id = Builder::from_block(BasicBlock::from_id_mut(ctx, block))
-                .push_return(zero)
-                .id;
+            let id = (ctx).builder(block).push_return(zero).id;
             Instruction::from_id_mut(ctx, id).set_address(addr);
         }
 
@@ -3576,11 +3602,13 @@ mod tests {
                 .set_origin(ValueId::BlockParam(param));
 
             let arg = ctx.get_const(7, 8).id();
-            let branch = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry))
+            let branch = (&mut ctx)
+                .builder(entry)
                 .push_branch_with_args(tail, vec![arg])
                 .id;
             Instruction::from_id_mut(&mut ctx, branch).set_address(0x1000);
-            let ret = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, tail))
+            let ret = (&mut ctx)
+                .builder(tail)
                 .push_return(ValueId::BlockParam(param))
                 .id;
             Instruction::from_id_mut(&mut ctx, ret).set_address(0x2000);

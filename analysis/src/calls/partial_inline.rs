@@ -369,7 +369,6 @@ crate::register_module_pass!(PartialInline);
 #[cfg(test)]
 mod tests {
     use qcode::{
-        builder::Builder,
         types::TypeId,
         value::{BasicBlock, BlockId, Instruction, VarnodeId, insn::Call},
     };
@@ -453,7 +452,7 @@ mod tests {
         reg: VarnodeId,
     ) {
         let reg_space = tc.reg_space;
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+        let mut b = (&mut tc.ctx).builder(block);
         b.set_insert_point_to_start();
         let f = b.push_extract(ValueId::Instruction(call_id), index).id();
         b.push_store(f, ValueId::Varnode(reg), reg_space);
@@ -575,7 +574,7 @@ mod tests {
         // Build `%m = foobar <$> @r0; %agg = (%m,)` at the head of f_entry;
         // `make_pure_reg` then wires that tuple as the functional return value.
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, f_entry));
+            let mut b = (&mut tc.ctx).builder(f_entry);
             b.set_insert_point_to_start();
             let m = b.push_map(body, r0, Vec::new()).id();
             b.push_tuple(vec![m]);

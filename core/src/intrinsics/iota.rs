@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn result_type_is_unbounded_i64_list() {
-        let mut types = TypeManager::default();
+        let types = TypeManager::default();
         let i64_ty = types.get_or_make_int(8);
         let id = IntrinsicId::from_name("iota").unwrap();
         let ty = id.desc().result_type(&types, &[i64_ty]);

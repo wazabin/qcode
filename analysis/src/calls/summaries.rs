@@ -542,7 +542,7 @@ mod tests {
         FunctionBody::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
-        let mut builder = Builder::from_context(&mut tc.ctx, addr);
+        let mut builder = (&mut tc.ctx).builder_at(addr);
         f(&mut builder);
         unsafe { builder.dont_finalize() };
         drop(builder);
@@ -574,7 +574,7 @@ mod tests {
             .block_param_mut(pid)
             .set_origin_id(ValueId::Varnode(sp).localize(pid.func));
         let sp_param = ValueId::BlockParam(pid);
-        let mut builder = Builder::from_context(&mut tc.ctx, addr);
+        let mut builder = (&mut tc.ctx).builder_at(addr);
         f(&mut builder, sp_param);
         unsafe { builder.dont_finalize() };
         drop(builder);
@@ -598,7 +598,7 @@ mod tests {
         let r0 = tc.r0;
         let reg = tc.reg_space;
         let fun = build_fn(&mut tc, "callee", 0x1000, |b| {
-            let v = b.context_mut().get_const(7u64, 8).id();
+            let v = b.shr().get_const(7u64, 8);
             b.push_store(v, ValueId::Varnode(r0), reg);
             b.push_load::<false>(ValueId::Varnode(r0), 8, reg);
         });
@@ -637,7 +637,7 @@ mod tests {
         let mut tc = TestContext::new();
         let (r0, reg) = (tc.r0, tc.reg_space);
         let fun = build_fn(&mut tc, "callee", 0x1000, |b| {
-            let v = b.context_mut().get_const(7u64, 8).id();
+            let v = b.shr().get_const(7u64, 8);
             b.push_store(v, ValueId::Varnode(r0), reg);
         });
 
@@ -660,14 +660,14 @@ mod tests {
     ) -> FunctionId {
         let reg = tc.reg_space;
         build_fn_with_sp(tc, "callee", addr, sp, |b, sp_param| {
-            let mag = b.context_mut().get_const(offset.unsigned_abs(), 8).id();
+            let mag = b.shr().get_const(offset.unsigned_abs(), 8);
             let v = if offset >= 0 {
                 b.push_add(sp_param, mag).id()
             } else {
                 b.push_sub(sp_param, mag).id()
             };
             b.push_store(v, ValueId::Varnode(sp), reg);
-            let ret = b.context_mut().get_const(0u64, 8).id();
+            let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
         })
     }
@@ -705,9 +705,9 @@ mod tests {
         let mut tc = TestContext::new();
         let (sp, reg) = (tc.r3, tc.reg_space);
         let fun = build_fn(&mut tc, "callee", 0x1000, |b| {
-            let v = b.context_mut().get_const(0x10u64, 8).id();
+            let v = b.shr().get_const(0x10u64, 8);
             b.push_store(v, ValueId::Varnode(sp), reg);
-            let ret = b.context_mut().get_const(0u64, 8).id();
+            let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
         });
         assert_eq!(compute_stack_delta(&tc.ctx, fun, sp), None);
@@ -730,7 +730,7 @@ mod tests {
         let r0 = tc.r0;
 
         let callee = build_fn_with_sp(&mut tc, "callee", 0x2000, sp, |b, sp_param| {
-            let c8 = b.context_mut().get_const(8, 8).id();
+            let c8 = b.shr().get_const(8, 8);
             let local = b.push_sub(sp_param, c8).id(); // @SP - 8
             let idx = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
             let ptr = b.push_add(local, idx).id(); // (@SP - 8) + idx → dynamic
@@ -772,16 +772,16 @@ mod tests {
 
         let build_local_fn = |tc: &mut TestContext, name: &'static str, addr: u64| {
             build_fn_with_sp(tc, name, addr, sp, |b, sp_param| {
-                let c8 = b.context_mut().get_const(8, 8).id();
-                let c16 = b.context_mut().get_const(16, 8).id();
+                let c8 = b.shr().get_const(8, 8);
+                let c16 = b.shr().get_const(16, 8);
                 let slot = b.push_sub(sp_param, c8).id(); // @SP - 8
-                let v = b.context_mut().get_const(7u64, 8).id();
+                let v = b.shr().get_const(7u64, 8);
                 b.push_store(v, slot, ram);
                 let slot_reload = b.push_sub(sp_param, c8).id(); // reload @SP - 8
                 let loaded = b.push_load::<false>(slot_reload, 8, ram).id();
                 let sink_slot = b.push_sub(sp_param, c16).id(); // @SP - 16
                 b.push_store(loaded, sink_slot, ram);
-                let sink = b.context_mut().get_const(0u64, 8).id();
+                let sink = b.shr().get_const(0u64, 8);
                 b.push_return(sink);
             })
         };

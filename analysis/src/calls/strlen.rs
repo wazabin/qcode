@@ -18,14 +18,12 @@
 use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
-    builder::Builder,
     space::LocalMemorySpaceId,
     value::{
         BlockId, FunctionId, QCodeView, ValueId,
         insn::{
             Binop, Branch, CBranch, InstructionId, IntBinop, IntrinsicApp, IntrinsicId, Mnemonic,
         },
-        util::base_ref::BaseRef,
     },
 };
 
@@ -341,7 +339,7 @@ fn apply_strlen<'str>(
         .map(|i| i.id);
     let len_val = {
         let mut host = cx.host(body);
-        let mut b = Builder::from_block(BaseRef::new(host.reborrow(), m.exit_block));
+        let mut b = host.builder(m.exit_block);
         if let Some(at) = first {
             b.set_insert_point_before(at);
         }
@@ -567,7 +565,7 @@ fn apply_strlen_ptr<'str>(
     let len_id = IntrinsicId::from_name("len").expect("len registered");
     let len_val = {
         let mut host = cx.host(body);
-        let mut b = Builder::from_block(BaseRef::new(host.reborrow(), m.diff_block));
+        let mut b = host.builder(m.diff_block);
         b.set_insert_point_before(m.diff_id);
         let tw = b.push_intrinsic(tw_id, vec![m.base]).id();
         b.push_intrinsic(len_id, vec![tw]).id()
@@ -615,7 +613,6 @@ register_function_pass!(Strlen);
 mod tests {
     use super::*;
     use qcode::{
-        builder::Builder,
         context::Context,
         testing::TestContext,
         value::{BasicBlock, FunctionBody, Value, insn::Mnemonic},
@@ -686,22 +683,22 @@ mod tests {
 
         // entry: seed store + preheader branch.
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            let zero = b.context_mut().get_const(0, 8).id();
+            let mut b = (&mut tc.ctx).builder(entry);
+            let zero = b.shr().get_const(0, 8);
             b.push_store(arr, base_src, shadow); // *[shadow]:N base_src = arr
             b.push_branch_with_args(header, vec![zero]);
         }
         // header: counted guard.
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, header));
-            let n = b.context_mut().get_const(N as u64, 8).id();
+            let mut b = (&mut tc.ctx).builder(header);
+            let n = b.shr().get_const(N as u64, 8);
             let cond = b.push_lt(i, n).id();
             b.push_cbranch_with_args(cond, body, vec![], exit, vec![]);
         }
         // body: read src lane, write dst lane, increment.
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, body));
-            let one = b.context_mut().get_const(1, 8).id();
+            let mut b = (&mut tc.ctx).builder(body);
+            let one = b.shr().get_const(1, 8);
             let addr_src = b.push_add(base_src, i).id();
             let elem = b.push_load::<false>(addr_src, 1, shadow).id();
             let addr_dst = b.push_add(base_dst, i).id();
@@ -711,16 +708,16 @@ mod tests {
         }
         // exit: wide reload (write-set) + an external use + return.
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, exit));
+            let mut b = (&mut tc.ctx).builder(exit);
             if stray {
                 // An extra shadow access on the destination region: should defeat
                 // the exactness check.
                 b.push_load::<false>(base_dst, 1, shadow);
             }
             let wv = b.push_load::<false>(base_dst, N, shadow).id();
-            let out = b.context_mut().get_const(0x9000, 8).id();
+            let out = b.shr().get_const(0x9000, 8);
             b.push_store(wv, out, ram); // external consumer of the write-set
-            let dummy = b.context_mut().get_const(0, 8).id();
+            let dummy = b.shr().get_const(0, 8);
             b.push_return(dummy);
         }
 
@@ -785,28 +782,28 @@ mod tests {
 
         // entry: seed store + preheader branch (i = 0).
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            let zero = b.context_mut().get_const(0, 8).id();
+            let mut b = (&mut tc.ctx).builder(entry);
+            let zero = b.shr().get_const(0, 8);
             b.push_store(arr, base, shadow);
             b.push_branch_with_args(header, vec![zero]);
         }
         // head: load lane, NUL test; continue while nonzero, else exit carrying i.
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, header));
+            let mut b = (&mut tc.ctx).builder(header);
             let addr = b.push_add(base, i).id();
             let byte = b.push_load::<false>(addr, 1, shadow).id();
-            let zero1 = b.context_mut().get_const(0, 1).id();
+            let zero1 = b.shr().get_const(0, 1);
             let nz = b.push_ne(byte, zero1).id();
             b.push_cbranch_with_args(nz, body, vec![], exit, vec![i]);
         }
         // body: increment, then either a clean back-edge or (extra_break) a second
         // exit on `i < 100` — a break that defeats the sole-exit requirement.
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, body));
-            let one = b.context_mut().get_const(1, 8).id();
+            let mut b = (&mut tc.ctx).builder(body);
+            let one = b.shr().get_const(1, 8);
             let inc = b.push_add(i, one).id();
             if extra_break {
-                let hundred = b.context_mut().get_const(100, 8).id();
+                let hundred = b.shr().get_const(100, 8);
                 let lt = b.push_lt(inc, hundred).id();
                 b.push_cbranch_with_args(lt, header, vec![inc], exit, vec![inc]);
             } else {
@@ -815,10 +812,10 @@ mod tests {
         }
         // exit: external consumer of the length + return.
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, exit));
-            let out = b.context_mut().get_const(0x9000, 8).id();
+            let mut b = (&mut tc.ctx).builder(exit);
+            let out = b.shr().get_const(0x9000, 8);
             b.push_store(count, out, ram);
-            let dummy = b.context_mut().get_const(0, 8).id();
+            let dummy = b.shr().get_const(0, 8);
             b.push_return(dummy);
         }
 
@@ -963,33 +960,33 @@ mod tests {
         let end = ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, exit).push_param(8).id);
 
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             b.push_branch_with_args(header, vec![s0]);
         }
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, header));
+            let mut b = (&mut tc.ctx).builder(header);
             let byte = b.push_load::<false>(s, 1, ram).id();
-            let zero = b.context_mut().get_const(0, 1).id();
+            let zero = b.shr().get_const(0, 1);
             let nz = b.push_ne(byte, zero).id();
             b.push_cbranch_with_args(nz, body, vec![], exit, vec![s]);
         }
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, body));
-            let one = b.context_mut().get_const(1, 8).id();
+            let mut b = (&mut tc.ctx).builder(body);
+            let one = b.shr().get_const(1, 8);
             let s1 = b.push_add(s, one).id();
             b.push_branch_with_args(header, vec![s1]);
         }
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, exit));
+            let mut b = (&mut tc.ctx).builder(exit);
             // strlen = end - base; or (no diff) the end pointer is consumed directly.
             let escaping = if with_diff {
                 b.push_sub(end, s0).id()
             } else {
                 end
             };
-            let out = b.context_mut().get_const(0x9000, 8).id();
+            let out = b.shr().get_const(0x9000, 8);
             b.push_store(escaping, out, ram);
-            let dummy = b.context_mut().get_const(0, 8).id();
+            let dummy = b.shr().get_const(0, 8);
             b.push_return(dummy);
         }
         (fid, exit, s0)

@@ -97,7 +97,7 @@ crate::register_function_pass!(NameThunks);
 mod tests {
     use super::*;
     use crate::test_util::run_function_pass;
-    use qcode::builder::Builder;
+
     use qcode::context::Context;
     use qcode::value::{BasicBlock, FunctionBody};
 
@@ -106,7 +106,7 @@ mod tests {
         let callee = FunctionBody::make_at_addr(ctx, 0x2000, Some(name.to_owned().into())).id;
         let entry = BasicBlock::make(ctx, callee).with_address(0x2000).id;
         let zero = ctx.get_const(0, 8).id();
-        Builder::from_block(BasicBlock::from_id_mut(ctx, entry)).push_return(zero);
+        (ctx).builder(entry).push_return(zero);
         FunctionBody::from_id_mut(ctx, callee)
             .set_root(entry)
             .unwrap();
@@ -118,7 +118,7 @@ mod tests {
     fn make_thunk(ctx: &mut Context, name: &str, callee: FunctionId) -> FunctionId {
         let f = FunctionBody::make_at_addr(ctx, 0x1000, Some(name.to_owned().into())).id;
         let block = BasicBlock::make(ctx, f).with_address(0x1000).id;
-        Builder::from_block(BasicBlock::from_id_mut(ctx, block)).push_tail_call(callee);
+        (ctx).builder(block).push_tail_call(callee);
         FunctionBody::from_id_mut(ctx, f).set_root(block).unwrap();
         f
     }

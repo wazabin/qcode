@@ -730,7 +730,6 @@ mod tests {
     use crate::AliasResult;
     use crate::gvn::gvn_function;
     use qcode::{
-        builder::Builder,
         context::Context,
         testing::TestContext,
         value::{BasicBlock, FunctionBody, Value, ValueId},
@@ -764,7 +763,7 @@ mod tests {
 
         // Entry ends in a `call`; no edge links it to `post_call`.
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             b.push_call(fun_id);
             unsafe { b.dont_finalize() };
         }
@@ -772,8 +771,8 @@ mod tests {
         // Orphaned fall-through: store a register and read it straight back.
         let load_id;
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, post_call));
-            let c = b.context_mut().get_const(0x42, 4).id();
+            let mut b = (&mut tc.ctx).builder(post_call);
+            let c = b.shr().get_const(0x42, 4);
             b.push_store(c, eax, reg_space);
             let loaded = b.push_load::<false>(eax, 4, reg_space).id();
             b.push_store(loaded, other, reg_space);

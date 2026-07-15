@@ -19,11 +19,8 @@
 use std::collections::{BTreeSet, HashMap};
 
 use qcode::{
-    builder::Builder,
     context::Context,
-    value::{
-        FunctionId, QCodeView, ValueId, Varnode, VarnodeId, insn::Mnemonic, util::base_ref::BaseRef,
-    },
+    value::{FunctionId, QCodeView, ValueId, Varnode, VarnodeId, insn::Mnemonic},
 };
 
 use super::frame::incoming_sp_param;
@@ -95,8 +92,8 @@ pub fn canonicalize_sp_slots_concrete<'a, 'str>(
         .filter(|o| !repr.contains_key(o))
         .collect();
     if !missing.is_empty() {
-        let host_borrow = cx.host(body);
-        let mut b = Builder::from_block(BaseRef::new(host_borrow, root));
+        let mut host_borrow = cx.host(body);
+        let mut b = (host_borrow).builder(root);
         b.set_insert_point_to_start();
         for off in missing {
             let mag = b.shr().get_const(off.unsigned_abs(), ptr_width);
@@ -187,7 +184,7 @@ pub fn canonicalize_sp_slots<'str>(
         .filter(|o| !repr.contains_key(o))
         .collect();
     if !missing.is_empty() {
-        let mut b = Builder::from_block(BaseRef::new(&mut *host, root));
+        let mut b = host.builder(root);
         b.set_insert_point_to_start();
         for off in missing {
             let mag = b.shr().get_const(off.unsigned_abs(), ptr_width);
@@ -279,9 +276,8 @@ mod tests {
 
         // `load(@SP - 8)` in each block — distinct Sub ValueIds.
         let load_in = |block, tc: &mut TestContext| {
-            let mut b =
-                qcode::builder::Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
-            let c8 = b.context_mut().get_const(8, 8).id();
+            let mut b = (&mut tc.ctx).builder(block);
+            let c8 = b.shr().get_const(8, 8);
             let addr = b.push_sub(sp, c8).id();
             let load = b.push_load::<false>(addr, 8, ram);
             let id = load.id();

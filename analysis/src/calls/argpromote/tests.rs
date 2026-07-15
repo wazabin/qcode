@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use qcode::builder::Builder;
+
     use qcode::value::{
         BasicBlock, BlockId, FunctionBody, Instruction, LocalValueId, Value, Varnode, VarnodeId,
         insn::{Binop, Call, InstructionId, IntBinop, Mnemonic},
@@ -92,7 +92,7 @@ mod tests {
         Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg_ty);
         tc.ctx.add_cfg_edge(g_call, g_cont);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, g_cont));
+            let mut b = (&mut tc.ctx).builder(g_cont);
             b.set_insert_point_to_start();
             let out = ValueId::Instruction(b.push_extract(ValueId::Instruction(call_id), 0).id);
             b.push_store(out, ValueId::Varnode(r3), tc.reg_space);
@@ -359,7 +359,7 @@ mod tests {
         // in `address_taken_set`.
         let addr = tc.ctx.get_const(0x9000, 8).id();
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, g_entry));
+            let mut b = (&mut tc.ctx).builder(g_entry);
             b.set_insert_point_to_start();
             b.push_store(ValueId::Function(f), addr, tc.reg_space);
         }
@@ -730,7 +730,7 @@ mod tests {
             .unwrap()
             .id;
         let gep = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let mut b = (&mut tc.ctx).builder(root);
             b.set_insert_point_before(add_id);
             b.push_gep(param, 0x30).id()
         };
@@ -1155,7 +1155,7 @@ mod tests {
                 .id,
         );
         let reg_tuple = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, ret_block));
+            let mut b = (&mut tc.ctx).builder(ret_block);
             b.set_insert_point_before(ret_id);
             ValueId::Instruction(b.push_named_tuple(vec![("o0".to_owned(), out)]).id)
         };
@@ -1318,7 +1318,7 @@ mod tests {
                 .id,
         );
         let reg_tuple = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, ret_block));
+            let mut b = (&mut tc.ctx).builder(ret_block);
             b.set_insert_point_before(ret_id);
             ValueId::Instruction(b.push_named_tuple(vec![("o0".to_owned(), out)]).id)
         };
@@ -1873,12 +1873,12 @@ mod tests {
             f.add_block(clean_entry);
         }
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, clean_entry));
+            let mut b = (&mut tc.ctx).builder(clean_entry);
             let a = b.push_param(8).id();
-            let c = b.context_mut().get_const(1, 8).id();
+            let c = b.shr().get_const(1, 8);
             let s = b.push_add(a, c).id();
             let _ = b.push_tuple(vec![s]).id();
-            let ptr = b.context_mut().get_const(0x2000, 8).id();
+            let ptr = b.shr().get_const(0x2000, 8);
             b.push_return(ptr);
             unsafe { b.dont_finalize() };
         }
@@ -1894,11 +1894,11 @@ mod tests {
         }
         let (r0, reg_space) = (tc.r0, tc.reg_space);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, dirty_entry));
+            let mut b = (&mut tc.ctx).builder(dirty_entry);
             let _ = b
                 .push_load::<false>(ValueId::Varnode(r0), 8, reg_space)
                 .id();
-            let ptr = b.context_mut().get_const(0x4000, 8).id();
+            let ptr = b.shr().get_const(0x4000, 8);
             b.push_return(ptr);
             unsafe { b.dont_finalize() };
         }

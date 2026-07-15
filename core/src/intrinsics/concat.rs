@@ -65,7 +65,7 @@ mod tests {
 
     #[test]
     fn concat_arrays_yields_larger_array() {
-        let mut types = TypeManager::default();
+        let types = TypeManager::default();
         let i32 = types.get_or_make_int(4);
         let a = types.get_or_make_array(i32, 3);
         let b = types.get_or_make_array(i32, 5);
@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn concat_with_list_yields_list() {
-        let mut types = TypeManager::default();
+        let types = TypeManager::default();
         let i8 = types.get_or_make_int(1);
         let a = types.get_or_make_array(i8, 3);
         let b = types.get_or_make_list(i8, 5);
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn concat_unbounded_list_yields_unbounded_list() {
-        let mut types = TypeManager::default();
+        let types = TypeManager::default();
         let i8 = types.get_or_make_int(1);
         let a = types.get_or_make_unbounded_list(i8);
         let b = types.get_or_make_array(i8, 5);

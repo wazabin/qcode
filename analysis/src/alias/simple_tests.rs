@@ -1,5 +1,4 @@
 use qcode::{
-    builder::Builder,
     context::Context,
     space::{Space, SpaceId, SpaceType},
     testing::TestContext,
@@ -18,7 +17,7 @@ fn make_space(ctx: &mut Context<'static>, name: &'static str) -> SpaceId {
 }
 
 fn build_in_custom_space(
-    f: impl FnOnce(&mut Builder<'static, '_>, SpaceId),
+    f: impl FnOnce(&mut Context<'static>, BlockId, SpaceId),
 ) -> (Context<'static>, BlockId, SpaceId) {
     let mut ctx = Context::new();
     let space = make_space(&mut ctx, "register");
@@ -26,10 +25,7 @@ fn build_in_custom_space(
         let __f = ctx.anon_function();
         ctx.get_or_make_block(0x1000, __f)
     };
-    let mut builder = Builder::from_context(&mut ctx, 0x1000);
-    f(&mut builder, space);
-    unsafe { builder.dont_finalize() };
-    drop(builder);
+    f(&mut ctx, block_id, space);
     (ctx, block_id, space)
 }
 
@@ -175,8 +171,8 @@ fn pointer_literals_are_tracked() {
         let __f = ctx.anon_function();
         ctx.get_or_make_block(0x1000, __f)
     };
-    let mut builder = Builder::from_context(&mut ctx, 0x1000);
-    let literal_ptr = builder.context_mut().get_const(0, 8).id();
+    let mut builder = (&mut ctx).builder_at(0x1000);
+    let literal_ptr = builder.shr().get_const(0, 8);
     builder.push_load::<false>(literal_ptr, 8, reg_space);
     unsafe { builder.dont_finalize() };
     drop(builder);
@@ -207,9 +203,10 @@ fn pointer_literals_are_tracked() {
 fn aligned_sp_peels_to_base() {
     let mut vn = None;
     let mut aligned = None;
-    let (ctx, _, _) = build_in_custom_space(|b, space| {
-        let v = Varnode::make(b.context_mut(), 0, 8, space).id;
-        let neg16 = b.context_mut().get_const((-16i64) as u64, 8).id();
+    let (ctx, _, _) = build_in_custom_space(|ctx, block, space| {
+        let v = Varnode::make(ctx, 0, 8, space).id;
+        let mut b = ctx.builder(block);
+        let neg16 = b.shr().get_const((-16i64) as u64, 8);
         let p = b.push_bit_and(v.into(), neg16).id();
         b.push_load::<false>(v.into(), 8, space);
         b.push_load::<false>(p, 8, space);
@@ -232,9 +229,10 @@ fn aligned_sp_peels_to_base() {
 #[test]
 fn non_align_mask_does_not_peel() {
     let mut masked = None;
-    let (ctx, _, _) = build_in_custom_space(|b, space| {
-        let v = Varnode::make(b.context_mut(), 0, 8, space).id;
-        let m = b.context_mut().get_const(0xff, 8).id();
+    let (ctx, _, _) = build_in_custom_space(|ctx, block, space| {
+        let v = Varnode::make(ctx, 0, 8, space).id;
+        let mut b = ctx.builder(block);
+        let m = b.shr().get_const(0xff, 8);
         let p = b.push_bit_and(v.into(), m).id();
         b.push_load::<false>(p, 8, space);
         masked = Some(p);
@@ -256,10 +254,11 @@ fn repeated_literal_uses_share_one_range_entry() {
     let mut a_id = None;
     let mut l1 = None;
     let mut l2 = None;
-    let (ctx, _, _) = build_in_custom_space(|b, space| {
-        let a = Varnode::make(b.context_mut(), 0, 8, space).id;
-        let p1 = b.context_mut().get_const(4, 8).id(); // [4,12) overlaps A [0,8)
-        let p2 = b.context_mut().get_const(6, 8).id(); // [6,14) overlaps p1
+    let (ctx, _, _) = build_in_custom_space(|ctx, block, space| {
+        let a = Varnode::make(ctx, 0, 8, space).id;
+        let mut b = ctx.builder(block);
+        let p1 = b.shr().get_const(4, 8); // [4,12) overlaps A [0,8)
+        let p2 = b.shr().get_const(6, 8); // [6,14) overlaps p1
         b.push_load::<false>(p1, 8, space);
         b.push_load::<false>(p1, 8, space); // same literal reused
         b.push_load::<false>(p2, 8, space);
@@ -297,9 +296,10 @@ fn repeated_literal_uses_share_one_range_entry() {
 fn same_literal_wider_second_use_still_merges() {
     let mut a_id = None;
     let mut lit = None;
-    let (ctx, _, _) = build_in_custom_space(|b, space| {
-        let a = Varnode::make(b.context_mut(), 8, 8, space).id; // A: [8,16)
-        let p = b.context_mut().get_const(4, 8).id();
+    let (ctx, _, _) = build_in_custom_space(|ctx, block, space| {
+        let a = Varnode::make(ctx, 8, 8, space).id; // A: [8,16)
+        let mut b = ctx.builder(block);
+        let p = b.shr().get_const(4, 8);
         b.push_load::<false>(p, 4, space); // [4,8) — no overlap with A
         b.push_load::<false>(p, 8, space); // [4,12) — overlaps A
         a_id = Some(a);
@@ -326,10 +326,11 @@ fn literal_straddles_two_disjoint_varnode_classes_joins_them() {
     let mut b = None;
     let mut literal_ptr = None;
 
-    let (ctx, _, _) = build_in_custom_space(|builder, space| {
-        let a_id = Varnode::make(builder.context_mut(), 0, 4, space).id;
-        let b_id = Varnode::make(builder.context_mut(), 8, 4, space).id;
-        let ptr = builder.context_mut().get_const(2, 8).id();
+    let (ctx, _, _) = build_in_custom_space(|ctx, block, space| {
+        let a_id = Varnode::make(ctx, 0, 4, space).id;
+        let b_id = Varnode::make(ctx, 8, 4, space).id;
+        let mut builder = ctx.builder(block);
+        let ptr = builder.shr().get_const(2, 8);
 
         builder.push_load::<false>(ptr, 8, space);
 
@@ -353,12 +354,10 @@ fn two_literal_pointers_same_addr_alias_without_varnode() {
     let mut lit1 = None;
     let mut lit2 = None;
 
-    let (ctx, _, _) = build_in_custom_space(|builder, space| {
-        let first = builder.context_mut().get_const(0x10, 8).id();
-        let second = builder
-            .context_mut()
-            .get_const(0xdead_beef_0000_0010, 4)
-            .id();
+    let (ctx, _, _) = build_in_custom_space(|ctx, block, space| {
+        let mut builder = ctx.builder(block);
+        let first = builder.shr().get_const(0x10, 8);
+        let second = builder.shr().get_const(0xdead_beef_0000_0010, 4);
 
         builder.push_load::<false>(first, 4, space);
         builder.push_load::<false>(second, 4, space);
@@ -380,9 +379,10 @@ fn two_literal_pointers_overlapping_ranges_alias() {
     let mut lit1 = None;
     let mut lit2 = None;
 
-    let (ctx, _, _) = build_in_custom_space(|builder, space| {
-        let first = builder.context_mut().get_const(0x100, 8).id();
-        let second = builder.context_mut().get_const(0x104, 8).id();
+    let (ctx, _, _) = build_in_custom_space(|ctx, block, space| {
+        let mut builder = ctx.builder(block);
+        let first = builder.shr().get_const(0x100, 8);
+        let second = builder.shr().get_const(0x104, 8);
 
         builder.push_load::<false>(first, 8, space);
         builder.push_load::<false>(second, 4, space);
@@ -408,13 +408,10 @@ fn two_literal_pointers_different_spaces_do_not_alias() {
         let __f = ctx.anon_function();
         ctx.get_or_make_block(0x1000, __f)
     };
-    let mut builder = Builder::from_context(&mut ctx, 0x1000);
+    let mut builder = (&mut ctx).builder_at(0x1000);
 
-    let lit1 = builder.context_mut().get_const(0x20, 8).id();
-    let lit2 = builder
-        .context_mut()
-        .get_const(0xfeed_face_0000_0020, 4)
-        .id();
+    let lit1 = builder.shr().get_const(0x20, 8);
+    let lit2 = builder.shr().get_const(0xfeed_face_0000_0020, 4);
     builder.push_load::<false>(lit1, 4, reg_space);
     builder.push_load::<false>(lit2, 4, alt_space);
 
@@ -434,9 +431,9 @@ fn same_pointer_used_in_multiple_spaces_degrades_to_unknown() {
         let __f = ctx.anon_function();
         ctx.get_or_make_block(0x1000, __f)
     };
-    let mut builder = Builder::from_context(&mut ctx, 0x1000);
+    let mut builder = (&mut ctx).builder_at(0x1000);
 
-    let ptr = builder.context_mut().get_const(0x20, 8).id();
+    let ptr = builder.shr().get_const(0x20, 8);
     builder.push_load::<false>(ptr, 4, reg_space);
     builder.push_load::<false>(ptr, 4, alt_space);
 
@@ -458,9 +455,10 @@ fn odd_pointer_arithmetic_degrades_to_unknown() {
     let mut vn_b = None;
     let mut r = None;
 
-    let (ctx, _, _) = build_in_custom_space(|builder, space| {
-        let a_id = Varnode::make(builder.context_mut(), 0, 8, space).id;
-        let b_id = Varnode::make(builder.context_mut(), 8, 8, space).id;
+    let (ctx, _, _) = build_in_custom_space(|ctx, block, space| {
+        let a_id = Varnode::make(ctx, 0, 8, space).id;
+        let b_id = Varnode::make(ctx, 8, 8, space).id;
+        let mut builder = ctx.builder(block);
         let sub = builder
             .push_sub(a_id.into(), b_id.into())
             .id()
@@ -579,15 +577,10 @@ fn literal_with_high_bit_set_aliases_overlapping_literals() {
     let mut lit1 = None;
     let mut lit2 = None;
 
-    let (ctx, _, _) = build_in_custom_space(|builder, space| {
-        let first = builder
-            .context_mut()
-            .get_const(0x8000_0000_0000_0000, 8)
-            .id();
-        let second = builder
-            .context_mut()
-            .get_const(0x8000_0000_0000_0004, 8)
-            .id();
+    let (ctx, _, _) = build_in_custom_space(|ctx, block, space| {
+        let mut builder = ctx.builder(block);
+        let first = builder.shr().get_const(0x8000_0000_0000_0000, 8);
+        let second = builder.shr().get_const(0x8000_0000_0000_0004, 8);
 
         builder.push_load::<false>(first, 8, space);
         builder.push_load::<false>(second, 4, space);
@@ -609,12 +602,10 @@ fn literal_with_upper_junk_bits_is_masked_to_size() {
     let mut a = None;
     let mut literal_ptr = None;
 
-    let (ctx, _, _) = build_in_custom_space(|builder, space| {
-        let a_id = Varnode::make(builder.context_mut(), 0x10, 4, space).id;
-        let ptr = builder
-            .context_mut()
-            .get_const(0xdead_beef_0000_0010, 4)
-            .id();
+    let (ctx, _, _) = build_in_custom_space(|ctx, block, space| {
+        let a_id = Varnode::make(ctx, 0x10, 4, space).id;
+        let mut builder = ctx.builder(block);
+        let ptr = builder.shr().get_const(0xdead_beef_0000_0010, 4);
 
         builder.push_load::<false>(ptr, 4, space);
 
@@ -638,11 +629,11 @@ fn untracked_value_may_alias_conservatively() {
         let __f = ctx.anon_function();
         ctx.get_or_make_block(0x1000, __f)
     };
-    let mut builder = Builder::from_context(&mut ctx, 0x1000);
+    let mut builder = (&mut ctx).builder_at(0x1000);
 
     // Two tracked, non-overlapping literal pointers (positive control).
-    let p = builder.context_mut().get_const(0x1000, 8).id();
-    let p2 = builder.context_mut().get_const(0x2000, 8).id();
+    let p = builder.shr().get_const(0x1000, 8);
+    let p2 = builder.shr().get_const(0x2000, 8);
     builder.push_load::<false>(p, 4, space);
     builder.push_load::<false>(p2, 4, space);
     unsafe { builder.dont_finalize() };
@@ -651,8 +642,8 @@ fn untracked_value_may_alias_conservatively() {
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
 
     // Append an instruction the analysis never saw.
-    let mut builder = Builder::from_context(&mut ctx, 0x1000);
-    let eight = builder.context_mut().get_const(8, 8).id();
+    let mut builder = (&mut ctx).builder_at(0x1000);
+    let eight = builder.shr().get_const(8, 8);
     let q = builder.push_add(p, eight).id();
     unsafe { builder.dont_finalize() };
     drop(builder);
@@ -675,9 +666,9 @@ fn untracked_value_may_alias_conservatively() {
 fn many_overlapping_subregisters_still_join_in_one_class() {
     let mut varnodes = Vec::new();
 
-    let (ctx, _, _) = build_in_custom_space(|builder, space| {
+    let (ctx, _, _) = build_in_custom_space(|ctx, _block, space| {
         for size in (1..=32).rev() {
-            let id = Varnode::make(builder.context_mut(), 0, size, space).id;
+            let id = Varnode::make(ctx, 0, size, space).id;
             varnodes.push(id);
         }
     });

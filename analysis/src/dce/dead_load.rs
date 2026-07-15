@@ -1226,7 +1226,7 @@ mod tests {
             let __f = ctx.anon_function();
             ctx.get_or_make_block(0x1000, __f)
         };
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
+        let mut builder = (&mut ctx).builder_at(0x1000);
         f(&mut builder);
         unsafe { builder.dont_finalize() };
         drop(builder);
@@ -1236,9 +1236,9 @@ mod tests {
     #[test]
     fn test_dead_load_eliminated() {
         let (ctx, block_id) = build_block(|b| {
-            let rax_vn = b.context().get_named("r0").unwrap().as_varnode().unwrap();
+            let rax_vn = b.shr().get_named("r0").unwrap().as_varnode().unwrap();
             let rax_ptr = ValueId::Varnode(rax_vn);
-            let space = reg_space(b.context());
+            let space = b.shr().named_spaces["register"];
             b.push_load::<false>(rax_ptr, 8, space);
         });
 
@@ -1249,11 +1249,11 @@ mod tests {
     #[test]
     fn test_used_load_not_eliminated() {
         let (ctx, block_id) = build_block(|b| {
-            let rax_vn = b.context().get_named("r0").unwrap().as_varnode().unwrap();
+            let rax_vn = b.shr().get_named("r0").unwrap().as_varnode().unwrap();
             let rax_ptr = ValueId::Varnode(rax_vn);
-            let space = reg_space(b.context());
+            let space = b.shr().named_spaces["register"];
             let loaded_id = b.push_load::<false>(rax_ptr, 8, space).id();
-            let one = b.context_mut().get_const(1, 8).id();
+            let one = b.shr().get_const(1, 8);
             b.push_add(loaded_id, one);
         });
 
@@ -1297,15 +1297,15 @@ mod tests {
             if off == 0 {
                 base
             } else {
-                let c = b.context_mut().get_const(off as u64, 8).id();
+                let c = b.shr().get_const(off as u64, 8);
                 ValueId::Instruction(b.push_add(base, c).id)
             }
         };
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block_id));
+            let mut b = (&mut tc.ctx).builder(block_id);
             let base = b.push_load::<false>(ValueId::Varnode(r1), 8, regsp).id();
             let store_ptr = offset_ptr(&mut b, base, store_off);
-            let five = b.context_mut().get_const(5, 4).id();
+            let five = b.shr().get_const(5, 4);
             b.push_store(five, store_ptr, shadow);
             let load_ptr = offset_ptr(&mut b, base, load_off);
             let v = b.push_load::<false>(load_ptr, 4, shadow).id();
@@ -1371,22 +1371,22 @@ mod tests {
     /// load of `base + 4` between the narrow stores and the covering store.
     fn array_build_block(with_read: bool) -> (Context<'static>, BlockId) {
         build_block(|b| {
-            let r1 = b.context().get_named("r1").unwrap().as_varnode().unwrap();
-            let regsp = reg_space(b.context());
-            let ram = b.context().shared.default_space;
+            let r1 = b.shr().get_named("r1").unwrap().as_varnode().unwrap();
+            let regsp = b.shr().named_spaces["register"];
+            let ram = b.shr().default_space;
             let base = b.push_load::<false>(ValueId::Varnode(r1), 8, regsp).id();
 
             let at = |b: &mut Builder<'static, '_>, off: u64| {
                 if off == 0 {
                     base
                 } else {
-                    let c = b.context_mut().get_const(off, 8).id();
+                    let c = b.shr().get_const(off, 8);
                     ValueId::Instruction(b.push_add(base, c).id)
                 }
             };
 
             for off in [0u64, 4, 8] {
-                let v = b.context_mut().get_const(0x1111_1111 + off, 4).id();
+                let v = b.shr().get_const(0x1111_1111 + off, 4);
                 let p = at(b, off);
                 b.push_store(v, p, ram);
             }
@@ -1399,7 +1399,7 @@ mod tests {
             }
 
             // Covering 12-byte store at base+0.
-            let blob = b.context_mut().get_bytes(vec![0u8; 12]).id();
+            let blob = b.shr().get_bytes(vec![0u8; 12]);
             b.push_store(blob, base, ram);
         })
     }
@@ -1539,8 +1539,8 @@ mod tests {
             .unwrap();
         let store_id;
         {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-            let v = b.context_mut().get_const(0x1u64, 8).id();
+            let mut b = (&mut tc.ctx).builder_at(0x1000);
+            let v = b.shr().get_const(0x1u64, 8);
             store_id = b.push_store(v, ValueId::Varnode(r), reg).id;
             b.push_call(callee);
             unsafe { b.dont_finalize() };
@@ -1623,7 +1623,6 @@ mod tests {
     #[test]
     fn redundant_stack_store_dead_despite_global_load() {
         use qcode::{
-            builder::Builder,
             testing::TestContext,
             value::{BasicBlock, FunctionBody},
         };
@@ -1644,16 +1643,16 @@ mod tests {
 
         let ram = tc.ctx.shared.default_space;
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-            let c18 = b.context_mut().get_const(0x18, 8).id();
+            let mut b = (&mut tc.ctx).builder(root);
+            let c18 = b.shr().get_const(0x18, 8);
             let slot = b.push_sub(sp, c18).id(); // @SP - 0x18
-            let val = b.context_mut().get_const(0x2f45c825, 4).id();
+            let val = b.shr().get_const(0x2f45c825, 4);
             b.push_store(val, slot, ram); // S1
             b.push_store(val, slot, ram); // S2 (identical → S1 dead)
-            let glob = b.context_mut().get_const(0x454df8, 4).id();
+            let glob = b.shr().get_const(0x454df8, 4);
             let g = b.push_load::<false>(glob, 4, ram).id(); // global load after the stores
             // Give the load a user so it is a live reader (not a pruned dead load).
-            let zero = b.context_mut().get_const(0, 4).id();
+            let zero = b.shr().get_const(0, 4);
             b.push_add(g, zero);
             unsafe { b.dont_finalize() };
         }
@@ -1691,7 +1690,6 @@ mod tests {
     #[test]
     fn unread_own_frame_local_store_is_dead() {
         use qcode::{
-            builder::Builder,
             testing::TestContext,
             value::{BasicBlock, FunctionBody},
         };
@@ -1712,10 +1710,10 @@ mod tests {
 
         let ram = tc.ctx.shared.default_space;
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-            let c8 = b.context_mut().get_const(8, 8).id();
-            let c10 = b.context_mut().get_const(0x10, 8).id();
-            let v = b.context_mut().get_const(0x1234, 4).id();
+            let mut b = (&mut tc.ctx).builder(root);
+            let c8 = b.shr().get_const(8, 8);
+            let c10 = b.shr().get_const(0x10, 8);
+            let v = b.shr().get_const(0x1234, 4);
             let local = b.push_sub(sp, c8).id(); // @SP - 8 (never read)
             b.push_store(v, local, ram); // dead
             let caller = b.push_add(sp, c8).id(); // @SP + 8 (caller frame)
@@ -1789,23 +1787,13 @@ mod tests {
     #[test]
     fn test_partial_overlap_not_dead() {
         let (ctx, block_id) = build_block(|b| {
-            let ax_vn = b
-                .context()
-                .get_named("r0_lo16")
-                .unwrap()
-                .as_varnode()
-                .unwrap();
-            let ah_vn = b
-                .context()
-                .get_named("r0_byte1")
-                .unwrap()
-                .as_varnode()
-                .unwrap();
-            let space = reg_space(b.context());
-            let v = b.context_mut().get_const(0x1234u64, 2).id();
+            let ax_vn = b.shr().get_named("r0_lo16").unwrap().as_varnode().unwrap();
+            let ah_vn = b.shr().get_named("r0_byte1").unwrap().as_varnode().unwrap();
+            let space = b.shr().named_spaces["register"];
+            let v = b.shr().get_const(0x1234u64, 2);
             b.push_store(v, ValueId::Varnode(ax_vn), space);
             let loaded_id = b.push_load::<false>(ValueId::Varnode(ah_vn), 1, space).id();
-            let zero = b.context_mut().get_const(0, 1).id();
+            let zero = b.shr().get_const(0, 1);
             b.push_add(loaded_id, zero);
         });
 
@@ -1898,19 +1886,14 @@ mod tests {
     #[test]
     fn test_narrow_store_killed_by_wide_register_store() {
         let (ctx, block_id) = build_block(|b| {
-            let r0_lo32 = b
-                .context()
-                .get_named("r0_lo32")
-                .unwrap()
-                .as_varnode()
-                .unwrap();
-            let r0 = b.context().get_named("r0").unwrap().as_varnode().unwrap();
-            let space = reg_space(b.context());
+            let r0_lo32 = b.shr().get_named("r0_lo32").unwrap().as_varnode().unwrap();
+            let r0 = b.shr().get_named("r0").unwrap().as_varnode().unwrap();
+            let space = b.shr().named_spaces["register"];
 
-            let narrow_val = b.context_mut().get_const(1u64, 4).id();
+            let narrow_val = b.shr().get_const(1u64, 4);
             b.push_store(narrow_val, ValueId::Varnode(r0_lo32), space);
 
-            let wide_val = b.context_mut().get_const(2u64, 8).id();
+            let wide_val = b.shr().get_const(2u64, 8);
             b.push_store(wide_val, ValueId::Varnode(r0), space);
         });
 

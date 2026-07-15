@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn result_type_is_a_machine_word() {
-        let mut types = TypeManager::default();
+        let types = TypeManager::default();
         let i8 = types.get_or_make_int(1);
         let arr = types.get_or_make_array(i8, 4);
         let id = IntrinsicId::from_name("len").unwrap();

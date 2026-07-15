@@ -394,7 +394,7 @@ mod tests {
             let pid = BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id;
             params.push(ValueId::BlockParam(pid));
         }
-        let mut b = Builder::from_context(&mut tc.ctx, addr);
+        let mut b = (&mut tc.ctx).builder_at(addr);
         body(&mut b, &params);
         unsafe { b.dont_finalize() };
         drop(b);
@@ -424,7 +424,7 @@ mod tests {
         let mut tc = TestContext::new();
         let ram = tc.ctx.shared.default_space;
         let f = build_pure_fn(&mut tc, "f", 0x1000, 1, |b, p| {
-            let v = b.context_mut().get_const(7, 8).id();
+            let v = b.shr().get_const(7, 8);
             b.push_store(v, p[0], ram);
         });
         infer_param_attrs(&mut tc.ctx);
@@ -499,7 +499,7 @@ mod tests {
         let ram = tc.ctx.shared.default_space;
         // callee(p): *p = 7 — not readonly.
         let callee = build_pure_fn(&mut tc, "callee", 0x2000, 1, |b, p| {
-            let v = b.context_mut().get_const(7, 8).id();
+            let v = b.shr().get_const(7, 8);
             b.push_store(v, p[0], ram);
         });
         let caller = build_pure_fn(&mut tc, "caller", 0x1000, 1, |b, _p| {
@@ -523,7 +523,7 @@ mod tests {
     fn indirect_call_revokes_both() {
         let mut tc = TestContext::new();
         let f = build_pure_fn(&mut tc, "f", 0x1000, 1, |b, _p| {
-            let target = b.context_mut().get_const(0x9999, 8).id();
+            let target = b.shr().get_const(0x9999, 8);
             b.push_call_ind(target);
         });
         // Give the indirect call an argument of p (reusing its existing ptr).

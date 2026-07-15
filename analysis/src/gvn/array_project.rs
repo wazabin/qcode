@@ -326,7 +326,6 @@ impl ArrayProject {
 #[cfg(test)]
 mod tests {
     use qcode::{
-        builder::Builder,
         testing::TestContext,
         types::TypeId,
         value::{
@@ -346,11 +345,11 @@ mod tests {
         }
         let (inc, ptr, ret);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             let elem = b.push_param(1).id();
-            let one = b.context_mut().get_const(1, 1).id();
+            let one = b.shr().get_const(1, 1);
             inc = b.push_add(elem, one).id();
-            ptr = b.context_mut().get_const(0, 8).id();
+            ptr = b.shr().get_const(0, 8);
             ret = b.push_return(ptr).id();
             unsafe { b.dont_finalize() };
         }
@@ -386,7 +385,7 @@ mod tests {
 
         // src param, typed as the array *before* the map captures its type.
         let src = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             b.push_param(4).id()
         };
         if let ValueId::BlockParam(pid) = src {
@@ -395,12 +394,12 @@ mod tests {
         let reg_space = tc.reg_space;
         let r0 = tc.r0;
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             let map = b.push_map(body, src, Vec::new()).id();
             // src[2]: a 1-byte slice at byte offset 2.
             let lane = b.get_range(map, 2..3).unwrap().id();
             b.push_store(lane, ValueId::Varnode(r0), reg_space);
-            let ptr = b.context_mut().get_const(0, 8).id();
+            let ptr = b.shr().get_const(0, 8);
             b.push_return(ptr);
         }
 
@@ -467,7 +466,7 @@ mod tests {
 
         // src param, typed as the array `[i8; 4]`.
         let src = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             b.push_param(4).id()
         };
         if let ValueId::BlockParam(pid) = src {
@@ -476,7 +475,7 @@ mod tests {
 
         // enumerate(src): `[(index: i64, elem: i8); 4]`, tuple width 9.
         let en = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             b.push_intrinsic(enum_id, vec![src]).id()
         };
         let en_ty = tc.ctx.type_of(en);
@@ -485,7 +484,7 @@ mod tests {
 
         // The k=2 lane: a tuple-typed byte slice `enumerate(src)[2]`.
         let lane = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             b.get_range(en, (2 * tsz)..(3 * tsz)).unwrap().id()
         };
         if let ValueId::Instruction(lid) = lane {
@@ -494,12 +493,12 @@ mod tests {
 
         let (r0, r1, reg_space) = (tc.r0, tc.r1, tc.reg_space);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             let index = b.push_extract(lane, 0).id();
             let elem = b.push_extract(lane, 1).id();
             b.push_store(index, ValueId::Varnode(r0), reg_space);
             b.push_store(elem, ValueId::Varnode(r1), reg_space);
-            let ptr = b.context_mut().get_const(0, 8).id();
+            let ptr = b.shr().get_const(0, 8);
             b.push_return(ptr);
         }
 
@@ -551,7 +550,7 @@ mod tests {
         let b_ty = tc.ctx.shared.types.get_or_make_array(i8, 5);
 
         let (a, b_src) = {
-            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut builder = (&mut tc.ctx).builder(entry);
             (builder.push_param(3).id(), builder.push_param(5).id())
         };
         if let ValueId::BlockParam(pid) = a {
@@ -564,11 +563,11 @@ mod tests {
         let reg_space = tc.reg_space;
         let r0 = tc.r0;
         {
-            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut builder = (&mut tc.ctx).builder(entry);
             let concat = builder.push_intrinsic(concat_id, vec![a, b_src]).id();
             let lane = builder.get_range(concat, 4..5).unwrap().id();
             builder.push_store(lane, ValueId::Varnode(r0), reg_space);
-            let ptr = builder.context_mut().get_const(0, 8).id();
+            let ptr = builder.shr().get_const(0, 8);
             builder.push_return(ptr);
         }
 
@@ -598,16 +597,16 @@ mod tests {
         }
         let tsz = tc.ctx.shared.types.size_of(tuple_ty);
         let t = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             b.push_param(tsz).id()
         };
         if let ValueId::BlockParam(pid) = t {
             tc.ctx.block_param_mut(pid).type_id = tuple_ty;
         }
         let (elem, ptr, ret) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             let elem = b.push_extract(t, 1).id();
-            let ptr = b.context_mut().get_const(0, 8).id();
+            let ptr = b.shr().get_const(0, 8);
             let ret = b.push_return(ptr).id();
             unsafe { b.dont_finalize() };
             (elem, ptr, ret)
@@ -652,7 +651,7 @@ mod tests {
 
         // src param `[i8; 4]`.
         let src = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             b.push_param(4).id()
         };
         if let ValueId::BlockParam(pid) = src {
@@ -663,20 +662,20 @@ mod tests {
         // the result `[i8; 4]` (from the body's return), not the `[tuple; 4]`
         // source.
         let (en, map_val) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             let en = b.push_intrinsic(enum_id, vec![src]).id();
-            let map_val = b.push_map(body, en, Vec::new()).id();
+            let map_val = b.push_map_typed(body, en, Vec::new(), arr_ty).id();
             (en, map_val)
         };
 
         let reg_space = tc.reg_space;
         let r0 = tc.r0;
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             // map(...)[2]: a 1-byte output slice at lane 2.
             let lane = b.get_range(map_val, 2..3).unwrap().id();
             b.push_store(lane, ValueId::Varnode(r0), reg_space);
-            let ptr = b.context_mut().get_const(0, 8).id();
+            let ptr = b.shr().get_const(0, 8);
             b.push_return(ptr);
         }
 
@@ -697,7 +696,7 @@ mod tests {
             .any(|m| matches!(m, Mnemonic::Range(r) if r.src.qualify(entry.func) == map_val || r.src.qualify(entry.func) == en));
         assert!(
             !range_over_derived,
-            "map/enumerate slices must project away"
+            "map/enumerate slices must project away: {insns:#?}"
         );
         let slices_src = insns.iter().any(
             |m| matches!(m, Mnemonic::Range(r) if r.src.qualify(entry.func) == src && r.start == 2),

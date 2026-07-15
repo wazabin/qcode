@@ -183,7 +183,7 @@ pub(crate) fn add_input(
         ctx.block_param_mut(pid).type_id = ty;
     }
     let root = FunctionBody::from_id(ctx, fid).root().map(|b| b.id)?;
-    let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
+    let mut b = (ctx).builder(root);
     b.set_insert_point_to_start();
     let addr = seed_addr(&mut b);
     b.push_store(param, addr, seed_space);
@@ -249,7 +249,7 @@ pub(crate) fn append_outputs<S>(
         };
         base_len = base_fields.len();
         let tuple = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, ret_block));
+            let mut b = (ctx).builder(ret_block);
             b.set_insert_point_before(ret_id);
             let mut fields = base_fields;
             for (i, s) in slots.iter().enumerate() {
@@ -293,7 +293,7 @@ pub(crate) fn append_outputs<S>(
             continue;
         };
         let result = ValueId::Instruction(call_id);
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, cont));
+        let mut b = (ctx).builder(cont);
         b.set_insert_point_to_start();
         let mut idx = base_len;
         for (s, &arity) in slots.iter().zip(&arities) {

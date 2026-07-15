@@ -93,6 +93,11 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             interfaces: self.interfaces,
         }
     }
+
+    /// Narrows this pass backing to the concrete body-local builder.
+    pub fn builder(&mut self, block: BlockId) -> crate::builder::Builder<'str, '_> {
+        crate::builder::Builder::new(&mut *self.fun, self.shared, self.interfaces, block)
+    }
 }
 
 /// The verb + read surface of a checked-out function pass, delegating to the

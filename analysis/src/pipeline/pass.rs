@@ -358,7 +358,6 @@ pub(super) fn resolve_minted_callees(
 mod minted_barrier_tests {
     use super::*;
     use qcode::{
-        builder::Builder,
         testing::TestContext,
         value::{
             BasicBlock, InstructionRef,
@@ -375,7 +374,7 @@ mod minted_barrier_tests {
             .set_root(block)
             .unwrap();
         {
-            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            let mut builder = (&mut tc.ctx).builder(block);
             builder.push_call(callee);
             unsafe { builder.dont_finalize() };
         }
@@ -417,7 +416,7 @@ mod minted_barrier_tests {
             .set_root(block)
             .unwrap();
         let sibling_call = {
-            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            let mut builder = (&mut tc.ctx).builder(block);
             builder.push_call(sibling);
             unsafe { builder.dont_finalize() };
             drop(builder);

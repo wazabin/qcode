@@ -334,7 +334,7 @@ crate::register_module_pass!(Depipeline);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qcode::{builder::Builder, testing::TestContext, value::Value};
+    use qcode::{testing::TestContext, value::Value};
 
     /// Build the canonical pipelined strcpy loop and return `(fid, header)`.
     fn build_pipelined(tc: &mut TestContext) -> (FunctionId, BlockId) {
@@ -376,8 +376,8 @@ mod tests {
             ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, exit).push_param(4).id);
 
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            let one = b.context_mut().get_const(1, 4).id();
+            let mut b = (&mut tc.ctx).builder(entry);
+            let one = b.shr().get_const(1, 4);
             // Pipelined prologue: pre-load src[0] and pre-step the source pointer,
             // so the carry seed `load(src)` matches the in-loop re-read
             // `load((src + 1) − 1)` the de-pipeliner synthesizes. The recognizer
@@ -387,8 +387,8 @@ mod tests {
             b.push_branch_with_args(header, vec![eax0, dst, p0]);
         }
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, header));
-            let one = b.context_mut().get_const(1, 4).id();
+            let mut b = (&mut tc.ctx).builder(header);
+            let one = b.shr().get_const(1, 4);
             b.push_store(dl, ecx, ram); // store(ram:1, @ECX <- @DL)
             let t = b.push_load::<false>(eax, 1, ram).id(); // %t = load(ram:1, @EAX)
             let ea = b.push_add(eax, one).id();
@@ -397,8 +397,8 @@ mod tests {
             b.push_cbranch_with_args(t, header, vec![ea, ec, t], exit, vec![ec]);
         }
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, exit));
-            let dummy = b.context_mut().get_const(0, 8).id();
+            let mut b = (&mut tc.ctx).builder(exit);
+            let dummy = b.shr().get_const(0, 8);
             b.push_return(dummy);
         }
         (fid, header)
@@ -481,15 +481,15 @@ mod tests {
         let _exit_ecx =
             ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, exit).push_param(4).id);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             // Inconsistent prologue: a constant carried byte and an un-stepped src,
             // so the seed does not equal `load(src)` = `load((src) − 1 + 1)`.
-            let init = b.context_mut().get_const(0x41, 1).id();
+            let init = b.shr().get_const(0x41, 1);
             b.push_branch_with_args(header, vec![src, dst, init]);
         }
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, header));
-            let one = b.context_mut().get_const(1, 4).id();
+            let mut b = (&mut tc.ctx).builder(header);
+            let one = b.shr().get_const(1, 4);
             b.push_store(dl, ecx, ram);
             let t = b.push_load::<false>(eax, 1, ram).id();
             let ea = b.push_add(eax, one).id();
@@ -497,8 +497,8 @@ mod tests {
             b.push_cbranch_with_args(t, header, vec![ea, ec, t], exit, vec![ec]);
         }
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, exit));
-            let dummy = b.context_mut().get_const(0, 8).id();
+            let mut b = (&mut tc.ctx).builder(exit);
+            let dummy = b.shr().get_const(0, 8);
             b.push_return(dummy);
         }
 
@@ -536,14 +536,14 @@ mod tests {
                 .id,
         );
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            let z = b.context_mut().get_const(0, 4).id();
+            let mut b = (&mut tc.ctx).builder(entry);
+            let z = b.shr().get_const(0, 4);
             b.push_branch_with_args(header, vec![z]);
         }
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, header));
-            let one = b.context_mut().get_const(1, 4).id();
-            let addr = b.context_mut().get_const(0x4000, 4).id();
+            let mut b = (&mut tc.ctx).builder(header);
+            let one = b.shr().get_const(1, 4);
+            let addr = b.shr().get_const(0x4000, 4);
             // A store (so the copy-shape gate passes) but the carry is `p + 1`,
             // not `load(iv)` — a real accumulator, not a delay register.
             b.push_store(p, addr, ram);
@@ -552,8 +552,8 @@ mod tests {
             b.push_cbranch_with_args(cond, header, vec![next], exit, vec![]);
         }
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, exit));
-            let dummy = b.context_mut().get_const(0, 8).id();
+            let mut b = (&mut tc.ctx).builder(exit);
+            let dummy = b.shr().get_const(0, 8);
             b.push_return(dummy);
         }
 

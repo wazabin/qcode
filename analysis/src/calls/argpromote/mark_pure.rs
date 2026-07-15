@@ -139,7 +139,6 @@ crate::register_module_pass!(MarkPure);
 mod tests {
     use super::*;
     use qcode::{
-        builder::Builder,
         testing::TestContext,
         value::{BasicBlock, FunctionBody, ValueId},
     };
@@ -171,8 +170,8 @@ mod tests {
         } else {
             LocalMemorySpaceId::Shared(tc.ctx.shared.default_space)
         };
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-        let v = b.context_mut().get_const(0x1234, 4).id();
+        let mut b = (&mut tc.ctx).builder(root);
+        let v = b.shr().get_const(0x1234, 4);
         b.push_store(v, p, space);
         unsafe { b.dont_finalize() };
         fid

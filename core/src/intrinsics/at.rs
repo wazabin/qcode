@@ -173,7 +173,7 @@ register_intrinsic!(At);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builder::Builder;
+
     use crate::context::Context;
     use crate::value::insn::IntrinsicId;
     use crate::value::{BasicBlock, BodyView, FunctionId, LocalValueId, ValueId};
@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn result_type_is_element_type() {
-        let mut types = TypeManager::default();
+        let types = TypeManager::default();
         let i32 = types.get_or_make_int(4);
         let arr = types.get_or_make_array(i32, 5);
         let i64 = types.get_or_make_int(8);
@@ -214,7 +214,7 @@ mod tests {
         let v = ctx.get_const(0x77, 4).id();
         let insert_id = IntrinsicId::from_name("insert").unwrap();
         let ins = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, blk));
+            let mut b = (&mut ctx).builder(blk);
             b.push_intrinsic(insert_id, vec![ValueId::BlockParam(a), i, v])
                 .id()
         };
@@ -244,7 +244,7 @@ mod tests {
         let v = ctx.get_const(0x77, 4).id();
         let insert_id = IntrinsicId::from_name("insert").unwrap();
         let ins = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, blk));
+            let mut b = (&mut ctx).builder(blk);
             b.push_intrinsic(insert_id, vec![ValueId::BlockParam(a), i, v])
                 .id()
         };
@@ -274,7 +274,7 @@ mod tests {
             ctx.get_or_make_block(0x1000, __f)
         };
         let sing = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, blk));
+            let mut b = (&mut ctx).builder(blk);
             b.push_intrinsic(sing_id, vec![v]).id()
         };
         let idx = ctx.get_const(0, 8).id();
@@ -305,7 +305,7 @@ mod tests {
         ctx.block_param_mut(b).type_id = b_ty;
         let concat_id = IntrinsicId::from_name("concat").unwrap();
         let cat = {
-            let mut bl = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, blk));
+            let mut bl = (&mut ctx).builder(blk);
             bl.push_intrinsic(
                 concat_id,
                 vec![ValueId::BlockParam(a), ValueId::BlockParam(b)],

@@ -1,11 +1,8 @@
 use qcode::{
-    builder::Builder,
     context::Context,
     space::{SpaceId, SpaceType},
     types::TypeId,
-    value::{
-        BasicBlock, FunctionBody, FunctionId, Value, ValueId, Varnode, VarnodeId, insn::Mnemonic,
-    },
+    value::{FunctionBody, FunctionId, Value, ValueId, Varnode, VarnodeId, insn::Mnemonic},
 };
 
 use rustc_hash::FxHashSet;
@@ -386,7 +383,7 @@ pub(crate) fn rewrite_registers(ctx: &mut Context, fid: FunctionId, eff: &Regist
             space,
             move |_b| ValueId::Varnode(r),
             move |ctx, call_id, block| {
-                let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, block));
+                let mut b = (ctx).builder(block);
                 b.set_insert_point_before(call_id);
                 b.push_load::<false>(ValueId::Varnode(r), size, space).id()
             },

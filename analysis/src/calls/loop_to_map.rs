@@ -10,7 +10,6 @@
 //! outlined into fresh pure functions by the shared [`super::outline`] machinery.
 
 use qcode::{
-    builder::Builder,
     space::{Space, SpaceType},
     value::{
         BlockId, FunctionId, QCodeView, ValueId,
@@ -282,7 +281,7 @@ fn apply<'str>(
     // ahead of the consumer through a scoped Builder over `m.host(body)`.
     let src = if uses_index {
         let mut host = m.host(body);
-        let mut b = Builder::from_block(BaseRef::new(host.reborrow(), mm.exit));
+        let mut b = host.builder(mm.exit);
         if let Some(at) = anchor {
             b.set_insert_point_before(at);
         }

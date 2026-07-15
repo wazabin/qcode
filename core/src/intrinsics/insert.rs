@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn result_type_is_the_array_type() {
-        let mut types = TypeManager::default();
+        let types = TypeManager::default();
         let i32 = types.get_or_make_int(4);
         let arr = types.get_or_make_array(i32, 5);
         let id = IntrinsicId::from_name("insert").unwrap();

@@ -67,7 +67,7 @@ mod tests {
     /// so it composes onto a `take_while` result.
     #[test]
     fn enumerate_of_a_list_is_a_list_of_tuples() {
-        let mut types = crate::types::TypeManager::default();
+        let types = crate::types::TypeManager::default();
         let i8 = types.get_or_make_int(1);
         let list = types.get_or_make_list(i8, 4);
 
@@ -84,7 +84,7 @@ mod tests {
 
     #[test]
     fn result_type_is_array_of_index_elem_tuples() {
-        let mut types = crate::types::TypeManager::default();
+        let types = crate::types::TypeManager::default();
         let i8 = types.get_or_make_int(1);
         let arr = types.get_or_make_array(i8, 4);
 

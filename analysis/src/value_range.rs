@@ -1319,7 +1319,6 @@ mod tests {
     /// because the `qcode!` macro has no byte-range surface syntax.
     #[test]
     fn range_extract_of_zero_high_bytes() {
-        use qcode::builder::Builder;
         use qcode::value::BasicBlock;
 
         let mut ctx = Context::new();
@@ -1336,12 +1335,12 @@ mod tests {
 
         // `%zero` is an instruction (range [0,0]); take its bytes [1:4).
         let hi = {
+            let tgt = ctx.get_or_make_block(0x1001, block.func);
             let mut blk = BasicBlock::from_id_mut(&mut ctx, block);
             blk.pop_insn(); // drop the `goto` so we can append before re-terminating
-            let mut b = Builder::from_block(blk);
+            drop(blk);
+            let mut b = ctx.builder(block);
             let hi = b.get_range(zero.into(), 1..4).unwrap().id();
-            let __f = b.current_block().func;
-            let tgt = b.context_mut().get_or_make_block(0x1001, __f);
             b.push_branch(tgt);
             hi
         };
@@ -1357,7 +1356,6 @@ mod tests {
     /// the boolean low byte.
     #[test]
     fn setnz_register_reconstruction_bounds_index() {
-        use qcode::builder::Builder;
         use qcode::value::BasicBlock;
 
         let mut ctx = Context::new();
@@ -1377,17 +1375,17 @@ mod tests {
         );
 
         let idx = {
+            let tgt = ctx.get_or_make_block(0x1001, block.func);
             let mut blk = BasicBlock::from_id_mut(&mut ctx, block);
             blk.pop_insn(); // drop the `goto` so we can append before re-terminating
-            let mut b = Builder::from_block(blk);
+            drop(blk);
+            let mut b = ctx.builder(block);
             // hi3 = wide[1:4] (== 0); hi = zext(hi3); hishift = hi << 8.
             let hi3 = b.get_range(wide.into(), 1..4).unwrap().id();
             let hi = b.push_zext(hi3, 4).id();
-            let shift = b.context_mut().get_const(8, 4).id();
+            let shift = b.shr().get_const(8, 4);
             let hishift = b.push_shl(hi, shift).id();
             let idx = b.push_bit_or(lo.into(), hishift).id();
-            let __f = b.current_block().func;
-            let tgt = b.context_mut().get_or_make_block(0x1001, __f);
             b.push_branch(tgt);
             idx
         };

@@ -350,7 +350,6 @@ pub(crate) fn collect_regions_for_base(
 mod tests {
     use super::*;
     use qcode::{
-        builder::Builder,
         testing::TestContext,
         value::{BasicBlock, FunctionBody},
     };
@@ -376,8 +375,8 @@ mod tests {
             ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
         let i = ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, body).push_param(8).id);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            let zero = b.context_mut().get_const(0, 8).id();
+            let mut b = (&mut tc.ctx).builder(entry);
+            let zero = b.shr().get_const(0, 8);
             b.push_branch_with_args(body, vec![zero]);
         }
         (fid, body, base, i)
@@ -389,8 +388,8 @@ mod tests {
         let (fid, body, base, i) = setup_loop(&mut tc);
         let ram = tc.ctx.shared.default_space;
         let access = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, body));
-            let four = b.context_mut().get_const(4, 8).id();
+            let mut b = (&mut tc.ctx).builder(body);
+            let four = b.shr().get_const(4, 8);
             let scaled = b.push_mul(i, four).id();
             let addr0 = b.push_add(base, scaled).id();
             let addr = b.push_add(addr0, four).id();
@@ -404,10 +403,10 @@ mod tests {
         };
         // Add a back-edge guard so value_range can bound i to [0, 19].
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, body));
-            let one = b.context_mut().get_const(1, 8).id();
+            let mut b = (&mut tc.ctx).builder(body);
+            let one = b.shr().get_const(1, 8);
             let ni = b.push_add(i, one).id();
-            let bound = b.context_mut().get_const(20, 8).id();
+            let bound = b.shr().get_const(20, 8);
             let cond = b.push_lt(ni, bound).id();
             b.push_cbranch_with_args(cond, body, vec![ni], body, vec![ni]);
         }
@@ -434,16 +433,16 @@ mod tests {
         let (fid, body, base, i) = setup_loop(&mut tc);
         let ram = tc.ctx.shared.default_space;
         let accesses = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, body));
-            let one = b.context_mut().get_const(1, 8).id();
+            let mut b = (&mut tc.ctx).builder(body);
+            let one = b.shr().get_const(1, 8);
             let addr_a = b.push_add(base, i).id();
-            let off = b.context_mut().get_const(32, 8).id();
+            let off = b.shr().get_const(32, 8);
             let addr_b0 = b.push_add(base, off).id();
             let addr_b = b.push_add(addr_b0, i).id();
             let a = b.push_store(one, addr_a, ram).id;
             let b_id = b.push_store(one, addr_b, ram).id;
             let ni = b.push_add(i, one).id();
-            let bound = b.context_mut().get_const(8, 8).id();
+            let bound = b.shr().get_const(8, 8);
             let cond = b.push_lt(ni, bound).id();
             b.push_cbranch_with_args(cond, body, vec![ni], body, vec![ni]);
             vec![
@@ -478,15 +477,15 @@ mod tests {
         let (fid, body, base, i) = setup_loop(&mut tc);
         let ram = tc.ctx.shared.default_space;
         let accesses = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, body));
-            let one = b.context_mut().get_const(1, 8).id();
+            let mut b = (&mut tc.ctx).builder(body);
+            let one = b.shr().get_const(1, 8);
             let addr = b.push_add(base, i).id();
             let a = b.push_store(one, addr, ram).id;
             let ValueId::Instruction(b_id) = b.push_load::<false>(addr, 4, ram).id() else {
                 panic!("load should produce an instruction value");
             };
             let ni = b.push_add(i, one).id();
-            let bound = b.context_mut().get_const(8, 8).id();
+            let bound = b.shr().get_const(8, 8);
             let cond = b.push_lt(ni, bound).id();
             b.push_cbranch_with_args(cond, body, vec![ni], body, vec![ni]);
             vec![

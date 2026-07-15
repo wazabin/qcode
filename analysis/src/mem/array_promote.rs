@@ -25,13 +25,13 @@
 use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
-    builder::{Builder, BuilderBacking},
+    builder::Builder,
     space::{LocalMemorySpaceId, Space, SpaceType},
     types::TypeId,
     value::{
         BlockId, FunctionId, QCodeView, TempSpaceId, ValueId,
         insn::{Branch, CBranch, InstructionId, IntrinsicApp, IntrinsicId, Load, Mnemonic},
-        util::{base_ref::BaseRef, pass_backing::PassBacking},
+        util::pass_backing::PassBacking,
     },
 };
 
@@ -437,12 +437,7 @@ fn append_edge_arg<'str>(
 /// own width, so the arithmetic wraps exactly as the lifted address did. The
 /// `index - 1` form is emitted verbatim as a `sub` so `loop_to_scan`'s
 /// `is_decrement` recognizes it.
-fn index_plus<'str, 'ctx, Ctx: BuilderBacking<'str>>(
-    b: &mut Builder<'str, 'ctx, Ctx>,
-    index: ValueId,
-    delta: i64,
-    width: usize,
-) -> ValueId {
+fn index_plus(b: &mut Builder<'_, '_>, index: ValueId, delta: i64, width: usize) -> ValueId {
     if delta == 0 {
         return index;
     }
@@ -461,8 +456,8 @@ fn index_plus<'str, 'ctx, Ctx: BuilderBacking<'str>>(
 
 /// The region base pointer `base_root (+ origin_word*esz)`, pushing the offset add
 /// through `b` when the origin is nonzero.
-fn region_base<'str, 'ctx, Ctx: BuilderBacking<'str>>(
-    b: &mut Builder<'str, 'ctx, Ctx>,
+fn region_base(
+    b: &mut Builder<'_, '_>,
     base_root: ValueId,
     origin_word: i64,
     esz: usize,
@@ -500,7 +495,7 @@ fn make_index<'str>(
     delta: i64,
 ) -> ValueId {
     let width = width_of(host, index);
-    let mut b = Builder::from_block(BaseRef::new(host.reborrow(), block));
+    let mut b = host.builder(block);
     b.set_insert_point_before(before);
     let v = index_plus(&mut b, index, delta, width);
     unsafe { b.dont_finalize() };
@@ -590,7 +585,7 @@ fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bo
         let term_id = last_insn(host, m.preheader);
         let base_width = width_of(host, m.base_root);
         let dst = {
-            let mut b = Builder::from_block(BaseRef::new(host.reborrow(), m.preheader));
+            let mut b = host.builder(m.preheader);
             b.set_insert_point_before(term_id);
             let dst = region_base(&mut b, m.base_root, m.origin_word, esz, base_width);
             unsafe { b.dont_finalize() };
@@ -707,7 +702,7 @@ fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bo
     {
         let first_id = host.block_ref(m.exit).iter().next().unwrap().id;
         let base_width = width_of(host, m.base_root);
-        let mut b = Builder::from_block(BaseRef::new(host.reborrow(), m.exit));
+        let mut b = host.builder(m.exit);
         b.set_insert_point_before(first_id);
         let dst = region_base(&mut b, m.base_root, m.origin_word, esz, base_width);
         b.push_store(arr_e, dst, m.region_space);

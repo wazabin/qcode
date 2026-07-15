@@ -21,7 +21,7 @@ use crate::{
     context::Context,
     types::AggregateField,
     value::{
-        BasicBlock, BlockParam, BlockParamId, FunctionBody, FunctionId, Instruction, InstructionId,
+        BasicBlock, BlockParam, BlockParamId, FunctionBody, FunctionId, InstructionId, QCodeView,
         Renameable, TempId, TempRef, Value, ValueId, ValueRef, Varnode, VarnodeId,
         block::BlockId,
         insn::{Callee, IntrinsicId},
@@ -250,6 +250,29 @@ fn prepare_named_callees(ctx: &mut Context, statements: &[Statement], symbols: &
     }
 }
 
+/// Resolves module-level memory-space names before a [`Builder`] borrows a
+/// function body. Body-local `$temp` spaces remain Builder-owned.
+fn prepare_named_spaces(ctx: &mut Context, statements: &[Statement]) {
+    let mut names = Vec::new();
+    for statement in statements {
+        let expression = match statement.inner() {
+            Statement::Assign { expr, .. } | Statement::Expr(expr) => Some(expr),
+            _ => None,
+        };
+        let Some(ExprNode::Load { space, .. } | ExprNode::Store { space, .. }) = expression else {
+            continue;
+        };
+        if !space.starts_with('$') {
+            names.push(space.as_str());
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        ctx.get_or_make_named_space(name);
+    }
+}
+
 fn lower_fn_body(
     ctx: &mut Context,
     addresses: &mut AddressIndex,
@@ -260,6 +283,7 @@ fn lower_fn_body(
     externals: &HashMap<String, ValueId>,
 ) -> Result<(), String> {
     let statements = &fn_decl.statements;
+    prepare_named_spaces(ctx, statements);
     let first = statements
         .first()
         .ok_or_else(|| format!("fn `{}`: body cannot be empty", fn_decl.name))?;
@@ -341,6 +365,7 @@ fn lower_statement_block(
     let entry = entry.clone();
 
     prepare_named_callees(ctx, body, symbols);
+    prepare_named_spaces(ctx, body);
 
     let mut block_ids: HashMap<String, BlockId> = HashMap::new();
     // A bare-block program (no `fn`) still forms one CFG, so all its blocks must
@@ -488,7 +513,7 @@ fn lower_body(
     }
 
     let entry_id = block_ids[entry];
-    let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, entry_id));
+    let mut b = (ctx).builder(entry_id);
     let mut lw = Lowerer {
         b: &mut b,
         locals: &mut locals,
@@ -515,6 +540,19 @@ struct Lowerer<'a, 'str, 'ctx> {
 }
 
 impl Lowerer<'_, '_, '_> {
+    fn prepared_space(&self, name: &str) -> Result<crate::space::SpaceId, String> {
+        let shared = self.b.shr();
+        shared
+            .named_spaces
+            .get(name)
+            .copied()
+            .or_else(|| {
+                (shared.spaces[shared.default_space].name.as_deref() == Some(name))
+                    .then_some(shared.default_space)
+            })
+            .ok_or_else(|| format!("unprepared memory space `{name}`"))
+    }
+
     fn block(&mut self, label: &Label) -> Result<BlockId, String> {
         let resolved = match label {
             Label::Named { name, .. } => self
@@ -536,9 +574,7 @@ impl Lowerer<'_, '_, '_> {
         // map already owns for a different function. Reject it — cross-function
         // control flow is a `call` / tail call, never a foreign block target.
         let current = self.b.current_block().func;
-        let owner = BasicBlock::from_id(self.b.context(), resolved)
-            .parent()
-            .map(|f| f.id);
+        let owner = self.b.view().block_ref(resolved).parent().map(|f| f.id);
         if let Some(owner) = owner
             && owner != current
         {
@@ -562,7 +598,7 @@ impl Lowerer<'_, '_, '_> {
         let from = self.b.current_block();
         for target in targets {
             let to = self.block(target)?;
-            self.b.context_mut().add_cfg_edge(from, to);
+            self.b.add_cfg_edge(from, to);
         }
         Ok(())
     }
@@ -589,21 +625,15 @@ impl Lowerer<'_, '_, '_> {
                 let ValueId::Instruction(id) = value else {
                     return Err(format!("`%{name}` must be bound to an instruction result"));
                 };
-                let _ = Instruction::from_id_mut(self.b.context_mut(), id)
-                    .rename(Cow::Owned(name.clone()));
+                let _ = self.b.rename_insn(id, Cow::Owned(name.clone()));
                 if let Some(struct_name) = decl_struct_ptr {
-                    let pointee = self.b.context_mut().shared.types.get_or_make_struct(
-                        struct_name,
-                        0,
-                        Vec::new(),
-                    );
-                    let sp = self
+                    let pointee = self
                         .b
-                        .context_mut()
-                        .shared
+                        .shr()
                         .types
-                        .get_or_make_struct_pointer(8, pointee);
-                    Instruction::from_id_mut(self.b.context_mut(), id).set_type(sp);
+                        .get_or_make_struct(struct_name, 0, Vec::new());
+                    let sp = self.b.shr().types.get_or_make_struct_pointer(8, pointee);
+                    self.b.set_insn_type(id, sp);
                 }
                 self.locals.insert(name.clone(), Local::Instruction(id));
                 self.symbols.ssa.insert(name.clone(), id);
@@ -757,9 +787,9 @@ impl Lowerer<'_, '_, '_> {
             let v = self.atom(value, None)?;
             // Constrain the destination param's width to the argument's, matching
             // the macro's size propagation across block edges.
-            let size = ValueRef::new(v, self.b.context()).size();
+            let size = ValueRef::from_view(self.b.view(), v).size();
             let pid = self.symbols.block_params[param_name];
-            BlockParam::from_id_mut(self.b.context_mut(), pid).constrain_size(size);
+            self.b.constrain_param_size(pid, size);
             out.push(v);
         }
         Ok(out)
@@ -817,7 +847,7 @@ impl Lowerer<'_, '_, '_> {
                 let space = if let Some(name) = space.strip_prefix('$') {
                     self.b.get_or_make_local_temp_space(name)
                 } else {
-                    self.b.context_mut().get_or_make_named_space(space).into()
+                    self.prepared_space(space)?.into()
                 };
                 Ok(self.b.push_load::<false>(p, *size_bytes, space).id())
             }
@@ -833,7 +863,7 @@ impl Lowerer<'_, '_, '_> {
                 let space = if let Some(name) = space.strip_prefix('$') {
                     self.b.get_or_make_local_temp_space(name)
                 } else {
-                    self.b.context_mut().get_or_make_named_space(space).into()
+                    self.prepared_space(space)?.into()
                 };
                 Ok(self.b.push_store(s, p, space).id())
             }
@@ -894,12 +924,10 @@ impl Lowerer<'_, '_, '_> {
                     ExtractField::Name(name) => {
                         let ty = self
                             .b
-                            .context()
                             .stored_type_of(a)
                             .ok_or("extract: aggregate has no stored type")?;
                         self.b
-                            .context()
-                            .shared
+                            .shr()
                             .types
                             .field_index(ty, name)
                             .ok_or_else(|| format!("extract: no field `{name}`"))?
@@ -918,7 +946,7 @@ impl Lowerer<'_, '_, '_> {
 
             ExprNode::Range { src, start, end } => {
                 let s = self.atom(src, None)?;
-                let src_size = ValueRef::new(s, self.b.context()).size();
+                let src_size = ValueRef::from_view(self.b.view(), s).size();
                 let start = start.map(|v| v as usize).unwrap_or(0);
                 let end = end.map(|v| v as usize).unwrap_or(src_size);
                 Ok(self.b.push_range(s, start, end - start).id())
@@ -1070,7 +1098,7 @@ impl Lowerer<'_, '_, '_> {
                     .ok_or_else(|| format!("unknown varnode `{name}` in addressof"))?;
                 let (addr_size, value) = match local {
                     Local::Varnode(vid) => (
-                        Varnode::from_id(self.b.context(), vid).space().addr_size,
+                        Varnode::from_id(self.b.shr(), vid).space().addr_size,
                         vid.into(),
                     ),
                     Local::Temp(id) => (
@@ -1096,9 +1124,9 @@ impl Lowerer<'_, '_, '_> {
             }
             Atom::Int(value) => {
                 let size = typed.size_bytes.or(size_hint).unwrap_or(8);
-                Ok(self.b.context_mut().get_const(*value, size).id())
+                Ok(self.b.shr().get_const(*value, size))
             }
-            Atom::Bool(value) => Ok(self.b.context_mut().get_bool_const(*value).id()),
+            Atom::Bool(value) => Ok(self.b.shr().get_bool_const(*value)),
         }
     }
 
@@ -1112,7 +1140,7 @@ impl Lowerer<'_, '_, '_> {
         name: &str,
     ) -> Result<(), String> {
         if let Some(expected) = explicit {
-            let actual = ValueRef::new(value, self.b.context()).size();
+            let actual = ValueRef::from_view(self.b.view(), value).size();
             if actual != expected {
                 return Err(format!(
                     "qcode size mismatch for `{name}`: expected {expected} bytes, got {actual}"
@@ -1130,7 +1158,7 @@ impl Lowerer<'_, '_, '_> {
         hint: Option<usize>,
     ) -> ValueId {
         if let (Local::BlockParam(pid), Some(size)) = (local, explicit.or(hint)) {
-            BlockParam::from_id_mut(self.b.context_mut(), pid).constrain_size(size);
+            self.b.constrain_param_size(pid, size);
         }
         local.value_id()
     }
@@ -1183,7 +1211,7 @@ impl Lowerer<'_, '_, '_> {
             }
             _ => return None,
         };
-        Some(ValueRef::new(local.value_id(), self.b.context()).size())
+        Some(ValueRef::from_view(self.b.view(), local.value_id()).size())
     }
 }
 
@@ -1210,8 +1238,7 @@ mod tests {
         let block = host_block(&mut rendered_ctx, "rendered");
         let arg = rendered_ctx.get_const(1, 8).id();
         let rendered_ids = {
-            let mut builder =
-                Builder::from_block(BasicBlock::from_id_mut(&mut rendered_ctx, block));
+            let mut builder = (&mut rendered_ctx).builder(block);
             let apply = builder.push_apply(Callee::Minted(1), vec![arg]).id();
             let map = builder.push_map(Callee::Minted(2), arg, Vec::new()).id();
             let scan = builder
@@ -1229,8 +1256,7 @@ mod tests {
 
         let tail_block = host_block(&mut rendered_ctx, "rendered_tail");
         let tail_id = {
-            let mut builder =
-                Builder::from_block(BasicBlock::from_id_mut(&mut rendered_ctx, tail_block));
+            let mut builder = (&mut rendered_ctx).builder(tail_block);
             let value = builder
                 .push_tail_call_with_args(Callee::Minted(5), vec![arg])
                 .id();

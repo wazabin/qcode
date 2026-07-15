@@ -54,7 +54,7 @@
 //! let mut ctx = Context::new();
 //!
 //! // Start a new block at machine address 0x1000
-//! let mut builder = Builder::from_context(&mut ctx, 0x1000);
+//! let mut builder = (&mut ctx).builder_at(0x1000);
 //!
 //! // Emit a load from memory
 //! let ptr = /* some ValueId */;

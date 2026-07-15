@@ -547,7 +547,6 @@ pub(crate) fn inline_pure_body(
 mod tests {
     use super::*;
     use qcode::{
-        builder::Builder,
         testing::TestContext,
         value::{Value, insn::Mnemonic},
     };
@@ -568,7 +567,7 @@ mod tests {
             f.add_block(entry);
         }
         let (idx, elem, result) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             let idx = b.push_param(8).id();
             let elem = b.push_param(1).id();
             let widened = b.push_zext(elem, 8).id();
@@ -631,7 +630,7 @@ mod tests {
         }
         let ram = tc.ctx.shared.default_space;
         let (idx, result) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             let idx = b.push_param(8).id();
             // A load is an untracked source: the expression is not closed.
             let loaded = b.push_load::<false>(idx, 8, ram).id();
@@ -661,7 +660,7 @@ mod tests {
             f.add_block(entry);
         }
         let (idx, elem, result) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             let idx = b.push_param(8).id();
             let elem = b.push_param(1).id();
             let widened = b.push_zext(elem, 8).id();

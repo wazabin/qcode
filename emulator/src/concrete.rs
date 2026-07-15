@@ -2670,8 +2670,7 @@ mod tests {
 
     #[test]
     fn enumerate_over_array_is_emulated() {
-        use qcode::builder::Builder;
-        use qcode::value::{BasicBlock, FunctionBody, ValueId, insn::IntrinsicId};
+        use qcode::value::{FunctionBody, ValueId, insn::IntrinsicId};
 
         let mut ctx = Context::new();
         let f = FunctionBody::make(&mut ctx, "f".into()).unwrap().id;
@@ -2694,9 +2693,9 @@ mod tests {
         }
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
         let e = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
+            let mut b = (&mut ctx).builder(entry);
             let e = b.push_intrinsic(enum_id, vec![src]).id();
-            let ptr = b.context_mut().get_const(0, 8).id();
+            let ptr = b.shr().get_const(0, 8);
             b.push_return(ptr);
             unsafe { b.dont_finalize() };
             e
@@ -2727,7 +2726,6 @@ mod tests {
     /// fixed array *is* materialized; see the `mt_scan` differential test.)
     #[test]
     fn enumerate_of_unbounded_list_bails_recoverably() {
-        use qcode::builder::Builder;
         use qcode::value::{
             BasicBlock, FunctionBody, InstructionRef, ValueId,
             insn::{IntrinsicApp, IntrinsicId, Return},
@@ -2744,7 +2742,7 @@ mod tests {
         let i8 = ctx.shared.types.get_or_make_int(1);
         let list_ty = ctx.shared.types.get_or_make_unbounded_list(i8);
         let src = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
+            let mut b = (&mut ctx).builder(entry);
             b.push_param(8).id()
         };
         if let ValueId::BlockParam(pid) = src {
@@ -2774,7 +2772,7 @@ mod tests {
         };
         let ptr = ctx.get_const(0, 8).id();
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
+            let mut b = (&mut ctx).builder(entry);
             b.push_return(ptr);
             unsafe { b.dont_finalize() };
         }
@@ -2802,7 +2800,6 @@ mod tests {
     /// array param bound to `bound`. Returns the emulated scalar lane, or `None`
     /// if `resolve_array` refuses the binding (e.g. an oversize param).
     fn run_at_over_array_param(n: usize, idx: u64, bound: SizedValue) -> Option<u64> {
-        use qcode::builder::Builder;
         use qcode::value::{
             BasicBlock, FunctionBody, ValueId,
             insn::{IntrinsicId, Return},
@@ -2826,11 +2823,11 @@ mod tests {
         let at_id = IntrinsicId::from_name("at").unwrap();
         let (ret, ptr, lane);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
+            let mut b = (&mut ctx).builder(entry);
             let arr = ValueId::BlockParam(arr_pid);
-            let i = b.context_mut().get_const(idx, 8).id();
+            let i = b.shr().get_const(idx, 8);
             lane = b.push_intrinsic(at_id, vec![arr, i]).id();
-            ptr = b.context_mut().get_const(0, 8).id();
+            ptr = b.shr().get_const(0, 8);
             ret = b.push_return(ptr).id();
             unsafe { b.dont_finalize() };
         }
@@ -3204,7 +3201,7 @@ mod tests {
 
     #[test]
     fn interpreter_qualifies_colliding_local_spaces_by_function() {
-        use qcode::{builder::Builder, value::TempSpace};
+        use qcode::value::TempSpace;
 
         fn make_writer(
             ctx: &mut Context<'static>,
@@ -3215,9 +3212,9 @@ mod tests {
             let root = BasicBlock::make(ctx, fid).id;
             FunctionBody::from_id_mut(ctx, fid).set_root(root).unwrap();
             let space = ctx.bodies[fid].push_temp_space(TempSpace::new(None, 1, 8));
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
-            let ptr = b.context_mut().get_const(0x20, 8).id();
-            let value = b.context_mut().get_const(byte, 1).id();
+            let mut b = (ctx).builder(root);
+            let ptr = b.shr().get_const(0x20, 8);
+            let value = b.shr().get_const(byte, 1);
             b.push_store(
                 value,
                 ptr,
@@ -3273,12 +3270,12 @@ mod tests {
             let __f = ctx.anon_function();
             ctx.get_or_make_block(0x1000, __f)
         };
+        let target = ctx.get_or_make_block(0x1001, block_id.func);
         let result = {
             let src = ctx.get_const(0x1234, 2).id();
-            let mut builder =
-                qcode::builder::Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+            let mut builder = (&mut ctx).builder(block_id);
             let result = builder.push_pcode_op(op, vec![src], None, 2).id;
-            builder.finalize(0x1001);
+            builder.finalize(target);
             result
         };
         let mut emulator = Emulator::from_block(&ctx, block_id);
@@ -3303,13 +3300,13 @@ mod tests {
             let __f = ctx.anon_function();
             ctx.get_or_make_block(0x1000, __f)
         };
+        let target = ctx.get_or_make_block(0x1001, block_id.func);
         let result = {
             let x = ctx.get_const(0x1234_5678, 4).id();
             let k = ctx.get_const(8, 4).id();
-            let mut builder =
-                qcode::builder::Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+            let mut builder = (&mut ctx).builder(block_id);
             let result = builder.push_intrinsic(rol, vec![x, k]).id;
-            builder.finalize(0x1001);
+            builder.finalize(target);
             result
         };
         let mut emulator = Emulator::from_block(&ctx, block_id);
@@ -3333,11 +3330,11 @@ mod tests {
             let __f = ctx.anon_function();
             ctx.get_or_make_block(0x1000, __f)
         };
+        let target = ctx.get_or_make_block(0x1001, block_id.func);
         {
-            let mut builder =
-                qcode::builder::Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+            let mut builder = (&mut ctx).builder(block_id);
             builder.push_pcode_op(op, vec![], None, 0);
-            builder.finalize(0x1001);
+            builder.finalize(target);
         }
         let mut emulator = Emulator::from_block(&ctx, block_id);
 

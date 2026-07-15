@@ -34,15 +34,12 @@ use std::collections::HashSet;
 
 use rustc_hash::FxHashMap as HashMap;
 
-use qcode::{
-    builder::Builder,
-    value::{
-        FunctionId, FunctionKind, LocalValueId, QCodeView, ValueId, VarnodeId,
-        block::BlockId,
-        block_param::BlockParam,
-        insn::{Branch, InstructionId, Mnemonic},
-        util::{base_ref::BaseRef, pass_backing::PassBacking},
-    },
+use qcode::value::{
+    FunctionId, FunctionKind, LocalValueId, QCodeView, ValueId, VarnodeId,
+    block::BlockId,
+    block_param::BlockParam,
+    insn::{Branch, InstructionId, Mnemonic},
+    util::{base_ref::BaseRef, pass_backing::PassBacking},
 };
 
 use crate::pipeline::{ContextView, FunctionBody, Minted, Outcome};
@@ -343,7 +340,7 @@ fn transform<'str>(
                 .iter()
                 .map(|a| value_map.get(a).copied().unwrap_or(*a))
                 .collect();
-            let mut b = Builder::from_block(BaseRef::new(minted.reborrow(), nb));
+            let mut b = minted.builder(nb);
             let out = b.push_apply(rec, args).id();
             b.push_return_value(out);
         }
@@ -357,7 +354,7 @@ fn transform<'str>(
         // TODO(5b-ii): `Builder` drives a `BaseRef`, which is not mirrored on
         // `FunctionBody`; go through a temporary host.
         let mut host = m.host(body);
-        let mut b = Builder::from_block(BaseRef::new(host.reborrow(), model.root));
+        let mut b = host.builder(model.root);
         let out = b.push_apply(rec, model.init_args.clone()).id();
         b.push_return_value(out);
     }

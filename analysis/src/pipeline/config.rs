@@ -1938,7 +1938,6 @@ mod tests {
     use super::*;
     use crate::{FunctionPass, FunctionPassAdapter};
     use qcode::{
-        builder::Builder,
         context::Context,
         value::{BasicBlock, FunctionBody, FunctionKind},
     };
@@ -1985,7 +1984,7 @@ mod tests {
         let _dummy_b = FunctionBody::make_at_addr(&mut ctx, 0x3000, None).id;
         let thunk = FunctionBody::make_at_addr(&mut ctx, 0x4000, None).id;
         let block = BasicBlock::make(&mut ctx, thunk).with_address(0x4000).id;
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block)).push_tail_call(callee);
+        (&mut ctx).builder(block).push_tail_call(callee);
         FunctionBody::from_id_mut(&mut ctx, thunk)
             .set_root(block)
             .unwrap();

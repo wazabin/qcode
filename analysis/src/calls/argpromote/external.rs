@@ -17,7 +17,6 @@
 //! rounds and aligned `arg[i] ↔ param i`.
 
 use qcode::{
-    builder::Builder,
     context::Context,
     space::SpaceId,
     value::{
@@ -273,7 +272,7 @@ fn bind_external_return(ctx: &mut Context, fid: FunctionId, ret: VarnodeId) -> b
         }
 
         Instruction::from_id_mut(ctx, call_id).set_type(int_ty);
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, cont));
+        let mut b = (ctx).builder(cont);
         b.set_insert_point_to_start();
         b.push_store(result, ValueId::Varnode(ret), ret_space);
         changed = true;
@@ -310,11 +309,11 @@ fn bind_external_args(
             if c.args.len() != idx {
                 return None;
             }
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, block));
+            let mut b = (ctx).builder(block);
             b.set_insert_point_before(call_id);
             let value = match slot {
                 Slot::Reg { vn, size, .. } => {
-                    let space = Varnode::from_id(b.context(), vn).space().id;
+                    let space = Varnode::from_id(b.shr(), vn).space().id;
                     b.push_load::<false>(ValueId::Varnode(vn), size, space).id()
                 }
                 Slot::Stack { offset, size } => {
@@ -324,7 +323,7 @@ fn bind_external_args(
                     let addr = if offset == 0 {
                         sp_val
                     } else {
-                        let off = b.context_mut().get_const(offset as u64, ptr_width).id();
+                        let off = b.shr().get_const(offset as u64, ptr_width);
                         b.push_add(sp_val, off).id()
                     };
                     b.push_load::<false>(addr, size, default_space).id()

@@ -125,7 +125,6 @@ fn by_sign(off: i64) -> FrameClass {
 mod tests {
     use super::*;
     use qcode::{
-        builder::Builder,
         testing::TestContext,
         value::{BasicBlock, FunctionBody},
     };
@@ -172,16 +171,16 @@ mod tests {
         let root = FunctionBody::from_id(&tc.ctx, fid).root().unwrap().id;
 
         let (local, caller_arg, ret_slot, aligned_slot, unrelated) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-            let c8 = b.context_mut().get_const(8, 8).id();
-            let neg16 = b.context_mut().get_const((-16i64) as u64, 8).id();
+            let mut b = (&mut tc.ctx).builder(root);
+            let c8 = b.shr().get_const(8, 8);
+            let neg16 = b.shr().get_const((-16i64) as u64, 8);
             let local = b.push_sub(sp, c8).id(); // @SP - 8  → below entry SP
             let caller_arg = b.push_add(sp, c8).id(); // @SP + 8  → incoming arg
             let ret_slot = sp; // @SP + 0  → return slot
             let aligned = b.push_bit_and(sp, neg16).id(); // @SP & -16
             let aligned_slot = b.push_add(aligned, c8).id(); // (@SP & -16) + 8
             // A pointer with no relation to @SP.
-            let other = b.context_mut().get_const(0x4000, 8).id();
+            let other = b.shr().get_const(0x4000, 8);
             let unrelated = b.push_add(other, c8).id();
             unsafe { b.dont_finalize() };
             (local, caller_arg, ret_slot, aligned_slot, unrelated)
@@ -231,11 +230,11 @@ mod tests {
         let root = FunctionBody::from_id(&tc.ctx, fid).root().unwrap().id;
 
         let slot = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-            let neg8 = b.context_mut().get_const((-8i64) as u64, 8).id();
-            let k10 = b.context_mut().get_const(0x10, 8).id();
-            let k270 = b.context_mut().get_const(0x270, 8).id();
-            let k658 = b.context_mut().get_const(0x658, 8).id();
+            let mut b = (&mut tc.ctx).builder(root);
+            let neg8 = b.shr().get_const((-8i64) as u64, 8);
+            let k10 = b.shr().get_const(0x10, 8);
+            let k270 = b.shr().get_const(0x270, 8);
+            let k658 = b.shr().get_const(0x658, 8);
             // ((@SP - 0x10) & -8)
             let s1 = b.push_sub(sp, k10).id();
             let a1 = b.push_bit_and(s1, neg8).id();
@@ -269,10 +268,10 @@ mod tests {
         let root = FunctionBody::from_id(&tc.ctx, fid).root().unwrap().id;
 
         let (aligned, slot) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
-            let neg8 = b.context_mut().get_const((-8i64) as u64, 8).id();
-            let k10 = b.context_mut().get_const(0x10, 8).id();
-            let k20 = b.context_mut().get_const(0x20, 8).id();
+            let mut b = (&mut tc.ctx).builder(root);
+            let neg8 = b.shr().get_const((-8i64) as u64, 8);
+            let k10 = b.shr().get_const(0x10, 8);
+            let k20 = b.shr().get_const(0x20, 8);
             // (@SP + 0x10) & -8  — anchored through a *positive* offset.
             let up = b.push_add(sp, k10).id();
             let aligned = b.push_bit_and(up, neg8).id();

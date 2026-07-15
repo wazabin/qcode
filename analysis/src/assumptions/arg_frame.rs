@@ -315,7 +315,6 @@ crate::register_module_pass!(AssumeArgFrame);
 #[cfg(test)]
 mod tests {
     use qcode::{
-        builder::Builder,
         testing::TestContext,
         value::{BasicBlock, BlockId, insn::Call},
     };
@@ -360,9 +359,9 @@ mod tests {
 
     /// Push `base - sub` (8-byte) at the start of `block` and return its value.
     fn push_sp_minus(tc: &mut TestContext, block: BlockId, base: ValueId, sub: u64) -> ValueId {
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+        let mut b = (&mut tc.ctx).builder(block);
         b.set_insert_point_to_start();
-        let k = b.context_mut().get_const(sub, 8).id();
+        let k = b.shr().get_const(sub, 8);
         let v = b.push_sub(base, k).id();
         unsafe { b.dont_finalize() };
         v

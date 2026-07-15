@@ -124,7 +124,7 @@ mod tests {
     use qcode::{
         builder::Builder,
         testing::TestContext,
-        value::{BasicBlock, Value, ValueId},
+        value::{Value, ValueId},
     };
 
     /// Build a single-block function, mark it `is_pure`, and run `body` to fill it.
@@ -137,7 +137,7 @@ mod tests {
             f.add_block(entry);
         }
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let mut b = (&mut tc.ctx).builder(entry);
             body(&mut b);
             unsafe { b.dont_finalize() };
         }
@@ -150,11 +150,11 @@ mod tests {
         let mut tc = TestContext::new();
         pure_flagged_fn(&mut tc, |b| {
             let a = b.push_param(8).id();
-            let c = b.context_mut().get_const(1, 8).id();
+            let c = b.shr().get_const(1, 8);
             let s = b.push_add(a, c).id();
             let tuple = b.push_tuple(vec![s]).id();
             let _ = tuple;
-            let ptr = b.context_mut().get_const(0x2000, 8).id();
+            let ptr = b.shr().get_const(0x2000, 8);
             b.push_return(ptr);
         });
         assert!(verify_pure_functions(&tc.ctx).is_empty());
@@ -167,7 +167,7 @@ mod tests {
         let space = tc.reg_space;
         pure_flagged_fn(&mut tc, |b| {
             let _ = b.push_load::<false>(reg, 8, space).id();
-            let ptr = b.context_mut().get_const(0x2000, 8).id();
+            let ptr = b.shr().get_const(0x2000, 8);
             b.push_return(ptr);
         });
         let violations = verify_pure_functions(&tc.ctx);
@@ -184,9 +184,9 @@ mod tests {
         let reg = ValueId::Varnode(tc.r0);
         let space = tc.reg_space;
         pure_flagged_fn(&mut tc, |b| {
-            let c = b.context_mut().get_const(7, 8).id();
+            let c = b.shr().get_const(7, 8);
             b.push_store(c, reg, space);
-            let ptr = b.context_mut().get_const(0x2000, 8).id();
+            let ptr = b.shr().get_const(0x2000, 8);
             b.push_return(ptr);
         });
         assert!(verify_pure_functions(&tc.ctx).is_empty());

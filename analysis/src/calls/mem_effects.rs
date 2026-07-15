@@ -195,7 +195,6 @@ mod tests {
     use super::*;
     use crate::{AliasResult, constant_fold_function, gvn_function};
     use qcode::{
-        builder::Builder,
         context::Context,
         lower::lower_str,
         testing::TestContext,
@@ -360,8 +359,8 @@ fn callee:
         let scratch = tc.ctx.bodies[fid].push_temp_space(TempSpace::new(Some("scratch"), 1, 8));
         let ptr = ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id);
         {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
-            let value = b.context_mut().get_const(1, 1).id();
+            let mut b = (&mut tc.ctx).builder(block);
+            let value = b.shr().get_const(1, 1);
             b.push_store(
                 value,
                 ptr,

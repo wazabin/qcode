@@ -27,7 +27,6 @@
 use qcode::{
     address_index::{AddressIndex, AddressTarget},
     assumption::Proposition,
-    builder::Builder,
     context::Context,
     value::{
         BasicBlock, BlockMutRef, FunctionBody, FunctionId, Value, ValueId, ValueRef,
@@ -268,10 +267,12 @@ impl HandleJumpTables {
                 continue;
             };
             clear_successors(ctx, from);
-            let mut block = BasicBlock::from_id_mut(ctx, from);
-            block.pop_insn();
             {
-                let mut builder = Builder::from_block(block);
+                let mut block = BasicBlock::from_id_mut(ctx, from);
+                block.pop_insn();
+            }
+            {
+                let mut builder = ctx.builder(from);
                 match resolved {
                     LocalTarget::Local(target_block) => {
                         builder.push_branch(target_block);
@@ -308,12 +309,14 @@ impl HandleJumpTables {
             let false_block = arm_block(ctx, fun_id, false_target_resolved);
 
             clear_successors(ctx, from);
-            let mut block = BasicBlock::from_id_mut(ctx, from);
-            block.pop_insn();
+            {
+                let mut block = BasicBlock::from_id_mut(ctx, from);
+                block.pop_insn();
+            }
 
-            let mut builder = Builder::from_block(block);
-            let size = ValueRef::from_id(builder.context(), index).size();
-            let false_value = builder.context_mut().get_const(offset, size).id();
+            let mut builder = ctx.builder(from);
+            let size = ValueRef::from_view(builder.view(), index).size();
+            let false_value = builder.shr().get_const(offset, size);
             // `index != false_value` selects the true target, else the false one.
             let cond = builder.push_ne(index, false_value).id();
             builder.push_cbranch(cond, true_block, false_block);
@@ -370,7 +373,7 @@ fn arm_block(ctx: &mut Context, fun_id: FunctionId, target: LocalTarget) -> Bloc
         LocalTarget::Local(b) => b,
         LocalTarget::Foreign(g) => {
             let tramp = BasicBlock::make(ctx, fun_id).id;
-            Builder::from_block(BasicBlock::from_id_mut(ctx, tramp)).push_tail_call(g);
+            (ctx).builder(tramp).push_tail_call(g);
             tramp
         }
     }
@@ -785,7 +788,7 @@ mod tests {
         for &target in targets {
             let block = BasicBlock::make(ctx, function).with_address(target).id;
             let return_ptr = ctx.get_const(0, 8).id();
-            Builder::from_block(BasicBlock::from_id_mut(ctx, block)).push_return(return_ptr);
+            (ctx).builder(block).push_return(return_ptr);
         }
     }
 
