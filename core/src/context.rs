@@ -8,11 +8,11 @@ use crate::{
     assumption::{Certainty, KnownContradiction, PassName, Proposition, Truth, Violation},
     error::{Error, ErrorTy, Result},
     pass_scope,
-    space::{Space, SpaceId},
+    space::{LocalMemorySpaceId, MemorySpaceId, Space, SpaceId},
     types::TypeManager,
     value::{
         BasicBlock, BlockParamRef, FunctionBody, FunctionId, FunctionRef, Instruction, ModuleView,
-        QCodeView, ValueId,
+        QCodeView, TempId, TempSpaceId, ValueId,
         block::{BlockId, BlockRef, EdgeData, EdgeId},
         block_param::{BlockParam, BlockParamId},
         insn::{InstructionId, InstructionRef, Mnemonic, PCodeOpId},
@@ -828,9 +828,77 @@ impl<'str> Context<'str> {
         target: FunctionId,
         olds: &[BlockId],
     ) -> HashMap<BlockId, BlockId> {
-        // Phase 1: structurally clone every block into `target`, accumulating the
-        // old -> new value and block maps.
+        // Body-local temporary values and spaces move with blocks that reference
+        // them. Collect the exact dependency closure first: operand/origin temps,
+        // explicit load/store spaces, and pointer provenance carried by types.
+        let mut needed_temps: HashSet<TempId> = HashSet::default();
+        let mut needed_temp_spaces: HashSet<TempSpaceId> = HashSet::default();
+        for &old in olds {
+            for &param_local in &self.block(old).params {
+                let param = self.block_param(BlockParamId::new(old.func, param_local));
+                if let Some(crate::value::LocalValueId::Temp(temp)) = param.origin {
+                    needed_temps.insert(TempId::new(old.func, temp));
+                }
+                if let Some(MemorySpaceId::Temp(space)) = self.shared.types.space_of(param.type_id)
+                {
+                    needed_temp_spaces.insert(space);
+                }
+            }
+            for &insn_local in &self.block(old).instructions {
+                let insn = self.instruction(InstructionId::new(old.func, insn_local));
+                for arg in insn.mnemonic().args() {
+                    if let crate::value::LocalValueId::Temp(temp) = arg {
+                        needed_temps.insert(TempId::new(old.func, temp));
+                    }
+                }
+                let explicit_space = match insn.mnemonic() {
+                    Mnemonic::Load(load) => Some(load.space),
+                    Mnemonic::Store(store) => Some(store.space),
+                    _ => None,
+                };
+                if let Some(LocalMemorySpaceId::Temp(space)) = explicit_space {
+                    needed_temp_spaces.insert(TempSpaceId::new(old.func, space));
+                }
+                if let Some(MemorySpaceId::Temp(space)) = self.shared.types.space_of(insn.type_id) {
+                    needed_temp_spaces.insert(space);
+                }
+            }
+        }
+        for &temp in &needed_temps {
+            let data = &self.bodies[temp.func].temps[temp.local];
+            needed_temp_spaces.insert(TempSpaceId::new(temp.func, data.space));
+        }
+
+        let mut needed_temp_spaces: Vec<_> = needed_temp_spaces.into_iter().collect();
+        needed_temp_spaces.sort_unstable();
+        let mut temp_space_map: HashMap<TempSpaceId, TempSpaceId> = HashMap::default();
+        for old in needed_temp_spaces {
+            if old.func == target {
+                continue;
+            }
+            let space = self.bodies[old.func].temp_spaces[old.local].clone();
+            let new = self.bodies[target].push_temp_space(space);
+            temp_space_map.insert(old, new);
+        }
+
+        let mut needed_temps: Vec<_> = needed_temps.into_iter().collect();
+        needed_temps.sort_unstable();
         let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
+        for old in needed_temps {
+            if old.func == target {
+                continue;
+            }
+            let mut temp = self.bodies[old.func].temps[old.local].clone();
+            temp.space = temp_space_map[&TempSpaceId::new(old.func, temp.space)].local;
+            if let Some(name) = temp.name.take() {
+                temp.name = Some(self.bodies[target].names.unique(name));
+            }
+            let new = self.bodies[target].push_temp(temp);
+            value_map.insert(ValueId::Temp(old), ValueId::Temp(new));
+        }
+
+        // Phase 1: structurally clone every block into `target`, accumulating the
+        // remaining old -> new value and block maps.
         let mut block_map: HashMap<BlockId, BlockId> = HashMap::default();
         for &old in olds {
             let new = BasicBlock::clone_block_into(self, old, target, &mut value_map);
@@ -847,6 +915,13 @@ impl<'str> Context<'str> {
             for (old_local, new_local) in old_params.into_iter().zip(new_params) {
                 let old_param = BlockParamId::new(old.func, old_local);
                 let new_param = BlockParamId::new(new.func, new_local);
+                let type_id = remap_rehomed_type(
+                    self,
+                    self.block_param(new_param).type_id,
+                    target,
+                    &temp_space_map,
+                );
+                self.block_param_mut(new_param).type_id = type_id;
                 let Some(origin) = self.block_param(new_param).origin else {
                     continue;
                 };
@@ -863,6 +938,13 @@ impl<'str> Context<'str> {
             let insns = self.block(new).instructions.clone();
             for insn_local in insns {
                 let insn_id = InstructionId::new(new.func, insn_local);
+                let type_id = remap_rehomed_type(
+                    self,
+                    self.instruction(insn_id).type_id,
+                    target,
+                    &temp_space_map,
+                );
+                self.instruction_mut(insn_id).type_id = type_id;
                 let mut mnemonic = self.instruction(insn_id).mnemonic().clone();
                 let mut pairs = Vec::new();
                 for arg in mnemonic.args() {
@@ -885,6 +967,7 @@ impl<'str> Context<'str> {
                     }
                 }
                 crate::value::block::substitute_operands(&mut mnemonic, &pairs);
+                remap_rehomed_memory_space(&mut mnemonic, old.func, target, &temp_space_map);
                 remap_block_targets(&mut mnemonic, old.func, new.func, &block_map);
                 *self.instruction_mut(insn_id).mnemonic_mut() = mnemonic;
             }
@@ -2302,6 +2385,59 @@ fn split_generated_suffix(name: &str) -> Option<(&str, u32)> {
     Some((base, digits.parse().ok()?))
 }
 
+/// Rebind pointer provenance carried by a result/parameter type when its
+/// temporary space was cloned into another function arena.
+fn remap_rehomed_type(
+    ctx: &Context<'_>,
+    type_id: crate::types::TypeId,
+    target: FunctionId,
+    temp_space_map: &HashMap<TempSpaceId, TempSpaceId>,
+) -> crate::types::TypeId {
+    let Some(MemorySpaceId::Temp(old_space)) = ctx.shared.types.space_of(type_id) else {
+        return type_id;
+    };
+    let Some(&new_space) = temp_space_map.get(&old_space) else {
+        debug_assert_eq!(
+            old_space.func, target,
+            "rehome: result type references unmapped foreign temporary space {old_space:?}"
+        );
+        return type_id;
+    };
+    ctx.shared.types.get_or_make_space_address(
+        ctx.shared.types.size_of(type_id),
+        MemorySpaceId::Temp(new_space),
+    )
+}
+
+/// Rebind the explicit memory space stored by load/store mnemonics. Operand
+/// remapping does not see this field because it is not a `LocalValueId`.
+fn remap_rehomed_memory_space(
+    mnemonic: &mut Mnemonic,
+    old_func: FunctionId,
+    target: FunctionId,
+    temp_space_map: &HashMap<TempSpaceId, TempSpaceId>,
+) {
+    let remap = |space: &mut LocalMemorySpaceId| {
+        let LocalMemorySpaceId::Temp(old_local) = *space else {
+            return;
+        };
+        let old = TempSpaceId::new(old_func, old_local);
+        if let Some(&new) = temp_space_map.get(&old) {
+            *space = LocalMemorySpaceId::Temp(new.local);
+        } else {
+            debug_assert_eq!(
+                old_func, target,
+                "rehome: mnemonic references unmapped foreign temporary space {old:?}"
+            );
+        }
+    };
+    match mnemonic {
+        Mnemonic::Load(load) => remap(&mut load.space),
+        Mnemonic::Store(store) => remap(&mut store.space),
+        _ => {}
+    }
+}
+
 /// Retarget a terminator's static block targets through `block_map` (used by
 /// [`Context::rehome_owned_blocks`] to point relocated branches at the clones).
 /// Value operands are handled separately via [`Mnemonic::replace_value`]; this
@@ -3455,7 +3591,7 @@ mod tests {
         use super::*;
 
         use crate::value::insn::{Callee, Mnemonic, TailCall};
-        use crate::value::{BasicBlock, FunctionBody, Instruction};
+        use crate::value::{BasicBlock, FunctionBody, Instruction, Value};
         use std::borrow::Cow;
 
         fn block_at(ctx: &mut Context<'static>, func: FunctionId, addr: u64) -> BlockId {
@@ -3552,6 +3688,77 @@ mod tests {
                 matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == Callee::Real(g)),
                 "thunk branch must become TailCall(G), got {term:?}",
             );
+        }
+
+        #[test]
+        fn split_rehomes_temporary_values_spaces_and_pointer_types() {
+            let mut ctx = Context::new();
+            let f = FunctionBody::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+            let entry = block_at(&mut ctx, f, 0x1000);
+            let tail = block_at(&mut ctx, f, 0x2000);
+            branch_at(&mut ctx, entry, tail, 0x1000);
+            FunctionBody::from_id_mut(&mut ctx, f)
+                .set_root(entry)
+                .unwrap();
+
+            let temp = ctx
+                .builder(tail)
+                .make_named_temp(Cow::Borrowed("scratch"), 8);
+            ctx.builder(entry)
+                .make_named_temp(Cow::Borrowed("unused"), 4);
+            let temp_space = ctx.bodies[f].temps[temp.local].space;
+            let load = {
+                let mut builder = ctx.builder(tail);
+                let ValueId::Instruction(load) = builder
+                    .push_load::<false>(
+                        ValueId::Temp(temp),
+                        8,
+                        LocalMemorySpaceId::Temp(temp_space),
+                    )
+                    .id()
+                else {
+                    unreachable!()
+                };
+                builder.push_return(ValueId::Instruction(load));
+                load
+            };
+            let pointer_type = ctx
+                .shared
+                .types
+                .get_or_make_space_address(8, MemorySpaceId::Temp(TempSpaceId::new(f, temp_space)));
+            ctx.instruction_mut(load).type_id = pointer_type;
+
+            let g =
+                FunctionBody::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("discovered"))).id;
+            assert_eq!(ctx.split_function_at(tail), g);
+
+            let diagnostics = crate::verify_body_arena_integrity(&ctx);
+            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+            assert_eq!(ctx.bodies[g].temp_spaces.len(), 1);
+            assert_eq!(ctx.bodies[g].temps.len(), 1);
+            assert_eq!(ctx.bodies[f].temps.len(), 2, "source arenas remain intact");
+
+            let moved_load = FunctionBody::from_id(&ctx, g)
+                .blocks()
+                .flat_map(|block| block.instructions())
+                .find(|insn| matches!(insn.mnemonic(), Mnemonic::Load(_)))
+                .expect("load moved with the split");
+            let Mnemonic::Load(moved) = moved_load.mnemonic() else {
+                unreachable!()
+            };
+            let LocalMemorySpaceId::Temp(moved_space) = moved.space else {
+                panic!("load lost temporary-space provenance")
+            };
+            assert!(matches!(moved.ptr, crate::value::LocalValueId::Temp(_)));
+            assert!(usize::from(moved_space) < ctx.bodies[g].temp_spaces.len());
+            assert_eq!(
+                ctx.shared.types.space_of(moved_load.type_id()),
+                Some(MemorySpaceId::Temp(TempSpaceId::new(g, moved_space)))
+            );
+
+            // This is the path that previously panicked in `function_fingerprint`.
+            let rendered = FunctionBody::from_id(&ctx, g).to_string();
+            assert!(rendered.contains("scratch"));
         }
 
         #[test]

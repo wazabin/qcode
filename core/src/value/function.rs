@@ -483,10 +483,17 @@ impl<'str> FunctionBody<'str> {
     }
 
     /// Resolves a qualified temporary-space ID against this body.
+    #[track_caller]
     pub fn temp_space(&self, id: TempSpaceId) -> &TempSpace {
         assert_eq!(
             id.func, self.id,
             "temporary space belongs to another function"
+        );
+        debug_assert!(
+            self.contains_temp_space(id),
+            "missing temporary space {id:?} in function {:?} (arena length {})",
+            self.id,
+            self.temp_spaces.len()
         );
         &self.temp_spaces[id.local]
     }
@@ -497,8 +504,15 @@ impl<'str> FunctionBody<'str> {
     }
 
     /// Resolves a qualified temporary-value ID against this body.
+    #[track_caller]
     pub fn temp(&self, id: TempId) -> &Temp<'str> {
         assert_eq!(id.func, self.id, "temporary belongs to another function");
+        debug_assert!(
+            self.contains_temp(id),
+            "missing temporary {id:?} in function {:?} (arena length {})",
+            self.id,
+            self.temps.len()
+        );
         &self.temps[id.local]
     }
 

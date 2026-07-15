@@ -61,7 +61,13 @@ where
         &self.function(function).edges[id]
     }
 
+    #[track_caller]
     fn temp_space(self, id: TempSpaceId) -> &'ctx TempSpace {
+        debug_assert!(
+            self.contains_temp_space(id),
+            "missing temporary space {id:?} in function {:?}",
+            id.func
+        );
         &self.function(id.func).temp_spaces[id.local]
     }
 
@@ -69,7 +75,13 @@ where
         usize::from(id.local) < self.function(id.func).temp_spaces.len()
     }
 
+    #[track_caller]
     fn temp(self, id: TempId) -> &'ctx Temp<'str> {
+        debug_assert!(
+            self.contains_temp(id),
+            "missing temporary {id:?} in function {:?}",
+            id.func
+        );
         &self.function(id.func).temps[id.local]
     }
 

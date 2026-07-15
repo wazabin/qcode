@@ -8,8 +8,21 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     context::Context,
+    space::{LocalMemorySpaceId, MemorySpaceId},
     value::{BlockId, BlockParamId, InstructionId, LocalValueId, insn::Mnemonic},
 };
+
+fn missing_type_temp_space(
+    ctx: &Context<'_>,
+    function: crate::value::FunctionId,
+    type_id: crate::types::TypeId,
+) -> Option<crate::value::TempSpaceId> {
+    let MemorySpaceId::Temp(space) = ctx.shared.types.space_of(type_id)? else {
+        return None;
+    };
+    (space.func != function || usize::from(space.local) >= ctx.bodies[function].temp_spaces.len())
+        .then_some(space)
+}
 
 /// Validate the ownership and cross-reference invariants of every function
 /// body's block, instruction, parameter, CFG-edge, and temporary arenas.
@@ -181,6 +194,12 @@ pub fn verify_body_arena_integrity(ctx: &Context<'_>) -> Vec<String> {
                 ));
             }
 
+            if let Some(space) = missing_type_temp_space(ctx, fid, insn_entry.type_id) {
+                out.push(format!(
+                    "instruction {insn_id:?} result type references missing temporary space {space:?}"
+                ));
+            }
+
             for arg in insn_entry.mnemonic().args() {
                 let missing = match arg {
                     LocalValueId::Instruction(id) => !live_insns.contains(&id),
@@ -195,6 +214,20 @@ pub fn verify_body_arena_integrity(ctx: &Context<'_>) -> Vec<String> {
                         arg.qualify(fid)
                     ));
                 }
+            }
+
+            let mnemonic_space = match insn_entry.mnemonic() {
+                Mnemonic::Load(load) => Some(load.space),
+                Mnemonic::Store(store) => Some(store.space),
+                _ => None,
+            };
+            if let Some(LocalMemorySpaceId::Temp(space)) = mnemonic_space
+                && usize::from(space) >= body.temp_spaces.len()
+            {
+                out.push(format!(
+                    "instruction {insn_id:?} references missing temporary space {:?}",
+                    crate::value::TempSpaceId::new(fid, space)
+                ));
             }
 
             let mut check_target = |target| {
@@ -234,6 +267,19 @@ pub fn verify_body_arena_integrity(ctx: &Context<'_>) -> Vec<String> {
                 out.push(format!(
                     "live parameter {param_id:?} has {} block memberships",
                     memberships.len()
+                ));
+            }
+            if let Some(space) = missing_type_temp_space(ctx, fid, param_entry.type_id) {
+                out.push(format!(
+                    "parameter {param_id:?} type references missing temporary space {space:?}"
+                ));
+            }
+            if let Some(LocalValueId::Temp(temp)) = param_entry.origin
+                && usize::from(temp) >= body.temps.len()
+            {
+                out.push(format!(
+                    "parameter {param_id:?} origin references missing temporary {:?}",
+                    crate::value::TempId::new(fid, temp)
                 ));
             }
         }
@@ -566,5 +612,39 @@ mod tests {
             .push(Temp::new(0, 8, LocalTempSpaceId::from(7)));
 
         assert_has(&ctx, "references missing temporary space");
+    }
+
+    #[test]
+    fn reports_dangling_temporary_operands_spaces_origins_and_types() {
+        use crate::value::insn::Load;
+
+        let mut ctx = fixture();
+        let f = ctx.function_ids()[0];
+        let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
+        let insn = ctx
+            .block(entry)
+            .instructions
+            .iter()
+            .copied()
+            .find(|&id| !ctx.bodies[f].insns[id].mnemonic().is_terminator())
+            .expect("value instruction");
+        let missing_temp = crate::value::LocalTempId::from(0);
+        let missing_space = LocalTempSpaceId::from(0);
+        *ctx.bodies[f].insns[insn].mnemonic_mut() = Mnemonic::Load(Load {
+            space: LocalMemorySpaceId::Temp(missing_space),
+            ptr: LocalValueId::Temp(missing_temp),
+            size: 8,
+        });
+        ctx.bodies[f].insns[insn].type_id = ctx.shared.types.get_or_make_space_address(
+            8,
+            MemorySpaceId::Temp(crate::value::TempSpaceId::new(f, missing_space)),
+        );
+        let param = ctx.block(entry).params[0];
+        ctx.bodies[f].params[param].origin = Some(LocalValueId::Temp(missing_temp));
+
+        assert_has(&ctx, "references removed local value");
+        assert_has(&ctx, "references missing temporary space");
+        assert_has(&ctx, "result type references missing temporary space");
+        assert_has(&ctx, "origin references missing temporary");
     }
 }
