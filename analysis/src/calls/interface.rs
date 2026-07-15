@@ -151,22 +151,50 @@ fn append_caller_arg_at_sites(
 /// `param[i] ↔ input_regs[i] ↔ arg[i]` alignment holds by construction after
 /// any removal. The caller must ensure the param has no remaining users.
 pub fn remove_entry_param(ctx: &mut Context, fid: FunctionId, index: usize) {
+    // Snapshot caller IDs before the first structural mutation, then drop the
+    // graph. The relationship itself is unchanged by this lockstep rewrite.
+    let call_sites = super::fresh_direct_call_sites(ctx, fid);
+    remove_entry_params_at_sites(ctx, fid, &[index], &call_sites);
+}
+
+/// Remove several entry params using caller sites supplied by an analysis
+/// snapshot known to remain valid for the rewrite.
+///
+/// All params and matching call arguments are removed in one batch, so each
+/// caller instruction is cloned and replaced at most once. `indices` may be in
+/// any order and may contain duplicates or out-of-range positions.
+pub(crate) fn remove_entry_params_at_sites(
+    ctx: &mut Context,
+    fid: FunctionId,
+    indices: &[usize],
+    call_sites: &[InstructionId],
+) {
     let Some(root) = FunctionBody::from_id(ctx, fid).root().map(|b| b.id) else {
         return;
     };
 
-    // Snapshot caller IDs before the first structural mutation, then drop the
-    // graph. The relationship itself is unchanged by this lockstep rewrite.
-    let call_sites = super::fresh_direct_call_sites(ctx, fid);
-
-    // Drop the root param at `index`, reindexing the survivors.
-    let mut params = ctx.block(root).params.clone();
-    if index >= params.len() {
+    let old_params = ctx.block(root).params.clone();
+    let mut removed = indices
+        .iter()
+        .copied()
+        .filter(|&index| index < old_params.len())
+        .collect::<Vec<_>>();
+    removed.sort_unstable();
+    removed.dedup();
+    if removed.is_empty() {
         return;
     }
-    let removed = params.remove(index);
-    let removed = BlockParamId::new(root.func, removed);
-    ctx.remove_block_param(removed);
+
+    // Drop the selected root-param payloads, then install and reindex the
+    // survivors once rather than after every individual removal.
+    for &index in &removed {
+        ctx.remove_block_param(BlockParamId::new(root.func, old_params[index]));
+    }
+    let params = old_params
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, param)| (!removed.contains(&index)).then_some(param))
+        .collect::<Vec<_>>();
 
     // Any inferred per-param attributes are indexed by the old positions; drop
     // them rather than reindex. The `param_attrs` pass re-infers afterward.
@@ -176,28 +204,35 @@ pub fn remove_entry_param(ctx: &mut Context, fid: FunctionId, index: usize) {
     }
     ctx.block_mut(root).params = params;
 
-    // Drop the matching input-register entry. Intentional legacy-path support:
-    // only acts when `input_regs` is set (conventional functions); for
+    // Drop the matching input-register entries. Intentional legacy-path
+    // support: only acts when `input_regs` is set (conventional functions); for
     // `pure_reg` it is `None` and this is a no-op (see the module docs).
     #[allow(deprecated)]
-    if let Some(inputs) = FunctionBody::from_id(ctx, fid).input_regs()
-        && index < inputs.len()
-    {
-        let mut inputs = inputs.to_vec();
-        inputs.remove(index);
+    if let Some(inputs) = FunctionBody::from_id(ctx, fid).input_regs() {
+        let inputs = inputs
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, input)| (!removed.contains(&index)).then_some(input))
+            .collect();
         FunctionBody::from_id_mut(ctx, fid).set_input_regs(inputs);
     }
 
-    // Drop the matching positional argument at every direct caller.
-    for call_id in call_sites {
+    // Drop all matching positional arguments at every direct caller, replacing
+    // each call instruction only once.
+    for &call_id in call_sites {
+        if !ctx.contains_instruction(call_id) {
+            continue;
+        }
         let Mnemonic::Call(call) = ctx.get_insn(call_id).mnemonic().clone() else {
             continue;
         };
-        if index >= call.args.len() {
-            continue;
-        }
-        let mut args = call.args;
-        args.remove(index);
+        let args = call
+            .args
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, arg)| (!removed.contains(&index)).then_some(arg))
+            .collect();
         ctx.replace_instruction_mnemonic(
             call_id,
             Mnemonic::Call(Call {
