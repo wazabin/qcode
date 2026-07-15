@@ -644,6 +644,63 @@ impl<'str> FunctionBody<'str> {
             .insert(index, insn.localize(block.func));
     }
 
+    /// Move the live, non-terminator instruction `insn` immediately before the
+    /// live instruction `before`, inferring the destination block from
+    /// `before`. The moved instruction keeps its ID, payload, name, and use-map
+    /// entries. Supports both cross-block motion and reordering within one
+    /// block.
+    pub fn move_insn_before(&mut self, insn: InstructionId, before: InstructionId) {
+        assert_eq!(
+            insn.func, self.id,
+            "instruction belongs to another function"
+        );
+        assert_eq!(
+            before.func, self.id,
+            "anchor instruction belongs to another function"
+        );
+        if insn == before {
+            return;
+        }
+        assert!(
+            !self.insn(insn).mnemonic().is_terminator(),
+            "moving a terminator requires updating its CFG edges"
+        );
+
+        let source = self
+            .insn(insn)
+            .parent
+            .map(|local| BlockId::new(self.id, local))
+            .expect("moved instruction must belong to a block");
+        let target = self
+            .insn(before)
+            .parent
+            .map(|local| BlockId::new(self.id, local))
+            .expect("anchor instruction must belong to a block");
+        let source_index = self
+            .block(source)
+            .instructions
+            .iter()
+            .position(|&local| local == insn.local)
+            .expect("moved instruction missing from its parent block");
+        let before_index = self
+            .block(target)
+            .instructions
+            .iter()
+            .position(|&local| local == before.local)
+            .expect("anchor instruction missing from its parent block");
+        let insert_index = if source == target && source_index < before_index {
+            before_index - 1
+        } else {
+            before_index
+        };
+
+        self.block_mut(source).instructions.remove(source_index);
+        self.block_mut(target)
+            .instructions
+            .insert(insert_index, insn.local);
+        self.insn_mut(insn).parent = Some(target.local);
+    }
+
     /// Add a directed CFG edge `from -> to`, stored in this body's edge arena and
     /// linked into both incident blocks' edge sets.
     pub fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {

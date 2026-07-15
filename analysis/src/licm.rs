@@ -336,9 +336,8 @@ fn emission_order<'ctx, 'str: 'ctx>(
     order
 }
 
-/// Hoist invariant instructions of one loop into `preheader`, in `order`. Each
-/// instruction is rebuilt in the preheader (before its terminator), its uses are
-/// redirected to the rebuilt copy, and the original is deleted.
+/// Hoist invariant instructions of one loop into `preheader`, in `order`, by
+/// moving each stable instruction ID before the preheader terminator.
 fn hoist_into_preheader<'a, 'str>(
     body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
@@ -347,29 +346,14 @@ fn hoist_into_preheader<'a, 'str>(
 ) -> bool {
     let mut hoisted = false;
     for &old in order {
-        let old_ref = cx.body_view(body).insn_ref(old);
-        let mnemonic = old_ref.mnemonic().clone();
-        let type_id = old_ref.type_id();
-        let new = body.push_mnemonic_with_type(mnemonic, type_id);
-
         let term = *cx
             .body_view(body)
             .block_ref(preheader)
             .instruction_ids()
             .last()
             .expect("preheader must have a terminator");
-        body.insert_insn_before(preheader, term, new);
-
-        // Redirect every remaining use (in the loop and beyond) to the hoisted
-        // copy. Processing in dependency order means a later invariant operand
-        // already points at its hoisted copy when we clone the consumer.
-        body.replace_all_uses_with(ValueId::Instruction(old), ValueId::Instruction(new));
+        body.move_insn_before(old, term);
         hoisted = true;
-    }
-
-    // Delete the now-dead originals from their loop blocks.
-    for &old in order {
-        body.remove_instruction(old);
     }
     hoisted
 }
@@ -385,28 +369,13 @@ fn hoist_into_preheader_generic<'str>(
 ) -> bool {
     let mut hoisted = false;
     for &old in order {
-        let old_ref = host.insn_ref(old);
-        let mnemonic = old_ref.mnemonic().clone();
-        let type_id = old_ref.type_id();
-        let new = host.push_mnemonic_with_type(preheader.func, mnemonic, type_id);
-
         let term = *host
             .block_ref(preheader)
             .instruction_ids()
             .last()
             .expect("preheader must have a terminator");
-        host.insert_insn_before(preheader, term, new);
-
-        // Redirect every remaining use (in the loop and beyond) to the hoisted
-        // copy. Processing in dependency order means a later invariant operand
-        // already points at its hoisted copy when we clone the consumer.
-        host.replace_all_uses_with(ValueId::Instruction(old), ValueId::Instruction(new));
+        host.move_insn_before(old, term);
         hoisted = true;
-    }
-
-    // Delete the now-dead originals from their loop blocks.
-    for &old in order {
-        host.remove_instruction(old);
     }
     hoisted
 }
@@ -443,9 +412,7 @@ fn hoist_loop_invariants_with_aliases<'a, 'str>(
         return false;
     }
 
-    // Plan all hoists first (read-only), then apply. Moving instructions never
-    // changes the CFG, so dominators / loop membership stay valid throughout.
-    let mut plans: Vec<(BlockId, Vec<InstructionId>)> = Vec::new();
+    let mut changed = false;
     for (latch, header) in edges {
         let loop_nodes = natural_loop(cx.body_view(body), latch, header);
         let Some(preheader) = loop_preheader(cx.body_view(body), header, &loop_nodes) else {
@@ -457,11 +424,6 @@ fn hoist_loop_invariants_with_aliases<'a, 'str>(
             continue;
         }
         let order = emission_order(cx.body_view(body), &loop_nodes, &invariant);
-        plans.push((preheader, order));
-    }
-
-    let mut changed = false;
-    for (preheader, order) in plans {
         changed |= hoist_into_preheader(body, cx, preheader, &order);
     }
     changed
@@ -482,9 +444,7 @@ fn hoist_loop_invariants_with_aliases_generic<'str>(
         return false;
     }
 
-    // Plan all hoists first (read-only), then apply. Moving instructions never
-    // changes the CFG, so dominators / loop membership stay valid throughout.
-    let mut plans: Vec<(BlockId, Vec<InstructionId>)> = Vec::new();
+    let mut changed = false;
     for (latch, header) in edges {
         let loop_nodes = natural_loop(ModuleView::new(&*host), latch, header);
         let Some(preheader) = loop_preheader(ModuleView::new(&*host), header, &loop_nodes) else {
@@ -496,11 +456,6 @@ fn hoist_loop_invariants_with_aliases_generic<'str>(
             continue;
         }
         let order = emission_order(ModuleView::new(&*host), &loop_nodes, &invariant);
-        plans.push((preheader, order));
-    }
-
-    let mut changed = false;
-    for (preheader, order) in plans {
         changed |= hoist_into_preheader_generic(host, preheader, &order);
     }
     changed

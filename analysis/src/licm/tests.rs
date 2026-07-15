@@ -83,7 +83,13 @@ fn hoists_invariant_arithmetic() {
         !BasicBlock::from_id(&ctx, body)
             .instruction_ids()
             .contains(&z),
-        "the original %z is gone from the body"
+        "%z leaves the body"
+    );
+    assert!(
+        BasicBlock::from_id(&ctx, entry)
+            .instruction_ids()
+            .contains(&z),
+        "LICM preserves %z's stable ID when moving it"
     );
 }
 
@@ -121,11 +127,12 @@ fn hoists_transitive_chain() {
 
     for v in [s, t, u] {
         assert!(
-            !BasicBlock::from_id(&ctx, body)
+            BasicBlock::from_id(&ctx, entry)
                 .instruction_ids()
                 .contains(&v),
-            "every invariant op leaves the body"
+            "every invariant op moves to the preheader with its original ID"
         );
+        assert!(ctx.contains_instruction(v));
     }
     assert_eq!(
         count_adds(&ctx, body),
@@ -395,10 +402,10 @@ fn is_idempotent() {
     );
 }
 
-/// A hoisted value still in use inside the loop is correctly rewired: the
-/// consumer now references the copy that lives in the preheader.
+/// A hoisted value still in use inside the loop keeps the same stable ID, so
+/// its consumer continues to reference it after the move.
 #[test]
-fn rewires_uses_to_hoisted_copy() {
+fn preserves_uses_of_hoisted_id() {
     let mut ctx = Context::new();
     qcode!(
         ctx,
@@ -440,10 +447,63 @@ fn rewires_uses_to_hoisted_copy() {
     let qcode::value::ValueId::Instruction(src_id) = src else {
         panic!("store source should be the hoisted add")
     };
+    assert_eq!(src_id, z, "LICM moves rather than replaces the definition");
     let parent = ctx.get_insn(src_id).parent().map(|b| b.id);
     assert_eq!(
         parent,
         Some(entry),
         "the hoisted add lives in the preheader (entry), and the body store reads it"
+    );
+}
+
+/// An instruction invariant in both an inner and outer loop is moved twice by
+/// the same LICM run without invalidating its stable ID. The inner-loop move
+/// places it in the inner preheader; the outer-loop move then carries that same
+/// ID to the outer preheader.
+#[test]
+fn nested_loops_move_shared_invariant_without_stale_id() {
+    let mut ctx = Context::new();
+    qcode!(
+        ctx,
+        "
+            varnode i64 A;
+            varnode i64 B;
+
+            fn f:
+                <entry>
+                    %x = load(A:8, &A);
+                    %y = load(B:8, &B);
+                    goto <outer_header @i=0x0>;
+                <outer_header @i:i64>
+                    %outer_cond = @i < 0x3;
+                    if %outer_cond goto <inner_preheader> else goto <exit>;
+                <inner_preheader>
+                    goto <inner_header @j=0x0>;
+                <inner_header @j:i64>
+                    %inner_cond = @j < 0x3;
+                    if %inner_cond goto <inner_body> else goto <outer_latch>;
+                <inner_body>
+                    %z = %x + %y;
+                    %j_next = @j + 0x1;
+                    goto <inner_header @j=%j_next>;
+                <outer_latch>
+                    %i_next = @i + 0x1;
+                    goto <outer_header @i=%i_next>;
+                <exit>
+                    return at 0x0;
+        "
+    );
+
+    assert!(run_function_pass::<Licm>(&mut ctx, f).unwrap());
+    assert!(ctx.contains_instruction(z));
+    assert_eq!(ctx.get_insn(z).parent().map(|block| block.id), Some(entry));
+    assert!(
+        BasicBlock::from_id(&ctx, entry)
+            .instruction_ids()
+            .contains(&z)
+    );
+    assert_eq!(
+        qcode::verify_body_arena_integrity(&ctx),
+        Vec::<String>::new()
     );
 }

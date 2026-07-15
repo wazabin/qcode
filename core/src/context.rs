@@ -2029,6 +2029,18 @@ impl<'str> Context<'str> {
             .insert(index, insn.localize(block.func));
     }
 
+    /// Move `insn` immediately before the arbitrary live instruction `before`,
+    /// preserving the moved instruction's stable ID. Both instructions must
+    /// belong to the same function; the destination block is inferred from the
+    /// anchor.
+    pub fn move_insn_before(&mut self, insn: InstructionId, before: InstructionId) {
+        assert_eq!(
+            insn.func, before.func,
+            "cannot move an instruction across functions"
+        );
+        self.bodies[insn.func].move_insn_before(insn, before);
+    }
+
     /// Mint a fresh empty block into `func`'s arena, parented and rostered.
     /// The module-scope mint of a fresh empty block.
     pub fn make_block(&mut self, func: FunctionId) -> BlockId {
@@ -2765,6 +2777,62 @@ mod tests {
 
         let count = ctx.instructions().count();
         assert!(count >= 1, "expected at least one instruction, got {count}");
+    }
+
+    #[test]
+    fn move_insn_before_preserves_id_and_supports_arbitrary_anchors() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+                <source>
+                    %a = i64 0x1 + i64 0x2;
+                    %free = i64 0x5 + i64 0x6;
+                    goto <target>;
+                <target>
+                    %b = i64 0x3 + i64 0x4;
+                    %consumer = %a + %b;
+                    return %consumer;
+            "
+        );
+
+        assert!(ctx.users(a).contains(&consumer));
+        ctx.move_insn_before(a, b);
+
+        assert!(ctx.contains_instruction(a), "moving keeps the ID live");
+        assert_eq!(ctx.get_insn(a).parent().map(|block| block.id), Some(target));
+        assert!(
+            !BasicBlock::from_id(&ctx, source)
+                .instruction_ids()
+                .contains(&a)
+        );
+        assert_eq!(
+            BasicBlock::from_id(&ctx, target).instruction_ids()[..3],
+            [a, b, consumer]
+        );
+        assert!(
+            ctx.users(a).contains(&consumer),
+            "moving preserves use-map entries"
+        );
+
+        // The anchor may be any instruction, including one in the same block.
+        ctx.move_insn_before(b, a);
+        assert_eq!(
+            BasicBlock::from_id(&ctx, target).instruction_ids()[..3],
+            [b, a, consumer]
+        );
+
+        // A terminator is also a valid destination anchor.
+        let return_id = *BasicBlock::from_id(&ctx, target)
+            .instruction_ids()
+            .last()
+            .unwrap();
+        ctx.move_insn_before(free, return_id);
+        assert_eq!(
+            BasicBlock::from_id(&ctx, target).instruction_ids()[..4],
+            [b, a, consumer, free]
+        );
     }
 
     #[test]
