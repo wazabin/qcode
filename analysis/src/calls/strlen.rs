@@ -356,23 +356,22 @@ fn apply_strlen<'str>(
         //   2. reroute the preheader straight to the (now param-less) exit,
         //   3. delete the dead loop blocks. (There is no seed store to strip — the
         //      `at`-form scan reads the root array param directly.)
-        // `remove_params_from_block` and `delete_private_loop` are still host-generic
-        // (cross-module helpers, migrated in their own chunks), so drive them through a
-        // scoped `cx.host(body)`.
-        let mut host = cx.host(body);
-        let kx = host
+        let kx = cx
+            .body_view(body)
             .block_ref(m.exit_block)
             .params()
             .position(|p| p.id() == m.count_param);
         if let Some(kx) = kx {
-            crate::dce::remove_params_from_block_c(
-                &mut host,
+            crate::dce::remove_params_from_block_body(
+                body,
+                cx,
                 m.exit_block,
                 &HashSet::from_iter([kx]),
             );
         }
         // Reroute the preheader straight to the (now param-less) exit and delete the
         // dead loop blocks (body before header, as they were emitted).
+        let mut host = cx.host(body);
         delete_private_loop(
             &mut host,
             fid,

@@ -30,15 +30,12 @@ use jstd::graph::analysis::{DominatorTree, compute_dominators};
 use qcode::{
     context::Context,
     value::{
-        BlockId, BlockParamId, FunctionId, LocalValueId, ModuleView, QCodeView, ValueId,
+        BlockId, BlockParamId, FunctionId, LocalValueId, QCodeView, ValueId,
         insn::{Branch, CBranch, Mnemonic},
-        util::pass_backing::PassBacking,
     },
 };
 
 use crate::{ContextView, FunctionBody};
-
-// TODO(5b-ii): Public functions below are thin wrappers marked for future migration
 
 use crate::gvn::affine::precompute_forms_for_blocks;
 use crate::gvn::congruence::{Congruence, SymId};
@@ -120,51 +117,32 @@ fn unique_incoming<'a, 'str: 'a>(
     found
 }
 
+fn selected_body(block_ids: &[BlockId], root: Option<BlockId>) -> Option<FunctionId> {
+    root.or_else(|| block_ids.first().copied())
+        .map(|block| block.func)
+}
+
 /// Replace every block parameter across `block_ids` that is redundant — bound to
 /// a single common value (or itself) on all incoming edges — with that value,
 /// then drop the param and its predecessor arguments. Iterates to a fixpoint so
 /// chains and cycles collapse. Leaves `root`'s params untouched.
 ///
 /// Returns whether anything was removed.
-/// TODO(5b-ii): Takes Context; migrate to FunctionBody/ContextView when public API stabilizes.
 pub fn remove_dead_block_args(
     ctx: &mut Context,
     block_ids: &[BlockId],
     root: Option<BlockId>,
 ) -> bool {
-    remove_dead_block_args_generic(ctx, block_ids, root)
+    let Some(function_id) = selected_body(block_ids, root) else {
+        return false;
+    };
+    crate::with_body_mut(ctx, function_id, |body, cx| {
+        remove_dead_block_args_body(body, cx, block_ids, root)
+    })
 }
 
-/// The `&mut Context` version of [`remove_dead_block_args`]'s core.
-/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-pub fn remove_dead_block_args_generic<'str>(
-    host: &mut Context<'str>,
-    block_ids: &[BlockId],
-    root: Option<BlockId>,
-) -> bool {
-    let mut changed = false;
-    loop {
-        // Cheap syntactic pass first (no value numbering); only when it is
-        // exhausted do we build the dominator tree + congruence engine to catch
-        // params whose incoming arguments are *congruent* but not identical.
-        let found = find_redundant_param(ModuleView::new(&*host), block_ids, root)
-            .or_else(|| find_congruent_param(ModuleView::new(&*host), block_ids, root));
-        let Some((block, index, param, repl)) = found else {
-            break;
-        };
-
-        // `p ≡ repl`: rewrite every use, then strip the param and the now-removed
-        // column of arguments from each predecessor.
-        host.replace_all_uses_with(ValueId::BlockParam(param), repl);
-        remove_params_from_block_generic(host, block, &HashSet::from_iter([index]));
-        changed = true;
-    }
-    changed
-}
-
-/// Host-generic core of [`remove_dead_block_args`]; see that function.
-/// This is the concrete version for FunctionBody/ContextView (stage 5b).
-pub fn remove_dead_block_args_host<'a, 'str>(
+/// Body-local core of [`remove_dead_block_args`].
+pub(crate) fn remove_dead_block_args_body<'a, 'str>(
     body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     block_ids: &[BlockId],
@@ -184,7 +162,7 @@ pub fn remove_dead_block_args_host<'a, 'str>(
         // `p ≡ repl`: rewrite every use, then strip the param and the now-removed
         // column of arguments from each predecessor.
         body.replace_all_uses_with(ValueId::BlockParam(param), repl);
-        remove_params_from_block_host(body, cx, block, &HashSet::from_iter([index]));
+        remove_params_from_block_body(body, cx, block, &HashSet::from_iter([index]));
         changed = true;
     }
     changed
@@ -216,129 +194,21 @@ pub fn remove_dead_block_args_host<'a, 'str>(
 /// stays dead, stripping the matching predecessor argument columns.
 ///
 /// Returns whether anything was removed.
-/// TODO(5b-ii): Takes Context; migrate to FunctionBody/ContextView when public API stabilizes.
 pub fn remove_dead_block_params(
     ctx: &mut Context,
     block_ids: &[BlockId],
     root: Option<BlockId>,
 ) -> bool {
-    remove_dead_block_params_generic(ctx, block_ids, root)
-}
-
-/// The `&mut Context` version of [`remove_dead_block_params`]'s core.
-/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-pub fn remove_dead_block_params_generic<'str>(
-    host: &mut Context<'str>,
-    block_ids: &[BlockId],
-    root: Option<BlockId>,
-) -> bool {
-    // Seed: directly-used params. Edges: forwarding (src param -> target param) on
-    // every branch-argument slot.
-    let mut live: HashSet<BlockParamId> = HashSet::default();
-    let mut edges: Vec<(BlockParamId, BlockParamId)> = Vec::new();
-
-    let mark = |v: ValueId, live: &mut HashSet<BlockParamId>| {
-        if let ValueId::BlockParam(p) = v {
-            live.insert(p);
-        }
-    };
-
-    for &block in block_ids {
-        let insns: Vec<_> = host.block_ref(block).iter().map(|i| i.id).collect();
-        for id in insns {
-            match host.insn_ref(id).mnemonic() {
-                Mnemonic::Branch(b) => forward_edges(
-                    ModuleView::new(&*host),
-                    block.func,
-                    &b.args,
-                    BlockId::new(block.func, b.target),
-                    &mut edges,
-                ),
-                Mnemonic::CBranch(c) => {
-                    // The condition is a real read; only the per-target argument
-                    // lists are forwarding edges.
-                    if let ValueId::BlockParam(p) = c.condition.qualify(block.func) {
-                        live.insert(p);
-                    }
-                    forward_edges(
-                        ModuleView::new(&*host),
-                        block.func,
-                        &c.success_args,
-                        BlockId::new(block.func, c.success_block),
-                        &mut edges,
-                    );
-                    forward_edges(
-                        ModuleView::new(&*host),
-                        block.func,
-                        &c.failure_args,
-                        BlockId::new(block.func, c.failure_block),
-                        &mut edges,
-                    );
-                }
-                // Every other instruction (incl. indirect branch/call pointers,
-                // call args, the return slot) observes all of its operands.
-                other => {
-                    for v in other.args() {
-                        mark(v.qualify(block.func), &mut live);
-                    }
-                }
-            }
-        }
-    }
-
-    // Seed root + protected params live, then propagate liveness backwards along
-    // the forwarding edges to a fixpoint: a param feeding a live param is live.
-    if let Some(root) = root {
-        for &local in ModuleView::new(&*host).block(root).param_ids() {
-            live.insert(BlockParamId::new(root.func, local));
-        }
-    }
-    for &(src, _) in &edges {
-        if ModuleView::new(&*host).block_param(src).protected {
-            live.insert(src);
-        }
-    }
-    loop {
-        let mut grew = false;
-        for &(src, tgt) in &edges {
-            if live.contains(&tgt) && live.insert(src) {
-                grew = true;
-            }
-        }
-        if !grew {
-            break;
-        }
-    }
-
-    // Collect dead params per block (protected params are always seeded live, so
-    // they never appear here; root params likewise).
-    let mut dead_by_block: rustc_hash::FxHashMap<BlockId, HashSet<usize>> = Default::default();
-    for &block in block_ids {
-        for (index, &local) in ModuleView::new(&*host)
-            .block(block)
-            .param_ids()
-            .iter()
-            .enumerate()
-        {
-            let p = BlockParamId::new(block.func, local);
-            if !live.contains(&p) {
-                dead_by_block.entry(block).or_default().insert(index);
-            }
-        }
-    }
-
-    if dead_by_block.is_empty() {
+    let Some(function_id) = selected_body(block_ids, root) else {
         return false;
-    }
-    for (block, indices) in dead_by_block {
-        remove_params_from_block_generic(host, block, &indices);
-    }
-    true
+    };
+    crate::with_body_mut(ctx, function_id, |body, cx| {
+        remove_dead_block_params_body(body, cx, block_ids, root)
+    })
 }
 
-/// Host-generic core of [`remove_dead_block_params`]; see that function.
-/// This is the concrete version for FunctionBody/ContextView (stage 5b).
-pub fn remove_dead_block_params_host<'a, 'str>(
+/// Body-local core of [`remove_dead_block_params`].
+pub(crate) fn remove_dead_block_params_body<'a, 'str>(
     body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     block_ids: &[BlockId],
@@ -449,7 +319,7 @@ pub fn remove_dead_block_params_host<'a, 'str>(
         return false;
     }
     for (block, indices) in dead_by_block {
-        remove_params_from_block_host(body, cx, block, &indices);
+        remove_params_from_block_body(body, cx, block, &indices);
     }
     true
 }
@@ -636,88 +506,13 @@ pub(crate) fn remove_params_from_block(
     block: BlockId,
     dead_indices: &HashSet<usize>,
 ) {
-    remove_params_from_block_generic(ctx, block, dead_indices);
+    crate::with_body_mut(ctx, block.func, |body, cx| {
+        remove_params_from_block_body(body, cx, block, dead_indices);
+    });
 }
 
-/// Module (`&mut Context`) core of [`remove_params_from_block`]; the checked-out
-/// pass path uses [`remove_params_from_block_c`].
-pub(crate) fn remove_params_from_block_generic<'str>(
-    host: &mut Context<'str>,
-    block: BlockId,
-    dead_indices: &HashSet<usize>,
-) {
-    let params = ModuleView::new(&*host).block(block).params.clone();
-    let mut kept = Vec::with_capacity(params.len());
-    let mut removed = Vec::new();
-    for (i, &local) in params.iter().enumerate() {
-        let p = BlockParamId::new(block.func, local);
-        if dead_indices.contains(&i) {
-            removed.push(p);
-        } else {
-            host.block_param_mut(p).index = kept.len();
-            kept.push(local);
-        }
-    }
-    host.block_mut(block).params = kept;
-
-    // A predecessor reaching `block` through both edges of a `CBranch` appears
-    // twice; dedup so we rewrite its terminator exactly once.
-    let preds: HashSet<BlockId> = host
-        .block_ref(block)
-        .predecessors()
-        .map(|(_, b)| b)
-        .collect();
-
-    for pred in preds {
-        let Some(term_local) = ModuleView::new(&*host)
-            .block(pred)
-            .instructions
-            .last()
-            .copied()
-        else {
-            continue;
-        };
-        let term_id = qcode::value::insn::InstructionId::new(pred.func, term_local);
-        let new = match ModuleView::new(&*host)
-            .instruction(term_id)
-            .mnemonic()
-            .clone()
-        {
-            Mnemonic::Branch(b) if BlockId::new(pred.func, b.target) == block => {
-                Mnemonic::Branch(Branch {
-                    target: b.target,
-                    args: filter_kept(&b.args, dead_indices),
-                })
-            }
-            Mnemonic::CBranch(c) => Mnemonic::CBranch(CBranch {
-                condition: c.condition,
-                success_block: c.success_block,
-                success_args: if BlockId::new(pred.func, c.success_block) == block {
-                    filter_kept(&c.success_args, dead_indices)
-                } else {
-                    c.success_args
-                },
-                failure_block: c.failure_block,
-                failure_args: if BlockId::new(pred.func, c.failure_block) == block {
-                    filter_kept(&c.failure_args, dead_indices)
-                } else {
-                    c.failure_args
-                },
-            }),
-            // Indirect terminators carry no per-target argument list, so a block
-            // reached that way has no params to feed and never reaches here.
-            _ => continue,
-        };
-        host.replace_instruction_mnemonic(term_id, new);
-    }
-    for param in removed {
-        host.remove_block_param(param);
-    }
-}
-
-/// Host-generic core of [`remove_params_from_block`]; see that function.
-/// This is the concrete version for FunctionBody/ContextView (stage 5b).
-pub(crate) fn remove_params_from_block_host<'a, 'str>(
+/// Body-local core of [`remove_params_from_block`].
+pub(crate) fn remove_params_from_block_body<'a, 'str>(
     body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     block: BlockId,
@@ -791,70 +586,6 @@ fn filter_kept(args: &[LocalValueId], drop: &HashSet<usize>) -> Vec<LocalValueId
         .filter(|(i, _)| !drop.contains(i))
         .map(|(_, &a)| a)
         .collect()
-}
-
-/// Concrete pass twin of [`remove_params_from_block`] over a checked-out function
-/// (`&mut PassBacking`), for the pass-path caller strlen. Mirrors
-/// [`remove_params_from_block_generic`]; the module path keeps the generic.
-pub(crate) fn remove_params_from_block_c<'str>(
-    host: &mut PassBacking<'_, 'str>,
-    block: BlockId,
-    dead_indices: &HashSet<usize>,
-) {
-    let params = host.view().block(block).params.clone();
-    let mut kept = Vec::with_capacity(params.len());
-    let mut removed = Vec::new();
-    for (i, &local) in params.iter().enumerate() {
-        let p = BlockParamId::new(block.func, local);
-        if dead_indices.contains(&i) {
-            removed.push(p);
-        } else {
-            host.block_param_mut(p).index = kept.len();
-            kept.push(local);
-        }
-    }
-    host.block_mut(block).params = kept;
-
-    let preds: HashSet<BlockId> = host
-        .block_ref(block)
-        .predecessors()
-        .map(|(_, b)| b)
-        .collect();
-
-    for pred in preds {
-        let Some(term_local) = host.view().block(pred).instructions.last().copied() else {
-            continue;
-        };
-        let term_id = qcode::value::insn::InstructionId::new(pred.func, term_local);
-        let new = match host.view().instruction(term_id).mnemonic().clone() {
-            Mnemonic::Branch(b) if BlockId::new(pred.func, b.target) == block => {
-                Mnemonic::Branch(Branch {
-                    target: b.target,
-                    args: filter_kept(&b.args, dead_indices),
-                })
-            }
-            Mnemonic::CBranch(c) => Mnemonic::CBranch(CBranch {
-                condition: c.condition,
-                success_block: c.success_block,
-                success_args: if BlockId::new(pred.func, c.success_block) == block {
-                    filter_kept(&c.success_args, dead_indices)
-                } else {
-                    c.success_args
-                },
-                failure_block: c.failure_block,
-                failure_args: if BlockId::new(pred.func, c.failure_block) == block {
-                    filter_kept(&c.failure_args, dead_indices)
-                } else {
-                    c.failure_args
-                },
-            }),
-            _ => continue,
-        };
-        host.replace_instruction_mnemonic(term_id, new);
-    }
-    for param in removed {
-        host.remove_block_param(param);
-    }
 }
 
 #[cfg(test)]

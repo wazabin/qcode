@@ -826,8 +826,8 @@ fn dce_core<'a, 'str>(
             round |= remove_dead_pure_call_body(body, cx, block_id);
             round |= remove_dead_insns_body(body, cx, block_id);
         }
-        round |= super::remove_dead_block_args_host(body, cx, &block_ids, root);
-        round |= super::remove_dead_block_params_host(body, cx, &block_ids, root);
+        round |= super::remove_dead_block_args_body(body, cx, &block_ids, root);
+        round |= super::remove_dead_block_params_body(body, cx, &block_ids, root);
         round |= remove_dead_counted_loop_body(body, cx, fun_id);
         if !round {
             break;
