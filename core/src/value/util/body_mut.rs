@@ -50,7 +50,9 @@ pub struct BodyMut<'a, 'str> {
 
 impl<'a, 'str> BodyMut<'a, 'str> {
     /// Wrap `fun` over the module's shared state and
-    /// interface registry. Debug-asserts the function owns only self-stored,
+    /// interface registry. Asserts (all builds — this is the once-per-checkout
+    /// enforcement point; `BodyView::new`'s copy is debug-only) the function
+    /// owns only self-stored,
     /// self-parented blocks (no reattribution).
     pub fn new(
         fun: &'a mut FunctionBody<'str>,
