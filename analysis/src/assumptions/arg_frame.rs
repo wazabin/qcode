@@ -97,11 +97,11 @@ fn assume_args_disjoint_caller_frame_changed_functions(
     let mut changed = rustc_hash::FxHashSet::default();
     for fid in fids {
         if eligible(ctx, fid, sp_reg, &taken) {
-            let first = ctx.assume_true(Proposition::ArgsDisjointFromCallerFrame(fid));
+            let first = assume_true_if_new(ctx, Proposition::ArgsDisjointFromCallerFrame(fid));
             // Same eligibility and consumer (the memory-forwarding alias rule), so
             // record the loaded-pointer-vs-slot assumption here too — it unblocks
             // forwarding the spilled buffer-pointer reload argpromote depends on.
-            let second = ctx.assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
+            let second = assume_true_if_new(ctx, Proposition::LoadedPointerDisjointFromSlot(fid));
             if first || second {
                 changed.insert(fid);
             }
@@ -113,6 +113,16 @@ fn assume_args_disjoint_caller_frame_changed_functions(
         changed.len()
     );
     changed
+}
+
+/// Record a true assumption only when the proposition has no truth yet.
+///
+/// [`Context::assume_true`] returns `true` for both a new assumption and an
+/// existing truth with the same polarity. That is useful to callers asking
+/// whether an assumption is accepted, but a pass outcome must report only an
+/// actual truth-map mutation as changed.
+fn assume_true_if_new(ctx: &mut Context, prop: Proposition) -> bool {
+    ctx.truth(prop).is_none() && ctx.assume_true(prop)
 }
 
 /// *Verify* pass — prove every assumed `ArgsDisjointFromCallerFrame` true or
@@ -448,6 +458,11 @@ mod tests {
         assert_eq!(
             assume_args_disjoint_caller_frame(&mut tc.ctx, Some(sp_reg)),
             2
+        );
+        assert_eq!(
+            assume_args_disjoint_caller_frame(&mut tc.ctx, Some(sp_reg)),
+            0,
+            "repeating accepted assumptions must not report a change"
         );
         verify_args_disjoint_caller_frame(&mut tc.ctx, Some(sp_reg));
         assert_eq!(
