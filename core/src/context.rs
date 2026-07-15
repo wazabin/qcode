@@ -572,6 +572,7 @@ impl<'str> Context<'str> {
     /// Indexed construction variant of [`get_or_make_block`](Self::get_or_make_block).
     /// The caller owns `addresses` for the duration of its lifting/lowering
     /// operation and threads it through every address-bearing mutation.
+    #[track_caller]
     pub fn get_or_make_block_indexed(
         &mut self,
         addresses: &mut crate::address_index::AddressIndex,
@@ -595,10 +596,27 @@ impl<'str> Context<'str> {
         };
         match existing {
             Some(block) => {
-                assert_eq!(
-                    block.func, func,
-                    "cannot reuse a block stored in another function arena"
-                );
+                if block.func != func {
+                    let stored = FunctionBody::from_id(self, block.func);
+                    let requested = FunctionBody::from_id(self, func);
+                    let parent = self.block(block).parent;
+                    let caller = std::panic::Location::caller();
+                    let detail = format!(
+                        "cannot reuse a block stored in another function arena: block={block:?} address=0x{addr:x}; stored={:?} name={:?} entry={:?} parent={parent:?}; requested={:?} name={:?} entry={:?}; caller={caller}",
+                        block.func,
+                        stored.name(),
+                        stored.address(),
+                        func,
+                        requested.name(),
+                        requested.address(),
+                    );
+                    log::error!(
+                        target: "qcode::arena",
+                        "{detail}\nbacktrace:\n{}",
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                    panic!("{detail}");
+                }
                 block
             }
             None => {
