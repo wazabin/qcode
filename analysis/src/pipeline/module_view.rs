@@ -362,14 +362,11 @@ mod tests {
                 .all(|entry| entry.ambient_id() == mint_owner)
         );
 
-        // The temporary ambient ID qualifies checked refs only. A minted-to-
-        // minted call retains the placeholder and cannot silently become a real
-        // call back to the owner.
-        let ambient = owner.id();
+        // A minted-to-minted call retains the placeholder and cannot silently
+        // become a real call back to the owner.
         {
             let (_, mut host) = host_with_minted(owner, &mut first_outcome, view, first);
             let call = host.push_mnemonic(
-                ambient,
                 Mnemonic::Call(qcode::value::insn::Call {
                     target: second,
                     args: Vec::new(),
@@ -417,8 +414,8 @@ mod tests {
         let (child, edge);
         {
             let (_, mut host) = host_with_minted(owner_fun, &mut outcome, view, placeholder);
-            let root = host.make_block(ambient);
-            child = host.make_block(ambient);
+            let root = host.make_block();
+            child = host.make_block();
             edge = host.add_cfg_edge(root, child);
             host.function_mut(ambient).set_root_id(Some(root.local));
             BaseRef::new(host.reborrow(), root)

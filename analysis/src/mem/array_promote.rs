@@ -506,7 +506,7 @@ fn insert_before<'str>(
     mnemonic: Mnemonic,
     ty: TypeId,
 ) -> ValueId {
-    let id = host.push_mnemonic_with_type(block.func, mnemonic, ty);
+    let id = host.push_mnemonic_with_type(mnemonic, ty);
     host.insert_insn_before(block, before, id);
     ValueId::Instruction(id)
 }
@@ -525,7 +525,7 @@ fn insert_at_top<'str>(
         .next()
         .expect("preheader has a terminator")
         .id;
-    let id = host.push_mnemonic_with_type(block.func, mnemonic, ty);
+    let id = host.push_mnemonic_with_type(mnemonic, ty);
     host.insert_insn_before(block, first, id);
     ValueId::Instruction(id)
 }
@@ -558,10 +558,9 @@ fn apply_generic<'str>(host: &mut BodyMut<'_, 'str>, m: &PromoteMatch) -> bool {
     // `BasicBlock::push_param` followed by the original's `type_id = arr_ty`).
     let new_param = |host: &mut BodyMut<'_, 'str>, bid: BlockId| {
         let index = host.block_ref(bid).num_params();
-        let pid = host.push_block_param(
-            bid.func,
-            qcode::value::block_param::BlockParam::new(index, arr_ty, bid.local),
-        );
+        let pid = host.push_block_param(qcode::value::block_param::BlockParam::new(
+            index, arr_ty, bid.local,
+        ));
         host.block_mut(bid).params.push(pid.localize(bid.func));
         ValueId::BlockParam(pid)
     };

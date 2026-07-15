@@ -305,9 +305,9 @@ fn transform<'str>(
         let (own, mut minted) = crate::pipeline::host_with_minted(body, minted_out, m, g);
 
         // Three fresh blocks: header (root, drivers in), base case, recursive case.
-        let g_head = minted.make_block(host_fid);
-        let base = minted.make_block(host_fid);
-        let rec = minted.make_block(host_fid);
+        let g_head = minted.make_block();
+        let base = minted.make_block();
+        let rec = minted.make_block();
         minted
             .function_mut(host_fid)
             .set_root_id(Some(g_head.local));
@@ -492,7 +492,7 @@ fn transform<'str>(
 /// value (host-routed `BasicBlock::push_param` + the `type_id` write).
 fn push_param<'str>(host: &mut BodyMut<'_, 'str>, block: BlockId, ty: TypeId) -> ValueId {
     let index = host.block_ref(block).num_params();
-    let pid = host.push_block_param(block.func, BlockParam::new(index, ty, block.local));
+    let pid = host.push_block_param(BlockParam::new(index, ty, block.local));
     host.block_mut(block).params.push(pid.localize(block.func));
     ValueId::BlockParam(pid)
 }
@@ -504,7 +504,7 @@ fn push_typed<'str>(
     mnemonic: Mnemonic,
     ty: TypeId,
 ) -> ValueId {
-    let id = host.push_mnemonic_with_type(block.func, mnemonic, ty);
+    let id = host.push_mnemonic_with_type(mnemonic, ty);
     BaseRef::new(host.reborrow(), block).push_insn(id);
     ValueId::Instruction(id)
 }

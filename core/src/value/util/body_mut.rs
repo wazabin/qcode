@@ -168,45 +168,37 @@ impl<'a, 'str> BodyMut<'a, 'str> {
 
     // ---- births -------------------------------------------------------------
 
-    pub fn push_edge(&mut self, func: FunctionId, edge: EdgeData) -> EdgeId {
-        self.function_mut(func).edges.push(edge)
+    pub fn push_edge(&mut self, edge: EdgeData) -> EdgeId {
+        self.fun.edges.push(edge)
     }
 
-    pub fn push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId {
-        self.function_mut(func).push_insn(insn)
+    pub fn push_insn(&mut self, insn: Instruction<'str>) -> InstructionId {
+        self.fun.push_insn(insn)
     }
 
-    pub fn push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
-        self.function_mut(func).push_block(block)
+    pub fn push_block(&mut self, block: BasicBlock<'str>) -> BlockId {
+        self.fun.push_block(block)
     }
 
-    pub fn make_block(&mut self, func: FunctionId) -> BlockId {
-        self.function_mut(func).make_block()
+    pub fn make_block(&mut self) -> BlockId {
+        self.fun.make_block()
     }
 
-    pub fn push_block_param(&mut self, func: FunctionId, param: BlockParam<'str>) -> BlockParamId {
-        self.function_mut(func).push_block_param(param)
+    pub fn push_block_param(&mut self, param: BlockParam<'str>) -> BlockParamId {
+        self.fun.push_block_param(param)
     }
 
-    pub fn push_mnemonic(
-        &mut self,
-        func: FunctionId,
-        mnemonic: Mnemonic,
-        size: usize,
-    ) -> InstructionId {
+    pub fn push_mnemonic(&mut self, mnemonic: Mnemonic, size: usize) -> InstructionId {
         let shared = self.shared;
-        self.function_mut(func)
-            .push_mnemonic(shared, mnemonic, size)
+        self.fun.push_mnemonic(shared, mnemonic, size)
     }
 
     pub fn push_mnemonic_with_type(
         &mut self,
-        func: FunctionId,
         mnemonic: Mnemonic,
         type_id: crate::types::TypeId,
     ) -> InstructionId {
-        self.function_mut(func)
-            .push_mnemonic_with_type(mnemonic, type_id)
+        self.fun.push_mnemonic_with_type(mnemonic, type_id)
     }
 
     pub fn insert_insn_before(
@@ -225,8 +217,8 @@ impl<'a, 'str> BodyMut<'a, 'str> {
         self.function_mut(from.func).add_cfg_edge(from, to)
     }
 
-    pub fn remove_cfg_edge(&mut self, func: FunctionId, edge_id: EdgeId) {
-        self.function_mut(func).remove_cfg_edge(edge_id)
+    pub fn remove_cfg_edge(&mut self, edge_id: EdgeId) {
+        self.fun.remove_cfg_edge(edge_id)
     }
 
     pub fn replace_all_uses_with(&mut self, old: ValueId, new: ValueId) {

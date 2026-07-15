@@ -245,7 +245,7 @@ fn transform<'str>(
         let mut block_map: HashMap<BlockId, BlockId> = HashMap::default();
         let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
         for &ob in &model.region {
-            let nb = minted.make_block(host_fid);
+            let nb = minted.make_block();
             block_map.insert(ob, nb);
             if let Some(name) = own.block_ref(ob).name() {
                 let _ =
@@ -291,7 +291,7 @@ fn transform<'str>(
                 let mut mn = r.mnemonic().clone();
                 let ty = r.type_id();
                 remap_block_targets(&mut mn, ob.func, nb.func, &block_map);
-                let new_id = minted.push_mnemonic_with_type(host_fid, mn, ty);
+                let new_id = minted.push_mnemonic_with_type(mn, ty);
                 BaseRef::new(minted.reborrow(), nb).push_insn(new_id);
                 value_map.insert(ValueId::Instruction(iid), ValueId::Instruction(new_id));
                 cloned.push(new_id);
@@ -372,7 +372,7 @@ fn push_param<'str>(
     ty: qcode::types::TypeId,
 ) -> ValueId {
     let index = host.block_ref(block).num_params();
-    let pid = host.push_block_param(block.func, BlockParam::new(index, ty, block.local));
+    let pid = host.push_block_param(BlockParam::new(index, ty, block.local));
     host.block_mut(block).params.push(pid.localize(block.func));
     ValueId::BlockParam(pid)
 }

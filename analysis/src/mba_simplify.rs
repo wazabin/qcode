@@ -522,7 +522,7 @@ fn push_insn<'str>(
     before: InstructionId,
     block: BlockId,
 ) -> ValueId {
-    let id = host.push_mnemonic(block.func, mnemonic, size);
+    let id = host.push_mnemonic(mnemonic, size);
     host.insert_insn_before(block, before, id);
     ValueId::Instruction(id)
 }

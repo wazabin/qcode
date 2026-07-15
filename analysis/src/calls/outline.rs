@@ -351,7 +351,7 @@ pub(crate) fn seq_result_type<'a, 'str: 'a>(
 /// mirror of `BasicBlock::push_param` + the `type_id` write). Returns its value.
 fn push_param_into<'str>(host: &mut BodyMut<'_, 'str>, block: BlockId, ty: TypeId) -> ValueId {
     let index = host.view().block(block).params.len();
-    let pid = host.push_block_param(block.func, BlockParam::new(index, ty, block.local));
+    let pid = host.push_block_param(BlockParam::new(index, ty, block.local));
     host.block_mut(block).params.push(pid.localize(block.func));
     ValueId::BlockParam(pid)
 }
@@ -365,7 +365,7 @@ fn push_insn_into<'str>(
     mnemonic: Mnemonic,
     ty: TypeId,
 ) -> ValueId {
-    let id = host.push_mnemonic_with_type(block.func, mnemonic, ty);
+    let id = host.push_mnemonic_with_type(mnemonic, ty);
     BaseRef::new(host.reborrow(), block).push_insn(id);
     ValueId::Instruction(id)
 }
@@ -441,7 +441,7 @@ fn outline_core<'str>(
     let (own, mut minted) = crate::pipeline::host_with_minted(body, minted_out, m, callee);
     // Root block, set as the minted function's entry, named for display (block
     // names are function-scoped, so uniqueness is within the new function).
-    let root = minted.make_block(fid);
+    let root = minted.make_block();
     minted.function_mut(fid).set_root_id(Some(root.local));
     let block_name = format!("{name}_entry");
     let _ = BaseRef::new(minted.reborrow(), root).rename_local(std::borrow::Cow::Owned(block_name));

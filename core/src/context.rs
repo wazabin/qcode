@@ -2712,7 +2712,7 @@ mod tests {
             let mut r = BaseRef::new(host.reborrow(), entry_b);
             r.rename("start".into()).unwrap();
             let e = host.add_cfg_edge(entry_b, bb1_b);
-            host.remove_cfg_edge(entry_b.func, e);
+            host.remove_cfg_edge(e);
             host.replace_all_uses_with(ValueId::Instruction(a_b), ValueId::Instruction(b_b));
             host.remove_instruction(a_b);
             let mut r = BaseRef::new(host.reborrow(), param_b);
