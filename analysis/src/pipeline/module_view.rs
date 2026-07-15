@@ -435,8 +435,9 @@ mod tests {
         assert_eq!(slot, 0);
         let root = BlockId::new(installed, detached.root_id().unwrap());
         let child = BlockId::new(installed, child.local);
-        assert_eq!(detached.block(root).parent, Some(installed));
-        assert_eq!(detached.block(child).parent, Some(installed));
+        // Ownership is derived from the storing arena (`id.func`).
+        assert_eq!(root.func, installed);
+        assert_eq!(child.func, installed);
         assert_eq!(detached.edge(edge).from, root.local);
         assert_eq!(detached.edge(edge).to, child.local);
         let host = BodyMut::new(&mut detached, view.shr(), view.interfaces());

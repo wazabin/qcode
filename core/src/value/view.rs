@@ -219,20 +219,9 @@ impl<'ctx, 'str> BodyView<'ctx, 'str> {
         shared: &'ctx Shared<'str>,
         interfaces: &'ctx Registry<FunctionId, FunctionInterface<'str>>,
     ) -> Self {
-        // Debug-only: a `BodyView` is constructed per read (every
-        // `BodyMut::view()` / builder push), so an O(roster) scan here would make
-        // block-granular loops quadratic in release. The release-mode guarantee
-        // lives at the exclusive checkout boundary (`BodyMut::new`), which runs
-        // once per pass run.
-        debug_assert!(
-            {
-                let id = body.id();
-                body.roster
-                    .iter()
-                    .all(|&local| body.blocks[local].parent == Some(id))
-            },
-            "BodyView requires a function with no reattributed blocks"
-        );
+        // Block ownership is derived from the storing arena (a rostered block
+        // lives in `body`'s own arena by construction), so there is no
+        // reattribution state left to scan for here.
         Self {
             body,
             shared,

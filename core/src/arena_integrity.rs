@@ -100,12 +100,8 @@ pub fn verify_body_arena_integrity(ctx: &Context<'_>) -> Vec<String> {
             let block_id = BlockId::new(fid, local);
             let block = &*block_entry;
 
-            if block.parent != Some(fid) {
-                out.push(format!(
-                    "function {fid:?}: live block {block_id:?} has parent {:?}",
-                    block.parent
-                ));
-            }
+            // Block ownership is derived from the storing arena (`fid`); there is
+            // no per-block parent field left to disagree with it.
 
             for &insn_local in &block.instructions {
                 insn_membership.entry(insn_local).or_default().push(local);
@@ -432,15 +428,13 @@ mod tests {
     }
 
     #[test]
-    fn reports_unrostered_block_and_wrong_owner() {
+    fn reports_unrostered_block() {
         let mut ctx = fixture();
         let f = ctx.function_ids()[0];
         let block = BasicBlock::make(&mut ctx, f).id;
         ctx.bodies[f].roster.retain(|&local| local != block.local);
-        ctx.block_mut(block).parent = None;
 
         assert_has(&ctx, "roster count 0");
-        assert_has(&ctx, "has parent None");
     }
 
     #[test]

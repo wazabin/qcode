@@ -25,10 +25,9 @@ use qcode::{context::Context, value::BasicBlock};
 ///    per-function CFG walk (dominators, liveness, rename) wander into a foreign
 ///    function. This is the release-build companion of the `add_cfg_edge`
 ///    `debug_assert`.
-/// 4. **Block storage.** Every block is self-stored: `block.id.func` (its arena)
-///    equals `block.parent` (its owner). A reattributed block — owned by one
-///    function, stored in another's arena — is inaccessible to a function pass
-///    borrowing only its own body.
+/// 4. **Block storage.** Ownership is derived from the storing arena: a block's
+///    owner is `block.id.func`, so a block is self-stored by construction. There
+///    is no separate parent field that could disagree (stage 2).
 ///
 /// With per-function IR ownership this turns the isolation goal into a checked
 /// invariant on the edge and storage axes (the operand and block-target axes are

@@ -603,9 +603,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         // the original name so within-instruction references still resolve here.
         // Routed through the host so a checked-out builder mints the block into its
         // owned function's arena (and registers the name in that function's table).
-        let func = self.block.func;
         let unique_name = self.body.names.unique(name.clone());
-        let id = self.body.push_block(BasicBlock::detached(func));
+        let id = self.body.push_block(BasicBlock::detached());
         self.body
             .register_local_name(
                 self.shared,

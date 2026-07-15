@@ -92,11 +92,6 @@ pub struct BasicBlock<'str> {
 
     /// Additional addresses that map to this block (accumulated from merged blocks).
     pub extra_addresses: Vec<u64>,
-
-    /// The function this block belongs to, if any. Invariant for a live block:
-    /// `parent == Some(id.func)` — the arena that stores the block is its
-    /// owning function.
-    pub parent: Option<FunctionId>,
 }
 
 impl<'str> BasicBlock<'str> {
@@ -137,14 +132,10 @@ impl<'str> BasicBlock<'str> {
             .map(|id| BasicBlock::from_id(ctx, id))
     }
 
-    /// Create a new block, born into `func`'s block arena. Its `parent` is set
-    /// to `func` (ownership == arena membership).
+    /// Create a new block, born into `func`'s block arena. Ownership is derived
+    /// from arena membership (the storing function).
     pub fn make<'ctx>(ctx: &'ctx mut Context<'str>, func: FunctionId) -> BlockMutRef<'str, 'ctx> {
-        let block = BasicBlock {
-            parent: Some(func),
-            ..BasicBlock::default()
-        };
-        let id = ctx.push_block(func, block);
+        let id = ctx.push_block(func, BasicBlock::default());
         BlockMutRef::new(ctx, id)
     }
 
@@ -160,15 +151,12 @@ impl<'str> BasicBlock<'str> {
         self.name.as_deref()
     }
 
-    /// A fresh, empty block value parented to `func` (crate-internal; the generic
-    /// builder pushes it into `func`'s arena via the mutation host). Mirrors the
-    /// literal in [`BasicBlock::make`], which can't be written outside this module
-    /// because some fields are private.
-    pub(crate) fn detached(func: FunctionId) -> Self {
-        BasicBlock {
-            parent: Some(func),
-            ..BasicBlock::default()
-        }
+    /// A fresh, empty block value (crate-internal; the generic builder pushes it
+    /// into a function's arena via the mutation host, which is what establishes
+    /// ownership). Mirrors the literal in [`BasicBlock::make`], which can't be
+    /// written outside this module because some fields are private.
+    pub(crate) fn detached() -> Self {
+        BasicBlock::default()
     }
 
     /// Structurally clone the block at `orig` into a fresh block owned by (and
@@ -431,9 +419,9 @@ where
     }
 
     pub fn parent(&'s self) -> Option<FunctionRef<'str, 'ctx, R>> {
-        self.inner()
-            .parent
-            .map(|fid| FunctionRef::new(self.view, fid))
+        // Ownership is derived from the storing arena: a block lives in its
+        // owning function's arena, so `id.func` is the owner.
+        Some(FunctionRef::new(self.view, self.id.func))
     }
 
     pub fn function(&'s self) -> Option<FunctionRef<'str, 'ctx, R>> {
@@ -831,10 +819,8 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     }
 
     pub fn parent_mut(&mut self) -> Option<FunctionMutRef<'str, '_>> {
-        self.ctx
-            .block(self.id)
-            .parent
-            .map(|fid| FunctionBody::from_id_mut(self.ctx, fid))
+        // Ownership is derived from the storing arena (`id.func`).
+        Some(FunctionBody::from_id_mut(self.ctx, self.id.func))
     }
 
     pub fn as_ref(&self) -> BlockRef<'str, '_> {

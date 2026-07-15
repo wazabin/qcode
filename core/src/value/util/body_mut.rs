@@ -49,11 +49,10 @@ pub struct BodyMut<'a, 'str> {
 }
 
 impl<'a, 'str> BodyMut<'a, 'str> {
-    /// Wrap `fun` over the module's shared state and
-    /// interface registry. Asserts (all builds — this is the once-per-checkout
-    /// enforcement point; `BodyView::new`'s copy is debug-only) the function
-    /// owns only self-stored,
-    /// self-parented blocks (no reattribution).
+    /// Wrap `fun` over the module's shared state and interface registry. Block
+    /// ownership is now derived from the storing arena (a rostered block lives in
+    /// `fun`'s own arena by construction), so there is no reattribution state left
+    /// to scan for here.
     pub fn new(
         fun: &'a mut FunctionBody<'str>,
         shared: &'a crate::context::Shared<'str>,
@@ -62,15 +61,6 @@ impl<'a, 'str> BodyMut<'a, 'str> {
             crate::value::function::FunctionInterface<'str>,
         >,
     ) -> Self {
-        let id = fun.id();
-        assert!(
-            fun.roster.iter().all(|&local| {
-                // Stored in this function's own arena and parented to it.
-                let blk = &fun.blocks[local];
-                blk.parent == Some(id)
-            }),
-            "BodyMut requires a function with no reattributed blocks"
-        );
         Self {
             fun,
             shared,

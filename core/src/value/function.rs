@@ -277,10 +277,10 @@ impl<'str> FunctionBody<'str> {
     /// detached body to its installed registry ID.
     ///
     /// Function arenas, operands, roster entries, and use-def data are body-local
-    /// and need no remap. Live block ownership and function-qualified entries in
-    /// the local reverse-name table carry the ambient ID (CFG edge endpoints are
-    /// now bare body-local ids and need no rewrite). Real `Callee::Real` targets
-    /// inside instruction mnemonics are
+    /// and need no remap. Function-qualified entries in the local reverse-name
+    /// table carry the ambient ID. Block ownership is now derived from the storing
+    /// arena and CFG edge endpoints are bare body-local ids, so neither needs a
+    /// rewrite. Real `Callee::Real` targets inside instruction mnemonics are
     /// semantic cross-function references, not ownership metadata, and are
     /// deliberately left untouched.
     pub fn rebind_ambient_id(&mut self, from: FunctionId, to: FunctionId) {
@@ -288,16 +288,6 @@ impl<'str> FunctionBody<'str> {
         if from == to {
             return;
         }
-        for mut block in self.blocks.iter_mut() {
-            assert_eq!(
-                block.parent,
-                Some(from),
-                "detached function block has an unexpected ambient owner"
-            );
-            block.parent = Some(to);
-        }
-        // CFG edge endpoints are now bare `LocalBlockId`s (stage 1): they carry no
-        // function qualifier, so there is nothing per-edge to rewrite.
         self.id = to;
     }
 
@@ -571,22 +561,20 @@ impl<'str> FunctionBody<'str> {
     }
 
     /// Push a fresh block into this body's arena and onto its ownership roster.
+    /// Ownership is derived from the storing arena: the returned id's `func` is
+    /// this body's own id.
     pub fn push_block(&mut self, block: BasicBlock<'str>) -> BlockId {
         let func = self.id;
-        assert_eq!(
-            block.parent,
-            Some(func),
-            "block parent must match its function-body arena"
-        );
         let local = self.blocks.push(block);
         let id = BlockId::new(func, local);
         self.roster.push(local);
         id
     }
 
-    /// Mint a fresh empty block, parented to this function and rostered.
+    /// Mint a fresh empty block, owned by this function (arena membership) and
+    /// rostered.
     pub fn make_block(&mut self) -> BlockId {
-        self.push_block(BasicBlock::detached(self.id))
+        self.push_block(BasicBlock::detached())
     }
 
     /// Push a fresh block parameter into this body's arena.
@@ -857,14 +845,9 @@ impl<'str> FunctionBody<'str> {
         }
     }
 
-    /// Drop `block` from this body's ownership roster.
+    /// Drop `block` from this body's ownership roster. Ownership is derived from
+    /// the storing arena (`block.func`).
     pub fn unroster_block(&mut self, block: BlockId) {
-        assert!(
-            self.block(block)
-                .parent
-                .is_none_or(|owner| owner == block.func),
-            "cannot unroster a block through another function body"
-        );
         self.roster.retain(|&b| b != block.localize(block.func));
     }
 
@@ -1929,29 +1912,20 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     ///
     /// With per-function block arenas, membership *is* arena ownership: a block
     /// lives in the arena of the function it was born into (`id.func`), and that
-    /// must equal `self.id`. This is now effectively an assertion plus a
-    /// `parent` (re)assignment; it no longer moves storage between functions.
+    /// must equal `self.id`. Ownership is derived from the arena, so this only
+    /// ensures the roster lists the block; it no longer moves storage between
+    /// functions.
     pub fn add_block(&mut self, id: BlockId) {
         assert_eq!(
             id.func, self.id,
             "cannot add a block stored in another function arena"
         );
-        let prev = self.ctx.block(id).parent;
         let local = id.localize(self.id);
-        if prev == Some(self.id) {
-            // Already owned; ensure the roster lists it exactly once (a freshly
-            // `make`d block is auto-rostered, so this is usually a no-op).
-            if !self.inner().roster.contains(&local) {
-                self.inner_mut().roster.push(local);
-            }
-            return;
+        // Ensure the roster lists it exactly once (a freshly `make`d block is
+        // auto-rostered, so this is usually a no-op).
+        if !self.inner().roster.contains(&local) {
+            self.inner_mut().roster.push(local);
         }
-        assert!(
-            prev.is_none(),
-            "cannot reassign block ownership across functions"
-        );
-        self.ctx.block_mut(id).parent = Some(self.id);
-        self.inner_mut().roster.push(local);
     }
 }
 
@@ -2163,19 +2137,9 @@ mod tests {
         let _ = ctx.bodies[b].block_param(a_param);
     }
 
-    #[test]
-    #[should_panic(expected = "block parent must match its function-body arena")]
-    fn body_push_block_rejects_foreign_parent() {
-        let (mut ctx, a, b, _, _, _, _, _, _) = colliding_body_ids();
-        ctx.bodies[b].push_block(BasicBlock::detached(a));
-    }
-
-    #[test]
-    #[should_panic(expected = "block parent must match its function-body arena")]
-    fn context_push_block_rejects_foreign_parent() {
-        let (mut ctx, a, b, _, _, _, _, _, _) = colliding_body_ids();
-        ctx.push_block(b, BasicBlock::detached(a));
-    }
+    // The `push_block` foreign-parent asserts are gone (stage 2): block ownership
+    // is derived from the storing arena, so a block pushed into body `b` is owned
+    // by `b` by construction — a foreign parent is unrepresentable.
 
     #[test]
     fn make_function_creates_function_with_correct_name_root_address() {

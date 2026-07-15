@@ -76,10 +76,10 @@ fn reachable_from<'ctx, 'str: 'ctx>(
     let mut stack = vec![entry];
     while let Some(block) = stack.pop() {
         for (_, succ) in host.block_ref(block).successors() {
-            // Ownership, not storage: a reattributed own block (owner == the
-            // walked function, stored in a foreign arena pre-normalization) is
-            // followed; a block owned by another function is not.
-            if host.block(succ).parent == Some(owner) && seen.insert(succ) {
+            // Ownership is derived from the storing arena (`succ.func`): a
+            // successor in the walked function is followed; one owned by another
+            // function is not.
+            if succ.func == owner && seen.insert(succ) {
                 stack.push(succ);
             }
         }
@@ -359,7 +359,8 @@ impl<'str> Walk<'_, 'str> {
             );
         }
         for &child in self.tree.children_of(block_id) {
-            if cx.body_view(body).block(child).parent == Some(self.owner) {
+            // Ownership is derived from the storing arena (`child.func`).
+            if child.func == self.owner {
                 self.rec(body, cx, child, &states);
             }
         }

@@ -224,7 +224,9 @@ fn try_merge_block<'a, 'str>(
     // shared CRT stubs, thunks) — must not be absorbed: `absorb_block` →
     // `unroster_block` mutates the *owner*'s roster, which a body-local pass may
     // not do. A cross-function successor (thunk/tail-call) is likewise left as-is.
-    if b_id.func != function_id || cx.body_view(body).block(b_id).parent != Some(function_id) {
+    // Ownership is derived from the storing arena, so `b_id.func` is the sole
+    // ownership check.
+    if b_id.func != function_id {
         return false;
     }
     body.absorb_block(a_id, b_id, edge_ab);

@@ -1140,19 +1140,19 @@ impl<'str> Context<'str> {
         // them so their `instruction_addrs` can be rebuilt afterwards.
         let mut prev_owners: HashSet<FunctionId> = HashSet::default();
         for &b in &tail {
-            if let Some(owner) = self.block(b).parent {
-                prev_owners.insert(owner);
-            }
+            // Ownership is derived from the storing arena (`b.func`).
+            prev_owners.insert(b.func);
         }
 
         // Treat the tail as G-owned while computing boundary rewrites, without
         // ever adopting its foreign-storage blocks into G's roster/root. The
         // physical move below is the only supported ownership transition.
-        let effective_owner = |ctx: &Context, candidate: BlockId| {
+        let effective_owner = |_ctx: &Context, candidate: BlockId| {
             if tail_set.contains(&candidate) {
                 Some(g)
             } else {
-                ctx.block(candidate).parent
+                // Ownership is derived from the storing arena.
+                Some(candidate.func)
             }
         };
 
@@ -1225,10 +1225,8 @@ impl<'str> Context<'str> {
             );
         }
         for (insn, owner_block, callee) in cond_calls {
-            let owner = self
-                .block(owner_block)
-                .parent
-                .expect("cbranch block has an owner");
+            // Ownership is derived from the storing arena.
+            let owner = owner_block.func;
             let tramp = BasicBlock::make(self, owner).id;
             (self).builder(tramp).push_tail_call(callee);
             self.add_cfg_edge(owner_block, tramp);
@@ -1631,11 +1629,6 @@ impl<'str> Context<'str> {
     }
 
     pub fn push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
-        assert_eq!(
-            block.parent,
-            Some(func),
-            "block parent must match its function-body arena"
-        );
         let local = self.bodies[func].blocks.push(block);
         let id = BlockId::new(func, local);
         // A block is born owned by the function whose arena stores it.
@@ -1644,14 +1637,8 @@ impl<'str> Context<'str> {
     }
 
     /// Removes `id` from its storage function's roster. The arena slot is
-    /// untouched; Path A forbids any different ownership function.
+    /// untouched. Ownership is derived from the storing arena (`id.func`).
     pub fn unroster_block(&mut self, id: BlockId) {
-        assert!(
-            self.bodies[id.func].blocks[id.local]
-                .parent
-                .is_none_or(|owner| owner == id.func),
-            "cross-arena block ownership is unsupported"
-        );
         self.bodies[id.func].roster.retain(|&b| b != id.local);
     }
 
@@ -2047,10 +2034,10 @@ impl<'str> Context<'str> {
         self.bodies[insn.func].move_insn_before(insn, before);
     }
 
-    /// Mint a fresh empty block into `func`'s arena, parented and rostered.
-    /// The module-scope mint of a fresh empty block.
+    /// Mint a fresh empty block into `func`'s arena, owned (arena membership) and
+    /// rostered. The module-scope mint of a fresh empty block.
     pub fn make_block(&mut self, func: FunctionId) -> BlockId {
-        self.push_block(func, BasicBlock::detached(func))
+        self.push_block(func, BasicBlock::detached())
     }
 
     /// Rehome `remove`'s outgoing CFG edges onto `keep`. The direct edge and
@@ -3747,7 +3734,6 @@ mod tests {
             // Every G block is self-stored.
             for b in FunctionBody::from_id(&ctx, g).block_ids() {
                 assert_eq!(b.func, g);
-                assert_eq!(ctx.block(b).parent, Some(g));
             }
 
             // The thunk's branch into the tail became a TailCall(G); its edge is gone.
