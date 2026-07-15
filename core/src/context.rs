@@ -1006,7 +1006,7 @@ impl<'str> Context<'str> {
         // Phase 5: delete the originals (unlinks their old edges, physically
         // removes their instructions and physical block payloads).
         for &old in olds {
-            BasicBlock::from_id_mut(self, old).delete(target);
+            BasicBlock::from_id_mut(self, old).delete();
         }
 
         // Phase 6: rebuild `target`'s reverse-use map from its live instructions,
@@ -2068,7 +2068,7 @@ impl<'str> Context<'str> {
     }
 
     /// Remove `block` from its function, including its arena payload.
-    pub fn delete_block(&mut self, block: BlockId, _function_id: FunctionId) {
+    pub fn delete_block(&mut self, block: BlockId) {
         let mut edges: Vec<EdgeId> = self.view().block(block).edges.iter().copied().collect();
         edges.sort_unstable();
         for edge in edges {
@@ -2106,13 +2106,7 @@ impl<'str> Context<'str> {
     }
 
     /// Absorb `other` into `keep`.
-    pub fn absorb_block(
-        &mut self,
-        keep: BlockId,
-        other: BlockId,
-        edge_ab: EdgeId,
-        _function_id: FunctionId,
-    ) {
+    pub fn absorb_block(&mut self, keep: BlockId, other: BlockId, edge_ab: EdgeId) {
         assert_eq!(
             keep.func, other.func,
             "cannot absorb across function arenas"
@@ -3563,7 +3557,7 @@ mod tests {
             .set_root(first)
             .expect("set root");
 
-        ctx.delete_block(removed, function);
+        ctx.delete_block(removed);
 
         let physical_order: Vec<_> = ctx.bodies[function]
             .blocks
@@ -3610,7 +3604,7 @@ mod tests {
             .set_root(root)
             .expect("set root");
 
-        ctx.delete_block(root, function);
+        ctx.delete_block(root);
 
         assert!(!ctx.contains_block(root));
         assert!(FunctionBody::from_id(&ctx, function).root().is_none());

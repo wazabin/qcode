@@ -732,16 +732,16 @@ macro_rules! impl_block_mut_verbs {
 
     /// Removes this block from its function, including its payload. Delegates
     /// to the backing's `delete_block` verb.
-    pub fn delete(&mut self, function_id: FunctionId) {
+    pub fn delete(&mut self) {
         let id = self.id;
-        self.ctx.delete_block(id, function_id);
+        self.ctx.delete_block(id);
     }
 
     /// Absorbs `other` into this block. Delegates to the backing's `absorb_block` verb;
     /// `edge_ab` must be the direct edge from this block to `other`.
-    pub fn absorb_block(&mut self, other: BlockId, edge_ab: EdgeId, function_id: FunctionId) {
+    pub fn absorb_block(&mut self, other: BlockId, edge_ab: EdgeId) {
         let id = self.id;
-        self.ctx.absorb_block(id, other, edge_ab, function_id);
+        self.ctx.absorb_block(id, other, edge_ab);
     }
         }
     };
@@ -1412,7 +1412,7 @@ mod tests {
 
         assert_eq!(BasicBlock::from_id(&ctx, exit).predecessors().count(), 2);
 
-        BasicBlock::from_id_mut(&mut ctx, b).delete(f);
+        BasicBlock::from_id_mut(&mut ctx, b).delete();
 
         assert_eq!(
             BasicBlock::from_id(&ctx, exit).predecessors().count(),
@@ -1447,7 +1447,7 @@ mod tests {
                 .any(|(_, s)| s == loop_hdr)
         );
 
-        BasicBlock::from_id_mut(&mut ctx, loop_hdr).delete(f);
+        BasicBlock::from_id_mut(&mut ctx, loop_hdr).delete();
 
         assert!(
             !ctx.contains_block(loop_hdr),
@@ -1487,7 +1487,7 @@ mod tests {
             "precondition: %x is used by %y"
         );
 
-        BasicBlock::from_id_mut(&mut ctx, b).delete(f);
+        BasicBlock::from_id_mut(&mut ctx, b).delete();
 
         assert!(
             !ctx.users(crate::value::ValueId::Instruction(x))

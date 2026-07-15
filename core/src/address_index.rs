@@ -189,7 +189,7 @@ mod tests {
         let block = BasicBlock::make(&mut ctx, function)
             .with_address_indexed(&mut index, 0x3000)
             .id;
-        ctx.delete_block(block, function);
+        ctx.delete_block(block);
 
         index.refresh(&ctx);
         assert_eq!(index.get(0x3000), None);

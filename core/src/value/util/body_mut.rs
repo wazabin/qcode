@@ -265,17 +265,11 @@ impl<'a, 'str> BodyMut<'a, 'str> {
         self.function_mut(block.func).unroster_block(block)
     }
 
-    pub fn delete_block(&mut self, block: BlockId, _function_id: FunctionId) {
+    pub fn delete_block(&mut self, block: BlockId) {
         self.function_mut(block.func).delete_block(block)
     }
 
-    pub fn absorb_block(
-        &mut self,
-        keep: BlockId,
-        other: BlockId,
-        edge_ab: EdgeId,
-        _function_id: FunctionId,
-    ) {
+    pub fn absorb_block(&mut self, keep: BlockId, other: BlockId, edge_ab: EdgeId) {
         self.function_mut(keep.func)
             .absorb_block(keep, other, edge_ab)
     }

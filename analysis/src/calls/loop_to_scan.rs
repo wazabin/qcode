@@ -430,7 +430,7 @@ fn apply<'str>(
             // `delete_private_loop` is still host-generic (a cross-module helper,
             // migrated in its own chunk), so drive it through a scoped host.
             let mut host = mv.host(body);
-            delete_private_loop(&mut host, fid, preheader, &loop_blocks, m.exit, exit_args);
+            delete_private_loop(&mut host, preheader, &loop_blocks, m.exit, exit_args);
         }
     }
     true

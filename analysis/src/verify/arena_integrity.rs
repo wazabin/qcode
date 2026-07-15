@@ -30,7 +30,7 @@ mod tests {
         let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
         let edge = *ctx.block(entry).edges.iter().next().expect("edge");
         let target = ctx.edge(f, edge).to;
-        BasicBlock::from_id_mut(&mut ctx, target).delete(f);
+        BasicBlock::from_id_mut(&mut ctx, target).delete();
 
         let diagnostics = crate::verify::verify(&ctx);
         assert!(

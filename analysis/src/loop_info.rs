@@ -240,7 +240,6 @@ pub(crate) fn is_loop_private<'a, 'str: 'a>(
 /// not, the reroute is skipped but the blocks are still deleted.
 pub(crate) fn delete_private_loop<'str>(
     host: &mut BodyMut<'_, 'str>,
-    fid: FunctionId,
     preheader: BlockId,
     blocks: &[BlockId],
     exit: BlockId,
@@ -264,7 +263,7 @@ pub(crate) fn delete_private_loop<'str>(
         host.add_cfg_edge(preheader, exit);
     }
     for &blk in blocks {
-        host.delete_block(blk, fid);
+        host.delete_block(blk);
     }
 }
 

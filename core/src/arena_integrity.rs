@@ -420,7 +420,7 @@ mod tests {
         let mut ctx = fixture();
         let f = ctx.function_ids()[0];
         let dead = BasicBlock::make(&mut ctx, f).id;
-        ctx.delete_block(dead, f);
+        ctx.delete_block(dead);
         ctx.function_mut(f).set_root_id(Some(dead.local));
 
         assert_has(&ctx, "root");
@@ -569,7 +569,7 @@ mod tests {
         let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
         let edge = *ctx.block(entry).edges.iter().next().expect("edge");
         let target = ctx.edge(f, edge).to;
-        ctx.delete_block(target, f);
+        ctx.delete_block(target);
 
         assert_has(&ctx, "targets removed block");
     }
@@ -579,7 +579,7 @@ mod tests {
         let mut ctx = fixture();
         let f = ctx.function_ids()[0];
         let dead_block = BasicBlock::make(&mut ctx, f).id;
-        ctx.delete_block(dead_block, f);
+        ctx.delete_block(dead_block);
         ctx.bodies[f]
             .names
             .register(

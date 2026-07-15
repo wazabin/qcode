@@ -325,7 +325,6 @@ fn try_match_strlen<'a, 'str: 'a>(
 fn apply_strlen<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
-    fid: FunctionId,
     m: &StrlenMatch,
 ) -> bool {
     // take_while(@arr) then len(...) of it, inserted at the top of the exit block.
@@ -374,7 +373,6 @@ fn apply_strlen<'str>(
         let mut host = cx.host(body);
         delete_private_loop(
             &mut host,
-            fid,
             m.preheader,
             &[m.body_block, m.header_block],
             m.exit_block,
@@ -396,7 +394,7 @@ fn recognize_strlen_at<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'
     let Some(sm) = try_match_strlen(m.body_view(body), fid) else {
         return false;
     };
-    apply_strlen(body, m, fid, &sm)
+    apply_strlen(body, m, &sm)
 }
 
 // ===========================================================================
