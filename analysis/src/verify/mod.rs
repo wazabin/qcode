@@ -97,10 +97,14 @@ impl Pass for Verify {
     fn description(&self) -> &'static str {
         "Check IR structural invariants (fails on violation)"
     }
-    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
+    fn run(
+        &self,
+        ctx: &mut Context,
+        _env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
         let violations = verify(ctx);
         if violations.is_empty() {
-            Ok(false)
+            Ok(crate::ModulePassOutcome::default())
         } else {
             Err(format!(
                 "IR verification failed:\n  - {}",

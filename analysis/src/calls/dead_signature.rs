@@ -51,7 +51,11 @@ const MAX_ITERS: usize = 100_000;
 /// Trim dead args and dead returned fields from every `pure_reg` function,
 /// rewriting all direct call sites. Returns `true` if anything changed.
 pub fn dead_signature(ctx: &mut Context) -> bool {
-    let mut changed = false;
+    !dead_signature_changed_functions(ctx).is_empty()
+}
+
+fn dead_signature_changed_functions(ctx: &mut Context) -> HashSet<FunctionId> {
+    let mut changed = HashSet::default();
     let mut worklist: Vec<FunctionId> = ctx
         .function_ids()
         .into_iter()
@@ -79,12 +83,12 @@ pub fn dead_signature(ctx: &mut Context) -> bool {
         let ret_changed = trim_dead_return_fields(ctx, fid, &call_index, &mut touched);
 
         if arg_changed || ret_changed {
-            changed = true;
             touched.insert(fid);
             // DCE the dirtied functions (drops the now-unused arg-setup loads /
             // the returned-field computations the trim exposed), then re-queue
             // them: a freed value may expose the next dead arg or field.
             for t in touched {
+                changed.insert(t);
                 dce_function(ctx, t);
                 if !worklist.contains(&t) {
                     worklist.push(t);
@@ -335,8 +339,14 @@ impl Pass for DeadSignature {
     fn description(&self) -> &'static str {
         "Remove dead arguments and dead returned fields from functionalized functions"
     }
-    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
-        Ok(dead_signature(ctx))
+    fn run(
+        &self,
+        ctx: &mut Context,
+        _env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        Ok(crate::ModulePassOutcome::functions(
+            dead_signature_changed_functions(ctx),
+        ))
     }
 }
 

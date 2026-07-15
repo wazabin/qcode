@@ -128,8 +128,22 @@ impl Pass for MarkPure {
     fn description(&self) -> &'static str {
         "Assert is_pure on fully functionalized (side-effect-free) functions"
     }
-    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
-        Ok(mark_pure_functions(ctx))
+    fn run(
+        &self,
+        ctx: &mut Context,
+        _env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        let before: rustc_hash::FxHashSet<_> = ctx
+            .functions()
+            .filter(|f| f.is_pure())
+            .map(|f| f.id)
+            .collect();
+        mark_pure_functions(ctx);
+        Ok(crate::ModulePassOutcome::functions(
+            ctx.functions()
+                .filter(|f| f.is_pure() && !before.contains(&f.id))
+                .map(|f| f.id),
+        ))
     }
 }
 

@@ -789,7 +789,8 @@ async fn run_module_stage(
             let _scope = qcode::pass_scope::enter(p.name());
             #[cfg(not(target_arch = "wasm32"))]
             let started = std::time::Instant::now();
-            let pass_changed = p.run(ctx, env).map_err(|e| format!("{}: {e}", p.name()))?;
+            let outcome = p.run(ctx, env).map_err(|e| format!("{}: {e}", p.name()))?;
+            let pass_changed = outcome.changed();
             #[cfg(not(target_arch = "wasm32"))]
             log::debug!(
                 target: "pipeline",
@@ -836,63 +837,27 @@ async fn run_module_stage(
     }
 }
 
-/// The set of functions currently flagged `is_pure`.
-fn pure_function_set(ctx: &Context) -> HashSet<FunctionId> {
-    ctx.functions()
-        .filter(|f| f.is_pure())
-        .map(|f| f.id)
-        .collect()
-}
-
-/// A cheap structural hash of one function's body — block ids and params, then each
-/// instruction's id and mnemonic (which carries its operand value-ids, so an operand
-/// rewrite changes the hash). Unlike [`function_fingerprint`] it does no string
-/// rendering, so it is affordable to call over a large clean set every fixpoint
-/// iteration; it need only detect same-run before/after changes, not be stable
-/// across runs. Used by [`run_module_stage_incremental`] to invalidate settled
-/// functions a whole-program pass rewrote.
-fn function_body_hash(ctx: &Context, fun_id: FunctionId) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for block in FunctionRef::from_id(ctx, fun_id).blocks() {
-        block.id.hash(&mut h);
-        for param in block.params() {
-            param.id().hash(&mut h);
-        }
-        for insn in block.iter() {
-            insn.id.hash(&mut h);
-            insn.mnemonic().hash(&mut h);
-        }
-    }
-    h.finish()
-}
-
-/// Mark every caller of `fun_id` dirty in `cache`. A change to a function's body,
+/// Add `fun_id` and every caller to the following module round. A change to a function's body,
 /// signature, or purity can change what its callers' `gvn`/`dce` do (pure-call
 /// emulation and dead-pure-call removal both read the callee), so a settled caller
 /// must be reprocessed.
-fn invalidate_callers(graph: &crate::CallGraph, cache: &mut FixpointCache, fun_id: FunctionId) {
+fn add_changed_and_callers(
+    graph: &crate::CallGraph,
+    targets: &mut HashSet<FunctionId>,
+    fun_id: FunctionId,
+) {
+    targets.insert(fun_id);
     for caller in graph.callers(fun_id) {
-        cache.mark_dirty(caller);
+        targets.insert(caller);
     }
 }
 
 /// Driver for a module stage carrying `module(<fn_pass>)` adapters (see
 /// [`run_module_stage`]). A non-repeating stage executes one parallel adapter
-/// batch; `repeat_until` stages retain the incremental cache across batches.
-///
-/// Correctness rests on tracking, per `(function, pass)`, whether the adapter has
-/// reached a fixpoint on that function and the function is unchanged since
-/// ([`FixpointCache`]). Two interprocedural dependencies force extra invalidation,
-/// because `gvn`/`dce` read a *callee* when optimizing a caller (pure-call
-/// emulation / dead-pure-call removal):
-///   * when an adapter changes a function, its callers are invalidated;
-///   * around a genuine whole-program pass (e.g. `argpromote`, `mark_pure`), any
-///     function whose body fingerprint changed — and any function newly flagged
-///     `is_pure` — invalidates itself and its callers.
-///
-/// The result is identical IR to re-running every adapter over every function each
-/// iteration, at a fraction of the work.
+/// batch; `repeat_until` stages carry one shared target-function set between
+/// rounds. Round one targets every eligible function. Every adapter in a round
+/// receives that same immutable set; exact module-pass outcomes and their callers
+/// are unioned into the following round's set.
 fn run_module_stage_incremental(
     ctx: &mut Context,
     env: &PipelineEnv,
@@ -902,13 +867,19 @@ fn run_module_stage_incremental(
     round: usize,
     progress: &mut impl FnMut(PipelineProgress),
 ) -> Result<bool, String> {
-    let mut cache = FixpointCache::default();
-    let mut known_pure = pure_function_set(ctx);
+    let mut targets: HashSet<FunctionId> = ctx
+        .functions()
+        .filter(|f| !f.is_external())
+        .filter(|f| !ctx.is_function_ignored(f.address()))
+        .map(|f| f.id)
+        .collect();
     let mut iters = 0;
     let mut stage_changed = false;
     let mut tracer = FixpointTracer::default();
     let tracer_label = format!("stage {} <module,incremental>", stage.name);
     loop {
+        let round_targets = std::mem::take(&mut targets);
+        let mut next_targets = HashSet::default();
         let watching = iters >= FIXPOINT_WATCH_ITERS;
         let mut changed = false;
         for p in passes {
@@ -922,17 +893,15 @@ fn run_module_stage_incremental(
             let started = std::time::Instant::now();
 
             let pass_changed = if let Some(inner) = p.as_module_fn() {
-                // Run unsettled functions through the same disjoint-body engine as
-                // ordinary function stages. Publish buffered effects first, then
-                // invalidate callers at a deterministic batch barrier. An
-                // invalidated caller runs on the next module-fixpoint iteration;
-                // any changed callee keeps that outer iteration alive.
+                // The target set belongs to the module round, not this pass: every
+                // adapter sees the same functions even when an earlier adapter
+                // changed only a subset of them.
                 let fun_ids: Vec<FunctionId> = ctx
                     .functions()
                     .filter(|f| !f.is_external())
                     .filter(|f| !ctx.is_function_ignored(f.address()))
                     .map(|f| f.id)
-                    .filter(|f| !cache.is_clean(*f, p.name()))
+                    .filter(|f| round_targets.contains(f))
                     .collect();
                 let changed_functions = run_module_fn_adapter(
                     ctx,
@@ -941,46 +910,33 @@ fn run_module_stage_incremental(
                     inner,
                     &fun_ids,
                     round,
-                    &mut cache,
                     resolve_threads(),
                     progress,
                 )?;
                 if !changed_functions.is_empty() {
                     let graph = crate::CallGraph::analyze(ctx);
                     for fun_id in changed_functions.iter().copied() {
-                        invalidate_callers(&graph, &mut cache, fun_id);
+                        add_changed_and_callers(&graph, &mut next_targets, fun_id);
                     }
                 }
                 !changed_functions.is_empty()
             } else {
-                // Genuine whole-program pass. Only *settled* (clean) functions risk
-                // being wrongly skipped later, and any already-dirty function it
-                // rewrites had its callers invalidated when it first went dirty — so
-                // fingerprinting the clean set alone soundly catches every new
-                // invalidation. Diff those fingerprints across the pass and dirty the
-                // ones that moved (plus their callers); also dirty callers of any
-                // function newly flagged `is_pure`.
-                let before: Vec<(FunctionId, u64)> = cache
-                    .clean_function_ids()
-                    .into_iter()
-                    .map(|f| (f, function_body_hash(ctx, f)))
-                    .collect();
-                let pc = p.run(ctx, env).map_err(|e| format!("{}: {e}", p.name()))?;
-                if pc {
+                let outcome = p.run(ctx, env).map_err(|e| format!("{}: {e}", p.name()))?;
+                if outcome.changed() {
                     let graph = crate::CallGraph::analyze(ctx);
-                    for (f, old) in before {
-                        if function_body_hash(ctx, f) != old {
-                            cache.mark_dirty(f);
-                            invalidate_callers(&graph, &mut cache, f);
-                        }
+                    for fun_id in outcome.changed_functions.iter().copied() {
+                        add_changed_and_callers(&graph, &mut next_targets, fun_id);
                     }
-                    let now_pure = pure_function_set(ctx);
-                    for &f in now_pure.difference(&known_pure) {
-                        invalidate_callers(&graph, &mut cache, f);
+                    if outcome.module_changed {
+                        next_targets.extend(
+                            ctx.functions()
+                                .filter(|f| !f.is_external())
+                                .filter(|f| !ctx.is_function_ignored(f.address()))
+                                .map(|f| f.id),
+                        );
                     }
-                    known_pure = now_pure;
                 }
-                pc
+                outcome.changed()
             };
 
             #[cfg(not(target_arch = "wasm32"))]
@@ -1024,6 +980,7 @@ fn run_module_stage_incremental(
             );
             return Err(nonconvergence_error(&stage.name, None));
         }
+        targets = next_targets;
     }
 }
 
@@ -1038,13 +995,13 @@ fn run_module_fn_adapter(
     pass: &dyn DynFunctionPass,
     fun_ids: &[FunctionId],
     round: usize,
-    cache: &mut FixpointCache,
     threads: usize,
     progress: &mut impl FnMut(PipelineProgress),
 ) -> Result<HashSet<FunctionId>, String> {
     let passes = [pass];
+    let mut cache = FixpointCache::default();
     run_function_worklist(
-        ctx, env, stage, &passes, fun_ids, cache, round, threads, false, progress,
+        ctx, env, stage, &passes, fun_ids, &mut cache, round, threads, false, progress,
     )
 }
 
@@ -1057,7 +1014,7 @@ pub(super) fn run_standalone_module_fn(
     ctx: &mut Context,
     env: &PipelineEnv,
     pass: &dyn DynFunctionPass,
-) -> Result<bool, String> {
+) -> Result<super::pass::ModulePassOutcome, String> {
     let stage = Stage {
         name: format!("module({})", pass.name()),
         passes: StagePasses::Function(Vec::new()),
@@ -1085,7 +1042,7 @@ pub(super) fn run_standalone_module_fn(
         false,
         &mut |_| {},
     )?;
-    Ok(!changed.is_empty())
+    Ok(super::pass::ModulePassOutcome::functions(changed))
 }
 
 /// Run a clean-IR whole-program stage during recursive lifting. Most passes are
@@ -1140,7 +1097,10 @@ async fn run_lifting_module_stage(
                     }
                     summary.changed()
                 }
-                _ => p.run(ctx, env).map_err(|e| format!("{}: {e}", p.name()))?,
+                _ => p
+                    .run(ctx, env)
+                    .map_err(|e| format!("{}: {e}", p.name()))?
+                    .changed(),
             };
             #[cfg(not(target_arch = "wasm32"))]
             log::debug!(
@@ -2035,6 +1995,7 @@ fn run_stage_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::pass::ModuleFnAdapter;
     use crate::pipeline::{LiftOutcome, Lifter};
     use crate::{FunctionPass, FunctionPassAdapter};
     use qcode::{
@@ -2042,10 +2003,13 @@ mod tests {
         discovery::Discovery,
         value::{BasicBlock, FunctionBody, FunctionKind},
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     static MODULE_ADAPTER_ACTIVE: AtomicUsize = AtomicUsize::new(0);
     static MODULE_ADAPTER_MAX_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static ROUND_PROBE_CHANGED: AtomicBool = AtomicBool::new(false);
+    static ROUND_PROBE_A_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static ROUND_PROBE_B_RUNS: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Default)]
     struct ModuleAdapterParallelProbe;
@@ -2067,6 +2031,50 @@ mod tests {
             MODULE_ADAPTER_MAX_ACTIVE.fetch_max(active, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(10));
             MODULE_ADAPTER_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            Ok(Outcome::default())
+        }
+    }
+
+    #[derive(Default)]
+    struct RoundProbeA;
+
+    impl FunctionPass for RoundProbeA {
+        const NAME: &'static str = "round_probe_a";
+
+        fn description(&self) -> &'static str {
+            "Changes exactly one function on its first module round"
+        }
+
+        fn run<'str>(
+            &self,
+            _f: &mut FunctionBody<'str>,
+            _cx: ContextView<'_, 'str>,
+            _next_minted: &mut u32,
+        ) -> Result<Outcome<'str>, String> {
+            ROUND_PROBE_A_RUNS.fetch_add(1, Ordering::SeqCst);
+            Ok(Outcome::changed(
+                !ROUND_PROBE_CHANGED.swap(true, Ordering::SeqCst),
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct RoundProbeB;
+
+    impl FunctionPass for RoundProbeB {
+        const NAME: &'static str = "round_probe_b";
+
+        fn description(&self) -> &'static str {
+            "Records the module round target set"
+        }
+
+        fn run<'str>(
+            &self,
+            _f: &mut FunctionBody<'str>,
+            _cx: ContextView<'_, 'str>,
+            _next_minted: &mut u32,
+        ) -> Result<Outcome<'str>, String> {
+            ROUND_PROBE_B_RUNS.fetch_add(1, Ordering::SeqCst);
             Ok(Outcome::default())
         }
     }
@@ -2093,31 +2101,66 @@ mod tests {
         let fun_ids = ctx.function_ids();
         let env = PipelineEnv::headless(&ctx);
         let pass = FunctionPassAdapter::<ModuleAdapterParallelProbe>::default();
-        let mut cache = FixpointCache::default();
-
-        let changed = run_module_fn_adapter(
-            &mut ctx,
-            &env,
-            stage,
-            &pass,
-            &fun_ids,
-            1,
-            &mut cache,
-            4,
-            &mut |_| {},
-        )
-        .expect("module adapter runs");
+        let changed =
+            run_module_fn_adapter(&mut ctx, &env, stage, &pass, &fun_ids, 1, 4, &mut |_| {})
+                .expect("module adapter runs");
 
         assert!(changed.is_empty());
         assert!(
             MODULE_ADAPTER_MAX_ACTIVE.load(Ordering::SeqCst) > 1,
             "module adapter did not execute concurrently"
         );
+    }
+
+    #[test]
+    fn module_adapters_share_one_target_set_per_round() {
+        ROUND_PROBE_CHANGED.store(false, Ordering::SeqCst);
+        ROUND_PROBE_A_RUNS.store(0, Ordering::SeqCst);
+        ROUND_PROBE_B_RUNS.store(0, Ordering::SeqCst);
+
+        let pipeline = Pipeline::parse(
+            r#"
+            [[stage]]
+            name = "module-round-targets"
+            scope = "module"
+            passes = ["module(gvn)"]
+            repeat_until = "no_change"
+            "#,
+        )
+        .expect("test pipeline parses");
+        let stage = &pipeline.stages[0];
+        let mut ctx = Context::new();
+        for i in 0..4 {
+            FunctionBody::make_at_addr(&mut ctx, 0x1000 + i * 0x10, None);
+        }
+        let env = PipelineEnv::headless(&ctx);
+        let passes: Vec<Box<dyn DynPass>> = vec![
+            Box::new(ModuleFnAdapter {
+                inner: Box::new(FunctionPassAdapter::<RoundProbeA>::default()),
+            }),
+            Box::new(ModuleFnAdapter {
+                inner: Box::new(FunctionPassAdapter::<RoundProbeB>::default()),
+            }),
+        ];
+        let stage_name = std::sync::Arc::from(stage.name.as_str());
+
         assert!(
-            fun_ids
-                .iter()
-                .all(|&f| cache.is_clean(f, ModuleAdapterParallelProbe::NAME))
+            run_module_stage_incremental(
+                &mut ctx,
+                &env,
+                stage,
+                &passes,
+                &stage_name,
+                1,
+                &mut |_| {},
+            )
+            .expect("incremental module stage runs")
         );
+
+        // Both passes see all four functions in round one. Probe A dirties one,
+        // so both passes see exactly that one function in round two.
+        assert_eq!(ROUND_PROBE_A_RUNS.load(Ordering::SeqCst), 5);
+        assert_eq!(ROUND_PROBE_B_RUNS.load(Ordering::SeqCst), 5);
     }
 
     struct ChainedLifter {

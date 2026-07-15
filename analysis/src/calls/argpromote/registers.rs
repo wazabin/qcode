@@ -273,7 +273,12 @@ pub(crate) fn scan_register_effects(
 /// Functionalize every eligible function's register effects (see
 /// [`try_promote_registers`]). Returns `true` if anything changed.
 pub fn argpromote_registers(ctx: &mut Context) -> bool {
-    let mut changed = false;
+    !argpromote_registers_changed_functions(ctx).is_empty()
+}
+
+fn argpromote_registers_changed_functions(ctx: &mut Context) -> FxHashSet<FunctionId> {
+    let mut changed = FxHashSet::default();
+    let graph = crate::CallGraph::analyze(ctx);
     // Gate every function on the two whole-program predicates via sets built once
     // instead of a per-function rescan: address-taken (stable — promotion adds no
     // `ValueId::Function` operands) and has-a-direct-caller (stable — promotion
@@ -283,7 +288,8 @@ pub fn argpromote_registers(ctx: &mut Context) -> bool {
     let called = super::called_function_set(ctx);
     for fid in ctx.function_ids() {
         if try_promote_registers(ctx, &address_taken, &called, fid) {
-            changed = true;
+            changed.insert(fid);
+            changed.extend(graph.callers(fid));
         }
     }
     changed
@@ -415,8 +421,14 @@ impl Pass for ArgPromoteRegisters {
     fn description(&self) -> &'static str {
         "Functionalize register side effects into a returned write-set (runs early)"
     }
-    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
-        Ok(argpromote_registers(ctx))
+    fn run(
+        &self,
+        ctx: &mut Context,
+        _env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        Ok(crate::ModulePassOutcome::functions(
+            argpromote_registers_changed_functions(ctx),
+        ))
     }
 }
 

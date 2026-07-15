@@ -34,6 +34,7 @@ use qcode::{
     space::Space,
     value::{FunctionBody, FunctionId, RegisterId, Renameable, VarnodeId},
 };
+use rustc_hash::FxHashSet;
 
 use super::{ArchConfig, CallingConvention, ContextSplit, ContextView, Outcome};
 use crate::structure::Program;
@@ -482,27 +483,70 @@ pub(super) fn replay_rename<'str>(
     Ok(changed)
 }
 
-/// A whole-program pass (an interprocedural milestone). `run` returns `Ok(true)`
-/// if it changed anything; the only milestones today report `Ok(false)`. Like
-/// [`FunctionPass`], its [`NAME`] is the single source of truth for the pipeline
-/// name.
+/// Mutations produced by a whole-program pass. `changed_functions` must include
+/// every affected function and seeds the next module-fixpoint round's shared
+/// function worklist. A pass that changes shared state, or cannot name a safe
+/// function superset, sets `module_changed` to conservatively target the module.
+#[derive(Debug, Default)]
+pub struct ModulePassOutcome {
+    pub changed_functions: FxHashSet<FunctionId>,
+    pub module_changed: bool,
+}
+
+impl ModulePassOutcome {
+    pub fn changed(&self) -> bool {
+        self.module_changed || !self.changed_functions.is_empty()
+    }
+
+    pub fn function(function: FunctionId) -> Self {
+        Self {
+            changed_functions: [function].into_iter().collect(),
+            module_changed: false,
+        }
+    }
+
+    pub fn functions(functions: impl IntoIterator<Item = FunctionId>) -> Self {
+        Self {
+            changed_functions: functions.into_iter().collect(),
+            module_changed: false,
+        }
+    }
+
+    pub fn module() -> Self {
+        Self {
+            changed_functions: FxHashSet::default(),
+            module_changed: true,
+        }
+    }
+
+    pub fn module_if(changed: bool) -> Self {
+        if changed {
+            Self::module()
+        } else {
+            Self::default()
+        }
+    }
+}
+
+/// A whole-program pass (an interprocedural milestone). Like [`FunctionPass`],
+/// its [`NAME`] is the single source of truth for the pipeline name.
 ///
 /// [`NAME`]: Pass::NAME
 pub trait Pass: Default {
     const NAME: &'static str;
     fn description(&self) -> &'static str;
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String>;
+    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<ModulePassOutcome, String>;
 }
 
 /// Object-safe dispatch shim for [`Pass`], mirroring [`DynFunctionPass`].
 pub trait DynPass {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String>;
+    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<ModulePassOutcome, String>;
     /// If this module pass is a `module(<fn_pass>)` adapter, the wrapped
-    /// per-function pass; `None` for a genuine whole-program pass. A dirty-tracking
-    /// module-stage runner uses this to drive the adapter function-by-function and
-    /// skip functions already at the pass's fixpoint. Running the inner pass
+    /// per-function pass; `None` for a genuine whole-program pass. An incremental
+    /// module-stage runner uses this to drive every adapter over the round's shared
+    /// target-function set. Running the inner pass
     /// directly is equivalent to [`DynPass::run`] (which loops it over all
     /// functions), so callers may always fall back to `run`.
     fn as_module_fn(&self) -> Option<&dyn DynFunctionPass> {
@@ -517,7 +561,7 @@ impl<T: Pass> DynPass for T {
     fn description(&self) -> &'static str {
         Pass::description(self)
     }
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
+    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<ModulePassOutcome, String> {
         Pass::run(self, ctx, env)
     }
 }
@@ -620,8 +664,8 @@ fn module_adapter_inner(name: &str) -> Option<&str> {
 /// threaded — without minting a bespoke module pass per function pass. The
 /// `module(...)` spelling keeps it visible in the TOML that the underlying pass is
 /// a function pass being run program-wide.
-struct ModuleFnAdapter {
-    inner: Box<dyn DynFunctionPass>,
+pub(super) struct ModuleFnAdapter {
+    pub(super) inner: Box<dyn DynFunctionPass>,
 }
 
 impl DynPass for ModuleFnAdapter {
@@ -631,7 +675,7 @@ impl DynPass for ModuleFnAdapter {
     fn description(&self) -> &'static str {
         self.inner.description()
     }
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
+    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<ModulePassOutcome, String> {
         super::config::run_standalone_module_fn(ctx, env, self.inner.as_ref())
     }
     fn as_module_fn(&self) -> Option<&dyn DynFunctionPass> {

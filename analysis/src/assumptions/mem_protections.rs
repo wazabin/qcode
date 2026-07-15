@@ -31,9 +31,13 @@ impl Pass for MemoryProtections {
     fn description(&self) -> &'static str {
         "Establish the binary's real memory protections (narrow the lifter's default r/x)"
     }
-    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
+    fn run(
+        &self,
+        ctx: &mut Context,
+        _env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
         establish_memory_protections(ctx);
-        Ok(false)
+        Ok(crate::ModulePassOutcome::module())
     }
 }
 

@@ -68,10 +68,15 @@ const MAX_INLINE_INSNS: usize = 10;
 /// callers. Returns `true` if anything changed. Removal of the now-dead returned
 /// fields is left to [`dead_signature`](super::dead_signature).
 pub fn partial_inline(ctx: &mut Context) -> bool {
-    let mut changed = false;
+    !partial_inline_changed_functions(ctx).is_empty()
+}
+
+fn partial_inline_changed_functions(ctx: &mut Context) -> rustc_hash::FxHashSet<FunctionId> {
+    let mut changed = rustc_hash::FxHashSet::default();
+    let graph = crate::CallGraph::analyze(ctx);
     for fid in ctx.function_ids() {
         if FunctionBody::from_id(ctx, fid).is_pure_reg() && try_partial_inline(ctx, fid) {
-            changed = true;
+            changed.extend(graph.callers(fid));
         }
     }
     changed
@@ -359,8 +364,14 @@ impl Pass for PartialInline {
     fn description(&self) -> &'static str {
         "Recompute a functionalized function's cheap outputs at its callers"
     }
-    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
-        Ok(partial_inline(ctx))
+    fn run(
+        &self,
+        ctx: &mut Context,
+        _env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        Ok(crate::ModulePassOutcome::functions(
+            partial_inline_changed_functions(ctx),
+        ))
     }
 }
 

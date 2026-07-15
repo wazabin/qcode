@@ -46,7 +46,7 @@ pub(crate) fn install_minted_for_test<'str>(
 pub(crate) use pass::with_body_mut;
 pub use pass::{
     DecompilePass, DynDecompilePass, DynFunctionPass, DynPass, FunctionPass, FunctionPassAdapter,
-    Pass, PassRegistration,
+    ModulePassOutcome, Pass, PassRegistration,
     PipelineEnv, RegisteredPass, known_pass_names, make_pass,
 };
 

@@ -161,7 +161,10 @@ fn plan_args(
 
 /// Append the resolved `Call.args` at every direct caller of each external
 /// function with a known prototype. Returns `true` if any call was changed.
-pub fn argpromote_external(ctx: &mut Context, env: &PipelineEnv) -> bool {
+fn argpromote_external_changed_functions(
+    ctx: &mut Context,
+    env: &PipelineEnv,
+) -> rustc_hash::FxHashSet<FunctionId> {
     let platform = match env.cfg.os {
         qcode::context::TargetOs::Windows => Platform::Windows,
         _ => Platform::Linux,
@@ -170,7 +173,7 @@ pub fn argpromote_external(ctx: &mut Context, env: &PipelineEnv) -> bool {
     let ptr_width = (env.cfg.bitness / 8).max(1) as usize;
     let stack_only = env.cfg.bitness == 32;
     let Some(sp) = env.sp_varnode else {
-        return false;
+        return rustc_hash::FxHashSet::default();
     };
     let sp_space = Varnode::from_id(&*ctx, sp).space().id;
     let default_space = ctx.shared.default_space;
@@ -187,13 +190,17 @@ pub fn argpromote_external(ctx: &mut Context, env: &PipelineEnv) -> bool {
         .map(|f| f.id)
         .filter(|&id| !crate::calls::direct_call_sites(ctx, &graph, id).is_empty())
         .collect();
+    let callers: rustc_hash::FxHashMap<FunctionId, Vec<FunctionId>> = externals
+        .iter()
+        .map(|&fid| (fid, graph.callers(fid)))
+        .collect();
     drop(graph);
 
     if externals.is_empty() {
-        return false;
+        return rustc_hash::FxHashSet::default();
     }
 
-    let mut changed = false;
+    let mut changed = rustc_hash::FxHashSet::default();
     for fid in externals {
         let raw = FunctionBody::from_id(ctx, fid).name().to_string();
         let sym = raw.split('@').next().unwrap_or(&raw);
@@ -204,12 +211,12 @@ pub fn argpromote_external(ctx: &mut Context, env: &PipelineEnv) -> bool {
             continue;
         };
         if bind_external_args(ctx, fid, &plan, sp, sp_space, default_space, ptr_width) {
-            changed = true;
+            changed.extend(callers[&fid].iter().copied());
         }
         if let Some(ret) = return_slot(proto, &env.cfg.abi, ptr_width)
             && bind_external_return(ctx, fid, ret)
         {
-            changed = true;
+            changed.extend(callers[&fid].iter().copied());
         }
     }
     changed
@@ -343,8 +350,14 @@ impl Pass for ArgPromoteExternal {
     fn description(&self) -> &'static str {
         "Resolve call arguments to external functions from their C prototype"
     }
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
-        Ok(argpromote_external(ctx, env))
+    fn run(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        Ok(crate::ModulePassOutcome::functions(
+            argpromote_external_changed_functions(ctx, env),
+        ))
     }
 }
 

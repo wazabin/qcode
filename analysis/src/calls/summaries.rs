@@ -835,9 +835,18 @@ impl Pass for SeedClobbers {
     fn description(&self) -> &'static str {
         "Seed each function's call-clobbered-register set from the lifted IR"
     }
-    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
+    fn run(
+        &self,
+        ctx: &mut Context,
+        _env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        let affected: Vec<FunctionId> = ctx
+            .functions()
+            .filter(|f| !f.is_external())
+            .map(|f| f.id)
+            .collect();
         set_all_call_clobbered_regs(ctx);
-        Ok(false)
+        Ok(crate::ModulePassOutcome::functions(affected))
     }
 }
 
@@ -851,12 +860,21 @@ impl Pass for Summaries {
     fn description(&self) -> &'static str {
         "Infer each function's input/clobber/saved summary and stack delta"
     }
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
+    fn run(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
         let Some(stack_ptr) = env.sp_varnode else {
-            return Ok(false);
+            return Ok(crate::ModulePassOutcome::default());
         };
+        let affected: Vec<FunctionId> = ctx
+            .functions()
+            .filter(|f| !f.is_external())
+            .map(|f| f.id)
+            .collect();
         set_all_function_summaries(ctx, stack_ptr);
-        Ok(false)
+        Ok(crate::ModulePassOutcome::functions(affected))
     }
 }
 

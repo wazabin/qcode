@@ -66,14 +66,20 @@ impl crate::Pass for EmulateMap {
         "Emulate maps and scans over fully-known arrays"
     }
 
-    fn run(&self, ctx: &mut Context, _env: &crate::PipelineEnv) -> Result<bool, String> {
+    fn run(
+        &self,
+        ctx: &mut Context,
+        _env: &crate::PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
         let snapshot = module_instruction_snapshot(ctx);
-        let mut changed = false;
+        let mut changed = rustc_hash::FxHashSet::default();
         for insn_id in snapshot {
             let ic = module_insn(ctx, insn_id);
-            changed |= self.rewrite(ctx, &ic);
+            if self.rewrite(ctx, &ic) {
+                changed.insert(insn_id.func);
+            }
         }
-        Ok(changed)
+        Ok(crate::ModulePassOutcome::functions(changed))
     }
 }
 

@@ -182,9 +182,18 @@ impl Pass for SeedWrittenSpaces {
     fn description(&self) -> &'static str {
         "Infer each function's transitive memory-write space set (for the GVN forwarding call-prune)"
     }
-    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
+    fn run(
+        &self,
+        ctx: &mut Context,
+        _env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        let affected: Vec<FunctionId> = ctx
+            .functions()
+            .filter(|f| !f.is_external())
+            .map(|f| f.id)
+            .collect();
         set_all_written_spaces(ctx);
-        Ok(false)
+        Ok(crate::ModulePassOutcome::functions(affected))
     }
 }
 

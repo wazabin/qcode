@@ -60,14 +60,20 @@ impl crate::Pass for ArrayProject {
         "Project array lanes and freshly-packed tuple fields"
     }
 
-    fn run(&self, ctx: &mut Context, _env: &crate::PipelineEnv) -> Result<bool, String> {
+    fn run(
+        &self,
+        ctx: &mut Context,
+        _env: &crate::PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
         let snapshot = module_instruction_snapshot(ctx);
-        let mut changed = false;
+        let mut changed = rustc_hash::FxHashSet::default();
         for insn_id in snapshot {
             let ic = module_insn(ctx, insn_id);
-            changed |= self.rewrite(ctx, &ic);
+            if self.rewrite(ctx, &ic) {
+                changed.insert(insn_id.func);
+            }
         }
-        Ok(changed)
+        Ok(crate::ModulePassOutcome::functions(changed))
     }
 }
 
@@ -334,7 +340,10 @@ mod tests {
 
     fn run_array_project(tc: &mut TestContext) {
         let env = crate::PipelineEnv::headless(&tc.ctx);
-        while crate::Pass::run(&super::ArrayProject, &mut tc.ctx, &env).unwrap() {}
+        while crate::Pass::run(&super::ArrayProject, &mut tc.ctx, &env)
+            .unwrap()
+            .changed()
+        {}
     }
 
     /// `body(elem: i8) -> elem + 1`, marked pure. A unary map body.

@@ -94,8 +94,12 @@ impl Pass for DiscoverAddressesInBinary {
     fn description(&self) -> &'static str {
         "Seed the binary's entry points as discovered functions for the lifter"
     }
-    fn run(&self, _ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
-        Ok(false)
+    fn run(
+        &self,
+        _ctx: &mut Context,
+        _env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        Ok(crate::ModulePassOutcome::default())
     }
 }
 
@@ -109,8 +113,12 @@ impl Pass for LiftNewAddresses {
     fn description(&self) -> &'static str {
         "Lift pending discovered addresses into the raw clean IR"
     }
-    fn run(&self, _ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
-        Ok(false)
+    fn run(
+        &self,
+        _ctx: &mut Context,
+        _env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        Ok(crate::ModulePassOutcome::default())
     }
 }
 

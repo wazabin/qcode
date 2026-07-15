@@ -29,10 +29,22 @@ impl Pass for ExternalSigs {
         "Give known external (libc) functions signatures from their C prototypes"
     }
 
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
+    fn run(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        if !abi_is_known(&env.cfg.abi) {
+            return Ok(crate::ModulePassOutcome::default());
+        }
+        let affected: Vec<FunctionId> = ctx
+            .functions()
+            .filter(|f| f.is_external())
+            .map(|f| f.id)
+            .collect();
         let target = abi_target(ctx, env);
         apply_all_external_signatures(ctx, &env.cfg.abi, target);
-        Ok(false)
+        Ok(crate::ModulePassOutcome::functions(affected))
     }
 }
 

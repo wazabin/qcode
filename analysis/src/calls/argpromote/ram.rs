@@ -86,7 +86,14 @@ pub fn argpromote(ctx: &mut Context) -> bool {
 /// frame locals are destroyed at return, so the caller can never observe writes to
 /// them (they are dead on exit). The redirected shadow store is left to DCE.
 pub fn argpromote_with_sp(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> bool {
-    let mut changed = false;
+    !argpromote_changed_functions_with_sp(ctx, sp_reg).is_empty()
+}
+
+fn argpromote_changed_functions_with_sp(
+    ctx: &mut Context,
+    sp_reg: Option<VarnodeId>,
+) -> FxHashSet<FunctionId> {
+    let mut changed = FxHashSet::default();
     // Both channels gate every function on being address-taken; build that set once
     // (O(instructions)) instead of rescanning the whole program per function. It
     // stays valid across the loop: promotion threads only data values, never adding
@@ -96,16 +103,19 @@ pub fn argpromote_with_sp(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> bool 
     // callee (see [`function_makes_blocking_call`]), and that callee must already
     // be promoted — its own loads gone — for the caller to qualify. One visit per
     // function (no fixpoint), so an already-promoted body is never re-promoted.
-    let order = callee_first_order(ctx, &crate::CallGraph::analyze(ctx));
+    let graph = crate::CallGraph::analyze(ctx);
+    let order = callee_first_order(ctx, &graph);
     for fid in order {
         // Lift constant-address (global) accesses into params first, so the freshly
         // param-relative derefs are visible to `try_promote`'s footprint scan in the
         // same visit.
         if super::globals::globalize_constants(ctx, &address_taken, fid) {
-            changed = true;
+            changed.insert(fid);
+            changed.extend(graph.callers(fid));
         }
         if try_promote(ctx, fid, sp_reg, &address_taken) {
-            changed = true;
+            changed.insert(fid);
+            changed.extend(graph.callers(fid));
         }
     }
     changed
@@ -1132,9 +1142,15 @@ impl Pass for ArgPromote {
     fn description(&self) -> &'static str {
         "Promote by-reference in/out pointer parameters to by-value"
     }
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
+    fn run(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
         let sp_reg = ctx.shared.registers.get(&env.cfg.stack_pointer).copied();
-        Ok(argpromote_with_sp(ctx, sp_reg))
+        Ok(crate::ModulePassOutcome::functions(
+            argpromote_changed_functions_with_sp(ctx, sp_reg),
+        ))
     }
 }
 

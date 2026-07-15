@@ -126,12 +126,16 @@ impl Pass for WindowsTebSeed {
         "Type the FS_OFFSET register as PtrTo<TEB> on Windows x86"
     }
 
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
+    fn run(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
         if env.cfg.os != TargetOs::Windows || env.cfg.bitness != 32 {
-            return Ok(false);
+            return Ok(crate::ModulePassOutcome::default());
         }
         let Some(fs) = register_varnode(ctx, "FS_OFFSET") else {
-            return Ok(false);
+            return Ok(crate::ModulePassOutcome::default());
         };
         // The override is global; if it's already a pointer, nothing to do.
         if ctx
@@ -139,9 +143,11 @@ impl Pass for WindowsTebSeed {
             .and_then(|t| ctx.shared.types.pointee_of(t))
             .is_some()
         {
-            return Ok(false);
+            return Ok(crate::ModulePassOutcome::default());
         }
-        Ok(seed_teb_register(ctx, fs, 32))
+        Ok(crate::ModulePassOutcome::module_if(seed_teb_register(
+            ctx, fs, 32,
+        )))
     }
 }
 
@@ -278,6 +284,7 @@ mod tests {
             !WindowsTebSeed
                 .run(&mut ctx, &env_for(TargetOs::Linux, 64))
                 .unwrap()
+                .changed()
         );
         let t = ctx.type_of(ValueId::Varnode(fs));
         assert!(ctx.shared.types.pointee_of(t).is_none());
@@ -287,6 +294,7 @@ mod tests {
             WindowsTebSeed
                 .run(&mut ctx, &env_for(TargetOs::Windows, 32))
                 .unwrap()
+                .changed()
         );
         let t = ctx.type_of(ValueId::Varnode(fs));
         assert!(ctx.shared.types.pointee_of(t).is_some());
@@ -294,6 +302,7 @@ mod tests {
             !WindowsTebSeed
                 .run(&mut ctx, &env_for(TargetOs::Windows, 32))
                 .unwrap()
+                .changed()
         );
     }
 }

@@ -81,29 +81,38 @@ fn eligible(
 /// *Make* pass — assume [`Proposition::ArgsDisjointFromCallerFrame`] for every
 /// eligible function. Returns how many were assumed this round.
 pub fn assume_args_disjoint_caller_frame(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> usize {
+    assume_args_disjoint_caller_frame_changed_functions(ctx, sp_reg).len()
+}
+
+fn assume_args_disjoint_caller_frame_changed_functions(
+    ctx: &mut Context,
+    sp_reg: Option<VarnodeId>,
+) -> rustc_hash::FxHashSet<FunctionId> {
     let _scope = pass_scope::enter("assume_args_disjoint_caller_frame");
     let Some(sp_reg) = sp_reg else {
-        return 0;
+        return rustc_hash::FxHashSet::default();
     };
     let taken = address_taken_set(ctx);
     let fids: Vec<FunctionId> = ctx.function_ids();
-    let mut count = 0;
+    let mut changed = rustc_hash::FxHashSet::default();
     for fid in fids {
         if eligible(ctx, fid, sp_reg, &taken) {
-            if ctx.assume_true(Proposition::ArgsDisjointFromCallerFrame(fid)) {
-                count += 1;
-            }
+            let first = ctx.assume_true(Proposition::ArgsDisjointFromCallerFrame(fid));
             // Same eligibility and consumer (the memory-forwarding alias rule), so
             // record the loaded-pointer-vs-slot assumption here too — it unblocks
             // forwarding the spilled buffer-pointer reload argpromote depends on.
-            ctx.assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
+            let second = ctx.assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
+            if first || second {
+                changed.insert(fid);
+            }
         }
     }
     qcode::pass_log!(
         debug,
-        "assumed ArgsDisjointFromCallerFrame for {count} functions"
+        "assumed caller-frame facts for {} functions",
+        changed.len()
     );
-    count
+    changed
 }
 
 /// *Verify* pass — prove every assumed `ArgsDisjointFromCallerFrame` true or
@@ -317,9 +326,14 @@ impl Pass for AssumeArgFrame {
     fn description(&self) -> &'static str {
         "Assume each function's incoming pointer args are disjoint from its caller-frame slots"
     }
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
-        assume_args_disjoint_caller_frame(ctx, env.sp_varnode);
-        Ok(false)
+    fn run(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        Ok(crate::ModulePassOutcome::functions(
+            assume_args_disjoint_caller_frame_changed_functions(ctx, env.sp_varnode),
+        ))
     }
 }
 

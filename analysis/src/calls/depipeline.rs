@@ -298,9 +298,14 @@ fn apply(ctx: &mut Context, fid: FunctionId, p: &Pipelined) {
 
 /// De-pipeline every pipelined-carry loop across all functions. Returns whether
 /// anything changed.
+#[cfg(test)]
 pub(crate) fn depipeline(ctx: &mut Context) -> bool {
+    !depipeline_changed_functions(ctx).is_empty()
+}
+
+fn depipeline_changed_functions(ctx: &mut Context) -> rustc_hash::FxHashSet<FunctionId> {
     let fids: Vec<FunctionId> = ctx.function_ids();
-    let mut changed = false;
+    let mut changed = rustc_hash::FxHashSet::default();
     for fid in fids {
         let Some(root) = FunctionBody::from_id(ctx, fid).root().map(|b| b.id) else {
             continue;
@@ -310,7 +315,7 @@ pub(crate) fn depipeline(ctx: &mut Context) -> bool {
         let dom = compute_dominators(&qcode::value::FunctionBody::from_id(ctx, fid), root);
         while let Some(p) = find_pipelined(ctx, fid, &dom) {
             apply(ctx, fid, &p);
-            changed = true;
+            changed.insert(fid);
         }
     }
     changed
@@ -324,8 +329,14 @@ impl Pass for Depipeline {
     fn description(&self) -> &'static str {
         "Remove a pipelined loop-carried delay register (assumes disjoint buffers)"
     }
-    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
-        Ok(depipeline(ctx))
+    fn run(
+        &self,
+        ctx: &mut Context,
+        _env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        Ok(crate::ModulePassOutcome::functions(
+            depipeline_changed_functions(ctx),
+        ))
     }
 }
 

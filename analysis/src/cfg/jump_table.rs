@@ -93,7 +93,11 @@ impl Pass for HandleJumpTables {
     /// blocks into their owning functions — so it is a whole-program module pass,
     /// not a per-function one. Drive the per-function body over every non-external,
     /// non-ignored function, matching a `scope = "function"` stage's eligibility.
-    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
+    fn run(
+        &self,
+        ctx: &mut Context,
+        _env: &PipelineEnv,
+    ) -> Result<crate::ModulePassOutcome, String> {
         let fun_ids: Vec<FunctionId> = ctx
             .functions()
             .filter(|f| !f.is_external())
@@ -101,11 +105,16 @@ impl Pass for HandleJumpTables {
             .map(|f| f.id)
             .collect();
         let mut addresses = AddressIndex::analyze(ctx);
-        let mut changed = false;
+        let mut changed = rustc_hash::FxHashSet::default();
         for fun_id in fun_ids {
-            changed |= Self::resolve_function_indexed(ctx, &mut addresses, fun_id)?;
+            if Self::resolve_function_indexed(ctx, &mut addresses, fun_id)? {
+                changed.insert(fun_id);
+            }
         }
-        Ok(changed)
+        Ok(crate::ModulePassOutcome {
+            module_changed: !changed.is_empty(),
+            changed_functions: changed,
+        })
     }
 }
 
