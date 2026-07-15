@@ -632,19 +632,7 @@ impl DynPass for ModuleFnAdapter {
         self.inner.description()
     }
     fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
-        let fun_ids: Vec<FunctionId> = ctx
-            .functions()
-            .filter(|f| !f.is_external())
-            // Honor `--ignore`: a function-pass run module-wide must still skip
-            // functions the user marked ignored.
-            .filter(|f| !ctx.is_function_ignored(f.address()))
-            .map(|f| f.id)
-            .collect();
-        let mut changed = false;
-        for fun_id in fun_ids {
-            changed |= self.inner.run(ctx, fun_id, env)?;
-        }
-        Ok(changed)
+        super::config::run_standalone_module_fn(ctx, env, self.inner.as_ref())
     }
     fn as_module_fn(&self) -> Option<&dyn DynFunctionPass> {
         Some(&*self.inner)

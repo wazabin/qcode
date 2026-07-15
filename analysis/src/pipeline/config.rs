@@ -765,13 +765,11 @@ async fn run_module_stage(
     dump_stage_inputs(ctx, &stage.dump, &stage.name);
     let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
 
-    // A `repeat_until` module stage that contains `module(<fn_pass>)` adapters
-    // (currently only `mark-pure`) re-runs each wrapped per-function pass over the
-    // *whole* program every fixpoint iteration, though each iteration typically
-    // changes only a handful of functions. Drive it incrementally instead: skip a
-    // function an adapter has already settled, invalidating it (and its callers)
-    // only when its body or a callee's purity changes.
-    if stage.repeat_until.is_some() && passes.iter().any(|p| p.as_module_fn().is_some()) {
+    // Module stages containing `module(<fn_pass>)` adapters use the incremental
+    // driver even without `repeat_until`: it owns the disjoint-body parallel
+    // adapter runner. Repeated stages additionally retain its settled-function
+    // cache and caller invalidation across fixpoint iterations.
+    if passes.iter().any(|p| p.as_module_fn().is_some()) {
         return run_module_stage_incremental(ctx, env, stage, passes, &stage_name, round, progress);
     }
 
@@ -879,8 +877,9 @@ fn invalidate_callers(graph: &crate::CallGraph, cache: &mut FixpointCache, fun_i
     }
 }
 
-/// Incremental driver for a `repeat_until` module stage carrying `module(<fn_pass>)`
-/// adapters (see [`run_module_stage`]).
+/// Driver for a module stage carrying `module(<fn_pass>)` adapters (see
+/// [`run_module_stage`]). A non-repeating stage executes one parallel adapter
+/// batch; `repeat_until` stages retain the incremental cache across batches.
 ///
 /// Correctness rests on tracking, per `(function, pass)`, whether the adapter has
 /// reached a fixpoint on that function and the function is unchanged since
@@ -923,34 +922,36 @@ fn run_module_stage_incremental(
             let started = std::time::Instant::now();
 
             let pass_changed = if let Some(inner) = p.as_module_fn() {
-                // Per-function adapter: run only functions not already settled for
-                // this pass; a change dirties the function (all passes' marks) and
-                // its callers, a no-change settles it.
+                // Run unsettled functions through the same disjoint-body engine as
+                // ordinary function stages. Publish buffered effects first, then
+                // invalidate callers at a deterministic batch barrier. An
+                // invalidated caller runs on the next module-fixpoint iteration;
+                // any changed callee keeps that outer iteration alive.
                 let fun_ids: Vec<FunctionId> = ctx
                     .functions()
                     .filter(|f| !f.is_external())
                     .filter(|f| !ctx.is_function_ignored(f.address()))
                     .map(|f| f.id)
+                    .filter(|f| !cache.is_clean(*f, p.name()))
                     .collect();
-                let mut any = false;
-                for fun_id in fun_ids {
-                    if cache.is_clean(fun_id, p.name()) {
-                        continue;
-                    }
-                    if inner.run(ctx, fun_id, env)? {
-                        cache.mark_dirty(fun_id);
-                        // `inner` may have introduced a new incoming edge to a
-                        // function processed later in this pass. Rebuild after
-                        // every changing adapter rather than updating a hidden
-                        // graph incrementally.
-                        let graph = crate::CallGraph::analyze(ctx);
+                let changed_functions = run_module_fn_adapter(
+                    ctx,
+                    env,
+                    stage,
+                    inner,
+                    &fun_ids,
+                    round,
+                    &mut cache,
+                    resolve_threads(),
+                    progress,
+                )?;
+                if !changed_functions.is_empty() {
+                    let graph = crate::CallGraph::analyze(ctx);
+                    for fun_id in changed_functions.iter().copied() {
                         invalidate_callers(&graph, &mut cache, fun_id);
-                        any = true;
-                    } else {
-                        cache.mark_clean(fun_id, p.name());
                     }
                 }
-                any
+                !changed_functions.is_empty()
             } else {
                 // Genuine whole-program pass. Only *settled* (clean) functions risk
                 // being wrongly skipped later, and any already-dirty function it
@@ -1011,7 +1012,7 @@ fn run_module_stage_incremental(
         }
         stage_changed |= changed;
         iters += 1;
-        if !changed {
+        if stage.repeat_until.is_none() || !changed {
             return Ok(stage_changed);
         }
         if iters >= MAX_FIXPOINT_ITERS {
@@ -1024,6 +1025,67 @@ fn run_module_stage_incremental(
             return Err(nonconvergence_error(&stage.name, None));
         }
     }
+}
+
+/// Run one `module(<function-pass>)` adapter through the shared function-stage
+/// execution engine. The pass runs once per function in this module iteration;
+/// the containing module stage owns repetition and caller invalidation.
+#[allow(clippy::too_many_arguments)]
+fn run_module_fn_adapter(
+    ctx: &mut Context,
+    env: &PipelineEnv,
+    stage: &Stage,
+    pass: &dyn DynFunctionPass,
+    fun_ids: &[FunctionId],
+    round: usize,
+    cache: &mut FixpointCache,
+    threads: usize,
+    progress: &mut impl FnMut(PipelineProgress),
+) -> Result<HashSet<FunctionId>, String> {
+    let passes = [pass];
+    run_function_worklist(
+        ctx, env, stage, &passes, fun_ids, cache, round, threads, false, progress,
+    )
+}
+
+/// Standalone [`DynPass::run`](super::pass::DynPass::run) bridge for a
+/// `module(<function-pass>)` adapter. Normal pipeline execution reaches the same
+/// worklist engine through [`run_module_stage_incremental`]; keeping this bridge
+/// here prevents the adapter's object-safe fallback from growing a second serial
+/// execution implementation.
+pub(super) fn run_standalone_module_fn(
+    ctx: &mut Context,
+    env: &PipelineEnv,
+    pass: &dyn DynFunctionPass,
+) -> Result<bool, String> {
+    let stage = Stage {
+        name: format!("module({})", pass.name()),
+        passes: StagePasses::Function(Vec::new()),
+        repeat_until: None,
+        include_external: false,
+        only_dirty: false,
+        dump: Vec::new(),
+    };
+    let fun_ids: Vec<_> = ctx
+        .functions()
+        .filter(|f| !f.is_external())
+        .filter(|f| !ctx.is_function_ignored(f.address()))
+        .map(|f| f.id)
+        .collect();
+    let mut cache = FixpointCache::default();
+    let changed = run_function_worklist(
+        ctx,
+        env,
+        &stage,
+        &[pass],
+        &fun_ids,
+        &mut cache,
+        0,
+        resolve_threads(),
+        false,
+        &mut |_| {},
+    )?;
+    Ok(!changed.is_empty())
 }
 
 /// Run a clean-IR whole-program stage during recursive lifting. Most passes are
@@ -1390,6 +1452,36 @@ fn run_function_stage_with_threads(
         .filter(|id| !stage.only_dirty || previous_dirty.is_none_or(|dirty| dirty.contains(id)))
         .filter(|id| restrict.is_none_or(|r| r.contains(id)))
         .collect();
+    let pass_refs: Vec<&dyn DynFunctionPass> = passes.iter().map(Box::as_ref).collect();
+    run_function_worklist(
+        ctx,
+        env,
+        stage,
+        &pass_refs,
+        &fun_ids,
+        cache,
+        round,
+        threads,
+        stage.repeat_until.is_some(),
+        progress,
+    )
+}
+
+/// Shared sequential/parallel executor for ordinary function stages and
+/// `module(<function-pass>)` adapters.
+#[allow(clippy::too_many_arguments)]
+fn run_function_worklist(
+    ctx: &mut Context,
+    env: &PipelineEnv,
+    stage: &Stage,
+    passes: &[&dyn DynFunctionPass],
+    fun_ids: &[FunctionId],
+    cache: &mut FixpointCache,
+    round: usize,
+    threads: usize,
+    repeat_until: bool,
+    progress: &mut impl FnMut(PipelineProgress),
+) -> Result<HashSet<FunctionId>, String> {
     let total = fun_ids.len();
     let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
 
@@ -1397,7 +1489,6 @@ fn run_function_stage_with_threads(
     // aggregated per pass over the whole stage rather than logged per call.
     let mut elapsed: HashMap<&'static str, (std::time::Duration, usize, usize)> =
         HashMap::default();
-
     let mut dirty = HashSet::default();
 
     // Every function pass is driven over a body borrowed in place from the bodies
@@ -1534,7 +1625,7 @@ fn run_function_stage_with_threads(
             env,
             stage,
             passes,
-            &fun_ids,
+            fun_ids,
             &stage_name,
             total,
             round,
@@ -1542,6 +1633,7 @@ fn run_function_stage_with_threads(
             &mut elapsed,
             &mut dirty,
             threads,
+            repeat_until,
             progress,
         )?;
         fun_ids.iter().copied().collect()
@@ -1571,7 +1663,7 @@ fn run_function_stage_with_threads(
                     &mut elapsed,
                     &stage.name,
                     &function,
-                    stage.repeat_until.is_some(),
+                    repeat_until,
                     |pass| {
                         progress(PipelineProgress::FunctionPass {
                             round,
@@ -1634,7 +1726,7 @@ fn run_function_stage_with_threads(
 /// preserved exactly as on the in-place path.
 #[allow(clippy::too_many_arguments)]
 fn run_one_function<'str>(
-    passes: &[Box<dyn DynFunctionPass>],
+    passes: &[&dyn DynFunctionPass],
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     cache: &mut FixpointCache,
@@ -1786,7 +1878,7 @@ fn run_stage_parallel(
     ctx: &mut Context,
     env: &PipelineEnv,
     stage: &Stage,
-    passes: &[Box<dyn DynFunctionPass>],
+    passes: &[&dyn DynFunctionPass],
     fun_ids: &[FunctionId],
     stage_name: &std::sync::Arc<str>,
     total: usize,
@@ -1795,6 +1887,7 @@ fn run_stage_parallel(
     elapsed: &mut HashMap<&'static str, (std::time::Duration, usize, usize)>,
     dirty: &mut HashSet<FunctionId>,
     threads: usize,
+    repeat_until: bool,
     progress: &mut impl FnMut(PipelineProgress),
 ) -> Result<(), String> {
     // 1. Snapshot per-function display names before the split borrow freezes the
@@ -1806,7 +1899,6 @@ fn run_stage_parallel(
     }
 
     let chunk_size = fun_ids.len().div_ceil(threads).max(1);
-    let repeat_until = stage.repeat_until.is_some();
     let stage_label = stage.name.clone();
 
     // 2-5. Under the split borrow: borrow every worklist body `&mut` in place
@@ -1950,6 +2042,83 @@ mod tests {
         discovery::Discovery,
         value::{BasicBlock, FunctionBody, FunctionKind},
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static MODULE_ADAPTER_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static MODULE_ADAPTER_MAX_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Default)]
+    struct ModuleAdapterParallelProbe;
+
+    impl FunctionPass for ModuleAdapterParallelProbe {
+        const NAME: &'static str = "module_adapter_parallel_probe";
+
+        fn description(&self) -> &'static str {
+            "Test pass that records concurrent module-adapter execution"
+        }
+
+        fn run<'str>(
+            &self,
+            _f: &mut FunctionBody<'str>,
+            _cx: ContextView<'_, 'str>,
+            _next_minted: &mut u32,
+        ) -> Result<Outcome<'str>, String> {
+            let active = MODULE_ADAPTER_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+            MODULE_ADAPTER_MAX_ACTIVE.fetch_max(active, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            MODULE_ADAPTER_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            Ok(Outcome::default())
+        }
+    }
+
+    #[test]
+    fn module_function_adapter_uses_shared_parallel_runner() {
+        MODULE_ADAPTER_ACTIVE.store(0, Ordering::SeqCst);
+        MODULE_ADAPTER_MAX_ACTIVE.store(0, Ordering::SeqCst);
+
+        let pipeline = Pipeline::parse(
+            r#"
+            [[stage]]
+            name = "module-adapter"
+            scope = "module"
+            passes = ["module(gvn)"]
+            "#,
+        )
+        .expect("test pipeline parses");
+        let stage = &pipeline.stages[0];
+        let mut ctx = Context::new();
+        for i in 0..8 {
+            FunctionBody::make_at_addr(&mut ctx, 0x1000 + i * 0x10, None);
+        }
+        let fun_ids = ctx.function_ids();
+        let env = PipelineEnv::headless(&ctx);
+        let pass = FunctionPassAdapter::<ModuleAdapterParallelProbe>::default();
+        let mut cache = FixpointCache::default();
+
+        let changed = run_module_fn_adapter(
+            &mut ctx,
+            &env,
+            stage,
+            &pass,
+            &fun_ids,
+            1,
+            &mut cache,
+            4,
+            &mut |_| {},
+        )
+        .expect("module adapter runs");
+
+        assert!(changed.is_empty());
+        assert!(
+            MODULE_ADAPTER_MAX_ACTIVE.load(Ordering::SeqCst) > 1,
+            "module adapter did not execute concurrently"
+        );
+        assert!(
+            fun_ids
+                .iter()
+                .all(|&f| cache.is_clean(f, ModuleAdapterParallelProbe::NAME))
+        );
+    }
 
     struct ChainedLifter {
         last: u64,
@@ -2138,10 +2307,11 @@ mod tests {
         >::default())];
         let mut cache = FixpointCache::default();
         let mut elapsed = HashMap::default();
+        let pass_refs: Vec<&dyn DynFunctionPass> = passes.iter().map(Box::as_ref).collect();
         let outcome = {
             let (bodies, view) = ctx.split(&env);
             run_one_function(
-                &passes,
+                &pass_refs,
                 &mut bodies[owner],
                 view,
                 &mut cache,
