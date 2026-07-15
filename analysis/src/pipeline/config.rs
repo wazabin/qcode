@@ -1040,6 +1040,13 @@ async fn run_lifting_module_stage(
 ) -> Result<bool, String> {
     dump_stage_inputs(ctx, &stage.dump, &stage.name);
     let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
+    // `lift_new_addresses` drains a finite discovery queue and may enqueue the
+    // directly reachable successors it just decoded.  Do not apply the generic
+    // optimization fixpoint cap to that queue drain: stopping every 100 batches
+    // forces the outer discovery driver to run expensive address analysis over
+    // partially lifted functions before continuing the already-known work.
+    // Other repeatable lifting-phase stages retain the non-convergence guard.
+    let drains_discoveries = passes.iter().any(|p| p.name() == "lift_new_addresses");
     let mut iters = 0;
     let mut stage_changed = false;
     loop {
@@ -1088,7 +1095,7 @@ async fn run_lifting_module_stage(
         if stage.repeat_until.is_none() || !changed {
             return Ok(stage_changed);
         }
-        if iters >= MAX_FIXPOINT_ITERS {
+        if !drains_discoveries && iters >= MAX_FIXPOINT_ITERS {
             return Err(nonconvergence_error(&stage.name, None));
         }
     }
@@ -1936,11 +1943,70 @@ fn run_stage_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::{LiftOutcome, Lifter};
     use crate::{FunctionPass, FunctionPassAdapter};
     use qcode::{
         context::Context,
+        discovery::Discovery,
         value::{BasicBlock, FunctionBody, FunctionKind},
     };
+
+    struct ChainedLifter {
+        last: u64,
+        lifted: usize,
+    }
+
+    impl Lifter for ChainedLifter {
+        fn seed_binary(&mut self, _ctx: &mut Context) -> Result<Vec<Discovery>, String> {
+            Ok(Vec::new())
+        }
+
+        fn ensure_function(&mut self, _ctx: &mut Context, _addr: u64) {}
+
+        fn lift_discovered(
+            &mut self,
+            _ctx: &mut Context,
+            discovery: Discovery,
+        ) -> Result<LiftOutcome, String> {
+            let key = discovery.key();
+            self.lifted += 1;
+            let successors = (discovery.target < self.last)
+                .then(|| Discovery::function(discovery.target + 1))
+                .into_iter()
+                .collect();
+            Ok(LiftOutcome::Lifted { key, successors })
+        }
+    }
+
+    #[test]
+    fn lifting_stage_drains_more_than_generic_fixpoint_cap() {
+        let pipeline = Pipeline::parse(
+            r#"
+            [[stage]]
+            name = "lift"
+            scope = "module"
+            passes = ["lift_new_addresses"]
+            repeat_until = "no_change"
+            "#,
+        )
+        .expect("test pipeline parses");
+        let mut ctx = Context::new();
+        assert!(ctx.discover(Discovery::function(0)));
+        let expected = MAX_FIXPOINT_ITERS + 2;
+        let mut lifter = ChainedLifter {
+            last: expected as u64 - 1,
+            lifted: 0,
+        };
+        let env = PipelineEnv::headless(&mut ctx);
+        let mut services = PipelineServices::with_lifter(&mut lifter);
+
+        pipeline
+            .run_lifting_phase(&mut ctx, &env, &mut services, 1, &mut |_| {})
+            .expect("lifting drains the complete discovery chain");
+
+        assert_eq!(lifter.lifted, expected);
+        assert!(ctx.has_no_discoveries());
+    }
 
     fn run_function_only_pipeline_with_threads(
         pipeline: &Pipeline,
