@@ -80,7 +80,6 @@ impl<'str> Minted<'str> {
 /// `rename` and installs `minted` at the post-run barrier in worklist order,
 /// exactly as it drained the wrapper before — the transport changes, the barrier
 /// semantics do not.
-#[derive(Default)]
 pub struct Outcome<'str> {
     /// Whether the pass changed the function's IR (the old `Ok(bool)`).
     pub changed: bool,
@@ -92,9 +91,27 @@ pub struct Outcome<'str> {
     /// the barrier. Concatenated across a function's pass fixpoint; entry `k`
     /// carries slot `k`, allocated by the driver's per-owner stage cursor.
     pub minted: Vec<Minted<'str>>,
+    /// Analyses preserved across the changing runs aggregated into this outcome.
+    pub(crate) preserved_analyses: super::PreservedAnalyses,
+}
+
+impl Default for Outcome<'_> {
+    fn default() -> Self {
+        Self {
+            changed: false,
+            rename: None,
+            minted: Vec::new(),
+            preserved_analyses: super::PreservedAnalyses::all(),
+        }
+    }
 }
 
 impl<'str> Outcome<'str> {
+    /// The analyses this particular invocation reported preserving.
+    pub fn preserved_analyses(&self) -> &super::PreservedAnalyses {
+        &self.preserved_analyses
+    }
+
     /// An unchanged outcome — no rename, no minted functions.
     pub fn unchanged() -> Self {
         Self::default()
@@ -104,9 +121,15 @@ impl<'str> Outcome<'str> {
     /// common case for the mechanical `Ok(bool)` → `Ok(Outcome::changed(bool))`
     /// sweep).
     pub fn changed(changed: bool) -> Self {
-        Self {
-            changed,
-            ..Self::default()
+        if changed {
+            Self {
+                changed: true,
+                rename: None,
+                minted: Vec::new(),
+                preserved_analyses: super::PreservedAnalyses::none(),
+            }
+        } else {
+            Self::default()
         }
     }
 
@@ -117,13 +140,72 @@ impl<'str> Outcome<'str> {
             changed: true,
             rename: Some(name),
             minted: Vec::new(),
+            preserved_analyses: super::PreservedAnalyses::none(),
         }
+    }
+
+    /// An outcome carrying detached functions produced by an outlining pass.
+    pub fn with_minted(changed: bool, minted: Vec<Minted<'str>>) -> Self {
+        let mut outcome = Self::changed(changed || !minted.is_empty());
+        outcome.minted = minted;
+        outcome
+    }
+
+    /// Report that this particular invocation preserved global analysis `A`.
+    /// This is intentionally outcome-level: a different path through the same
+    /// pass may report a different preservation set.
+    pub fn preserving_global<A: super::GlobalAnalysis>(mut self) -> Self {
+        self.preserved_analyses.preserve_global::<A>();
+        self
+    }
+
+    /// Report that this particular invocation preserved local analysis `A` for
+    /// the function being transformed.
+    pub fn preserving_local<A: super::LocalAnalysis>(mut self) -> Self {
+        self.preserved_analyses.preserve_local::<A>();
+        self
     }
 }
 
 impl<'str> From<bool> for Outcome<'str> {
     fn from(changed: bool) -> Self {
         Self::changed(changed)
+    }
+}
+
+#[cfg(test)]
+mod preservation_tests {
+    use super::*;
+    use crate::{AliasAnalysis, CallGraphAnalysis};
+
+    #[test]
+    fn unchanged_function_outcome_preserves_everything() {
+        let outcome = Outcome::changed(false);
+        assert!(
+            outcome
+                .preserved_analyses()
+                .preserves_global_analysis::<CallGraphAnalysis>()
+        );
+        assert!(
+            outcome
+                .preserved_analyses()
+                .preserves_local_analysis::<AliasAnalysis>()
+        );
+    }
+
+    #[test]
+    fn changed_function_outcome_invalidates_unreported_analyses() {
+        let outcome = Outcome::changed(true).preserving_global::<CallGraphAnalysis>();
+        assert!(
+            outcome
+                .preserved_analyses()
+                .preserves_global_analysis::<CallGraphAnalysis>()
+        );
+        assert!(
+            !outcome
+                .preserved_analyses()
+                .preserves_local_analysis::<AliasAnalysis>()
+        );
     }
 }
 

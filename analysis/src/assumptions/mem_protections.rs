@@ -35,9 +35,12 @@ impl Pass for MemoryProtections {
         &self,
         ctx: &mut Context,
         _env: &PipelineEnv,
+        _targets: &[qcode::value::FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         establish_memory_protections(ctx);
-        Ok(crate::ModulePassOutcome::module())
+        Ok(crate::ModulePassOutcome::module()
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_local::<crate::AliasAnalysis>())
     }
 }
 

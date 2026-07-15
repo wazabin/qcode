@@ -92,11 +92,7 @@ impl FunctionPass for LoopToRecursion {
     ) -> Result<Outcome<'str>, String> {
         let mut minted = Vec::new();
         let changed = loop_to_recursion(m, f, next_minted, &mut minted);
-        Ok(Outcome {
-            changed,
-            rename: None,
-            minted,
-        })
+        Ok(Outcome::with_minted(changed, minted))
     }
 }
 

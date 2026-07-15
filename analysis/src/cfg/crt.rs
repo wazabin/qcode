@@ -26,6 +26,7 @@ impl Pass for DiscoverLibcMain {
         &self,
         ctx: &mut Context,
         env: &PipelineEnv,
+        _targets: &[qcode::value::FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         Ok(crate::ModulePassOutcome::module_if(discover_libc_main(
             ctx, env,
@@ -153,7 +154,12 @@ mod tests {
         };
         let env = PipelineEnv::from_parts(cfg, tc.r3);
 
-        assert!(DiscoverLibcMain.run(&mut tc.ctx, &env).unwrap().changed());
+        assert!(
+            DiscoverLibcMain
+                .run(&mut tc.ctx, &env, &[])
+                .unwrap()
+                .changed()
+        );
         let discoveries = tc.ctx.discoveries().collect::<Vec<_>>();
         assert_eq!(discoveries.len(), 1);
         assert_eq!(discoveries[0].target, 0x2000);
@@ -192,7 +198,12 @@ mod tests {
         };
         let env = PipelineEnv::from_parts(cfg, tc.r3);
 
-        assert!(DiscoverLibcMain.run(&mut tc.ctx, &env).unwrap().changed());
+        assert!(
+            DiscoverLibcMain
+                .run(&mut tc.ctx, &env, &[])
+                .unwrap()
+                .changed()
+        );
 
         let entry_id = AddressIndex::analyze(&tc.ctx).function_at(0x1000).unwrap();
         // The synthetic edge is keyed by `main`'s address.
@@ -219,6 +230,11 @@ mod tests {
         );
 
         // Re-running is idempotent: the edge already exists, so nothing changes.
-        assert!(!DiscoverLibcMain.run(&mut tc.ctx, &env).unwrap().changed());
+        assert!(
+            !DiscoverLibcMain
+                .run(&mut tc.ctx, &env, &[])
+                .unwrap()
+                .changed()
+        );
     }
 }

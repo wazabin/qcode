@@ -79,6 +79,26 @@ pub struct AliasResult {
     pub(crate) frame: Option<FrameInfo>,
 }
 
+/// Pipeline marker for the standard frame-aware per-function alias oracle.
+pub struct AliasAnalysis;
+
+impl crate::LocalAnalysis for AliasAnalysis {
+    type Result = AliasResult;
+
+    fn analyze<'str>(
+        body: &qcode::value::FunctionBody<'str>,
+        cx: crate::ContextView<'_, 'str>,
+    ) -> Self::Result {
+        let function = body.id();
+        let shared = cx.shr();
+        let sp_reg = shared.registers.get(&cx.env().cfg.stack_pointer).copied();
+        cx.env()
+            .alias_base(shared)
+            .for_function(cx.body_view(body), function)
+            .with_frame_freshness(cx.body_view(body), function, sp_reg)
+    }
+}
+
 impl AliasResult {
     /// The alias equivalence-class of `a`, or `None` if `a` was not
     /// involved in any constraint during analysis.

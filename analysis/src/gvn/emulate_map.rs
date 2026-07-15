@@ -70,8 +70,13 @@ impl crate::Pass for EmulateMap {
         &self,
         ctx: &mut Context,
         _env: &crate::PipelineEnv,
+        targets: &[qcode::value::FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
-        let snapshot = module_instruction_snapshot(ctx);
+        let targets: rustc_hash::FxHashSet<_> = targets.iter().copied().collect();
+        let snapshot = module_instruction_snapshot(ctx)
+            .into_iter()
+            .filter(|id| targets.contains(&id.func))
+            .collect::<Vec<_>>();
         let mut changed = rustc_hash::FxHashSet::default();
         for insn_id in snapshot {
             let ic = module_insn(ctx, insn_id);
@@ -349,7 +354,8 @@ mod tests {
 
     fn run_emulate_map(tc: &mut TestContext) {
         let env = crate::PipelineEnv::headless(&tc.ctx);
-        crate::Pass::run(&super::EmulateMap, &mut tc.ctx, &env).unwrap();
+        let targets = tc.ctx.function_ids();
+        crate::Pass::run(&super::EmulateMap, &mut tc.ctx, &env, &targets).unwrap();
     }
 
     /// Terminate `entry` with `return value` (the builder only offers a bare

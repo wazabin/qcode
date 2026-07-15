@@ -36,9 +36,20 @@ use qcode::{
 };
 use rustc_hash::FxHashSet;
 
-use super::{ArchConfig, CallingConvention, ContextSplit, ContextView, Outcome};
+use super::{
+    AnalysisManager, ArchConfig, CallingConvention, ContextSplit, ContextView,
+    LocalAnalysisManager, Outcome, PreservedAnalyses,
+};
 use crate::structure::Program;
 use crate::RegisterBase;
+
+#[cfg(test)]
+fn call_graph_snapshot(ctx: &Context<'_>) -> Vec<crate::CallEdge> {
+    crate::CallGraph::analyze(ctx)
+        .edges()
+        .map(|(_, edge)| *edge)
+        .collect()
+}
 
 /// The architecture-specific inputs the register-aware passes need, resolved once
 /// per pipeline run and shared by reference with every pass.
@@ -134,6 +145,14 @@ pub trait DynFunctionPass: Send + Sync {
     fn run(&self, ctx: &mut Context, fun_id: FunctionId, env: &PipelineEnv)
     -> Result<bool, String>;
 
+    fn run_with_analyses(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        env: &PipelineEnv,
+        analyses: &mut AnalysisManager,
+    ) -> Result<bool, String>;
+
     /// Run the pass on a [`FunctionBody`] the driver has *already* borrowed from the
     /// bodies registry, so the driver owns the barrier. This is the surface the
     /// parallel driver (and the sequential fixpoint) use to run a pass on a body they
@@ -145,6 +164,7 @@ pub trait DynFunctionPass: Send + Sync {
         body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         next_minted: &mut u32,
+        analyses: &mut LocalAnalysisManager,
     ) -> Result<Outcome<'str>, String>;
 }
 
@@ -173,6 +193,18 @@ pub trait FunctionPass: Default {
         // Driver-owned placeholder cursor, reset once per owner at stage entry.
         next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String>;
+
+    /// Analysis-aware entry point. Existing passes use [`FunctionPass::run`];
+    /// consumers of cached local analyses override this method.
+    fn run_with_analyses<'str>(
+        &self,
+        f: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        next_minted: &mut u32,
+        _analyses: &mut LocalAnalysisManager,
+    ) -> Result<Outcome<'str>, String> {
+        self.run(f, cx, next_minted)
+    }
 }
 
 /// Adapts a [`FunctionPass`] to the object-safe [`DynFunctionPass`] the registry
@@ -212,8 +244,9 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
         body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         next_minted: &mut u32,
+        analyses: &mut LocalAnalysisManager,
     ) -> Result<Outcome<'str>, String> {
-        FunctionPass::run(&self.inner, body, cx, next_minted)
+        FunctionPass::run_with_analyses(&self.inner, body, cx, next_minted, analyses)
     }
     fn run(
         &self,
@@ -221,20 +254,52 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
         fun_id: FunctionId,
         env: &PipelineEnv,
     ) -> Result<bool, String> {
+        self.run_with_analyses(ctx, fun_id, env, &mut AnalysisManager::default())
+    }
+    fn run_with_analyses(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        env: &PipelineEnv,
+        analyses: &mut AnalysisManager,
+    ) -> Result<bool, String> {
+        #[cfg(test)]
+        let call_graph_before = call_graph_snapshot(ctx);
         // Split the context: borrow the target body `&mut` in place and run the
         // pass over the frozen module view; the view is bodies-free, so it cannot
         // alias the borrowed body.
         let outcome = {
             let (bodies, view) = ctx.split(env);
             let mut next_minted = 0;
-            self.run_checked(&mut bodies[fun_id], view, &mut next_minted)?
+            let mut local = analyses.take_local(fun_id);
+            let outcome =
+                self.run_checked(&mut bodies[fun_id], view, &mut next_minted, &mut local)?;
+            if outcome.changed || !outcome.minted.is_empty() {
+                local.invalidate(&outcome.preserved_analyses);
+            }
+            analyses.put_local(fun_id, local);
+            outcome
         };
         // Barrier, in the driver's order: install and resolve minted callees,
         // then apply the returned self-rename. The body was mutated in place.
+        let preserved = outcome.preserved_analyses.clone();
         let installed = install_minted(ctx, T::NAME, outcome.minted)?;
         let patched = resolve_minted_callees(ctx, T::NAME, fun_id, &installed)?;
         replay_rename(ctx, T::NAME, fun_id, outcome.rename)?;
-        Ok(outcome.changed || patched)
+        let changed = outcome.changed || patched;
+        if changed {
+            analyses.invalidate_globals(&preserved);
+        }
+        #[cfg(test)]
+        if preserved.preserves_global_analysis::<crate::CallGraphAnalysis>() {
+            assert_eq!(
+                call_graph_before,
+                call_graph_snapshot(ctx),
+                "{} reported preserving CallGraphAnalysis but changed its result",
+                T::NAME,
+            );
+        }
+        Ok(changed)
     }
 }
 
@@ -487,13 +552,30 @@ pub(super) fn replay_rename<'str>(
 /// every affected function and seeds the next module-fixpoint round's shared
 /// function worklist. A pass that changes shared state, or cannot name a safe
 /// function superset, sets `module_changed` to conservatively target the module.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ModulePassOutcome {
     pub changed_functions: FxHashSet<FunctionId>,
     pub module_changed: bool,
+    /// Analyses preserved by this particular invocation.
+    pub(crate) preserved_analyses: PreservedAnalyses,
+}
+
+impl Default for ModulePassOutcome {
+    fn default() -> Self {
+        Self {
+            changed_functions: FxHashSet::default(),
+            module_changed: false,
+            preserved_analyses: PreservedAnalyses::all(),
+        }
+    }
 }
 
 impl ModulePassOutcome {
+    /// The analyses this particular invocation reported preserving.
+    pub fn preserved_analyses(&self) -> &PreservedAnalyses {
+        &self.preserved_analyses
+    }
+
     pub fn changed(&self) -> bool {
         self.module_changed || !self.changed_functions.is_empty()
     }
@@ -502,13 +584,20 @@ impl ModulePassOutcome {
         Self {
             changed_functions: [function].into_iter().collect(),
             module_changed: false,
+            preserved_analyses: PreservedAnalyses::none(),
         }
     }
 
     pub fn functions(functions: impl IntoIterator<Item = FunctionId>) -> Self {
-        Self {
-            changed_functions: functions.into_iter().collect(),
-            module_changed: false,
+        let changed_functions: FxHashSet<_> = functions.into_iter().collect();
+        if changed_functions.is_empty() {
+            Self::default()
+        } else {
+            Self {
+                changed_functions,
+                module_changed: false,
+                preserved_analyses: PreservedAnalyses::none(),
+            }
         }
     }
 
@@ -516,6 +605,7 @@ impl ModulePassOutcome {
         Self {
             changed_functions: FxHashSet::default(),
             module_changed: true,
+            preserved_analyses: PreservedAnalyses::none(),
         }
     }
 
@@ -526,6 +616,20 @@ impl ModulePassOutcome {
             Self::default()
         }
     }
+
+    /// Report that this particular invocation preserved global analysis `A`.
+    pub fn preserving_global<A: super::GlobalAnalysis>(mut self) -> Self {
+        self.preserved_analyses.preserve_global::<A>();
+        self
+    }
+
+    /// Report that this particular invocation preserved local analysis `A` for
+    /// every function named by `changed_functions` (or all functions when
+    /// `module_changed` is set).
+    pub fn preserving_local<A: super::LocalAnalysis>(mut self) -> Self {
+        self.preserved_analyses.preserve_local::<A>();
+        self
+    }
 }
 
 /// A whole-program pass (an interprocedural milestone). Like [`FunctionPass`],
@@ -535,14 +639,43 @@ impl ModulePassOutcome {
 pub trait Pass: Default {
     const NAME: &'static str;
     fn description(&self) -> &'static str;
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<ModulePassOutcome, String>;
+    fn run(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+        targets: &[FunctionId],
+    ) -> Result<ModulePassOutcome, String>;
+
+    /// Analysis-aware entry point. Existing passes use [`Pass::run`]; consumers
+    /// of cached global or local analyses override this method.
+    fn run_with_analyses(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+        targets: &[FunctionId],
+        _analyses: &mut AnalysisManager,
+    ) -> Result<ModulePassOutcome, String> {
+        self.run(ctx, env, targets)
+    }
 }
 
 /// Object-safe dispatch shim for [`Pass`], mirroring [`DynFunctionPass`].
 pub trait DynPass {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<ModulePassOutcome, String>;
+    fn run(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+        targets: &[FunctionId],
+    ) -> Result<ModulePassOutcome, String>;
+    fn run_with_analyses(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+        targets: &[FunctionId],
+        analyses: &mut AnalysisManager,
+    ) -> Result<ModulePassOutcome, String>;
     /// If this module pass is a `module(<fn_pass>)` adapter, the wrapped
     /// per-function pass; `None` for a genuine whole-program pass. An incremental
     /// module-stage runner uses this to drive every adapter over the round's shared
@@ -561,8 +694,37 @@ impl<T: Pass> DynPass for T {
     fn description(&self) -> &'static str {
         Pass::description(self)
     }
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<ModulePassOutcome, String> {
-        Pass::run(self, ctx, env)
+    fn run(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+        targets: &[FunctionId],
+    ) -> Result<ModulePassOutcome, String> {
+        Pass::run(self, ctx, env, targets)
+    }
+    fn run_with_analyses(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+        targets: &[FunctionId],
+        analyses: &mut AnalysisManager,
+    ) -> Result<ModulePassOutcome, String> {
+        #[cfg(test)]
+        let call_graph_before = call_graph_snapshot(ctx);
+        let outcome = Pass::run_with_analyses(self, ctx, env, targets, analyses)?;
+        #[cfg(test)]
+        if outcome
+            .preserved_analyses()
+            .preserves_global_analysis::<crate::CallGraphAnalysis>()
+        {
+            assert_eq!(
+                call_graph_before,
+                call_graph_snapshot(ctx),
+                "{} reported preserving CallGraphAnalysis but changed its result",
+                T::NAME,
+            );
+        }
+        Ok(outcome)
     }
 }
 
@@ -675,8 +837,22 @@ impl DynPass for ModuleFnAdapter {
     fn description(&self) -> &'static str {
         self.inner.description()
     }
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<ModulePassOutcome, String> {
-        super::config::run_standalone_module_fn(ctx, env, self.inner.as_ref())
+    fn run(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+        targets: &[FunctionId],
+    ) -> Result<ModulePassOutcome, String> {
+        self.run_with_analyses(ctx, env, targets, &mut AnalysisManager::default())
+    }
+    fn run_with_analyses(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+        targets: &[FunctionId],
+        analyses: &mut AnalysisManager,
+    ) -> Result<ModulePassOutcome, String> {
+        super::config::run_standalone_module_fn(ctx, env, self.inner.as_ref(), targets, analyses)
     }
     fn as_module_fn(&self) -> Option<&dyn DynFunctionPass> {
         Some(&*self.inner)
@@ -803,5 +979,37 @@ mod tests {
     #[test]
     fn unknown_name_does_not_resolve() {
         assert!(make_pass("not_a_registered_pass").is_none());
+    }
+
+    #[test]
+    fn unchanged_module_outcome_preserves_everything() {
+        let outcome = ModulePassOutcome::functions([]);
+        assert!(
+            outcome
+                .preserved_analyses()
+                .preserves_global_analysis::<crate::CallGraphAnalysis>()
+        );
+        assert!(
+            outcome
+                .preserved_analyses()
+                .preserves_local_analysis::<crate::AliasAnalysis>()
+        );
+    }
+
+    #[test]
+    fn changed_module_outcome_invalidates_unreported_analyses() {
+        let function = FunctionId::from(0usize);
+        let outcome =
+            ModulePassOutcome::function(function).preserving_local::<crate::AliasAnalysis>();
+        assert!(
+            !outcome
+                .preserved_analyses()
+                .preserves_global_analysis::<crate::CallGraphAnalysis>()
+        );
+        assert!(
+            outcome
+                .preserved_analyses()
+                .preserves_local_analysis::<crate::AliasAnalysis>()
+        );
     }
 }

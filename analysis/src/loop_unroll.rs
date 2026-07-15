@@ -70,7 +70,9 @@ impl FunctionPass for RecognizeSimpleLoops {
         _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
-        Ok(Outcome::changed(recognize_simple_loops_host(f, m, fid)))
+        Ok(Outcome::changed(recognize_simple_loops_host(f, m, fid))
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_local::<crate::AliasAnalysis>())
     }
 }
 

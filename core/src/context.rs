@@ -599,7 +599,10 @@ impl<'str> Context<'str> {
                 if block.func != func {
                     let stored = FunctionBody::from_id(self, block.func);
                     let requested = FunctionBody::from_id(self, func);
-                    let parent = self.block(block).parent;
+                    // Blocks are stored in per-function arenas now; ownership is
+                    // encoded by the qualified block id rather than a field on
+                    // `BasicBlock`.
+                    let parent = Some(block.func);
                     let caller = std::panic::Location::caller();
                     let detail = format!(
                         "cannot reuse a block stored in another function arena: block={block:?} address=0x{addr:x}; stored={:?} name={:?} entry={:?} parent={parent:?}; requested={:?} name={:?} entry={:?}; caller={caller}",

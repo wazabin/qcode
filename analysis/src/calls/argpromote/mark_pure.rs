@@ -16,6 +16,11 @@ use crate::{Pass, PipelineEnv};
 /// them is fully pure. Idempotent; returns `true` if any flag was newly set.
 /// The [`verify`](crate::verify) pure-function rule re-checks this invariant.
 pub fn mark_pure_functions(ctx: &mut Context) -> bool {
+    let targets = ctx.function_ids();
+    mark_pure_functions_targeted(ctx, &targets)
+}
+
+fn mark_pure_functions_targeted(ctx: &mut Context, targets: &[FunctionId]) -> bool {
     // Loop to a fixpoint: a pure function may call pure functions
     // ([`mnemonic_is_pure`]), so a caller becomes provably pure only once its
     // callees are flagged. A single pass in an unlucky (caller-before-callee)
@@ -25,7 +30,7 @@ pub fn mark_pure_functions(ctx: &mut Context) -> bool {
     let mut changed = false;
     loop {
         let mut round = false;
-        for fid in ctx.function_ids() {
+        for fid in targets.iter().copied() {
             let f = FunctionBody::from_id(ctx, fid);
             if f.is_pure() || !f.is_pure_reg() {
                 continue;
@@ -132,18 +137,24 @@ impl Pass for MarkPure {
         &self,
         ctx: &mut Context,
         _env: &PipelineEnv,
+        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         let before: rustc_hash::FxHashSet<_> = ctx
             .functions()
             .filter(|f| f.is_pure())
             .map(|f| f.id)
             .collect();
-        mark_pure_functions(ctx);
+        mark_pure_functions_targeted(ctx, targets);
         Ok(crate::ModulePassOutcome::functions(
-            ctx.functions()
+            targets
+                .iter()
+                .copied()
+                .map(|id| FunctionBody::from_id(ctx, id))
                 .filter(|f| f.is_pure() && !before.contains(&f.id))
                 .map(|f| f.id),
-        ))
+        )
+        .preserving_global::<crate::CallGraphAnalysis>()
+        .preserving_local::<crate::AliasAnalysis>())
     }
 }
 

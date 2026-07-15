@@ -40,10 +40,15 @@ const MAX_PARAMS: usize = 64;
 /// eligible (`pure_reg`, non-external) function. Returns `true` if any stored
 /// attribute vector changed.
 pub fn infer_param_attrs(ctx: &mut Context) -> bool {
-    !infer_param_attrs_changed_functions(ctx).is_empty()
+    let targets = ctx.function_ids();
+    !infer_param_attrs_changed_functions(ctx, &targets).is_empty()
 }
 
-fn infer_param_attrs_changed_functions(ctx: &mut Context) -> rustc_hash::FxHashSet<FunctionId> {
+fn infer_param_attrs_changed_functions(
+    ctx: &mut Context,
+    targets: &[FunctionId],
+) -> rustc_hash::FxHashSet<FunctionId> {
+    let target_set: rustc_hash::FxHashSet<_> = targets.iter().copied().collect();
     // Eligible functions and their param counts. Only functionalized functions
     // have `param[i] ↔ arg[i]` alignment, so only they are inferred here.
     let eligible: Vec<(FunctionId, usize)> = ctx
@@ -85,6 +90,9 @@ fn infer_param_attrs_changed_functions(ctx: &mut Context) -> rustc_hash::FxHashS
     // Commit.
     let mut changed = rustc_hash::FxHashSet::default();
     for (fid, vec) in attrs {
+        if !target_set.contains(&fid) {
+            continue;
+        }
         let prev = FunctionBody::from_id(ctx, fid)
             .param_attrs()
             .map(|a| a.to_vec());
@@ -363,10 +371,12 @@ impl Pass for ParamAttrsPass {
         &self,
         ctx: &mut Context,
         _env: &PipelineEnv,
+        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
-        Ok(crate::ModulePassOutcome::functions(
-            infer_param_attrs_changed_functions(ctx),
-        ))
+        Ok(
+            crate::ModulePassOutcome::functions(infer_param_attrs_changed_functions(ctx, targets))
+                .preserving_global::<crate::CallGraphAnalysis>(),
+        )
     }
 }
 

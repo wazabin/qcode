@@ -60,6 +60,17 @@ pub struct CallGraph {
     incoming: HashMap<FunctionId, Vec<CallEdgeId>>,
 }
 
+/// Pipeline analysis marker for the disposable module call graph.
+pub struct CallGraphAnalysis;
+
+impl crate::GlobalAnalysis for CallGraphAnalysis {
+    type Result = CallGraph;
+
+    fn analyze(ctx: &Context<'_>) -> Self::Result {
+        CallGraph::analyze(ctx)
+    }
+}
+
 impl CallGraph {
     /// Derive the complete call graph from the context's current live IR and
     /// semantic synthetic-discovery inputs.

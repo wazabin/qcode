@@ -81,21 +81,22 @@ fn eligible(
 /// *Make* pass — assume [`Proposition::ArgsDisjointFromCallerFrame`] for every
 /// eligible function. Returns how many were assumed this round.
 pub fn assume_args_disjoint_caller_frame(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> usize {
-    assume_args_disjoint_caller_frame_changed_functions(ctx, sp_reg).len()
+    let targets = ctx.function_ids();
+    assume_args_disjoint_caller_frame_changed_functions(ctx, sp_reg, &targets).len()
 }
 
 fn assume_args_disjoint_caller_frame_changed_functions(
     ctx: &mut Context,
     sp_reg: Option<VarnodeId>,
+    targets: &[FunctionId],
 ) -> rustc_hash::FxHashSet<FunctionId> {
     let _scope = pass_scope::enter("assume_args_disjoint_caller_frame");
     let Some(sp_reg) = sp_reg else {
         return rustc_hash::FxHashSet::default();
     };
     let taken = address_taken_set(ctx);
-    let fids: Vec<FunctionId> = ctx.function_ids();
     let mut changed = rustc_hash::FxHashSet::default();
-    for fid in fids {
+    for fid in targets.iter().copied() {
         if eligible(ctx, fid, sp_reg, &taken) {
             let first = ctx.assume_true(Proposition::ArgsDisjointFromCallerFrame(fid));
             // Same eligibility and consumer (the memory-forwarding alias rule), so
@@ -330,10 +331,12 @@ impl Pass for AssumeArgFrame {
         &self,
         ctx: &mut Context,
         env: &PipelineEnv,
+        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         Ok(crate::ModulePassOutcome::functions(
-            assume_args_disjoint_caller_frame_changed_functions(ctx, env.sp_varnode),
-        ))
+            assume_args_disjoint_caller_frame_changed_functions(ctx, env.sp_varnode, targets),
+        )
+        .preserving_global::<crate::CallGraphAnalysis>())
     }
 }
 

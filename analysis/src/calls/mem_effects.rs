@@ -95,6 +95,15 @@ fn local_effect(
 /// unbounded effect (`None`) is the conservative value the prune already assumes,
 /// so an under-approximation is impossible.
 pub fn set_all_written_spaces(ctx: &mut Context) {
+    let targets = ctx.function_ids();
+    set_written_spaces_targeted(ctx, &targets);
+}
+
+fn set_written_spaces_targeted(
+    ctx: &mut Context,
+    targets: &[FunctionId],
+) -> rustc_hash::FxHashSet<FunctionId> {
+    let target_set: rustc_hash::FxHashSet<_> = targets.iter().copied().collect();
     let ids: Vec<FunctionId> = ctx
         .functions()
         .filter(|f| !f.is_external())
@@ -157,7 +166,11 @@ pub fn set_all_written_spaces(ctx: &mut Context) {
         }
     }
 
+    let mut changed_functions = rustc_hash::FxHashSet::default();
     for &id in &ids {
+        if !target_set.contains(&id) {
+            continue;
+        }
         let summary = match &effect[&id] {
             Effect::Unbounded => None,
             Effect::Bounded(set) => {
@@ -166,8 +179,12 @@ pub fn set_all_written_spaces(ctx: &mut Context) {
                 Some(v)
             }
         };
+        if FunctionBody::from_id(ctx, id).written_spaces() != summary.as_deref() {
+            changed_functions.insert(id);
+        }
         FunctionBody::from_id_mut(ctx, id).set_written_spaces(summary);
     }
+    changed_functions
 }
 
 // ----- pass ------------------------------------------------------------------
@@ -186,14 +203,11 @@ impl Pass for SeedWrittenSpaces {
         &self,
         ctx: &mut Context,
         _env: &PipelineEnv,
+        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
-        let affected: Vec<FunctionId> = ctx
-            .functions()
-            .filter(|f| !f.is_external())
-            .map(|f| f.id)
-            .collect();
-        set_all_written_spaces(ctx);
-        Ok(crate::ModulePassOutcome::functions(affected))
+        let changed = set_written_spaces_targeted(ctx, targets);
+        Ok(crate::ModulePassOutcome::functions(changed)
+            .preserving_global::<crate::CallGraphAnalysis>())
     }
 }
 

@@ -97,12 +97,15 @@ impl Pass for HandleJumpTables {
         &self,
         ctx: &mut Context,
         _env: &PipelineEnv,
+        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
-        let fun_ids: Vec<FunctionId> = ctx
-            .functions()
-            .filter(|f| !f.is_external())
-            .filter(|f| !ctx.is_function_ignored(f.address()))
-            .map(|f| f.id)
+        let fun_ids: Vec<FunctionId> = targets
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let f = FunctionBody::from_id(ctx, id);
+                !f.is_external() && !ctx.is_function_ignored(f.address())
+            })
             .collect();
         let mut addresses = AddressIndex::analyze(ctx);
         let mut changed = rustc_hash::FxHashSet::default();
@@ -114,6 +117,7 @@ impl Pass for HandleJumpTables {
         Ok(crate::ModulePassOutcome {
             module_changed: !changed.is_empty(),
             changed_functions: changed,
+            preserved_analyses: crate::PreservedAnalyses::none(),
         })
     }
 }

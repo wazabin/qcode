@@ -101,6 +101,7 @@ impl Pass for Verify {
         &self,
         ctx: &mut Context,
         _env: &PipelineEnv,
+        _targets: &[qcode::value::FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         let violations = verify(ctx);
         if violations.is_empty() {

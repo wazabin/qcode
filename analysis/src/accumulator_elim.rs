@@ -80,11 +80,7 @@ impl FunctionPass for AccumulatorElim {
     ) -> Result<Outcome<'str>, String> {
         let mut minted = Vec::new();
         let changed = accumulator_elim(m, f, next_minted, &mut minted);
-        Ok(Outcome {
-            changed,
-            rename: None,
-            minted,
-        })
+        Ok(Outcome::with_minted(changed, minted))
     }
 }
 

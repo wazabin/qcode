@@ -300,13 +300,16 @@ fn apply(ctx: &mut Context, fid: FunctionId, p: &Pipelined) {
 /// anything changed.
 #[cfg(test)]
 pub(crate) fn depipeline(ctx: &mut Context) -> bool {
-    !depipeline_changed_functions(ctx).is_empty()
+    let targets = ctx.function_ids();
+    !depipeline_changed_functions(ctx, &targets).is_empty()
 }
 
-fn depipeline_changed_functions(ctx: &mut Context) -> rustc_hash::FxHashSet<FunctionId> {
-    let fids: Vec<FunctionId> = ctx.function_ids();
+fn depipeline_changed_functions(
+    ctx: &mut Context,
+    targets: &[FunctionId],
+) -> rustc_hash::FxHashSet<FunctionId> {
     let mut changed = rustc_hash::FxHashSet::default();
-    for fid in fids {
+    for fid in targets.iter().copied() {
         let Some(root) = FunctionBody::from_id(ctx, fid).root().map(|b| b.id) else {
             continue;
         };
@@ -333,9 +336,10 @@ impl Pass for Depipeline {
         &self,
         ctx: &mut Context,
         _env: &PipelineEnv,
+        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         Ok(crate::ModulePassOutcome::functions(
-            depipeline_changed_functions(ctx),
+            depipeline_changed_functions(ctx, targets),
         ))
     }
 }

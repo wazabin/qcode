@@ -61,7 +61,7 @@ use qcode::{
 };
 use rustc_hash::FxHashSet;
 
-use super::append_entry_param;
+use super::{append_entry_param, interface::append_entry_param_at_sites};
 
 mod external;
 mod globals;
@@ -129,6 +129,13 @@ pub(crate) fn address_taken_set(ctx: &Context) -> FxHashSet<FunctionId> {
 /// called functions is invariant while the loop runs.
 pub(crate) fn called_function_set(ctx: &Context) -> FxHashSet<FunctionId> {
     let graph = crate::CallGraph::analyze(ctx);
+    called_function_set_from_graph(ctx, &graph)
+}
+
+pub(crate) fn called_function_set_from_graph(
+    ctx: &Context,
+    graph: &crate::CallGraph,
+) -> FxHashSet<FunctionId> {
     graph
         .edges()
         .filter_map(|(_, edge)| {
@@ -173,12 +180,17 @@ pub(crate) fn add_input(
     name: Option<String>,
     origin: Option<ValueId>,
     type_id: Option<TypeId>,
+    call_sites: Option<&[InstructionId]>,
     seed_space: impl Into<LocalMemorySpaceId>,
     seed_addr: impl FnOnce(&mut Builder) -> ValueId,
     caller_value: impl FnMut(&mut Context, InstructionId, BlockId) -> ValueId,
 ) -> Option<ValueId> {
     let seed_space = seed_space.into();
-    let param = append_entry_param(ctx, fid, size, name, origin, caller_value)?;
+    let param = if let Some(call_sites) = call_sites {
+        append_entry_param_at_sites(ctx, fid, size, name, origin, call_sites, caller_value)?
+    } else {
+        append_entry_param(ctx, fid, size, name, origin, caller_value)?
+    };
     if let (ValueId::BlockParam(pid), Some(ty)) = (param, type_id) {
         ctx.block_param_mut(pid).type_id = ty;
     }
@@ -205,10 +217,12 @@ pub(crate) fn add_input(
 /// assembled aggregate — resized when appending, since the register channel may
 /// have already typed it. A no-op when `slots` is empty (a read-only promotion
 /// leaves the returns and result type untouched).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn append_outputs<S>(
     ctx: &mut Context,
     fid: FunctionId,
     slots: &[S],
+    call_sites: Option<&[InstructionId]>,
     append: bool,
     field_names: impl Fn(usize, &S) -> Vec<String>,
     at_return: impl Fn(&mut Builder, &S) -> Vec<ValueId>,
@@ -272,8 +286,14 @@ pub(crate) fn append_outputs<S>(
         return;
     };
 
-    let call_sites = super::fresh_direct_call_sites(ctx, fid);
-    for call_id in call_sites {
+    let owned_call_sites;
+    let call_sites = if let Some(call_sites) = call_sites {
+        call_sites
+    } else {
+        owned_call_sites = super::fresh_direct_call_sites(ctx, fid);
+        &owned_call_sites
+    };
+    for &call_id in call_sites {
         // The call now yields the write-set aggregate. Resize when appending: the
         // register channel may have already typed it to its (smaller) positional
         // write-set, and we are growing it with the appended fields.

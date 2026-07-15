@@ -10,10 +10,10 @@ pub mod stack;
 
 pub mod calls;
 pub use calls::{
-    CallEdge, CallEdgeId, CallGraph, CallKind, CallTarget, append_caller_arg, append_entry_param,
-    argpromote, argpromote_registers, compute_call_clobbered_regs, compute_clobbered_regs,
-    compute_input_regs, compute_stack_delta, learn_stack_facts, remove_entry_param,
-    seed_stack_facts, set_all_call_clobbered_regs, set_all_function_summaries,
+    CallEdge, CallEdgeId, CallGraph, CallGraphAnalysis, CallKind, CallTarget, append_caller_arg,
+    append_entry_param, argpromote, argpromote_registers, compute_call_clobbered_regs,
+    compute_clobbered_regs, compute_input_regs, compute_stack_delta, learn_stack_facts,
+    remove_entry_param, seed_stack_facts, set_all_call_clobbered_regs, set_all_function_summaries,
     set_all_written_spaces, set_clobbered_regs, set_function_summaries,
 };
 
@@ -43,7 +43,7 @@ pub use dce::{
 };
 
 pub mod alias;
-pub use alias::{AliasResult, RegisterBase};
+pub use alias::{AliasAnalysis, AliasResult, RegisterBase};
 
 pub mod dataflow_graph;
 pub use dataflow_graph::{
@@ -87,16 +87,16 @@ pub use lift::{discover_addresses_in_binary, lift_new_addresses};
 pub mod pipeline;
 pub(crate) use pipeline::with_body_mut;
 pub use pipeline::{
-    ArchConfig, CallingConvention, ContextSplit, ContextView, DEFAULT_PIPELINE_TOML, DecompilePass,
-    DynDecompilePass,
-    DynFunctionPass, DynPass,
-    FunctionBody, FunctionPass, FunctionPassAdapter, GpReg, LiftOutcome, LiftSummary, Outcome, Pass,
-    ModulePassOutcome, PassRegistration, Pipeline, PipelineEnv, PipelineServices, ProgressSink,
-    RegisteredPass,
+    AnalysisManager, ArchConfig, CallingConvention, ContextSplit, ContextView,
+    DEFAULT_PIPELINE_TOML, DecompilePass, DynDecompilePass, DynFunctionPass, DynPass, FunctionBody,
+    FunctionPass, FunctionPassAdapter, GlobalAnalysis, GpReg, LiftOutcome, LiftSummary,
+    LocalAnalysis, LocalAnalysisManager, ModulePassOutcome, Outcome, Pass, PassRegistration,
+    Pipeline, PipelineEnv, PipelineServices, PreservedAnalyses, ProgressSink, RegisteredPass,
     YieldSignal,
     analyze_and_lift_with_progress, analyze_default, analyze_with_pipeline, known_pass_names,
     make_pass,
 };
+
 #[cfg(not(target_arch = "wasm32"))]
 pub use pipeline::{
     PipelineFile, create_named_user_pipeline_from_default_in, create_user_pipeline_from_default_in,

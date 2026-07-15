@@ -32,7 +32,13 @@ pub(crate) fn run_function_pass<P: FunctionPass + Send + Sync>(
     ctx: &mut Context,
     fun: FunctionId,
 ) -> Result<bool, String> {
-    DynFunctionPass::run(&FunctionPassAdapter::<P>::default(), ctx, fun, &dummy_env())
+    DynFunctionPass::run_with_analyses(
+        &FunctionPassAdapter::<P>::default(),
+        ctx,
+        fun,
+        &dummy_env(),
+        &mut crate::AnalysisManager::default(),
+    )
 }
 
 /// Borrow `fun`'s body in place, run `f` against its [`FunctionBody`] and a

@@ -452,11 +452,7 @@ impl FunctionPass for LoopToScan {
         if let Some(sm) = try_match(m.body_view(f), f.id()) {
             let mut minted = Vec::new();
             let changed = apply(m, f, next_minted, &mut minted, &sm);
-            return Ok(Outcome {
-                changed,
-                rename: None,
-                minted,
-            });
+            return Ok(Outcome::with_minted(changed, minted));
         }
         Ok(Outcome::unchanged())
     }

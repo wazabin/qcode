@@ -64,8 +64,13 @@ impl crate::Pass for ArrayProject {
         &self,
         ctx: &mut Context,
         _env: &crate::PipelineEnv,
+        targets: &[qcode::value::FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
-        let snapshot = module_instruction_snapshot(ctx);
+        let targets: rustc_hash::FxHashSet<_> = targets.iter().copied().collect();
+        let snapshot = module_instruction_snapshot(ctx)
+            .into_iter()
+            .filter(|id| targets.contains(&id.func))
+            .collect::<Vec<_>>();
         let mut changed = rustc_hash::FxHashSet::default();
         for insn_id in snapshot {
             let ic = module_insn(ctx, insn_id);
@@ -340,10 +345,15 @@ mod tests {
 
     fn run_array_project(tc: &mut TestContext) {
         let env = crate::PipelineEnv::headless(&tc.ctx);
-        while crate::Pass::run(&super::ArrayProject, &mut tc.ctx, &env)
-            .unwrap()
-            .changed()
-        {}
+        loop {
+            let targets = tc.ctx.function_ids();
+            if !crate::Pass::run(&super::ArrayProject, &mut tc.ctx, &env, &targets)
+                .unwrap()
+                .changed()
+            {
+                break;
+            }
+        }
     }
 
     /// `body(elem: i8) -> elem + 1`, marked pure. A unary map body.

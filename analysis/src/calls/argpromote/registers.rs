@@ -7,9 +7,12 @@ use qcode::{
 
 use rustc_hash::FxHashSet;
 
-use crate::{Pass, PipelineEnv};
+use crate::{AnalysisManager, CallGraph, CallGraphAnalysis, Pass, PipelineEnv};
 
-use super::{add_input, address_taken_set, append_outputs, called_function_set};
+use super::{
+    add_input, address_taken_set, append_outputs, called_function_set,
+    called_function_set_from_graph,
+};
 
 fn is_register(ctx: &Context, vn: VarnodeId) -> bool {
     matches!(Varnode::from_id(ctx, vn).space().ty, SpaceType::Register)
@@ -273,23 +276,32 @@ pub(crate) fn scan_register_effects(
 /// Functionalize every eligible function's register effects (see
 /// [`try_promote_registers`]). Returns `true` if anything changed.
 pub fn argpromote_registers(ctx: &mut Context) -> bool {
-    !argpromote_registers_changed_functions(ctx).is_empty()
+    let graph = CallGraph::analyze(ctx);
+    let targets = ctx.function_ids();
+    !argpromote_registers_changed_functions(ctx, &graph, &targets).is_empty()
 }
 
-fn argpromote_registers_changed_functions(ctx: &mut Context) -> FxHashSet<FunctionId> {
+fn argpromote_registers_changed_functions(
+    ctx: &mut Context,
+    graph: &CallGraph,
+    targets: &[FunctionId],
+) -> FxHashSet<FunctionId> {
+    let target_set: FxHashSet<_> = targets.iter().copied().collect();
     let mut changed = FxHashSet::default();
-    let graph = crate::CallGraph::analyze(ctx);
     // Gate every function on the two whole-program predicates via sets built once
     // instead of a per-function rescan: address-taken (stable — promotion adds no
     // `ValueId::Function` operands) and has-a-direct-caller (stable — promotion
     // rewrites interfaces but adds/removes no `Call.target` edges). See
     // [`super::address_taken_set`] / [`super::called_function_set`].
     let address_taken = super::address_taken_set(ctx);
-    let called = super::called_function_set(ctx);
-    for fid in ctx.function_ids() {
-        if try_promote_registers(ctx, &address_taken, &called, fid) {
+    let called = called_function_set_from_graph(ctx, graph);
+    for fid in targets.iter().copied() {
+        let callers = graph.callers(fid);
+        if callers.iter().all(|id| target_set.contains(id))
+            && try_promote_registers(ctx, graph, &address_taken, &called, fid)
+        {
             changed.insert(fid);
-            changed.extend(graph.callers(fid));
+            changed.extend(callers);
         }
     }
     changed
@@ -312,6 +324,7 @@ fn output_meta(ctx: &Context, regs: &[VarnodeId]) -> Vec<(VarnodeId, usize, Spac
 
 fn try_promote_registers(
     ctx: &mut Context,
+    graph: &CallGraph,
     address_taken: &FxHashSet<FunctionId>,
     called: &FxHashSet<FunctionId>,
     fid: FunctionId,
@@ -337,7 +350,8 @@ fn try_promote_registers(
         return false;
     }
 
-    rewrite_registers(ctx, fid, &eff);
+    let call_sites = crate::calls::direct_call_sites(ctx, graph, fid);
+    rewrite_registers_at_sites(ctx, fid, &eff, &call_sites);
 
     // The body now reads its registers only through by-value params and returns
     // every write through the aggregate write-set: it is a pure value function.
@@ -354,7 +368,18 @@ type InputMeta = (VarnodeId, usize, SpaceId, Option<String>, Option<TypeId>);
 /// fresh at every caller) and append the outputs as a flat positional write-set
 /// replayed at every caller. Leaves `is_pure_reg` for [`try_promote_registers`] to
 /// set — factored out so unit tests can drive the rewrite without the gating.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn rewrite_registers(ctx: &mut Context, fid: FunctionId, eff: &RegisterEffects) {
+    let call_sites = crate::calls::fresh_direct_call_sites(ctx, fid);
+    rewrite_registers_at_sites(ctx, fid, eff, &call_sites);
+}
+
+fn rewrite_registers_at_sites(
+    ctx: &mut Context,
+    fid: FunctionId,
+    eff: &RegisterEffects,
+    call_sites: &[qcode::value::insn::InstructionId],
+) {
     // --- inputs: one by-value param per input register --------------------------
     // The body reads its live-in registers through params the next mem2reg run
     // SSA-promotes. Precompute `(register, size, space, name, type)` before the
@@ -386,6 +411,7 @@ pub(crate) fn rewrite_registers(ctx: &mut Context, fid: FunctionId, eff: &Regist
             name,
             Some(ValueId::Varnode(r)),
             ty,
+            Some(call_sites),
             space,
             move |_b| ValueId::Varnode(r),
             move |ctx, call_id, block| {
@@ -404,6 +430,7 @@ pub(crate) fn rewrite_registers(ctx: &mut Context, fid: FunctionId, eff: &Regist
         ctx,
         fid,
         &outputs,
+        Some(call_sites),
         false,
         |_i, (_, _, _, name)| vec![name.clone()],
         |b, &(r, size, space, _)| vec![b.push_load::<false>(ValueId::Varnode(r), size, space).id()],
@@ -425,10 +452,29 @@ impl Pass for ArgPromoteRegisters {
         &self,
         ctx: &mut Context,
         _env: &PipelineEnv,
+        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
-        Ok(crate::ModulePassOutcome::functions(
-            argpromote_registers_changed_functions(ctx),
-        ))
+        Ok(crate::ModulePassOutcome::functions({
+            let graph = CallGraph::analyze(ctx);
+            argpromote_registers_changed_functions(ctx, &graph, targets)
+        })
+        .preserving_global::<CallGraphAnalysis>())
+    }
+
+    fn run_with_analyses(
+        &self,
+        ctx: &mut Context,
+        _env: &PipelineEnv,
+        targets: &[FunctionId],
+        analyses: &mut AnalysisManager,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        let graph = analyses.global::<CallGraphAnalysis>(ctx);
+        Ok(
+            crate::ModulePassOutcome::functions(argpromote_registers_changed_functions(
+                ctx, graph, targets,
+            ))
+            .preserving_global::<CallGraphAnalysis>(),
+        )
     }
 }
 

@@ -98,6 +98,7 @@ impl Pass for DiscoverAddressesInBinary {
         &self,
         _ctx: &mut Context,
         _env: &PipelineEnv,
+        _targets: &[qcode::value::FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         Ok(crate::ModulePassOutcome::default())
     }
@@ -117,6 +118,7 @@ impl Pass for LiftNewAddresses {
         &self,
         _ctx: &mut Context,
         _env: &PipelineEnv,
+        _targets: &[qcode::value::FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         Ok(crate::ModulePassOutcome::default())
     }

@@ -130,6 +130,7 @@ impl Pass for WindowsTebSeed {
         &self,
         ctx: &mut Context,
         env: &PipelineEnv,
+        _targets: &[qcode::value::FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         if env.cfg.os != TargetOs::Windows || env.cfg.bitness != 32 {
             return Ok(crate::ModulePassOutcome::default());
@@ -145,9 +146,10 @@ impl Pass for WindowsTebSeed {
         {
             return Ok(crate::ModulePassOutcome::default());
         }
-        Ok(crate::ModulePassOutcome::module_if(seed_teb_register(
-            ctx, fs, 32,
-        )))
+        Ok(
+            crate::ModulePassOutcome::module_if(seed_teb_register(ctx, fs, 32))
+                .preserving_global::<crate::CallGraphAnalysis>(),
+        )
     }
 }
 
@@ -282,7 +284,7 @@ mod tests {
         // Wrong platform: no-op, register stays untyped.
         assert!(
             !WindowsTebSeed
-                .run(&mut ctx, &env_for(TargetOs::Linux, 64))
+                .run(&mut ctx, &env_for(TargetOs::Linux, 64), &[])
                 .unwrap()
                 .changed()
         );
@@ -292,7 +294,7 @@ mod tests {
         // Windows x86: types the register and is idempotent on a second run.
         assert!(
             WindowsTebSeed
-                .run(&mut ctx, &env_for(TargetOs::Windows, 32))
+                .run(&mut ctx, &env_for(TargetOs::Windows, 32), &[])
                 .unwrap()
                 .changed()
         );
@@ -300,7 +302,7 @@ mod tests {
         assert!(ctx.shared.types.pointee_of(t).is_some());
         assert!(
             !WindowsTebSeed
-                .run(&mut ctx, &env_for(TargetOs::Windows, 32))
+                .run(&mut ctx, &env_for(TargetOs::Windows, 32), &[])
                 .unwrap()
                 .changed()
         );

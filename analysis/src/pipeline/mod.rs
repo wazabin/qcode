@@ -13,6 +13,7 @@
 //! architecture-specific registers the register-aware passes need are injected
 //! via [`ArchConfig`]. Callers build one with `harbinger::arch::arch_config`.
 
+mod analysis_manager;
 mod config;
 mod lifter;
 mod module_view;
@@ -43,6 +44,9 @@ pub(crate) fn install_minted_for_test<'str>(
     let installed = pass::install_minted(ctx, "test", minted).expect("minted install");
     pass::resolve_minted_callees(ctx, "test", owner, &installed).expect("minted callee resolution");
 }
+pub use analysis_manager::{
+    AnalysisManager, GlobalAnalysis, LocalAnalysis, LocalAnalysisManager, PreservedAnalyses,
+};
 pub(crate) use pass::with_body_mut;
 pub use pass::{
     DecompilePass, DynDecompilePass, DynFunctionPass, DynPass, FunctionPass, FunctionPassAdapter,

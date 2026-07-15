@@ -50,7 +50,8 @@ impl FunctionPass for StructTyping {
         _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
-        Ok(Outcome::changed(struct_typing(f, cx, fid)))
+        Ok(Outcome::changed(struct_typing(f, cx, fid))
+            .preserving_global::<crate::CallGraphAnalysis>())
     }
 }
 

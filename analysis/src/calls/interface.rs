@@ -45,6 +45,29 @@ pub fn append_entry_param(
     size: usize,
     name: Option<String>,
     origin: Option<ValueId>,
+    build_caller_value: impl FnMut(&mut Context, InstructionId, BlockId) -> ValueId,
+) -> Option<ValueId> {
+    let call_sites = super::fresh_direct_call_sites(ctx, fid);
+    append_entry_param_at_sites(
+        ctx,
+        fid,
+        size,
+        name,
+        origin,
+        &call_sites,
+        build_caller_value,
+    )
+}
+
+/// [`append_entry_param`] with caller sites supplied by an analysis snapshot
+/// known to be preserved by the enclosing pass.
+pub(crate) fn append_entry_param_at_sites(
+    ctx: &mut Context,
+    fid: FunctionId,
+    size: usize,
+    name: Option<String>,
+    origin: Option<ValueId>,
+    call_sites: &[InstructionId],
     mut build_caller_value: impl FnMut(&mut Context, InstructionId, BlockId) -> ValueId,
 ) -> Option<ValueId> {
     let root = FunctionBody::from_id(ctx, fid).root().map(|b| b.id)?;
@@ -65,7 +88,7 @@ pub fn append_entry_param(
     }
 
     // Append the matching positional argument at every direct call site.
-    append_caller_arg(ctx, fid, |ctx, call_id, block| {
+    append_caller_arg_at_sites(ctx, call_sites, |ctx, call_id, block| {
         Some(build_caller_value(ctx, call_id, block))
     });
 
@@ -82,11 +105,19 @@ pub fn append_entry_param(
 pub fn append_caller_arg(
     ctx: &mut Context,
     fid: FunctionId,
-    mut build: impl FnMut(&mut Context, InstructionId, BlockId) -> Option<ValueId>,
+    build: impl FnMut(&mut Context, InstructionId, BlockId) -> Option<ValueId>,
 ) -> bool {
     let call_sites = super::fresh_direct_call_sites(ctx, fid);
+    append_caller_arg_at_sites(ctx, &call_sites, build)
+}
+
+fn append_caller_arg_at_sites(
+    ctx: &mut Context,
+    call_sites: &[InstructionId],
+    mut build: impl FnMut(&mut Context, InstructionId, BlockId) -> Option<ValueId>,
+) -> bool {
     let mut changed = false;
-    for call_id in call_sites {
+    for &call_id in call_sites {
         let Some(block) = ctx.get_insn(call_id).parent().map(|b| b.id) else {
             continue;
         };

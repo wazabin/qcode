@@ -102,18 +102,20 @@ fn run() -> Result<(), String> {
     qcode::lower::lower_str(&mut ctx, &source).map_err(|e| format!("parse/lower: {e}"))?;
 
     let env = PipelineEnv::headless(&mut ctx);
+    let mut analyses = qcode_analysis::AnalysisManager::default();
     for pass in &args.passes {
         let resolved = make_pass(pass)
             .ok_or_else(|| format!("unknown pass `{pass}`; known: {}", known_pass_names()))?;
         match resolved {
             RegisteredPass::Function(p) => {
                 for fun_id in ctx.function_ids() {
-                    p.run(&mut ctx, fun_id, &env)
+                    p.run_with_analyses(&mut ctx, fun_id, &env, &mut analyses)
                         .map_err(|e| format!("pass `{pass}` failed: {e}"))?;
                 }
             }
             RegisteredPass::Module(p) => {
-                p.run(&mut ctx, &env)
+                let targets = ctx.function_ids();
+                p.run_with_analyses(&mut ctx, &env, &targets, &mut analyses)
                     .map_err(|e| format!("pass `{pass}` failed: {e}"))?;
             }
         }

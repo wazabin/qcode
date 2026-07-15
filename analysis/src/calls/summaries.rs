@@ -839,14 +839,19 @@ impl Pass for SeedClobbers {
         &self,
         ctx: &mut Context,
         _env: &PipelineEnv,
+        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
-        let affected: Vec<FunctionId> = ctx
-            .functions()
-            .filter(|f| !f.is_external())
-            .map(|f| f.id)
+        let affected: Vec<FunctionId> = targets
+            .iter()
+            .copied()
+            .filter(|&id| !FunctionBody::from_id(ctx, id).is_external())
             .collect();
-        set_all_call_clobbered_regs(ctx);
-        Ok(crate::ModulePassOutcome::functions(affected))
+        for id in affected.iter().copied() {
+            let regs = compute_call_clobbered_regs(ctx, id);
+            FunctionBody::from_id_mut(ctx, id).set_clobbered_regs(regs);
+        }
+        Ok(crate::ModulePassOutcome::functions(affected)
+            .preserving_global::<crate::CallGraphAnalysis>())
     }
 }
 
@@ -864,17 +869,21 @@ impl Pass for Summaries {
         &self,
         ctx: &mut Context,
         env: &PipelineEnv,
+        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         let Some(stack_ptr) = env.sp_varnode else {
             return Ok(crate::ModulePassOutcome::default());
         };
-        let affected: Vec<FunctionId> = ctx
-            .functions()
-            .filter(|f| !f.is_external())
-            .map(|f| f.id)
+        let affected: Vec<FunctionId> = targets
+            .iter()
+            .copied()
+            .filter(|&id| !FunctionBody::from_id(ctx, id).is_external())
             .collect();
-        set_all_function_summaries(ctx, stack_ptr);
-        Ok(crate::ModulePassOutcome::functions(affected))
+        for id in affected.iter().copied() {
+            set_function_summaries(ctx, id, stack_ptr);
+        }
+        Ok(crate::ModulePassOutcome::functions(affected)
+            .preserving_global::<crate::CallGraphAnalysis>())
     }
 }
 

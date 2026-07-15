@@ -6,7 +6,7 @@
 //! add it to the tuple in [`gvn_passes`] (order matters: earlier members see
 //! the instruction first).
 
-use crate::{AliasResult, with_body_mut};
+use crate::{AliasAnalysis, AliasResult, LocalAnalysisManager, PreservedAnalyses, with_body_mut};
 
 use qcode::{
     context::Context,
@@ -310,13 +310,40 @@ impl FunctionPass for Gvn {
         changed |= gvn_body(f, m, fun_id, Some(&aliases));
         Ok(Outcome::changed(changed))
     }
+
+    fn run_with_analyses<'str>(
+        &self,
+        f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
+        analyses: &mut LocalAnalysisManager,
+    ) -> Result<Outcome<'str>, String> {
+        let fun_id = f.id();
+        let mut changed = constant_fold_body(f, m, fun_id);
+        if changed {
+            // The canonicalization above changes the pointer expressions from
+            // which alias facts are derived, so any entry cache is stale before
+            // GVN itself begins.
+            analyses.invalidate(&PreservedAnalyses::none());
+        }
+        let aliases = analyses.get::<AliasAnalysis>(f, m);
+        changed |= gvn_body(f, m, fun_id, Some(aliases));
+        Ok(Outcome::changed(changed))
+    }
 }
 
 crate::register_function_pass!(Gvn);
 
 #[cfg(test)]
 mod registration_tests {
-    use crate::{RegisteredPass, make_pass};
+    use qcode::context::Context;
+    use qcode_macro::qcode;
+
+    use super::Gvn;
+    use crate::{
+        AliasAnalysis, CallGraphAnalysis, ContextSplit, FunctionPass, LocalAnalysisManager,
+        PipelineEnv, RegisteredPass, make_pass,
+    };
 
     #[test]
     fn cross_body_passes_are_explicit_and_concretize_is_gone() {
@@ -327,5 +354,72 @@ mod registration_tests {
             );
         }
         assert!(make_pass("concretize").is_none());
+    }
+
+    #[test]
+    fn gvn_no_change_preserves_aliases_but_a_change_invalidates_them() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn settled:
+            <entry>
+                return 0;
+
+            fn foldable:
+            <entry>
+                %sum = 1 + 2;
+                return %sum;
+            "
+        );
+        let env = PipelineEnv::headless(&ctx);
+
+        let mut settled_analyses = LocalAnalysisManager::default();
+        let settled_outcome = {
+            let (bodies, view) = ctx.split(&env);
+            FunctionPass::run_with_analyses(
+                &Gvn,
+                &mut bodies[settled],
+                view,
+                &mut 0,
+                &mut settled_analyses,
+            )
+            .unwrap()
+        };
+        assert!(!settled_outcome.changed);
+        assert!(
+            settled_outcome
+                .preserved_analyses()
+                .preserves_local_analysis::<AliasAnalysis>()
+        );
+        assert!(
+            settled_outcome
+                .preserved_analyses()
+                .preserves_global_analysis::<CallGraphAnalysis>()
+        );
+
+        let mut foldable_analyses = LocalAnalysisManager::default();
+        let foldable_outcome = {
+            let (bodies, view) = ctx.split(&env);
+            FunctionPass::run_with_analyses(
+                &Gvn,
+                &mut bodies[foldable],
+                view,
+                &mut 0,
+                &mut foldable_analyses,
+            )
+            .unwrap()
+        };
+        assert!(foldable_outcome.changed);
+        assert!(
+            !foldable_outcome
+                .preserved_analyses()
+                .preserves_local_analysis::<AliasAnalysis>()
+        );
+        assert!(
+            !foldable_outcome
+                .preserved_analyses()
+                .preserves_global_analysis::<CallGraphAnalysis>()
+        );
     }
 }

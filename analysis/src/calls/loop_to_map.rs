@@ -431,11 +431,7 @@ impl FunctionPass for LoopToMap {
     ) -> Result<Outcome<'str>, String> {
         let mut minted = Vec::new();
         let changed = recognize_total_map(m, f, next_minted, &mut minted);
-        Ok(Outcome {
-            changed,
-            rename: None,
-            minted,
-        })
+        Ok(Outcome::with_minted(changed, minted))
     }
 }
 

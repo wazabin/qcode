@@ -62,7 +62,9 @@ impl FunctionPass for NameThunks {
         match new_name {
             Some(name) => {
                 // Returned; the driver uniquifies and applies it at the barrier.
-                Ok(Outcome::renamed(Cow::Owned(name)))
+                Ok(Outcome::renamed(Cow::Owned(name))
+                    .preserving_global::<crate::CallGraphAnalysis>()
+                    .preserving_local::<crate::AliasAnalysis>())
             }
             None => Ok(Outcome::unchanged()),
         }
