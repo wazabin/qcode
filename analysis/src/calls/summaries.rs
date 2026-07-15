@@ -105,7 +105,12 @@ impl FrameCtx {
 
     /// The frame offset of `v`, in either stack-address representation.
     fn offset(&self, ctx: &Context, v: ValueId) -> Option<i64> {
-        frame_offset(ctx, &self.numbering, self.base, v)
+        frame_offset(
+            qcode::value::ModuleView::new(ctx),
+            &self.numbering,
+            self.base,
+            v,
+        )
     }
 }
 
@@ -389,8 +394,12 @@ pub fn compute_stack_delta(
             if store.ptr.qualify(insn.id.func) != sp {
                 continue;
             }
-            if let Some(off) = frame_offset(ctx, &numbering, base, store.src.qualify(insn.id.func))
-            {
+            if let Some(off) = frame_offset(
+                qcode::value::ModuleView::new(ctx),
+                &numbering,
+                base,
+                store.src.qualify(insn.id.func),
+            ) {
                 block_delta = Some(off);
             }
         }

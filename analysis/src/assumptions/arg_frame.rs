@@ -210,7 +210,12 @@ fn args_provably_collide(
         let Some(base_arg) = c.args.get(esp_idx).map(|a| a.qualify(call_id.func)) else {
             continue;
         };
-        let Some(base_off) = frame_offset(ctx, numbering, *caller_sp, base_arg) else {
+        let Some(base_off) = frame_offset(
+            qcode::value::ModuleView::new(ctx),
+            numbering,
+            *caller_sp,
+            base_arg,
+        ) else {
             continue;
         };
         for (i, &arg) in c.args.iter().enumerate() {
@@ -222,8 +227,12 @@ fn args_provably_collide(
                 continue;
             };
             // A non-`@SP`-rooted arg (global/heap) can't be shown to collide.
-            let Some(a_off) = frame_offset(ctx, numbering, *caller_sp, arg.qualify(call_id.func))
-            else {
+            let Some(a_off) = frame_offset(
+                qcode::value::ModuleView::new(ctx),
+                numbering,
+                *caller_sp,
+                arg.qualify(call_id.func),
+            ) else {
                 continue;
             };
             // Resolved overlap of `[a_off, a_off+pe)` with `[base_off, base_off+frame_ext)`
@@ -247,8 +256,10 @@ fn caller_frame_extent(ctx: &Context, fid: FunctionId, sp: ValueId, numbering: &
                 Mnemonic::Store(s) => (s.ptr.qualify(insn.id.func), s.size),
                 _ => continue,
             };
-            if frame_class(ctx, numbering, sp, ptr) == Some(FrameClass::CallerFrame)
-                && let Some(off) = frame_offset(ctx, numbering, sp, ptr)
+            if frame_class(qcode::value::ModuleView::new(ctx), numbering, sp, ptr)
+                == Some(FrameClass::CallerFrame)
+                && let Some(off) =
+                    frame_offset(qcode::value::ModuleView::new(ctx), numbering, sp, ptr)
             {
                 ext = ext.max(off + size as i64);
             }
@@ -274,7 +285,9 @@ fn param_access_extent(
                 Mnemonic::Store(s) => (s.ptr.qualify(insn.id.func), s.size),
                 _ => continue,
             };
-            let (base, off) = numbering.base_offset(ptr).unwrap_or((ptr, 0));
+            let (base, off) = numbering
+                .base_offset(qcode::value::ModuleView::new(ctx), ptr)
+                .unwrap_or((ptr, 0));
             if base == param && off >= 0 {
                 let e = off + size as i64;
                 ext = Some(ext.map_or(e, |x| x.max(e)));

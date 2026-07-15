@@ -93,7 +93,8 @@ impl Base {
 
 /// Decompose `ptr` (read/written in memory `space`) into its base identity and
 /// the signed byte offset of its first byte within that base.
-fn locate(
+fn locate<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     ptr: ValueId,
     space: LocalMemorySpaceId,
     aliases: Option<&AliasResult>,
@@ -102,7 +103,7 @@ fn locate(
     if let Some((sp, start, _end)) = aliases.and_then(|a| a.interval(ptr)) {
         return (Base::Pinned(sp), start as i64);
     }
-    match numbering.base_offset(ptr) {
+    match numbering.base_offset(host, ptr) {
         Some((base, off)) => (Base::Symbolic(space, base), off),
         None => (Base::Symbolic(space, ptr), 0),
     }
@@ -171,15 +172,16 @@ impl MemForward {
     /// Record that, after this load executes, `value` is held at `load`'s
     /// location. Called for every load (forwarded or not) so a later identical
     /// load can reuse the result.
-    pub(super) fn define_load(
+    pub(super) fn define_load<'ctx, 'str: 'ctx>(
         &mut self,
+        host: impl QCodeView<'ctx, 'str>,
         func: FunctionId,
         load: &Load,
         value: ValueId,
         aliases: Option<&AliasResult>,
         numbering: &Numbering,
     ) {
-        let (base, start) = locate(load.ptr.qualify(func), load.space, aliases, numbering);
+        let (base, start) = locate(host, load.ptr.qualify(func), load.space, aliases, numbering);
         for (i, off) in (start..start + load.size as i64).enumerate() {
             self.byte_map.insert(
                 (base, off),
@@ -230,7 +232,13 @@ impl MemForward {
     ) {
         let store_ptr = store.ptr.qualify(func);
         let store_src = store.src.qualify(func);
-        let (base, start) = locate(store_ptr, store.space, aliases, numbering);
+        let (base, start) = locate(
+            cx.body_view(body),
+            store_ptr,
+            store.space,
+            aliases,
+            numbering,
+        );
         let end = start + store.size as i64;
 
         self.byte_map.retain(|&(cb, _), _| {
@@ -282,6 +290,7 @@ impl MemForward {
         numbering: &Numbering,
     ) -> Option<ValueId> {
         let (base, start) = locate(
+            cx.body_view(body),
             load.ptr.qualify(insn_id.func),
             load.space,
             aliases,
@@ -663,7 +672,13 @@ impl MemForward {
         let Mnemonic::Load(load) = host.insn_ref(id).mnemonic().clone() else {
             return None;
         };
-        let (base, start) = locate(load.ptr.qualify(id.func), load.space, aliases, numbering);
+        let (base, start) = locate(
+            host,
+            load.ptr.qualify(id.func),
+            load.space,
+            aliases,
+            numbering,
+        );
         let segs = self.segments(base, start, start + load.size as i64)?;
         let [seg] = segs.as_slice() else { return None };
         (seg.load_off == 0
@@ -692,7 +707,7 @@ impl MemForward {
         numbering: &Numbering,
         peel: bool,
     ) -> (Base, i64) {
-        let (mut base, mut off) = locate(ptr, space, aliases, numbering);
+        let (mut base, mut off) = locate(host, ptr, space, aliases, numbering);
         if !peel {
             return (base, off);
         }
@@ -704,7 +719,7 @@ impl MemForward {
             let Some(value) = self.reload_forwards_to(host, basev, aliases, numbering) else {
                 break;
             };
-            let (b2, o2) = locate(value, space, aliases, numbering);
+            let (b2, o2) = locate(host, value, space, aliases, numbering);
             base = b2;
             off += o2;
         }
@@ -814,7 +829,62 @@ impl MemForward {
 mod tests {
     use super::*;
     use qcode::testing::TestContext;
-    use qcode::value::{BasicBlock, FunctionBody, TempSpace};
+    use qcode::value::{BasicBlock, FunctionBody, ModuleView, TempSpace};
+    use qcode_macro::qcode;
+
+    /// GVN's affine numbering is a read-only snapshot built before the
+    /// dominator walk. If an earlier block forwards and deletes one of the
+    /// snapshot's affine base instructions, loaded-pointer peeling in a later
+    /// block must ignore that stale decomposition rather than indexing the dead
+    /// instruction.
+    #[test]
+    fn loaded_ptr_peeling_ignores_deleted_affine_base() {
+        let mut tc = TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+                varnode i64 SLOT;
+
+                fn f:
+                    <entry>
+                        %old = load(SLOT:8, &SLOT);
+                        %ptr = %old + i64 0x4;
+                        return %ptr;
+            "
+        );
+
+        let numbering = crate::gvn::affine::precompute_forms(ModuleView::new(&tc.ctx), f);
+
+        // Model an earlier GVN block forwarding `%old` to another value and
+        // deleting the redundant instruction. `%ptr` itself remains live, but
+        // the precomputed form still decomposes it as `%old + 4`.
+        let replacement = tc.ctx.get_const(0x1000, 8).id();
+        tc.ctx
+            .replace_all_uses_with(ValueId::Instruction(old), replacement);
+        tc.ctx.remove_instruction(old);
+        assert!(!tc.ctx.contains_instruction(old));
+
+        let space: LocalMemorySpaceId = tc.ctx.shared.default_space.into();
+        assert_eq!(
+            numbering.base_offset(ModuleView::new(&tc.ctx), ValueId::Instruction(ptr)),
+            None,
+            "numbering must reject a decomposition whose base is no longer live"
+        );
+        let resolved = MemForward::default().resolve_loaded_ptr(
+            ModuleView::new(&tc.ctx),
+            ValueId::Instruction(ptr),
+            space,
+            None,
+            &numbering,
+            true,
+        );
+
+        assert_eq!(
+            resolved,
+            (Base::Symbolic(space, ValueId::Instruction(ptr)), 0),
+            "a stale affine base must fall back to the live pointer itself"
+        );
+    }
 
     /// A store of `src` (width = location width) to varnode `vn`.
     fn store_to(tc: &TestContext, func: FunctionId, vn: VarnodeId, src: ValueId) -> Store {

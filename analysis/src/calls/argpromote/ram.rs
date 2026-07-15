@@ -46,7 +46,12 @@ impl OwnFrame {
     /// [`FrameClass::Local`]).
     fn is_local(&self, ctx: &Context, addr: ValueId) -> bool {
         self.sp_param.is_some_and(|sp| {
-            frame_class(ctx, &self.numbering, sp, addr) == Some(FrameClass::Local)
+            frame_class(
+                qcode::value::ModuleView::new(ctx),
+                &self.numbering,
+                sp,
+                addr,
+            ) == Some(FrameClass::Local)
         })
     }
 
@@ -55,7 +60,12 @@ impl OwnFrame {
     fn is_frame_slot(&self, ctx: &Context, addr: ValueId) -> bool {
         self.sp_param.is_some_and(|sp| {
             matches!(
-                frame_class(ctx, &self.numbering, sp, addr),
+                frame_class(
+                    qcode::value::ModuleView::new(ctx),
+                    &self.numbering,
+                    sp,
+                    addr,
+                ),
                 Some(FrameClass::Local | FrameClass::CallerFrame)
             )
         })
@@ -430,7 +440,9 @@ fn all_writes_resolvable(
             // A constant offset of *either* sign is caller-resolvable (the caller
             // snapshots `arg + offset`); a dynamic address decomposes to a non-param
             // base and is rejected.
-            let (base, _off) = numbering.base_offset(addr).unwrap_or((addr, 0));
+            let (base, _off) = numbering
+                .base_offset(qcode::value::ModuleView::new(ctx), addr)
+                .unwrap_or((addr, 0));
             is_param(base)
         })
     })
@@ -517,7 +529,9 @@ fn regions_disjoint(
             }
             // Offset-precise disjointness against the written region: the scalar
             // must share the region's base param and miss its byte span.
-            let (base, off) = numbering.base_offset(addr).unwrap_or((addr, 0));
+            let (base, off) = numbering
+                .base_offset(qcode::value::ModuleView::new(ctx), addr)
+                .unwrap_or((addr, 0));
             base == region_base && (off + wsize as i64 <= region_lo || off >= region_hi)
         })
     })
@@ -734,7 +748,9 @@ fn apply(
             if own_frame.is_local(ctx, addr) {
                 continue;
             }
-            let (base, offset) = numbering.base_offset(addr).unwrap_or((addr, 0));
+            let (base, offset) = numbering
+                .base_offset(qcode::value::ModuleView::new(&*ctx), addr)
+                .unwrap_or((addr, 0));
             let base_size = promoted
                 .iter()
                 .find(|q| q.param == base)

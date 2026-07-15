@@ -671,18 +671,31 @@ impl Numbering {
     /// The affine decomposition of `ptr` as a single base term plus a signed
     /// byte offset, i.e. `ptr == base + constant` with a unit coefficient.
     /// Returns `None` for multi-term, scaled, masked, or non-affine pointers —
-    /// the caller then treats the whole pointer value as its own base.
+    /// and when the recorded base has since been deleted from the live IR — the
+    /// caller then treats the whole pointer value as its own base.
     ///
     /// This is the affine base-identity used by memory forwarding: `(p + 4) - 4`
     /// and `p` decompose to the same `base = p`, so they unify for free.
-    pub(crate) fn base_offset(&self, ptr: ValueId) -> Option<(ValueId, i64)> {
+    pub(crate) fn base_offset<'ctx, 'str: 'ctx>(
+        &self,
+        host: impl QCodeView<'ctx, 'str>,
+        ptr: ValueId,
+    ) -> Option<(ValueId, i64)> {
         match self.forms.get(&ptr)? {
             NormalForm::Affine {
                 width,
                 constant,
                 terms,
             } if terms.len() == 1 && terms[0].1 == 1 => {
-                Some((terms[0].0, signed(*constant, *width)))
+                let base = terms[0].0;
+                let live = match base {
+                    ValueId::Instruction(id) => host.contains_instruction(id),
+                    ValueId::BasicBlock(id) => host.contains_block(id),
+                    ValueId::BlockParam(id) => host.contains_block_param(id),
+                    ValueId::Temp(id) => host.contains_temp(id),
+                    _ => true,
+                };
+                live.then_some((base, signed(*constant, *width)))
             }
             _ => None,
         }
@@ -885,18 +898,19 @@ mod spike {
         // VERDICT 1 — plain slots get stable `(@SP, offset)` identity, the same for
         // every independent occurrence, with no `@stack_base` literal and no
         // dominance information. This is the make-or-break for the migration.
-        assert_eq!(nb.base_offset(s1), Some((sp, -8)));
-        assert_eq!(nb.base_offset(s2), Some((sp, -8)));
+        let view = qcode::value::ModuleView::new(&tc.ctx);
+        assert_eq!(nb.base_offset(view, s1), Some((sp, -8)));
+        assert_eq!(nb.base_offset(view, s2), Some((sp, -8)));
 
         // VERDICT 2 — SP moves thread through affine composition for free: a slot
         // reached after `sub rsp, 0x20` still roots at `@SP`, at the summed offset.
-        assert_eq!(nb.base_offset(threaded), Some((sp, -0x18)));
+        assert_eq!(nb.base_offset(view, threaded), Some((sp, -0x18)));
 
         // VERDICT 3 — the regression: `and rsp, -16` is a *mask*, not affine, so the
         // slot re-roots at the aligned base (`@SP & -16`) instead of `@SP`. Identity
         // among post-alignment slots survives; the link back to `@SP` is lost.
-        assert_eq!(nb.base_offset(aligned), None);
-        assert_eq!(nb.base_offset(al), Some((aligned, 8)));
+        assert_eq!(nb.base_offset(view, aligned), None);
+        assert_eq!(nb.base_offset(view, al), Some((aligned, 8)));
     }
 
     /// `affine_mentions` recognises every pointer transitively built on `@SP`,
@@ -992,8 +1006,9 @@ mod spike {
 
         // Both decompose to the same affine base+offset, so memory forwarding
         // treats them as the same cell.
-        assert_eq!(nb.base_offset(gep), Some((p, 0x60)));
-        assert_eq!(nb.base_offset(add), nb.base_offset(gep));
+        let view = qcode::value::ModuleView::new(&tc.ctx);
+        assert_eq!(nb.base_offset(view, gep), Some((p, 0x60)));
+        assert_eq!(nb.base_offset(view, add), nb.base_offset(view, gep));
         // The gep is still recognised as built on `p`.
         assert!(nb.affine_mentions(gep, p));
     }

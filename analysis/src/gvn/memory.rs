@@ -86,11 +86,23 @@ impl<'str> SubPass<'str> for MemoryForwarding {
                 match forwarded {
                     Some(value) => {
                         ed.replace(body, cx, ic.insn_id, value);
-                        state.define_load(ic.insn_id.func, load, value, ic.aliases, ic.numbering);
+                        state.define_load(
+                            cx.body_view(body),
+                            ic.insn_id.func,
+                            load,
+                            value,
+                            ic.aliases,
+                            ic.numbering,
+                        );
                     }
-                    None => {
-                        state.define_load(ic.insn_id.func, load, ic.id, ic.aliases, ic.numbering)
-                    }
+                    None => state.define_load(
+                        cx.body_view(body),
+                        ic.insn_id.func,
+                        load,
+                        ic.id,
+                        ic.aliases,
+                        ic.numbering,
+                    ),
                 }
                 Claim::Done
             }

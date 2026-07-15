@@ -254,7 +254,7 @@ impl AliasResult {
         for block in host.function_ref(fid).blocks() {
             for insn in block.iter() {
                 let v = ValueId::Instruction(insn.id);
-                if let Some(FrameClass::Local) = frame_class(host.shared(), &numbering, sp, v) {
+                if let Some(FrameClass::Local) = frame_class(host, &numbering, sp, v) {
                     own_frame_locals.insert(v);
                 }
             }
@@ -309,12 +309,8 @@ fn frame_is_captured<'ctx, 'str: 'ctx>(
     numbering: &Numbering,
     sp: ValueId,
 ) -> bool {
-    let is_own_frame = |v: ValueId| {
-        matches!(
-            frame_class(host.shared(), numbering, sp, v),
-            Some(FrameClass::Local)
-        )
-    };
+    let is_own_frame =
+        |v: ValueId| matches!(frame_class(host, numbering, sp, v), Some(FrameClass::Local));
     for block in host.function_ref(fid).blocks() {
         for insn in block.iter() {
             let func = insn.id.func;
@@ -384,7 +380,7 @@ impl FrameInfo {
         use Provenance as P;
         // Stack provenance first: `@SP ± k`, realigned frames, and the bare `@SP`
         // param (offset 0 → caller frame).
-        if let Some(fc) = frame_class(host.shared(), &self.numbering, self.sp_param, v) {
+        if let Some(fc) = frame_class(host, &self.numbering, self.sp_param, v) {
             return match fc {
                 FrameClass::Local => P::OWN_FRAME,
                 FrameClass::CallerFrame => P::CALLER_FRAME,
@@ -426,7 +422,7 @@ impl FrameInfo {
                 // Affine `base + const` over a global base — the old
                 // `is_global_static` fallback for a global reached via a non-add op.
                 _ => {
-                    if let Some((base, _)) = self.numbering.base_offset(v)
+                    if let Some((base, _)) = self.numbering.base_offset(host, v)
                         && base != v
                         && self.provenance(host, base).is_pure(P::GLOBAL_STATIC)
                     {

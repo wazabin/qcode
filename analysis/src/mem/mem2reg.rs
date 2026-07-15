@@ -92,7 +92,13 @@ pub(crate) fn has_dynamic_stack_pointer_deref(
             let Some(access) = MemoryAccess::from_mnemonic(insn.mnemonic(), insn.id.func) else {
                 continue;
             };
-            if frame_offset(ctx, &numbering, sp, access.ptr).is_none()
+            if frame_offset(
+                qcode::value::ModuleView::new(ctx),
+                &numbering,
+                sp,
+                access.ptr,
+            )
+            .is_none()
                 && numbering.affine_mentions(access.ptr, sp)
             {
                 return true;
@@ -715,7 +721,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
     /// stack-pointer param or `ptr` is not an `@SP ± N` slot.
     fn slot_offset(&self, ptr: ValueId) -> Option<i64> {
         let sp = self.sp_param?;
-        frame_offset(self.read().shared(), &self.numbering, sp, ptr)
+        frame_offset(self.read(), &self.numbering, sp, ptr)
     }
 
     /// Whether `ptr` is `@SP`-derived but *not* a fixed slot offset — a

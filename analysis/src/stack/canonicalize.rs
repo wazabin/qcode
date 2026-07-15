@@ -54,7 +54,7 @@ pub fn canonicalize_sp_slots_concrete<'a, 'str>(
                 Mnemonic::Store(store) => store.ptr.qualify(insn.id.func),
                 _ => continue,
             };
-            if let Some((base, off)) = numbering.base_offset(ptr)
+            if let Some((base, off)) = numbering.base_offset(cx.body_view(body), ptr)
                 && base == sp_param
             {
                 ptr_offset.insert(ptr, off);
@@ -77,7 +77,7 @@ pub fn canonicalize_sp_slots_concrete<'a, 'str>(
     }
     for insn in cx.body_view(body).function_ref(fid).root().unwrap().iter() {
         let v = ValueId::Instruction(insn.id);
-        if let Some((base, off)) = numbering.base_offset(v)
+        if let Some((base, off)) = numbering.base_offset(cx.body_view(body), v)
             && base == sp_param
             && offsets.contains(&off)
         {
@@ -146,7 +146,7 @@ pub fn canonicalize_sp_slots<'str>(
                 Mnemonic::Store(store) => store.ptr.qualify(insn.id.func),
                 _ => continue,
             };
-            if let Some((base, off)) = numbering.base_offset(ptr)
+            if let Some((base, off)) = numbering.base_offset(view, ptr)
                 && base == sp_param
             {
                 ptr_offset.insert(ptr, off);
@@ -169,7 +169,7 @@ pub fn canonicalize_sp_slots<'str>(
     }
     for insn in host.function_ref(fid).root().unwrap().iter() {
         let v = ValueId::Instruction(insn.id);
-        if let Some((base, off)) = numbering.base_offset(v)
+        if let Some((base, off)) = numbering.base_offset(view, v)
             && base == sp_param
             && offsets.contains(&off)
         {

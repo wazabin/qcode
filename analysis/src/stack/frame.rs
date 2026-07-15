@@ -13,7 +13,7 @@
 //! agnostic replacement for matching `StackAddress` literals directly, and the
 //! foundation for the frame-freshness alias rule.
 
-use qcode::value::{FunctionId, FunctionRef, ValueId, VarnodeId, util::base_ref::AsShared};
+use qcode::value::{FunctionId, FunctionRef, QCodeView, ValueId, VarnodeId};
 
 use crate::gvn::affine::Numbering;
 
@@ -59,7 +59,13 @@ pub(crate) fn incoming_sp_param<'a, 'str: 'a>(
 /// aligned base) through a **non-positive** offset — a *positive* offset before a
 /// mask could round to an address at/above entry `@SP` (the caller's frame), which
 /// must not be classified as a local.
-fn is_aligned_sp(numbering: &Numbering, sp_param: ValueId, base: ValueId, depth: u32) -> bool {
+fn is_aligned_sp<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    numbering: &Numbering,
+    sp_param: ValueId,
+    base: ValueId,
+    depth: u32,
+) -> bool {
     if depth == 0 {
         return false;
     }
@@ -67,11 +73,11 @@ fn is_aligned_sp(numbering: &Numbering, sp_param: ValueId, base: ValueId, depth:
         return false;
     };
     // Peel the affine offset of the value being aligned; it must go downward.
-    let (inner, off) = numbering.base_offset(term).unwrap_or((term, 0));
+    let (inner, off) = numbering.base_offset(host, term).unwrap_or((term, 0));
     if off > 0 {
         return false;
     }
-    inner == sp_param || is_aligned_sp(numbering, sp_param, inner, depth - 1)
+    inner == sp_param || is_aligned_sp(host, numbering, sp_param, inner, depth - 1)
 }
 
 /// The signed byte offset of `v` from the entry stack pointer `@SP`, when `v` is
@@ -80,34 +86,34 @@ fn is_aligned_sp(numbering: &Numbering, sp_param: ValueId, base: ValueId, depth:
 ///
 /// Returns `None` for a realigned (`@SP & -mask`) base — which has no stable
 /// `@SP`-relative offset — and for any non-stack pointer.
-pub(crate) fn frame_offset<'a, 'str: 'a>(
-    _src: impl AsShared<'a, 'str>,
+pub(crate) fn frame_offset<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     numbering: &Numbering,
     sp_param: ValueId,
     v: ValueId,
 ) -> Option<i64> {
     // Affine `@SP ± k` (the bare param decomposes to itself at offset 0).
-    let (base, off) = numbering.base_offset(v).unwrap_or((v, 0));
+    let (base, off) = numbering.base_offset(host, v).unwrap_or((v, 0));
     (base == sp_param).then_some(off)
 }
 
 /// Classify pointer `v` against the frame whose incoming stack pointer is
 /// `sp_param`, decomposing `@SP ± k` through `numbering`. Returns `None` when `v`
 /// is not stack-pointer-rooted.
-pub(crate) fn frame_class<'a, 'str: 'a>(
-    src: impl AsShared<'a, 'str>,
+pub(crate) fn frame_class<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     numbering: &Numbering,
     sp_param: ValueId,
     v: ValueId,
 ) -> Option<FrameClass> {
     // An `@SP`/`@stack_base`-relative slot: classify by the sign of its offset.
-    if let Some(off) = frame_offset(src, numbering, sp_param, v) {
+    if let Some(off) = frame_offset(host, numbering, sp_param, v) {
         return Some(by_sign(off));
     }
     // A realigned frame base (`@SP & -mask`, possibly cascaded): everything offset
     // from it is a local — incoming args never flow through the alignment mask.
-    let (base, _) = numbering.base_offset(v).unwrap_or((v, 0));
-    is_aligned_sp(numbering, sp_param, base, ALIGN_CASCADE_LIMIT).then_some(FrameClass::Local)
+    let (base, _) = numbering.base_offset(host, v).unwrap_or((v, 0));
+    is_aligned_sp(host, numbering, sp_param, base, ALIGN_CASCADE_LIMIT).then_some(FrameClass::Local)
 }
 
 /// Below the entry stack pointer (`off < 0`) is an own-frame local; the
@@ -187,19 +193,20 @@ mod tests {
         };
 
         let nb = precompute_forms(qcode::value::ModuleView::new(&tc.ctx), fid);
-        let class = |v| frame_class(&tc.ctx, &nb, sp, v);
+        let view = qcode::value::ModuleView::new(&tc.ctx);
+        let class = |v| frame_class(view, &nb, sp, v);
 
         // The canonical slot key agrees across representations and is `None`
         // exactly where there is no stable `@SP`-relative offset.
-        assert_eq!(frame_offset(&tc.ctx, &nb, sp, local), Some(-8));
-        assert_eq!(frame_offset(&tc.ctx, &nb, sp, caller_arg), Some(8));
-        assert_eq!(frame_offset(&tc.ctx, &nb, sp, ret_slot), Some(0));
+        assert_eq!(frame_offset(view, &nb, sp, local), Some(-8));
+        assert_eq!(frame_offset(view, &nb, sp, caller_arg), Some(8));
+        assert_eq!(frame_offset(view, &nb, sp, ret_slot), Some(0));
         assert_eq!(
-            frame_offset(&tc.ctx, &nb, sp, aligned_slot),
+            frame_offset(view, &nb, sp, aligned_slot),
             None,
             "a realigned base has no stable @SP-relative offset"
         );
-        assert_eq!(frame_offset(&tc.ctx, &nb, sp, unrelated), None);
+        assert_eq!(frame_offset(view, &nb, sp, unrelated), None);
 
         assert_eq!(class(local), Some(FrameClass::Local), "@SP - 8 is a local");
         assert_eq!(
@@ -249,10 +256,11 @@ mod tests {
 
         let nb = precompute_forms(qcode::value::ModuleView::new(&tc.ctx), fid);
         // A cascaded base has no stable `@SP`-relative offset…
-        assert_eq!(frame_offset(&tc.ctx, &nb, sp, slot), None);
+        let view = qcode::value::ModuleView::new(&tc.ctx);
+        assert_eq!(frame_offset(view, &nb, sp, slot), None);
         // …but is still classified as an own-frame local.
         assert_eq!(
-            frame_class(&tc.ctx, &nb, sp, slot),
+            frame_class(view, &nb, sp, slot),
             Some(FrameClass::Local),
             "a slot on a cascaded realignment of @SP is a local"
         );
@@ -282,12 +290,12 @@ mod tests {
 
         let nb = precompute_forms(qcode::value::ModuleView::new(&tc.ctx), fid);
         assert_eq!(
-            frame_class(&tc.ctx, &nb, sp, aligned),
+            frame_class(qcode::value::ModuleView::new(&tc.ctx), &nb, sp, aligned),
             None,
             "(@SP + k) & -mask may land in the caller frame — not a local"
         );
         assert_eq!(
-            frame_class(&tc.ctx, &nb, sp, slot),
+            frame_class(qcode::value::ModuleView::new(&tc.ctx), &nb, sp, slot),
             None,
             "a slot on an upward-anchored realignment is not a local"
         );
