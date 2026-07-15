@@ -559,7 +559,7 @@ impl<'str> FunctionBody<'str> {
     // 6). Each verb operates directly on this body's own arenas, reading shared
     // data (types for minting) through an explicit `&Context` where needed. These
     // are the algorithm bodies formerly living on the checked-out mutation path
-    // (`value::util::pass_backing`), ported here with the routing indirection dropped:
+    // (`value::util::body_mut`), ported here with the routing indirection dropped:
     // `self.function_mut(f)` collapses to `self`, `self.view()` to `self`'s
     // own arena accessors. The owning [`FunctionId`] comes from [`id`](Self::id).
 

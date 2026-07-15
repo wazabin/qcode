@@ -486,10 +486,10 @@ mod tests {
         // And/Or results and hide the boolean half of the MBA.
         let root = FunctionBody::from_id(&ctx, mtmul).root().expect("root").id;
         while crate::dce::remove_dead_insns(&mut ctx, root) {}
-        // mba_simplify's surface is pass-scoped; run it over a `PassBacking`
+        // mba_simplify's surface is pass-scoped; run it over a `BodyMut`
         // borrowing the body in place alongside the read-only shared state.
         let mba_changed = {
-            let mut host = qcode::value::util::pass_backing::PassBacking::new(
+            let mut host = qcode::value::util::body_mut::BodyMut::new(
                 &mut ctx.bodies[mtmul],
                 &ctx.shared,
                 &ctx.interfaces,

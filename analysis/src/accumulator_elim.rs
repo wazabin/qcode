@@ -51,7 +51,7 @@ use qcode::{
         block::BlockId,
         block_param::{BlockParam, BlockParamId},
         insn::{Apply, CBranch, Extract, Mnemonic},
-        util::{base_ref::BaseRef, pass_backing::PassBacking},
+        util::{base_ref::BaseRef, body_mut::BodyMut},
     },
 };
 
@@ -436,7 +436,7 @@ fn transform<'str>(
     }
     let driver_init: Vec<ValueId> = p.d_slots.iter().map(|&i| model.init_args[i]).collect();
     // TODO(5b-ii): the seeding below runs on a temporary host because
-    // `push_typed`/`clone_self` stay generic for the minted `PassBacking` path.
+    // `push_typed`/`clone_self` stay generic for the minted `BodyMut` path.
     let mut host = m.host(body);
     // `apply g(driver_init)` typed explicitly (g uninstalled), then unpack each
     // accumulator field the original return reads.
@@ -490,7 +490,7 @@ fn transform<'str>(
 
 /// Push a driver param typed `ty` onto `block` in the minted host, returning its
 /// value (host-routed `BasicBlock::push_param` + the `type_id` write).
-fn push_param<'str>(host: &mut PassBacking<'_, 'str>, block: BlockId, ty: TypeId) -> ValueId {
+fn push_param<'str>(host: &mut BodyMut<'_, 'str>, block: BlockId, ty: TypeId) -> ValueId {
     let index = host.block_ref(block).num_params();
     let pid = host.push_block_param(block.func, BlockParam::new(index, ty, block.local));
     host.block_mut(block).params.push(pid.localize(block.func));
@@ -499,7 +499,7 @@ fn push_param<'str>(host: &mut PassBacking<'_, 'str>, block: BlockId, ty: TypeId
 
 /// Mint an instruction with an explicit result type and append it to `block`.
 fn push_typed<'str>(
-    host: &mut PassBacking<'_, 'str>,
+    host: &mut BodyMut<'_, 'str>,
     block: BlockId,
     mnemonic: Mnemonic,
     ty: TypeId,
@@ -557,7 +557,7 @@ fn collect_deps<'ctx, 'str: 'ctx>(
 /// seeded leaves via `subst` and resolving block-param references via `bindings`.
 fn clone_cross<'ctx, 'str: 'ctx>(
     read: impl QCodeView<'ctx, 'str>,
-    write: &mut PassBacking<'_, 'str>,
+    write: &mut BodyMut<'_, 'str>,
     val: ValueId,
     subst: &mut HashMap<ValueId, ValueId>,
     bindings: &HashMap<BlockParamId, ValueId>,
@@ -600,7 +600,7 @@ fn clone_cross<'ctx, 'str: 'ctx>(
 /// Like [`clone_cross`] but source and target are the *same* (host) function;
 /// reads route through the host's own read view.
 fn clone_self<'str>(
-    host: &mut PassBacking<'_, 'str>,
+    host: &mut BodyMut<'_, 'str>,
     val: ValueId,
     subst: &mut HashMap<ValueId, ValueId>,
     bindings: &HashMap<BlockParamId, ValueId>,

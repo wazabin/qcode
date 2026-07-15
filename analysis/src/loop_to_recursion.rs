@@ -39,7 +39,7 @@ use qcode::value::{
     block::BlockId,
     block_param::BlockParam,
     insn::{Branch, InstructionId, Mnemonic},
-    util::{base_ref::BaseRef, pass_backing::PassBacking},
+    util::{base_ref::BaseRef, body_mut::BodyMut},
 };
 
 use crate::pipeline::{ContextView, FunctionBody, Minted, Outcome};
@@ -367,7 +367,7 @@ fn transform<'str>(
 /// Push a cloned param typed `ty` onto `block`, returning its value (host-routed
 /// `BasicBlock::push_param` + the `type_id` write).
 fn push_param<'str>(
-    host: &mut PassBacking<'_, 'str>,
+    host: &mut BodyMut<'_, 'str>,
     block: BlockId,
     ty: qcode::types::TypeId,
 ) -> ValueId {

@@ -2086,7 +2086,7 @@ mod tests {
     fn checked_builder_matches_module_builder() {
         use crate::value::{
             FunctionId, FunctionRef, block::BasicBlock, function::FunctionBody,
-            util::pass_backing::PassBacking,
+            util::body_mut::BodyMut,
         };
 
         // The same body over any host: consts and a couple of binops (exercising
@@ -2148,8 +2148,7 @@ mod tests {
         let fid_b = FunctionBody::make(&mut ctx_b, "foo".into()).unwrap().id;
         let entry_b = FunctionBody::from_id_mut(&mut ctx_b, fid_b).make_root().id;
         {
-            let mut host =
-                PassBacking::new(&mut ctx_b.bodies[fid_b], &ctx_b.shared, &ctx_b.interfaces);
+            let mut host = BodyMut::new(&mut ctx_b.bodies[fid_b], &ctx_b.shared, &ctx_b.interfaces);
             let mut b = host.builder(entry_b);
             body(&mut b);
         }

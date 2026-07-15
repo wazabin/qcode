@@ -48,7 +48,7 @@ use qcode::value::{
     BodyView, FunctionId, FunctionRef, InstructionRef, QCodeView, Value, ValueId, ValueRef,
     block::BlockId,
     insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic, Unary, Unop},
-    util::pass_backing::PassBacking,
+    util::body_mut::BodyMut,
 };
 
 use rumba_core::{
@@ -95,7 +95,7 @@ fn users_of(host: BodyView<'_, '_>, v: ValueId) -> Vec<InstructionId> {
 /// Maximum width rumba can model. Wider roots are skipped.
 const MAX_WIDTH_BYTES: usize = 8;
 
-pub fn mba_simplify<'str>(host: &mut PassBacking<'_, 'str>, fun: FunctionId) -> bool {
+pub fn mba_simplify<'str>(host: &mut BodyMut<'_, 'str>, fun: FunctionId) -> bool {
     let roots: Vec<InstructionId> = FunctionRef::new(host.view(), fun)
         .blocks()
         .flat_map(|b| b.instruction_ids().to_vec())
@@ -128,7 +128,7 @@ fn is_root(host: BodyView<'_, '_>, iid: InstructionId) -> bool {
     true
 }
 
-fn try_simplify_root<'str>(host: &mut PassBacking<'_, 'str>, root: InstructionId) -> bool {
+fn try_simplify_root<'str>(host: &mut BodyMut<'_, 'str>, root: InstructionId) -> bool {
     let size = insn_size(host.view(), root);
     if size == 0 || size > MAX_WIDTH_BYTES {
         return false;
@@ -421,7 +421,7 @@ fn cost(e: &Expr, mask: u64) -> usize {
 
 #[allow(clippy::too_many_arguments)]
 fn emit<'str>(
-    host: &mut PassBacking<'_, 'str>,
+    host: &mut BodyMut<'_, 'str>,
     e: &Expr,
     leaves: &[ValueId],
     size: usize,
@@ -467,7 +467,7 @@ fn emit<'str>(
 
 #[allow(clippy::too_many_arguments)]
 fn fold_emit<'str>(
-    host: &mut PassBacking<'_, 'str>,
+    host: &mut BodyMut<'_, 'str>,
     operands: &[Expr],
     op: IntBinop,
     leaves: &[ValueId],
@@ -494,7 +494,7 @@ fn fold_emit<'str>(
 }
 
 fn push_binop<'str>(
-    host: &mut PassBacking<'_, 'str>,
+    host: &mut BodyMut<'_, 'str>,
     op: IntBinop,
     lhs: ValueId,
     rhs: ValueId,
@@ -516,7 +516,7 @@ fn push_binop<'str>(
 }
 
 fn push_insn<'str>(
-    host: &mut PassBacking<'_, 'str>,
+    host: &mut BodyMut<'_, 'str>,
     mnemonic: Mnemonic,
     size: usize,
     before: InstructionId,
@@ -528,7 +528,7 @@ fn push_insn<'str>(
 }
 
 /// Remove `iid` and any operand subtree that becomes userless once it is gone.
-fn prune_dead<'str>(host: &mut PassBacking<'_, 'str>, iid: InstructionId) {
+fn prune_dead<'str>(host: &mut BodyMut<'_, 'str>, iid: InstructionId) {
     if !users_of(host.view(), ValueId::Instruction(iid)).is_empty() {
         return;
     }
@@ -641,10 +641,10 @@ mod tests {
     use qcode_emulator::{SizedValue, StandaloneEmulator};
     use qcode_macro::qcode;
 
-    /// Run [`mba_simplify`] on `fid` over a `PassBacking` borrowing the body in
+    /// Run [`mba_simplify`] on `fid` over a `BodyMut` borrowing the body in
     /// place — the pass surface is pass-scoped — leaving the rewritten body in `ctx`.
     fn run_mba(ctx: &mut Context, fid: FunctionId) -> bool {
-        let mut host = PassBacking::new(&mut ctx.bodies[fid], &ctx.shared, &ctx.interfaces);
+        let mut host = BodyMut::new(&mut ctx.bodies[fid], &ctx.shared, &ctx.interfaces);
         mba_simplify(&mut host, fid)
     }
 

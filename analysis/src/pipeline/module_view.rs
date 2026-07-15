@@ -23,7 +23,7 @@ use qcode::{
     context::{Context, Shared},
     value::{
         BodyView, FunctionBody, FunctionId, FunctionKind, function::FunctionInterface,
-        insn::Callee, util::pass_backing::PassBacking,
+        insn::Callee, util::body_mut::BodyMut,
     },
 };
 
@@ -179,17 +179,17 @@ impl<'ctx, 'str> ContextView<'ctx, 'str> {
         self.shared
     }
 
-    /// The whole interface registry (for building a [`PassBacking`]/[`BodyView`]).
+    /// The whole interface registry (for building a [`BodyMut`]/[`BodyView`]).
     pub fn interfaces(&self) -> &'ctx Registry<FunctionId, FunctionInterface<'str>> {
         self.interfaces
     }
 
     /// Build the mutation host for a pass's exclusively borrowed body.
-    pub fn host<'body>(self, body: &'body mut FunctionBody<'str>) -> PassBacking<'body, 'str>
+    pub fn host<'body>(self, body: &'body mut FunctionBody<'str>) -> BodyMut<'body, 'str>
     where
         'ctx: 'body,
     {
-        PassBacking::new(body, self.shared, self.interfaces)
+        BodyMut::new(body, self.shared, self.interfaces)
     }
 
     /// Build the static read view for a pass's borrowed body.
@@ -270,7 +270,7 @@ pub fn host_with_minted<'body, 'ctx, 'str>(
     minted: &'body mut [Minted<'str>],
     cx: ContextView<'ctx, 'str>,
     callee: Callee,
-) -> (BodyView<'body, 'str>, PassBacking<'body, 'str>)
+) -> (BodyView<'body, 'str>, BodyMut<'body, 'str>)
 where
     'ctx: 'body,
 {
@@ -439,7 +439,7 @@ mod tests {
         assert_eq!(detached.block(child).parent, Some(installed));
         assert_eq!(detached.edge(edge).from, root);
         assert_eq!(detached.edge(edge).to, child);
-        let host = PassBacking::new(&mut detached, view.shr(), view.interfaces());
+        let host = BodyMut::new(&mut detached, view.shr(), view.interfaces());
         assert_eq!(
             host.view()
                 .block_ref(root)

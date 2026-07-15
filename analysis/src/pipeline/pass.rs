@@ -245,12 +245,12 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
 /// `mem2reg_framed`) use to reach the concrete function-pass core: their callers
 /// hold a `&mut Context` but neither a [`FunctionBody`] nor a [`PipelineEnv`], and
 /// they supply their own alias oracle, so the [`ContextView`]'s headless env is
-/// not consulted by the cores. Because the concrete [`PassBacking`] path
+/// not consulted by the cores. Because the concrete [`BodyMut`] path
 /// debug-asserts the body is self-stored, every caller must feed a function with
 /// no reattributed blocks — which, post the driver's `split_overlapping_functions`
 /// normalization, every production function is.
 ///
-/// [`PassBacking`]: qcode::value::util::pass_backing::PassBacking
+/// [`BodyMut`]: qcode::value::util::body_mut::BodyMut
 pub(crate) fn with_body_mut<'str, R>(
     ctx: &mut Context<'str>,
     fid: FunctionId,

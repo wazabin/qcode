@@ -8,8 +8,8 @@ use crate::{
         insn::{InstructionId, InstructionRef, LocalInsnId, Mnemonic},
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
+            body_mut::BodyMut,
             named::{Named, Renameable, update_context_name},
-            pass_backing::PassBacking,
         },
     },
 };
@@ -610,7 +610,7 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for BlockMutRef<'str, 'ctx> 
 
 // Read access over a mutation host: shared reads via the host's shared context,
 // the read view via its static provider. Two concrete backings — `&mut Context`
-// (module) and `PassBacking` (checked-out function pass) — each routing through
+// (module) and `BodyMut` (checked-out function pass) — each routing through
 // the backing's inherent `shared`/`view`.
 impl<'s, 'str> WithCtx<'s, 's, 'str> for BaseRef<&mut Context<'str>, BlockId>
 where
@@ -620,7 +620,7 @@ where
         self.ctx.shared()
     }
 }
-impl<'s, 'a, 'str> WithCtx<'s, 's, 'str> for BaseRef<PassBacking<'a, 'str>, BlockId>
+impl<'s, 'a, 'str> WithCtx<'s, 's, 'str> for BaseRef<BodyMut<'a, 'str>, BlockId>
 where
     'str: 's,
 {
@@ -650,13 +650,13 @@ impl<'str, 'ctx> Renameable<'str, 'ctx> for BlockMutRef<'str, 'ctx> {
 // Naming/renaming a block through a checked-out host (concrete: a generic
 // a fully generic backing can't prove `'str` outlives the returned `&str`). Block names are
 // function-local, so this reads/writes the owned function's arena directly.
-impl<'a, 'str> Named for BaseRef<PassBacking<'a, 'str>, BlockId> {
+impl<'a, 'str> Named for BaseRef<BodyMut<'a, 'str>, BlockId> {
     fn name(&self) -> Option<&str> {
         self.ctx.fun.blocks[self.id.local].name.as_deref()
     }
 }
 
-impl<'a, 'str> Renameable<'str, 'a> for BaseRef<PassBacking<'a, 'str>, BlockId> {
+impl<'a, 'str> Renameable<'str, 'a> for BaseRef<BodyMut<'a, 'str>, BlockId> {
     fn rename(&mut self, name: Cow<'str, str>) -> Result<()> {
         let id = self.id.into();
         let old_name = self.ctx.fun.blocks[self.id.local]
@@ -671,7 +671,7 @@ impl<'a, 'str> Renameable<'str, 'a> for BaseRef<PassBacking<'a, 'str>, BlockId> 
 }
 
 // The own-block mutation verbs, emitted for each concrete mutation backing —
-// `&mut Context` (module) and `PassBacking` (checked-out function pass). Both
+// `&mut Context` (module) and `BodyMut` (checked-out function pass). Both
 // bodies are identical (they call the backing's inherent verbs); the macro keeps
 // the pair in lockstep without a shared trait bound.
 macro_rules! impl_block_mut_verbs {
@@ -748,7 +748,7 @@ macro_rules! impl_block_mut_verbs {
 }
 
 impl_block_mut_verbs!(<'c, 'str> &'c mut Context<'str>);
-impl_block_mut_verbs!(<'a, 'str> PassBacking<'a, 'str>);
+impl_block_mut_verbs!(<'a, 'str> BodyMut<'a, 'str>);
 
 impl Display for BlockMutRef<'_, '_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {

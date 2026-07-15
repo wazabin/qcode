@@ -1216,7 +1216,7 @@ pub(super) fn function_fingerprint(ctx: &Context, fun_id: FunctionId) -> u64 {
 /// `Display` output straight into the hasher — no intermediate `String`. Used to
 /// fingerprint a function whether it is live in the module ([`function_fingerprint`])
 /// or checked out of it (the per-function fixpoint tracer, which renders the body
-/// through its `PassBacking` host).
+/// through its `BodyMut` host).
 pub(super) fn fingerprint_display(d: impl std::fmt::Display) -> u64 {
     use std::fmt::Write as _;
     use std::hash::Hasher;
@@ -1370,7 +1370,7 @@ fn run_function_stage_with_threads(
     // Every producer of reattributed blocks (the recursive lifter, and
     // `split_overlapping_functions` during discovery rounds) discharges strict
     // locality at its own tail, so every function reaching this stage is already
-    // self-stored — the invariant `PassBacking::new` asserts at construction. No
+    // self-stored — the invariant `BodyMut::new` asserts at construction. No
     // storage normalization is needed here.
     dump_stage_inputs(ctx, &stage.dump, &stage.name);
     let fun_ids: Vec<FunctionId> = ctx

@@ -23,7 +23,7 @@ use qcode::{
     value::{
         BlockId, BlockRef, FunctionId, FunctionRef, InstructionRef, ModuleView, QCodeView, ValueId,
         insn::{Binary, Binop, Branch, CBranch, InstructionId, IntBinop, Mnemonic},
-        util::pass_backing::PassBacking,
+        util::body_mut::BodyMut,
     },
 };
 
@@ -239,7 +239,7 @@ pub(crate) fn is_loop_private<'a, 'str: 'a>(
 /// `blocks`. `preheader` is assumed to end in a terminator; if it somehow does
 /// not, the reroute is skipped but the blocks are still deleted.
 pub(crate) fn delete_private_loop<'str>(
-    host: &mut PassBacking<'_, 'str>,
+    host: &mut BodyMut<'_, 'str>,
     fid: FunctionId,
     preheader: BlockId,
     blocks: &[BlockId],

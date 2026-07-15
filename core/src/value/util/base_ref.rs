@@ -74,7 +74,7 @@ pub trait WithCtx<'s, 'ctx: 's, 'str: 'ctx> {
 /// wrapper-ref constructors (`Varnode::from_id`, `Space::from_id`,
 /// `LiteralRef`/`BytesRef`) accept **either** a whole `&Context` (module scope)
 /// **or** a bare `&Shared` (pass scope, via `QCodeView::shared()` /
-/// `PassBacking::shr()`) with no call-site churn (context-split stage 5b-ii item
+/// `BodyMut::shr()`) with no call-site churn (context-split stage 5b-ii item
 /// #1). The leaf refs themselves store only a `&Shared`.
 pub trait AsShared<'a, 'str> {
     // Implemented only for `Copy` reference types (`&Context`, `&Shared`), so

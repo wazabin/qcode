@@ -1942,7 +1942,7 @@ impl<'str> Context<'str> {
     // ---- module read/mint surface (context-split stage 5b-ii Pin A) ----------
     //
     // Module-scope read accessors and type-minting verbs, mirrored on the
-    // checked-out `PassBacking` pass host, so the module walker and the
+    // checked-out `BodyMut` pass host, so the module walker and the
     // module-scope GVN sub-passes read/mint over `&mut Context` directly.
     // `function{,_mut}` alias the existing `body{,_mut}`.
 
@@ -1955,7 +1955,7 @@ impl<'str> Context<'str> {
         self
     }
     /// The module's shared IR state ([`Shared`]) — the module-path twin of
-    /// [`ModuleView::shared`]/[`PassBacking::shr`], so a `&mut Context` module walker and
+    /// [`ModuleView::shared`]/[`BodyMut::shr`], so a `&mut Context` module walker and
     /// a checked-out pass spell shared-data reads identically (context-split
     /// stage 5b-ii item #1).
     pub fn shr(&self) -> &Shared<'str> {
@@ -2631,12 +2631,12 @@ mod tests {
     }
 
     #[test]
-    fn pass_backing_mut_matches_module_mut() {
+    fn body_mut_mut_matches_module_mut() {
         use crate::value::{
             BlockParam, FunctionId, FunctionRef, InstructionId, Renameable,
             block::BlockId,
             block_param::BlockParamId,
-            util::{base_ref::BaseRef, pass_backing::PassBacking},
+            util::{base_ref::BaseRef, body_mut::BodyMut},
         };
 
         fn build(mut ctx: &mut Context<'static>) -> (FunctionId, BlockId, BlockId, InstructionId) {
@@ -2719,8 +2719,7 @@ mod tests {
         let b_b = BasicBlock::from_id(&ctx_b, entry_b).instruction_ids()[1];
 
         {
-            let mut host =
-                PassBacking::new(&mut ctx_b.bodies[fid_b], &ctx_b.shared, &ctx_b.interfaces);
+            let mut host = BodyMut::new(&mut ctx_b.bodies[fid_b], &ctx_b.shared, &ctx_b.interfaces);
             let mut r = BaseRef::new(host.reborrow(), entry_b);
             r.set_comment(Some("c".into()));
             let mut r = BaseRef::new(host.reborrow(), entry_b);

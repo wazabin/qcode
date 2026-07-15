@@ -245,7 +245,7 @@ where
 }
 
 // Own-instruction mutations, emitted for each concrete mutation backing —
-// `&mut Context` (module) and `PassBacking` (checked-out function pass) — so a
+// `&mut Context` (module) and `BodyMut` (checked-out function pass) — so a
 // `FunctionPass` can retype and rename the instructions it owns whether the
 // function lives in the module registry or has been checked out. Mirror the
 // `&mut Context`-only [`InstructionMutRef::set_type`] / `Renameable` impls.
@@ -289,7 +289,7 @@ macro_rules! impl_insn_mut_verbs {
 }
 
 impl_insn_mut_verbs!(<'c, 'str> &'c mut Context<'str>);
-impl_insn_mut_verbs!(<'a, 'str> crate::value::util::pass_backing::PassBacking<'a, 'str>);
+impl_insn_mut_verbs!(<'a, 'str> crate::value::util::body_mut::BodyMut<'a, 'str>);
 
 #[derive(Clone, Copy)]
 pub struct InstructionRef<'str, 'ctx, R = ModuleView<'ctx, 'str>> {
