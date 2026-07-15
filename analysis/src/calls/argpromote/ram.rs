@@ -86,16 +86,13 @@ pub fn argpromote(ctx: &mut Context) -> bool {
 /// frame locals are destroyed at return, so the caller can never observe writes to
 /// them (they are dead on exit). The redirected shadow store is left to DCE.
 pub fn argpromote_with_sp(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> bool {
-    let targets = ctx.function_ids();
-    !argpromote_changed_functions_with_sp(ctx, sp_reg, &targets).is_empty()
+    !argpromote_changed_functions_with_sp(ctx, sp_reg).is_empty()
 }
 
 fn argpromote_changed_functions_with_sp(
     ctx: &mut Context,
     sp_reg: Option<VarnodeId>,
-    targets: &[FunctionId],
 ) -> FxHashSet<FunctionId> {
-    let target_set: FxHashSet<_> = targets.iter().copied().collect();
     let mut changed = FxHashSet::default();
     // Both channels gate every function on being address-taken; build that set once
     // (O(instructions)) instead of rescanning the whole program per function. It
@@ -109,23 +106,16 @@ fn argpromote_changed_functions_with_sp(
     let graph = crate::CallGraph::analyze(ctx);
     let order = callee_first_order(ctx, &graph);
     for fid in order {
-        if !target_set.contains(&fid) {
-            continue;
-        }
-        let callers = graph.callers(fid);
-        if callers.iter().any(|id| !target_set.contains(id)) {
-            continue;
-        }
         // Lift constant-address (global) accesses into params first, so the freshly
         // param-relative derefs are visible to `try_promote`'s footprint scan in the
         // same visit.
         if super::globals::globalize_constants(ctx, &address_taken, fid) {
             changed.insert(fid);
-            changed.extend(callers.iter().copied());
+            changed.extend(graph.callers(fid));
         }
         if try_promote(ctx, fid, sp_reg, &address_taken) {
             changed.insert(fid);
-            changed.extend(callers);
+            changed.extend(graph.callers(fid));
         }
     }
     changed
@@ -1158,14 +1148,11 @@ impl Pass for ArgPromote {
         &self,
         ctx: &mut Context,
         env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         let sp_reg = ctx.shared.registers.get(&env.cfg.stack_pointer).copied();
         Ok(
-            crate::ModulePassOutcome::functions(argpromote_changed_functions_with_sp(
-                ctx, sp_reg, targets,
-            ))
-            .preserving_global::<crate::CallGraphAnalysis>(),
+            crate::ModulePassOutcome::functions(argpromote_changed_functions_with_sp(ctx, sp_reg))
+                .preserving_global::<crate::CallGraphAnalysis>(),
         )
     }
 }

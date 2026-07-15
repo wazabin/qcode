@@ -689,12 +689,10 @@ impl<'str> FunctionBody<'str> {
     /// entries. Supports both cross-block motion and reordering within one
     /// block.
     pub fn move_insn_before(&mut self, insn: InstructionId, before: InstructionId) {
+        let id = self.id();
+        assert_eq!(insn.func, id, "instruction belongs to another function");
         assert_eq!(
-            insn.func, self.id,
-            "instruction belongs to another function"
-        );
-        assert_eq!(
-            before.func, self.id,
+            before.func, id,
             "anchor instruction belongs to another function"
         );
         if insn == before {
@@ -708,12 +706,12 @@ impl<'str> FunctionBody<'str> {
         let source = self
             .insn(insn)
             .parent
-            .map(|local| BlockId::new(self.id, local))
+            .map(|local| BlockId::new(id, local))
             .expect("moved instruction must belong to a block");
         let target = self
             .insn(before)
             .parent
-            .map(|local| BlockId::new(self.id, local))
+            .map(|local| BlockId::new(id, local))
             .expect("anchor instruction must belong to a block");
         let source_index = self
             .block(source)

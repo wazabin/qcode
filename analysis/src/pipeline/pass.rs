@@ -770,6 +770,29 @@ impl<T: DecompilePass> DynDecompilePass for T {
     ) -> Result<bool, String> {
         DecompilePass::run(self, ctx, fun_id, program)
     }
+    fn run_with_analyses(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+        analyses: &mut AnalysisManager,
+    ) -> Result<ModulePassOutcome, String> {
+        #[cfg(test)]
+        let call_graph_before = call_graph_snapshot(ctx);
+        let outcome = Pass::run_with_analyses(self, ctx, env, analyses)?;
+        #[cfg(test)]
+        if outcome
+            .preserved_analyses()
+            .preserves_global_analysis::<crate::CallGraphAnalysis>()
+        {
+            assert_eq!(
+                call_graph_before,
+                call_graph_snapshot(ctx),
+                "{} reported preserving CallGraphAnalysis but changed its result",
+                T::NAME,
+            );
+        }
+        Ok(outcome)
+    }
 }
 
 // ----- registry --------------------------------------------------------------

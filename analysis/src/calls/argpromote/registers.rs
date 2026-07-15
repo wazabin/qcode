@@ -277,16 +277,13 @@ pub(crate) fn scan_register_effects(
 /// [`try_promote_registers`]). Returns `true` if anything changed.
 pub fn argpromote_registers(ctx: &mut Context) -> bool {
     let graph = CallGraph::analyze(ctx);
-    let targets = ctx.function_ids();
-    !argpromote_registers_changed_functions(ctx, &graph, &targets).is_empty()
+    !argpromote_registers_changed_functions(ctx, &graph).is_empty()
 }
 
 fn argpromote_registers_changed_functions(
     ctx: &mut Context,
     graph: &CallGraph,
-    targets: &[FunctionId],
 ) -> FxHashSet<FunctionId> {
-    let target_set: FxHashSet<_> = targets.iter().copied().collect();
     let mut changed = FxHashSet::default();
     // Gate every function on the two whole-program predicates via sets built once
     // instead of a per-function rescan: address-taken (stable — promotion adds no
@@ -295,13 +292,10 @@ fn argpromote_registers_changed_functions(
     // [`super::address_taken_set`] / [`super::called_function_set`].
     let address_taken = super::address_taken_set(ctx);
     let called = called_function_set_from_graph(ctx, graph);
-    for fid in targets.iter().copied() {
-        let callers = graph.callers(fid);
-        if callers.iter().all(|id| target_set.contains(id))
-            && try_promote_registers(ctx, graph, &address_taken, &called, fid)
-        {
+    for fid in ctx.function_ids() {
+        if try_promote_registers(ctx, graph, &address_taken, &called, fid) {
             changed.insert(fid);
-            changed.extend(callers);
+            changed.extend(graph.callers(fid));
         }
     }
     changed
@@ -452,11 +446,10 @@ impl Pass for ArgPromoteRegisters {
         &self,
         ctx: &mut Context,
         _env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         Ok(crate::ModulePassOutcome::functions({
             let graph = CallGraph::analyze(ctx);
-            argpromote_registers_changed_functions(ctx, &graph, targets)
+            argpromote_registers_changed_functions(ctx, &graph)
         })
         .preserving_global::<CallGraphAnalysis>())
     }
@@ -465,15 +458,12 @@ impl Pass for ArgPromoteRegisters {
         &self,
         ctx: &mut Context,
         _env: &PipelineEnv,
-        targets: &[FunctionId],
         analyses: &mut AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
         let graph = analyses.global::<CallGraphAnalysis>(ctx);
         Ok(
-            crate::ModulePassOutcome::functions(argpromote_registers_changed_functions(
-                ctx, graph, targets,
-            ))
-            .preserving_global::<CallGraphAnalysis>(),
+            crate::ModulePassOutcome::functions(argpromote_registers_changed_functions(ctx, graph))
+                .preserving_global::<CallGraphAnalysis>(),
         )
     }
 }

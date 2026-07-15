@@ -114,8 +114,7 @@ fn run() -> Result<(), String> {
                 }
             }
             RegisteredPass::Module(p) => {
-                let targets = ctx.function_ids();
-                p.run_with_analyses(&mut ctx, &env, &targets, &mut analyses)
+                p.run_with_analyses(&mut ctx, &env, &mut analyses)
                     .map_err(|e| format!("pass `{pass}` failed: {e}"))?;
             }
         }

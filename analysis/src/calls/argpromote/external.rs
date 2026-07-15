@@ -164,9 +164,7 @@ fn plan_args(
 fn argpromote_external_changed_functions(
     ctx: &mut Context,
     env: &PipelineEnv,
-    targets: &[FunctionId],
 ) -> rustc_hash::FxHashSet<FunctionId> {
-    let target_set: rustc_hash::FxHashSet<_> = targets.iter().copied().collect();
     let platform = match env.cfg.os {
         qcode::context::TargetOs::Windows => Platform::Windows,
         _ => Platform::Linux,
@@ -204,12 +202,6 @@ fn argpromote_external_changed_functions(
 
     let mut changed = rustc_hash::FxHashSet::default();
     for fid in externals {
-        if callers[&fid]
-            .iter()
-            .any(|caller| !target_set.contains(caller))
-        {
-            continue;
-        }
         let raw = FunctionBody::from_id(ctx, fid).name().to_string();
         let sym = raw.split('@').next().unwrap_or(&raw);
         let Some(proto) = cabi::lookup(target, sym) else {
@@ -362,13 +354,10 @@ impl Pass for ArgPromoteExternal {
         &self,
         ctx: &mut Context,
         env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         Ok(
-            crate::ModulePassOutcome::functions(argpromote_external_changed_functions(
-                ctx, env, targets,
-            ))
-            .preserving_global::<crate::CallGraphAnalysis>(),
+            crate::ModulePassOutcome::functions(argpromote_external_changed_functions(ctx, env))
+                .preserving_global::<crate::CallGraphAnalysis>(),
         )
     }
 }

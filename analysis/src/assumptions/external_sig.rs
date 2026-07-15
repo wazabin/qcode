@@ -33,18 +33,17 @@ impl Pass for ExternalSigs {
         &self,
         ctx: &mut Context,
         env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         if !abi_is_known(&env.cfg.abi) {
             return Ok(crate::ModulePassOutcome::default());
         }
-        let affected: Vec<FunctionId> = targets
-            .iter()
-            .copied()
-            .filter(|&id| FunctionBody::from_id(ctx, id).is_external())
+        let affected: Vec<FunctionId> = ctx
+            .functions()
+            .filter(|f| f.is_external())
+            .map(|f| f.id)
             .collect();
         let target = abi_target(ctx, env);
-        apply_external_signatures(ctx, &affected, &env.cfg.abi, target);
+        apply_all_external_signatures(ctx, &env.cfg.abi, target);
         Ok(crate::ModulePassOutcome::functions(affected)
             .preserving_global::<crate::CallGraphAnalysis>())
     }
@@ -226,16 +225,7 @@ pub fn apply_all_external_signatures(
         .filter(|f| f.is_external())
         .map(|f| f.id)
         .collect();
-    apply_external_signatures(ctx, &ids, abi, target);
-}
-
-fn apply_external_signatures(
-    ctx: &mut Context,
-    ids: &[FunctionId],
-    abi: &CallingConvention,
-    target: AbiTarget,
-) {
-    for id in ids.iter().copied() {
+    for id in ids {
         apply_external_signature(ctx, id, abi, target);
     }
 }

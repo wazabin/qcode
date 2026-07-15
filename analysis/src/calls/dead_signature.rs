@@ -51,19 +51,14 @@ const MAX_ITERS: usize = 100_000;
 /// Trim dead args and dead returned fields from every `pure_reg` function,
 /// rewriting all direct call sites. Returns `true` if anything changed.
 pub fn dead_signature(ctx: &mut Context) -> bool {
-    let targets = ctx.function_ids();
-    !dead_signature_changed_functions(ctx, &targets).is_empty()
+    !dead_signature_changed_functions(ctx).is_empty()
 }
 
-fn dead_signature_changed_functions(
-    ctx: &mut Context,
-    targets: &[FunctionId],
-) -> HashSet<FunctionId> {
+fn dead_signature_changed_functions(ctx: &mut Context) -> HashSet<FunctionId> {
     let mut changed = HashSet::default();
-    let target_set: HashSet<_> = targets.iter().copied().collect();
-    let mut worklist: Vec<FunctionId> = targets
-        .iter()
-        .copied()
+    let mut worklist: Vec<FunctionId> = ctx
+        .function_ids()
+        .into_iter()
         .filter(|&f| FunctionBody::from_id(ctx, f).is_pure_reg())
         .collect();
 
@@ -80,12 +75,6 @@ fn dead_signature_changed_functions(
             break;
         }
         if !FunctionBody::from_id(ctx, fid).is_pure_reg() {
-            continue;
-        }
-        if direct_call_sites(ctx, fid, &call_index)
-            .iter()
-            .any(|site| !target_set.contains(&site.func))
-        {
             continue;
         }
 
@@ -354,10 +343,9 @@ impl Pass for DeadSignature {
         &self,
         ctx: &mut Context,
         _env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         Ok(
-            crate::ModulePassOutcome::functions(dead_signature_changed_functions(ctx, targets))
+            crate::ModulePassOutcome::functions(dead_signature_changed_functions(ctx))
                 .preserving_global::<crate::CallGraphAnalysis>(),
         )
     }
