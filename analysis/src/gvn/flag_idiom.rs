@@ -8,7 +8,7 @@ use qcode::value::{
 use super::fold::const_value;
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 use crate::{ContextView, FunctionBody};
 
@@ -17,10 +17,10 @@ use crate::{ContextView, FunctionBody};
 /// dead flag math falls to DCE. It runs on the checked-out function-pass path (own-function reads only).
 pub(super) struct FlagIdiom;
 
-/// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
+/// The function-pass [`SubPass`] impl (context-split stage 5b-ii):
 /// `simplify_flag_idiom` reads through `cx.body_view(body)` and the rewrite
 /// materializes through `Editor::replace_with_new_insn_c`.
-impl<'str> SubPassC<'str> for FlagIdiom {
+impl<'str> SubPass<'str> for FlagIdiom {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }

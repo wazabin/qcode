@@ -9,7 +9,7 @@ use qcode::value::{
 
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 #[cfg(test)]
 use qcode::context::Context;
@@ -25,10 +25,10 @@ use crate::{ContextView, FunctionBody};
 /// storage.
 pub(super) struct Fold;
 
-/// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
+/// The function-pass [`SubPass`] impl (context-split stage 5b-ii):
 /// `try_fold_insn` reads through `cx.body_view(body)` and the fold forwards
 /// through `Editor::replace_c`.
-impl<'str> SubPassC<'str> for Fold {
+impl<'str> SubPass<'str> for Fold {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }

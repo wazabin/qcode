@@ -379,7 +379,7 @@ pub(super) fn key_for(form: &NormalForm, id: ValueId, mnemonic: &Mnemonic) -> No
 
 // ---------------------------------------------------------------------------
 // Concrete pass twins over (&mut FunctionBody, ContextView) — 5b-ii Pin A step 2.
-// Mirror the generic materialize family; the pass path (cse's SubPassC) drives
+// Mirror the generic materialize family; the pass path (cse's SubPass) drives
 // `materialize_c`, the module path keeps the generic `materialize`.
 // ---------------------------------------------------------------------------
 

@@ -21,7 +21,7 @@ use qcode::value::{
 use std::any::Any;
 
 use super::affine::{NormalForm, Numbering, arith_form, key_for, materialize_c};
-use super::walk::{Claim, Editor, InsnCtx, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 #[cfg(test)]
 use qcode::context::Context;
@@ -33,11 +33,11 @@ use crate::{ContextView, FunctionBody};
 /// the body's inherent verbs), so it runs on the function-pass path.
 pub(super) struct Cse;
 
-/// The function-pass [`SubPassC`] impl (context-split stage 5b-ii): reads
+/// The function-pass [`SubPass`] impl (context-split stage 5b-ii): reads
 /// route through `cx.body_view(body)`, shallow forwards through `Editor`'s `_c`
 /// methods, and the in-place canonical rebuild runs through `materialize_c` over
 /// `&mut PassBacking`.
-impl<'str> SubPassC<'str> for Cse {
+impl<'str> SubPass<'str> for Cse {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(Numbering::default())
     }

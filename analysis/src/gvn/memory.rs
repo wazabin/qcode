@@ -15,7 +15,7 @@ use super::affine::Numbering;
 use std::any::Any;
 
 use super::mem_forward::MemForward;
-use super::walk::{Claim, Editor, InsnCtx, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 use crate::{ContextView, FunctionBody};
 
@@ -24,11 +24,11 @@ use crate::{ContextView, FunctionBody};
 /// view and every rebuild through the body's inherent verbs.
 pub(super) struct MemoryForwarding;
 
-/// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
+/// The function-pass [`SubPass`] impl (context-split stage 5b-ii):
 /// reads route through `cx.body_view(body)`, the load forward through `Editor`'s
 /// `_c` method, and the [`MemForward`] rebuild/record helpers (`record_store_c`,
 /// `try_load_c`) run over `&mut PassBacking`.
-impl<'str> SubPassC<'str> for MemoryForwarding {
+impl<'str> SubPass<'str> for MemoryForwarding {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(MemForward::default())
     }

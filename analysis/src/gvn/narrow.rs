@@ -38,7 +38,7 @@ use qcode::value::{
     insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic, Range, Sext, Unary, Unop, Zext},
 };
 
-use super::walk::{Claim, Editor, InsnCtx, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 use crate::{ContextView, FunctionBody};
 
@@ -47,11 +47,11 @@ use crate::{ContextView, FunctionBody};
 /// interners.
 pub(super) struct NarrowTrunc;
 
-/// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
+/// The function-pass [`SubPass`] impl (context-split stage 5b-ii):
 /// eligibility reads through `cx.body_view(body)`, the recursive `narrow_to_c`
 /// rewrite runs over `&mut PassBacking`, and the forward goes through
 /// `Editor::replace_c`.
-impl<'str> SubPassC<'str> for NarrowTrunc {
+impl<'str> SubPass<'str> for NarrowTrunc {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }

@@ -26,7 +26,7 @@ use qcode::value::{
 use super::fold::{all_ones, const_value};
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 use crate::{ContextView, FunctionBody};
 
@@ -36,11 +36,11 @@ use crate::{ContextView, FunctionBody};
 /// and every folded constant is minted through the shared interner.
 pub(super) struct Identities;
 
-/// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
+/// The function-pass [`SubPass`] impl (context-split stage 5b-ii):
 /// reads route through `cx.body_view(body)`, the intrinsic/identity rewrites
 /// through `Editor`'s `_c` methods, and the constant-interning
 /// `simplify_bitwise_c`/`simplify_compare_c` helpers run over `&mut PassBacking`.
-impl<'str> SubPassC<'str> for Identities {
+impl<'str> SubPass<'str> for Identities {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }

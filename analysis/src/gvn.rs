@@ -1,6 +1,6 @@
 //! Global value numbering, built from composable sub-passes.
 //!
-//! The pass is a chain of [`walk::SubPass`]es driven by the generic walkers in
+//! The pass is a chain of [`walk::SubPass`]es driven by the body-local walkers in
 //! [`walk`]: per instruction, each sub-pass is tried in order until one claims
 //! it. To add a new sub-pass, implement [`walk::SubPass`] in its own module and
 //! add it to the tuple in [`gvn_passes`] (order matters: earlier members see
@@ -41,7 +41,7 @@ use identity::Identities;
 use intrinsics::Recognize;
 use memory::MemoryForwarding;
 use narrow::NarrowTrunc;
-use walk::{SubPassC, run_dominator_walk_c, run_flat_fixpoint_c, run_single_block_c};
+use walk::{SubPass, run_dominator_walk, run_flat_fixpoint, run_single_block};
 
 /// Current instruction context for one deterministic module-pass sweep.
 ///
@@ -107,10 +107,10 @@ fn module_insn(ctx: &Context, insn_id: InstructionId) -> ModuleInsn {
 /// pass contract forbids, so `emulate_map`, `array_project`, and `pure_call`
 /// are independent module passes.
 ///
-/// The chain runs over the host-free [`SubPassC`] surface on a checked-out
+/// The chain runs over the host-free [`SubPass`] surface on a checked-out
 /// `(&mut FunctionBody, ContextView)`; both the whole-function entry points and
 /// the single-block [`gvn`] drive it through the check-out shim.
-fn gvn_passes_c<'str>() -> Vec<Box<dyn SubPassC<'str>>> {
+fn gvn_passes<'str>() -> Vec<Box<dyn SubPass<'str>>> {
     vec![
         Box::new(MemoryForwarding),
         Box::new(Fold),
@@ -143,7 +143,7 @@ pub fn constant_fold_function(ctx: &mut Context, func_id: FunctionId) -> bool {
     })
 }
 
-/// Concrete core of [`constant_fold_function`] (context-split stage 5b-ii): runs
+/// Body-local core of [`constant_fold_function`]: runs
 /// the [`Fold`] sub-pass to a fixpoint over a checked-out `(&mut FunctionBody,
 /// ContextView)` with no threaded mutation host.
 fn constant_fold_body<'str>(
@@ -151,7 +151,7 @@ fn constant_fold_body<'str>(
     cx: ContextView<'_, 'str>,
     func_id: FunctionId,
 ) -> bool {
-    run_flat_fixpoint_c(body, cx, func_id, &[Box::new(Fold) as Box<dyn SubPassC>])
+    run_flat_fixpoint(body, cx, func_id, &[Box::new(Fold) as Box<dyn SubPass>])
 }
 
 /// Sink low-word truncations through arithmetic, cancelling widenings, to a
@@ -161,7 +161,7 @@ pub fn narrow_function(ctx: &mut Context, func_id: FunctionId) -> bool {
     with_checked_out_body(ctx, func_id, |body, cx| narrow_body(body, cx, func_id))
 }
 
-/// Concrete core of [`narrow_function`] (context-split stage 5b-ii): runs the
+/// Body-local core of [`narrow_function`]: runs the
 /// [`NarrowTrunc`] sub-pass to a fixpoint over a checked-out `(&mut FunctionBody,
 /// ContextView)`.
 fn narrow_body<'str>(
@@ -169,11 +169,11 @@ fn narrow_body<'str>(
     cx: ContextView<'_, 'str>,
     func_id: FunctionId,
 ) -> bool {
-    run_flat_fixpoint_c(
+    run_flat_fixpoint(
         body,
         cx,
         func_id,
-        &[Box::new(NarrowTrunc) as Box<dyn SubPassC>],
+        &[Box::new(NarrowTrunc) as Box<dyn SubPass>],
     )
 }
 
@@ -186,11 +186,11 @@ fn narrow_body<'str>(
 pub fn gvn(block: &mut BlockMutRef, aliases: Option<&AliasResult>) {
     let block_id = block.id;
     // The block's owning (storage) function — self-stored, so `id.func` is the
-    // function to check out and run the concrete single-block core against.
+    // function to borrow and run the body-local single-block core against.
     let func_id = block_id.func;
     let ctx = block.ctx_mut();
     let _ = with_checked_out_body(ctx, func_id, |body, cx| {
-        run_single_block_c(body, cx, block_id, &gvn_passes_c(), aliases)
+        run_single_block(body, cx, block_id, &gvn_passes(), aliases)
     });
 }
 
@@ -208,7 +208,7 @@ pub fn gvn_function(ctx: &mut Context, func_id: FunctionId, aliases: Option<&Ali
     })
 }
 
-/// Concrete core of [`gvn_function`] (context-split stage 5b-ii): runs the full
+/// Body-local core of [`gvn_function`]: runs the full
 /// GVN sub-pass chain over the dominator tree of `func_id` on a checked-out
 /// `(&mut FunctionBody, ContextView)` with no threaded mutation host.
 fn gvn_body<'str>(
@@ -217,7 +217,7 @@ fn gvn_body<'str>(
     func_id: FunctionId,
     aliases: Option<&AliasResult>,
 ) -> bool {
-    run_dominator_walk_c(body, cx, func_id, &gvn_passes_c(), aliases)
+    run_dominator_walk(body, cx, func_id, &gvn_passes(), aliases)
 }
 
 // ----- passes ----------------------------------------------------------------

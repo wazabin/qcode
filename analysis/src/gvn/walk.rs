@@ -91,11 +91,7 @@ fn reachable_from<'ctx, 'str: 'ctx>(
 // `(&mut FunctionBody, ContextView)` with no threaded mutation host: reads route
 // through `cx.body_view(body)`, shallow rewrites through the inherent
 // `body.verb(cx, …)` surface (via `Editor`'s `_c` methods). The large shared
-// mutation helpers (`materialize`, `MemForward::{record_store,try_load}`,
-// `narrow_to`, `simplify_bitwise`/`simplify_compare`) are still reached through a
-// scoped `cx.host(body)` — the same pattern the dce sibling (8cbc4b2) uses for
-// `replace_terminator_with_branch`; they stay generic because the generic path
-// above shares them.
+// mutation helpers are reached through the same body-local mutation boundary.
 // ===========================================================================
 
 use crate::{ContextView, FunctionBody};
@@ -165,7 +161,7 @@ impl Editor {
 /// [`Recognize`](super::intrinsics::Recognize), [`FlagIdiom`](super::flag_idiom::FlagIdiom),
 /// [`Identities`](super::identity::Identities), [`MemoryForwarding`](super::memory::MemoryForwarding),
 /// and [`Cse`](super::cse::Cse).
-pub(super) trait SubPassC<'str> {
+pub(super) trait SubPass<'str> {
     /// See [`SubPass::init_state`].
     fn init_state(&self) -> Box<dyn Any>;
 
@@ -210,14 +206,14 @@ pub(super) trait SubPassC<'str> {
     }
 }
 
-/// Concrete twin of [`init_states`].
-fn init_states_c<'str>(passes: &[Box<dyn SubPassC<'str>>]) -> Vec<Box<dyn Any>> {
+/// Create one fresh erased state slot per sub-pass.
+fn init_states<'str>(passes: &[Box<dyn SubPass<'str>>]) -> Vec<Box<dyn Any>> {
     passes.iter().map(|p| p.init_state()).collect()
 }
 
-/// Concrete twin of [`clone_states`].
-fn clone_states_c<'str>(
-    passes: &[Box<dyn SubPassC<'str>>],
+/// Clone each sub-pass state for a dominated child.
+fn clone_states<'str>(
+    passes: &[Box<dyn SubPass<'str>>],
     states: &[Box<dyn Any>],
 ) -> Vec<Box<dyn Any>> {
     passes
@@ -227,12 +223,12 @@ fn clone_states_c<'str>(
         .collect()
 }
 
-/// Concrete twin of [`run_block`].
-fn run_block_c<'str>(
+/// Run the chain over one block and remove redundant instructions afterwards.
+fn run_block<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     block_id: BlockId,
-    passes: &[Box<dyn SubPassC<'str>>],
+    passes: &[Box<dyn SubPass<'str>>],
     states: &mut [Box<dyn Any>],
     aliases: Option<&AliasResult>,
     numbering: &Numbering,
@@ -267,26 +263,26 @@ fn run_block_c<'str>(
 /// Run the sub-passes over a single block with fresh state and no block-boundary
 /// hooks (no dominator tree exists for a lone block), over a checked-out
 /// `(&mut FunctionBody, ContextView)`.
-pub(super) fn run_single_block_c<'str>(
+pub(super) fn run_single_block<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     block_id: BlockId,
-    passes: &[Box<dyn SubPassC<'str>>],
+    passes: &[Box<dyn SubPass<'str>>],
     aliases: Option<&AliasResult>,
 ) -> bool {
     // No function context for a lone block: memory forwarding falls back to
     // degenerate per-pointer bases (exact-match only).
     let numbering = Numbering::default();
-    let mut states = init_states_c(passes);
-    run_block_c(body, cx, block_id, passes, &mut states, aliases, &numbering)
+    let mut states = init_states(passes);
+    run_block(body, cx, block_id, passes, &mut states, aliases, &numbering)
 }
 
-/// Concrete single-function-scope twin of the flat fixpoint driver.
-pub(super) fn run_flat_fixpoint_c<'str>(
+/// Run one sub-pass chain to a flat per-function fixpoint.
+pub(super) fn run_flat_fixpoint<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     func_id: FunctionId,
-    passes: &[Box<dyn SubPassC<'str>>],
+    passes: &[Box<dyn SubPass<'str>>],
 ) -> bool {
     let block_ids: Vec<BlockId> = cx
         .body_view(body)
@@ -300,8 +296,8 @@ pub(super) fn run_flat_fixpoint_c<'str>(
     loop {
         let mut changed = false;
         for &block_id in &block_ids {
-            let mut states = init_states_c(passes);
-            changed |= run_block_c(body, cx, block_id, passes, &mut states, None, &numbering);
+            let mut states = init_states(passes);
+            changed |= run_block(body, cx, block_id, passes, &mut states, None, &numbering);
         }
         changed_any |= changed;
         if !changed {
@@ -311,9 +307,9 @@ pub(super) fn run_flat_fixpoint_c<'str>(
     changed_any
 }
 
-/// Concrete twin of [`Walk`].
-struct WalkC<'a, 'str> {
-    passes: &'a [Box<dyn SubPassC<'str>>],
+/// Per-entry dominator-walk state.
+struct Walk<'a, 'str> {
+    passes: &'a [Box<dyn SubPass<'str>>],
     tree: &'a DominatorTree<BlockId>,
     aliases: Option<&'a AliasResult>,
     numbering: &'a Numbering,
@@ -322,7 +318,7 @@ struct WalkC<'a, 'str> {
     changed: bool,
 }
 
-impl<'str> WalkC<'_, 'str> {
+impl<'str> Walk<'_, 'str> {
     fn rec(
         &mut self,
         body: &mut FunctionBody<'str>,
@@ -330,7 +326,7 @@ impl<'str> WalkC<'_, 'str> {
         block_id: BlockId,
         inherited: &[Box<dyn Any>],
     ) {
-        let mut states = clone_states_c(self.passes, inherited);
+        let mut states = clone_states(self.passes, inherited);
         let is_shared = self.shared.contains(&block_id);
         for (pass, state) in self.passes.iter().zip(states.iter_mut()) {
             pass.on_block_entry(
@@ -344,7 +340,7 @@ impl<'str> WalkC<'_, 'str> {
                 is_shared,
             );
         }
-        self.changed |= run_block_c(
+        self.changed |= run_block(
             body,
             cx,
             block_id,
@@ -371,12 +367,12 @@ impl<'str> WalkC<'_, 'str> {
     }
 }
 
-/// Concrete twin of [`run_dominator_walk`].
-pub(super) fn run_dominator_walk_c<'str>(
+/// Run the canonical GVN chain over a function's dominator regions.
+pub(super) fn run_dominator_walk<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     func_id: FunctionId,
-    passes: &[Box<dyn SubPassC<'str>>],
+    passes: &[Box<dyn SubPass<'str>>],
     aliases: Option<&AliasResult>,
 ) -> bool {
     let root = match cx.body_view(body).function_ref(func_id).root() {
@@ -410,7 +406,7 @@ pub(super) fn run_dominator_walk_c<'str>(
     let mut changed = false;
     for entry in std::iter::once(root).chain(entries) {
         let tree = compute_dominators(&cx.body_view(body).function_ref(entry.func), entry);
-        let mut walk = WalkC {
+        let mut walk = Walk {
             passes,
             tree: &tree,
             aliases,
@@ -419,7 +415,7 @@ pub(super) fn run_dominator_walk_c<'str>(
             owner: func_id,
             changed: false,
         };
-        walk.rec(body, cx, entry, &init_states_c(passes));
+        walk.rec(body, cx, entry, &init_states(passes));
         changed |= walk.changed;
     }
     changed

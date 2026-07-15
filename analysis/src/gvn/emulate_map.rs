@@ -29,7 +29,7 @@ use qcode_emulator::{BodyArg, SizedValue, StandaloneEmulator};
 use crate::calls::return_field;
 
 use super::fold::const_value;
-use super::{ModuleInsn, module_instruction_snapshot};
+use super::{ModuleInsn, module_insn, module_instruction_snapshot};
 
 /// Upper bound on emulated instructions per lane. Map bodies are loop-free pure
 /// expressions, so this only guards against a degenerate body.
@@ -69,8 +69,9 @@ impl crate::Pass for EmulateMap {
     fn run(&self, ctx: &mut Context, _env: &crate::PipelineEnv) -> Result<bool, String> {
         let snapshot = module_instruction_snapshot(ctx);
         let mut changed = false;
-        for ic in &snapshot {
-            changed |= self.rewrite(ctx, ic);
+        for insn_id in snapshot {
+            let ic = module_insn(ctx, insn_id);
+            changed |= self.rewrite(ctx, &ic);
         }
         Ok(changed)
     }
