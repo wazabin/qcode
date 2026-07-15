@@ -44,22 +44,24 @@ use memory::MemoryForwarding;
 use narrow::NarrowTrunc;
 use walk::{SubPassC, run_dominator_walk_c, run_flat_fixpoint_c, run_single_block_c};
 
-/// Frozen instruction context for one deterministic module-pass sweep.
+/// Current instruction context for one deterministic module-pass sweep.
 ///
 /// Unlike the GVN walker context, this carries no aliases, numbering, or
-/// inherited state. Cross-body module passes snapshot the existing instruction
-/// stream once; instructions they create are intentionally left for the next
+/// inherited state. Cross-body module passes snapshot IDs once, then read each
+/// instruction immediately before visiting it so earlier use-rewrites are
+/// visible. Instructions created during the sweep are left for the next
 /// pipeline fixpoint iteration.
 struct ModuleInsn {
+    block_id: qcode::value::block::BlockId,
     insn_id: InstructionId,
     id: ValueId,
     mnemonic: Mnemonic,
 }
 
-/// Snapshot every instruction in eligible functions in function-roster,
+/// Snapshot every instruction ID in eligible functions in function-roster,
 /// block-roster, and program order. This is traversal only, not another walker:
 /// the independent module passes own all recognition and mutation.
-fn module_instruction_snapshot(ctx: &Context) -> Vec<ModuleInsn> {
+fn module_instruction_snapshot(ctx: &Context) -> Vec<InstructionId> {
     let fun_ids: Vec<FunctionId> = ctx
         .functions()
         .filter(|f| !f.is_external())
@@ -71,16 +73,25 @@ fn module_instruction_snapshot(ctx: &Context) -> Vec<ModuleInsn> {
     for fun_id in fun_ids {
         for block_id in FunctionBody::from_id(ctx, fun_id).block_ids() {
             for insn_id in qcode::value::BasicBlock::from_id(ctx, block_id).instruction_ids() {
-                let insn = ctx.insn_ref(insn_id);
-                snapshot.push(ModuleInsn {
-                    insn_id,
-                    id: ValueId::Instruction(insn_id),
-                    mnemonic: insn.mnemonic().clone(),
-                });
+                snapshot.push(insn_id);
             }
         }
     }
     snapshot
+}
+
+/// Read the instruction after any earlier rewrites in the same sweep.
+fn module_insn(ctx: &Context, insn_id: InstructionId) -> ModuleInsn {
+    let insn = ctx.insn_ref(insn_id);
+    ModuleInsn {
+        block_id: insn
+            .parent()
+            .expect("module-pass instruction is attached")
+            .id,
+        insn_id,
+        id: ValueId::Instruction(insn_id),
+        mnemonic: insn.mnemonic().clone(),
+    }
 }
 
 /// The full GVN sub-pass chain. Order is load-bearing: memory forwarding must

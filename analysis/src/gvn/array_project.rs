@@ -31,42 +31,51 @@ use qcode::{
 
 use crate::calls::inline_pure_body;
 
-use std::any::Any;
+use super::{ModuleInsn, module_insn, module_instruction_snapshot};
 
-use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass};
-
-/// Projecting a lane out of a `map` inlines the pure *body callee*'s IR, so this
-/// runs only on the module host (dispatched by the
-/// [`concretize`](super::concretize) module pass).
+/// Projecting a lane out of a `map` inlines a pure callee body, so this is an
+/// independent module pass. One invocation performs one frozen sweep; pipeline
+/// configuration owns the projection fixpoint.
+#[derive(Default)]
 pub(super) struct ArrayProject;
 
-impl<'str> ModuleSubPass<'str> for ArrayProject {
-    fn init_state(&self) -> Box<dyn Any> {
-        Box::new(())
-    }
-
-    fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
-        Box::new(())
-    }
-
-    fn on_insn(
-        &self,
-        host: &mut Context<'str>,
-        _state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim {
-        let ctx: &mut Context = host;
-        match *ic.mnemonic {
+impl ArrayProject {
+    fn rewrite(&self, ctx: &mut Context, ic: &ModuleInsn) -> bool {
+        match ic.mnemonic.clone() {
             Mnemonic::Range(Range { src, start, size }) => {
-                self.project_range(ctx, ic, ed, src.qualify(ic.insn_id.func), start, size)
+                self.project_range(ctx, ic, src.qualify(ic.insn_id.func), start, size)
             }
             Mnemonic::Extract(Extract { agg, index }) => {
-                self.fold_extract_tuple(ctx, ic, ed, agg.qualify(ic.insn_id.func), index)
+                self.fold_extract_tuple(ctx, ic, agg.qualify(ic.insn_id.func), index)
             }
-            _ => Claim::Pass,
+            _ => false,
         }
     }
+}
+
+impl crate::Pass for ArrayProject {
+    const NAME: &'static str = "array_project";
+
+    fn description(&self) -> &'static str {
+        "Project array lanes and freshly-packed tuple fields"
+    }
+
+    fn run(&self, ctx: &mut Context, _env: &crate::PipelineEnv) -> Result<bool, String> {
+        let snapshot = module_instruction_snapshot(ctx);
+        let mut changed = false;
+        for insn_id in snapshot {
+            let ic = module_insn(ctx, insn_id);
+            changed |= self.rewrite(ctx, &ic);
+        }
+        Ok(changed)
+    }
+}
+
+crate::register_module_pass!(ArrayProject);
+
+fn replace(ctx: &mut Context, insn: qcode::value::InstructionId, with: ValueId) {
+    ctx.replace_all_uses_with(ValueId::Instruction(insn), with);
+    ctx.remove_instruction(insn);
 }
 
 impl ArrayProject {
@@ -75,34 +84,27 @@ impl ArrayProject {
     fn project_range(
         &self,
         ctx: &mut Context,
-        ic: &InsnCtx,
-        ed: &mut Editor,
+        ic: &ModuleInsn,
         src: ValueId,
         start: usize,
         size: usize,
-    ) -> Claim {
+    ) -> bool {
         let ValueId::Instruction(src_id) = src else {
-            return Claim::Pass;
+            return false;
         };
         match ctx.get_insn(src_id).mnemonic().clone() {
-            Mnemonic::Map(_) => self.project_map(ctx, ic, ed, src_id, start, size),
-            Mnemonic::Intrinsic(intr) if intr.id.name() == "enumerate" => self.project_enumerate(
-                ctx,
-                ic,
-                ed,
-                src,
-                intr.args[0].qualify(src_id.func),
-                start,
-                size,
-            ),
+            Mnemonic::Map(_) => self.project_map(ctx, ic, src_id, start, size),
+            Mnemonic::Intrinsic(intr) if intr.id.name() == "enumerate" => {
+                self.project_enumerate(ctx, ic, src, intr.args[0].qualify(src_id.func), start, size)
+            }
             Mnemonic::Intrinsic(intr) if intr.id.name() == "concat" => {
                 let args: Vec<ValueId> = intr.args.iter().map(|a| a.qualify(src_id.func)).collect();
-                self.project_concat(ctx, ic, ed, &args, start, size)
+                self.project_concat(ctx, ic, &args, start, size)
             }
             // A `scan` is deliberately *not* projected: lane `k` is the `k`-th
             // accumulator, which depends on the whole prefix `0..=k`, not just
             // `src[k]`, so there is no cheap single-element extract.
-            _ => Claim::Pass,
+            _ => false,
         }
     }
 
@@ -110,14 +112,13 @@ impl ArrayProject {
     fn project_map(
         &self,
         ctx: &mut Context,
-        ic: &InsnCtx,
-        ed: &mut Editor,
+        ic: &ModuleInsn,
         map_id: qcode::value::InstructionId,
         start: usize,
         size: usize,
-    ) -> Claim {
+    ) -> bool {
         let Mnemonic::Map(map) = ctx.get_insn(map_id).mnemonic().clone() else {
-            return Claim::Pass;
+            return false;
         };
 
         // Lane alignment is against the map's *output* element width `osz` (the
@@ -126,11 +127,11 @@ impl ArrayProject {
         // bare elements.
         let out_ty = ctx.type_of(ValueId::Instruction(map_id));
         let Some((out_elem, _)) = ctx.shared.types.array_of(out_ty) else {
-            return Claim::Pass;
+            return false;
         };
         let osz = ctx.shared.types.size_of(out_elem);
         if osz == 0 || size != osz || !start.is_multiple_of(osz) {
-            return Claim::Pass;
+            return false;
         }
         let k = (start / osz) as u64;
 
@@ -138,11 +139,11 @@ impl ArrayProject {
         // element width `isz`.
         let in_ty = ctx.type_of(map.src.qualify(map_id.func));
         let Some((in_elem, _)) = ctx.shared.types.array_of(in_ty) else {
-            return Claim::Pass;
+            return false;
         };
         let isz = ctx.shared.types.size_of(in_elem);
         if isz == 0 {
-            return Claim::Pass;
+            return false;
         }
         let element = {
             let r = InstructionRef::from_mnemonic(
@@ -168,14 +169,14 @@ impl ArrayProject {
         let mut args = vec![element];
         args.extend(map.captures.iter().map(|c| c.qualify(map_id.func)));
         let Some(body) = map.body.real() else {
-            return Claim::Pass;
+            return false;
         };
         let Some(result) = inline_pure_body(ctx, body, &args, ic.block_id, ic.insn_id) else {
-            return Claim::Pass;
+            return false;
         };
 
-        ed.replace(ctx, ic.insn_id, result);
-        Claim::Done
+        replace(ctx, ic.insn_id, result);
+        true
     }
 
     /// `Range(enumerate(src), k·tsz, tsz)` ⇒ `pack(index = k, elem = src[k])`.
@@ -183,29 +184,28 @@ impl ArrayProject {
     fn project_enumerate(
         &self,
         ctx: &mut Context,
-        ic: &InsnCtx,
-        ed: &mut Editor,
+        ic: &ModuleInsn,
         enum_val: ValueId,
         src: ValueId,
         start: usize,
         size: usize,
-    ) -> Claim {
+    ) -> bool {
         // The enumerate result type `[(index: i64, elem: T); N]` gives the tuple
         // width `tsz`; the operand array `[T; N]` gives the element width `esz`.
         let enum_ty = ctx.type_of(enum_val);
         let Some((tuple_ty, _count)) = ctx.shared.types.array_of(enum_ty) else {
-            return Claim::Pass;
+            return false;
         };
         let tsz = ctx.shared.types.size_of(tuple_ty);
         let src_ty = ctx.type_of(src);
         let Some((elem_ty, _)) = ctx.shared.types.array_of(src_ty) else {
-            return Claim::Pass;
+            return false;
         };
         let esz = ctx.shared.types.size_of(elem_ty);
 
         // Lane alignment: exactly one tuple wide, starting on a lane boundary.
         if tsz == 0 || size != tsz || !start.is_multiple_of(tsz) {
-            return Claim::Pass;
+            return false;
         }
         let k = (start / tsz) as u64;
 
@@ -252,8 +252,8 @@ impl ArrayProject {
             ValueId::Instruction(t)
         };
 
-        ed.replace(ctx, ic.insn_id, tuple);
-        Claim::Done
+        replace(ctx, ic.insn_id, tuple);
+        true
     }
 
     /// `Range(concat(a, b), off, size)` ⇒ `Range(a, off, size)` when wholly in
@@ -261,18 +261,17 @@ impl ArrayProject {
     fn project_concat(
         &self,
         ctx: &mut Context,
-        ic: &InsnCtx,
-        ed: &mut Editor,
+        ic: &ModuleInsn,
         args: &[ValueId],
         start: usize,
         size: usize,
-    ) -> Claim {
+    ) -> bool {
         let [lhs, rhs] = args else {
-            return Claim::Pass;
+            return false;
         };
         let lhs_ty = ctx.type_of(*lhs);
         let Some((lhs_elem, lhs_len, _)) = ctx.shared.types.seq_of(lhs_ty) else {
-            return Claim::Pass;
+            return false;
         };
         let lhs_bytes = ctx.shared.types.size_of(lhs_elem) * lhs_len;
 
@@ -281,7 +280,7 @@ impl ArrayProject {
         } else if start >= lhs_bytes {
             (*rhs, start - lhs_bytes)
         } else {
-            return Claim::Pass;
+            return false;
         };
 
         let r = InstructionRef::from_mnemonic(
@@ -296,30 +295,29 @@ impl ArrayProject {
         )
         .id;
         BasicBlock::from_id_mut(ctx, ic.block_id).insert_insn_before(ic.insn_id, r);
-        ed.replace(ctx, ic.insn_id, ValueId::Instruction(r));
-        Claim::Done
+        replace(ctx, ic.insn_id, ValueId::Instruction(r));
+        true
     }
 
     /// `Extract(Tuple{fields…}, i)` ⇒ `fields[i]`.
     fn fold_extract_tuple(
         &self,
         ctx: &mut Context,
-        ic: &InsnCtx,
-        ed: &mut Editor,
+        ic: &ModuleInsn,
         agg: ValueId,
         index: usize,
-    ) -> Claim {
+    ) -> bool {
         let ValueId::Instruction(tuple_id) = agg else {
-            return Claim::Pass;
+            return false;
         };
         let Mnemonic::Tuple(Tuple { fields }) = ctx.get_insn(tuple_id).mnemonic().clone() else {
-            return Claim::Pass;
+            return false;
         };
         let Some(&field) = fields.get(index) else {
-            return Claim::Pass;
+            return false;
         };
-        ed.replace(ctx, ic.insn_id, field.qualify(tuple_id.func));
-        Claim::Done
+        replace(ctx, ic.insn_id, field.qualify(tuple_id.func));
+        true
     }
 }
 
@@ -333,6 +331,11 @@ mod tests {
             insn::{IntrinsicId, Mnemonic, Return, Store},
         },
     };
+
+    fn run_array_project(tc: &mut TestContext) {
+        let env = crate::PipelineEnv::headless(&tc.ctx);
+        while crate::Pass::run(&super::ArrayProject, &mut tc.ctx, &env).unwrap() {}
+    }
 
     /// `body(elem: i8) -> elem + 1`, marked pure. A unary map body.
     fn build_inc_body(tc: &mut TestContext) -> FunctionId {
@@ -403,7 +406,7 @@ mod tests {
             b.push_return(ptr);
         }
 
-        super::super::concretize::concretize_function(&mut tc.ctx, host);
+        run_array_project(&mut tc);
 
         // No Range-of-Map remains; the body was inlined (an int_add appears), and
         // the surviving Range now slices the array source directly (`src[2]`).
@@ -502,7 +505,7 @@ mod tests {
             b.push_return(ptr);
         }
 
-        super::super::concretize::concretize_function(&mut tc.ctx, host);
+        run_array_project(&mut tc);
 
         let insns: Vec<Mnemonic> = BasicBlock::from_id(&tc.ctx, entry)
             .iter()
@@ -571,7 +574,7 @@ mod tests {
             builder.push_return(ptr);
         }
 
-        super::super::concretize::concretize_function(&mut tc.ctx, host);
+        run_array_project(&mut tc);
 
         let insns: Vec<Mnemonic> = BasicBlock::from_id(&tc.ctx, entry)
             .iter()
@@ -682,7 +685,7 @@ mod tests {
         // Each projection inserts instructions a later GVN sweep reduces (the map
         // lane inlines the body, whose `Extract(enumerate[2])` then projects and
         // folds), so iterate to a fixpoint as the real pass pipeline does.
-        super::super::concretize::concretize_function(&mut tc.ctx, host);
+        run_array_project(&mut tc);
 
         let insns: Vec<Mnemonic> = BasicBlock::from_id(&tc.ctx, entry)
             .iter()
