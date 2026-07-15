@@ -21,7 +21,6 @@ use qcode::{
 
 pub(crate) mod affine;
 mod array_project;
-pub(crate) mod concretize;
 pub(crate) mod congruence;
 mod cse;
 mod emulate_map;
@@ -105,7 +104,8 @@ fn module_insn(ctx: &Context, insn_id: InstructionId) -> ModuleInsn {
 /// The three body-reading sub-passes (`PureCall`, `EmulateMap`, `ArrayProject`)
 /// that used to sit between `NarrowTrunc` and `Recognize` are **not** here: they
 /// read pure *callee* bodies, an interprocedural read the parallel-safe function
-/// pass contract forbids, so they live in the [`concretize`] module pass.
+/// pass contract forbids, so `emulate_map`, `array_project`, and `pure_call`
+/// are independent module passes.
 ///
 /// The chain runs over the host-free [`SubPassC`] surface on a checked-out
 /// `(&mut FunctionBody, ContextView)`; both the whole-function entry points and
@@ -313,3 +313,19 @@ impl FunctionPass for Gvn {
 }
 
 crate::register_function_pass!(Gvn);
+
+#[cfg(test)]
+mod registration_tests {
+    use crate::{RegisteredPass, make_pass};
+
+    #[test]
+    fn cross_body_passes_are_explicit_and_concretize_is_gone() {
+        for name in ["emulate_map", "array_project", "pure_call"] {
+            assert!(
+                matches!(make_pass(name), Some(RegisteredPass::Module(_))),
+                "{name} must be a registered module pass"
+            );
+        }
+        assert!(make_pass("concretize").is_none());
+    }
+}

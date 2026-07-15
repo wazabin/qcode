@@ -159,13 +159,12 @@ impl Editor {
     }
 }
 
-/// Concrete twin of [`SubPass`]: one composable GVN concern over a checked-out
+/// One composable GVN concern over a checked-out
 /// `(&mut FunctionBody, ContextView)`. Implemented by the seven function-pass
 /// sub-passes ([`Fold`](super::fold::Fold), [`NarrowTrunc`](super::narrow::NarrowTrunc),
 /// [`Recognize`](super::intrinsics::Recognize), [`FlagIdiom`](super::flag_idiom::FlagIdiom),
 /// [`Identities`](super::identity::Identities), [`MemoryForwarding`](super::memory::MemoryForwarding),
-/// [`Cse`](super::cse::Cse)); the three body-reading sub-passes keep only the
-/// generic [`SubPass`] impl (they run on the module `concretize` path).
+/// and [`Cse`](super::cse::Cse).
 pub(super) trait SubPassC<'str> {
     /// See [`SubPass::init_state`].
     fn init_state(&self) -> Box<dyn Any>;

@@ -284,12 +284,11 @@ passes = ["gvn", "dead_store", "dce"]
 #   * `mark_pure` asserts `is_pure` on functions whose returns are now a
 #     deterministic function of their params (a pure call to an already-pure
 #     callee is permitted, so a caller settles once its callees are flagged);
-#   * `module(gvn)` folds/canonicalizes and `concretize` emulates those pure
-#     callees at constant-argument call sites, replacing the projecting `extract`
-#     with the computed literal — which can turn a previously call-derived address
-#     (e.g. a deobfuscated `FS:<canary>` offset) into a constant, and forwards
-#     argpromote's shadow seeds into the loads that read them back (`concretize`
-#     is the module home of gvn's three pure-callee body-reading sub-passes);
+#   * `module(gvn)` folds/canonicalizes; `emulate_map`, `array_project`, and
+#     `pure_call` perform the three cross-body transformations explicitly,
+#     replacing projecting extracts with computed values — which can turn a
+#     previously call-derived address (e.g. a deobfuscated `FS:<canary>` offset)
+#     into a constant — and forward argpromote's shadow seeds into their loads;
 #   * `module(dce)` / `module(dead_store)` sweep the folded extracts, now-dead
 #     calls, and unread shadow stores;
 #   * `argpromote` then re-runs: with the address now constant, the load it had to
@@ -300,7 +299,7 @@ passes = ["gvn", "dead_store", "dce"]
 [[stage]]
 name = "mark-pure"
 scope = "module"
-passes = ["mark_pure", "module(gvn)", "emulate_map", "array_project", "pure_call", "concretize", "module(dce)", "module(dead_store)", "assume_arg_frame", "argpromote"]
+passes = ["mark_pure", "module(gvn)", "emulate_map", "array_project", "pure_call", "module(dce)", "module(dead_store)", "assume_arg_frame", "argpromote"]
 repeat_until = "no_change"
 
 # Promote bounded memory regions in pure functions to first-class array values so
@@ -334,13 +333,13 @@ scope = "function"
 passes = ["loop_to_scan", "loop_to_map", "strlen"]
 
 # Project the `Extract`/`Range`-of-`map` back to a `body(k, in[k])` element at the
-# caller now that the loops are folded. `concretize` is the module home of gvn's
-# three pure-callee body-reading sub-passes (a function pass may not read another
-# function's body); `final-canonicalize`'s `gvn` then folds the inlined bodies.
+# caller now that the loops are folded. The three explicit module passes own the
+# cross-body reads (a function pass may not read another function's body), and
+# `final-canonicalize`'s `gvn` then folds the inlined bodies.
 [[stage]]
 name = "loop-fold-project"
 scope = "module"
-passes = ["emulate_map", "array_project", "pure_call", "concretize"]
+passes = ["emulate_map", "array_project", "pure_call"]
 repeat_until = "no_change"
 
 # Infer per-parameter `readonly` / `nocapture` pointer attributes bottom-up over
