@@ -248,10 +248,12 @@ impl<'ctx, 'str: 'ctx> QCodeView<'ctx, 'str> for BodyView<'ctx, 'str> {
     }
 
     fn function(self, id: FunctionId) -> &'ctx FunctionBody<'str> {
-        assert_eq!(
-            id,
-            self.body.id(),
-            "BodyView cannot read a foreign function body"
+        let owner = self.body.id();
+        assert!(
+            id == owner,
+            "A function pass running on `{}` ({owner:?}) attempted to read `{}` ({id:?})",
+            self.interfaces[owner].name,
+            self.interfaces[id].name,
         );
         self.body
     }
@@ -320,7 +322,21 @@ mod tests {
         let view = BodyView::new(&ctx.bodies[own], &ctx.shared, &ctx.interfaces);
 
         assert_eq!(view.interface(foreign).name.as_ref(), "foreign");
-        assert!(std::panic::catch_unwind(|| view.function(foreign)).is_err());
+        let panic = match std::panic::catch_unwind(|| view.function(foreign)) {
+            Ok(_) => panic!("foreign body read unexpectedly succeeded"),
+            Err(panic) => panic,
+        };
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("BodyView panic should carry a string message");
+        assert_eq!(
+            message,
+            format!(
+                "A function pass running on `own` ({own:?}) attempted to read `foreign` ({foreign:?})"
+            )
+        );
     }
 
     #[test]

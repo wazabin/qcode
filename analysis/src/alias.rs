@@ -327,7 +327,7 @@ fn frame_is_captured<'ctx, 'str: 'ctx>(
                     for (j, &arg) in c.args.iter().enumerate() {
                         if is_own_frame(arg.qualify(func))
                             && !target
-                                .and_then(|target| host.function_ref(target).param_attr(j))
+                                .and_then(|target| host.interface(target).param_attr(j))
                                 .is_some_and(|a| a.nocapture)
                         {
                             return true;
@@ -463,7 +463,7 @@ impl FrameInfo {
         let Some(target) = c.target.real() else {
             return P::OPAQUE;
         };
-        let callee = host.function_ref(target);
+        let callee = host.interface(target);
         let all_nocapture = c.clobbers.is_empty()
             && (0..c.args.len()).all(|j| callee.param_attr(j).is_some_and(|a| a.nocapture));
         if !all_nocapture {
@@ -1395,8 +1395,13 @@ mod tests {
                 })
             };
             tc.ctx.replace_instruction_mnemonic(cid, mn);
+            let host = qcode::value::BodyView::new(
+                &tc.ctx.bodies[fid],
+                &tc.ctx.shared,
+                &tc.ctx.interfaces,
+            );
             let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-                qcode::value::ModuleView::new(&tc.ctx),
+                host,
                 fid,
                 Some(sp_reg),
             );
@@ -1456,8 +1461,13 @@ mod tests {
                     clobbers: vec![],
                 }),
             );
+            let host = qcode::value::BodyView::new(
+                &tc.ctx.bodies[fid],
+                &tc.ctx.shared,
+                &tc.ctx.interfaces,
+            );
             let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-                qcode::value::ModuleView::new(&tc.ctx),
+                host,
                 fid,
                 Some(sp_reg),
             );
@@ -1465,11 +1475,7 @@ mod tests {
                 r.frame.as_ref().unwrap().frame_uncaptured,
                 "an INPUT arg does not capture the frame"
             );
-            r.provably_disjoint(
-                qcode::value::ModuleView::new(&tc.ctx),
-                local,
-                ValueId::Instruction(call_result),
-            )
+            r.provably_disjoint(host, local, ValueId::Instruction(call_result))
         }
 
         assert!(

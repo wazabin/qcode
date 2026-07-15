@@ -226,6 +226,16 @@ impl<'str> FunctionInterface<'str> {
             kind: FunctionKind::Machine,
         }
     }
+
+    /// The inferred pointer attributes for positional argument `index`, or
+    /// `None` when this function has no analyzed attributes.
+    pub fn param_attr(&self, index: usize) -> Option<ParamAttrs> {
+        self.signature
+            .as_ref()
+            .and_then(|s| s.param_attrs.as_ref())
+            .and_then(|attrs| attrs.get(index))
+            .copied()
+    }
 }
 
 impl<'str> FunctionBody<'str> {
@@ -1152,12 +1162,7 @@ where
     /// argument escapes and may be written through). See
     /// [`FunctionSignature::param_attrs`].
     pub fn param_attr(&'s self, index: usize) -> Option<ParamAttrs> {
-        self.interface()
-            .signature
-            .as_ref()
-            .and_then(|s| s.param_attrs.as_ref())
-            .and_then(|attrs| attrs.get(index))
-            .copied()
+        self.interface().param_attr(index)
     }
 
     /// The full per-parameter attribute vector, if analyzed.
