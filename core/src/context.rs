@@ -1580,42 +1580,6 @@ impl<'str> Context<'str> {
         }
     }
 
-    /// Physically removes a set of instructions after pruning their operands
-    /// from reverse-use maps.
-    /// Call after removing them from their parent blocks and unlinking any CFG
-    /// edges owned by terminators.
-    pub fn remove_instructions(&mut self, dead: &HashSet<InstructionId>) {
-        let mut ids: Vec<_> = dead.iter().copied().collect();
-        ids.sort_unstable();
-        let mut affected_args: HashSet<(FunctionId, crate::value::LocalValueId)> =
-            HashSet::default();
-        for &id in &ids {
-            assert!(
-                self.contains_instruction(id),
-                "cannot remove stale instruction {id:?}"
-            );
-            let mnemonic = self.bodies[id.func].insns[id.local].mnemonic();
-            affected_args.extend(mnemonic.args().into_iter().map(|arg| (id.func, arg)));
-        }
-        for (func, arg) in affected_args {
-            let remove_key = if let Some(users) = self.bodies[func].users.get_mut(&arg) {
-                users.retain(|&local| !dead.contains(&InstructionId::new(func, local)));
-                users.is_empty()
-            } else {
-                false
-            };
-            if remove_key {
-                self.bodies[func].users.remove(&arg);
-            }
-        }
-        for id in ids {
-            self.bodies[id.func]
-                .users
-                .remove(&ValueId::Instruction(id).strip_func());
-            self.bodies[id.func].insns.remove(id.local);
-        }
-    }
-
     pub fn push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
         let local = self.bodies[func].blocks.push(block);
         let id = BlockId::new(func, local);

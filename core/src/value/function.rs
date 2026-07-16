@@ -1,5 +1,5 @@
 use jstd::{Identifier, registry::Registry, stable_arena::StableArena};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     borrow::Cow,
     collections::BTreeSet,
@@ -905,6 +905,37 @@ impl<'str> FunctionBody<'str> {
             self.users.entry(new).or_default().push(user.localize(func));
         }
         self.users.remove(&old);
+    }
+
+    /// Physically removes a set of instructions after pruning their operands
+    /// from the reverse-use map. Call after removing them from their parent
+    /// blocks and unlinking any CFG edges owned by terminators.
+    pub fn remove_instructions(&mut self, dead: &FxHashSet<LocalInsnId>) {
+        let mut ids: Vec<_> = dead.iter().copied().collect();
+        ids.sort_unstable();
+        let mut affected_args: FxHashSet<LocalValueId> = FxHashSet::default();
+        for &id in &ids {
+            assert!(
+                self.insns.contains(id),
+                "cannot remove stale instruction {id:?}"
+            );
+            affected_args.extend(self.insns[id].mnemonic().args());
+        }
+        for arg in affected_args {
+            let remove_key = if let Some(users) = self.users.get_mut(&arg) {
+                users.retain(|local| !dead.contains(local));
+                users.is_empty()
+            } else {
+                false
+            };
+            if remove_key {
+                self.users.remove(&arg);
+            }
+        }
+        for id in ids {
+            self.users.remove(&LocalValueId::Instruction(id));
+            self.insns.remove(id);
+        }
     }
 
     /// Remove instruction `id` from its block, unlink its outgoing CFG edges if a

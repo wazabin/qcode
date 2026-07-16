@@ -17,6 +17,7 @@
 //! and they are thin arena pushes with no drift-prone logic.
 
 use jstd::registry::Registry;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     context::{Context, Shared},
@@ -25,7 +26,7 @@ use crate::{
         block::{BlockId, EdgeId},
         block_param::BlockParamId,
         function::FunctionInterface,
-        insn::{InstructionId, Mnemonic},
+        insn::{InstructionId, LocalInsnId, Mnemonic},
         util::body_mut::BodyMut,
     },
 };
@@ -117,6 +118,20 @@ pub trait QCodeMut<'str> {
     /// physically drop its payload.
     fn remove_instruction(&mut self, id: InstructionId) {
         self.function_mut(id.func).remove_instruction(id);
+    }
+
+    /// Physically removes a set of instructions after pruning their operands
+    /// from the reverse-use maps, grouped per owning function. Call after
+    /// removing them from their parent blocks and unlinking any CFG edges owned
+    /// by terminators.
+    fn remove_instructions(&mut self, dead: &FxHashSet<InstructionId>) {
+        let mut by_func: FxHashMap<FunctionId, FxHashSet<LocalInsnId>> = FxHashMap::default();
+        for &id in dead {
+            by_func.entry(id.func).or_default().insert(id.local);
+        }
+        for (func, dead) in by_func {
+            self.function_mut(func).remove_instructions(&dead);
+        }
     }
 
     /// Rehome `remove`'s outgoing CFG edges onto `keep`. The direct edge and
