@@ -206,13 +206,14 @@ fn apply<'str>(
     next_minted: &mut u32,
     minted: &mut Vec<Minted<'str>>,
     m: &ScanMatch,
+    src_arr_ty: qcode::types::TypeId,
 ) -> bool {
     let fid = body.id();
     let (index_ty, i64_ty, name) = {
         let host = mv.body_view(body);
         (
             host.type_of(m.index),
-            host.shared().types.get_or_make_int(8),
+            host.shared().types.get_int(8),
             format!("{}_scan_body", host.function_ref(fid).name()),
         )
     };
@@ -232,12 +233,9 @@ fn apply<'str>(
     }
     let (body_fn, src_kind, src_arr_ty) = match m.elem {
         Some((elem_read, l0_exit)) => {
-            let (esz, src_arr_ty) = {
+            let esz = {
                 let types = &mv.body_view(body).shared().types;
-                (
-                    types.size_of(m.elem_ty),
-                    types.get_or_make_array(m.elem_ty, n1),
-                )
+                types.size_of(m.elem_ty)
             };
             let Some(body_fn) = outline_scan_body(
                 mv,
@@ -259,11 +257,6 @@ fn apply<'str>(
             (body_fn, Src::Slice { l0_exit, esz }, src_arr_ty)
         }
         None => {
-            let src_arr_ty = mv
-                .body_view(body)
-                .shared()
-                .types
-                .get_or_make_array(i64_ty, n1);
             let Some(body_fn) = outline_scan_body(
                 mv,
                 body,
@@ -341,7 +334,8 @@ fn apply<'str>(
     // (stored-value) type with the source's length/kind.
     let scan = {
         let body_ret = mv.body_view(body).type_of(m.stored_val);
-        let ty = crate::calls::outline::seq_result_type(mv.body_view(body), src, body_ret);
+        let ty = crate::calls::outline::seq_result_type(mv.body_view(body), src, body_ret)
+            .expect("scan result type must be published before rewriting");
         let id = body.push_mnemonic_with_type(
             Mnemonic::Scan(qcode::value::insn::Scan {
                 body: body_fn,
@@ -450,8 +444,27 @@ impl FunctionPass for LoopToScan {
         next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         if let Some(sm) = try_match(m.body_view(f), f.id()) {
+            let src_elem_ty = if sm.elem.is_some() {
+                sm.elem_ty
+            } else {
+                m.shr().types.get_int(8)
+            };
+            let src_count = sm.count - 1;
+            let result_elem_ty = m.body_view(f).type_of(sm.stored_val);
+            let mut requests = Vec::new();
+            let src_arr_ty = m.shr().types.get_array(src_elem_ty, src_count);
+            if src_arr_ty.is_none() {
+                requests.push(qcode::types::TypeRequest::array(src_elem_ty, src_count));
+            }
+            if m.shr().types.get_array(result_elem_ty, src_count).is_none() {
+                requests.push(qcode::types::TypeRequest::array(result_elem_ty, src_count));
+            }
+            if !requests.is_empty() {
+                return Ok(Outcome::requesting_types(requests));
+            }
+            let src_arr_ty = src_arr_ty.expect("requested source array must now be published");
             let mut minted = Vec::new();
-            let changed = apply(m, f, next_minted, &mut minted, &sm);
+            let changed = apply(m, f, next_minted, &mut minted, &sm, src_arr_ty);
             return Ok(Outcome::with_minted(changed, minted));
         }
         Ok(Outcome::unchanged())

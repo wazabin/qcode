@@ -936,7 +936,7 @@ impl<'str> Mem2Reg<'_, 'str> {
         // Host-routed mirror of `BasicBlock::push_param(size)`: mint an
         // `Int(size)`-typed param and append it to the block's param list.
         let index = self.read().block(block_id).param_ids().len();
-        let type_id = self.read().shared().types.get_or_make_int(size);
+        let type_id = self.read().shared().types.get_int(size);
         let param_id = self
             .body
             .push_block_param(BlockParam::new(index, type_id, block_id.local));

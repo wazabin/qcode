@@ -503,7 +503,7 @@ fn simplify_compare<'str>(
                 }
                 if let Some((src, src_size)) = as_zext(cx.body_view(body), other) {
                     let zero = cx.body_view(body).shared().get_const(0, src_size);
-                    let bool_ty = cx.body_view(body).shared().types.get_or_make_bool();
+                    let bool_ty = cx.body_view(body).shared().types.get_bool();
                     ed.replace_with_new_insn_typed(
                         body,
                         cx,
@@ -532,7 +532,7 @@ fn simplify_compare<'str>(
                                 && let Some(flipped) = negated_compare(inner)
                             {
                                 let (a, b) = (a.qualify(id.func), b.qualify(id.func));
-                                let bool_ty = cx.body_view(body).shared().types.get_or_make_bool();
+                                let bool_ty = cx.body_view(body).shared().types.get_bool();
                                 ed.replace_with_new_insn_typed(
                                     body,
                                     cx,

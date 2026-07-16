@@ -54,7 +54,7 @@ use qcode::{
     builder::Builder,
     context::Context,
     space::LocalMemorySpaceId,
-    types::TypeId,
+    types::{AggregateField, TypeId},
     value::{
         BasicBlock, BlockId, FunctionBody, FunctionId, Instruction, ValueId,
         insn::{InstructionId, Mnemonic},
@@ -263,7 +263,7 @@ pub(crate) fn append_outputs<S>(
             Vec::new()
         };
         base_len = base_fields.len();
-        let tuple = {
+        let fields = {
             let mut b = (ctx).builder(ret_block);
             b.set_insert_point_before(ret_id);
             let mut fields = base_fields;
@@ -274,14 +274,41 @@ pub(crate) fn append_outputs<S>(
                     fields.push((name, v));
                 }
             }
-            ValueId::Instruction(b.push_named_tuple(fields).id)
+            fields
+        };
+        let tuple_fields: Vec<AggregateField> = fields
+            .iter()
+            .map(|(name, value)| AggregateField::new(name.clone(), ctx.type_of(*value)))
+            .collect();
+        let return_ty = if let Some(return_ty) = writeset_ty {
+            debug_assert_eq!(
+                ctx.shared.types.aggregate_fields(return_ty),
+                Some(tuple_fields.as_slice()),
+                "all returns of a function must agree on the return-record layout"
+            );
+            return_ty
+        } else if ctx.shared.types.function_return(fid).is_some() {
+            ctx.shared
+                .types
+                .edit_function_return(fid, tuple_fields)
+                .expect("existing function return type must remain editable")
+        } else {
+            ctx.shared
+                .types
+                .create_function_return(fid, tuple_fields)
+                .expect("function return type must be created exactly once")
+        };
+        let tuple = {
+            let mut b = (ctx).builder(ret_block);
+            b.set_insert_point_before(ret_id);
+            ValueId::Instruction(b.push_named_tuple_with_type(fields, return_ty).id)
         };
         let mut m = ctx.get_insn(ret_id).mnemonic().clone();
         if let Mnemonic::Return(ref mut r) = m {
             r.value = Some(tuple.localize(ret_id.func));
         }
         ctx.replace_instruction_mnemonic(ret_id, m);
-        writeset_ty = Some(ctx.type_of(tuple));
+        writeset_ty = Some(return_ty);
     }
     let Some(writeset_ty) = writeset_ty else {
         return;

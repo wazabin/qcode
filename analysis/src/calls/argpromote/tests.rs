@@ -946,6 +946,15 @@ mod tests {
         assert!(argpromote(&mut tc.ctx));
         // One write replayed; the returned pointer rides the real-return channel.
         assert_eq!(replayed_stores(&tc, call_id), 1);
+        let return_type = tc
+            .ctx
+            .stored_type_of(ValueId::Instruction(call_id))
+            .unwrap();
+        assert_eq!(tc.ctx.shared.types.function_return(foo), Some(return_type));
+        assert_eq!(
+            tc.ctx.shared.types.function_return_owner(return_type),
+            Some(foo)
+        );
     }
 
     /// `int foo(int* p) { p += 10; *p = 5; }`

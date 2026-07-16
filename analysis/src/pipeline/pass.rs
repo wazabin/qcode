@@ -179,9 +179,9 @@ pub trait DynFunctionPass: Send + Sync {
 /// The litmus test the signature enforces: **a function pass may read the
 /// module's published interface and mutate its own function — nothing else.** It
 /// reads the module through a `&`-shared [`ContextView`] and mutates only its own
-/// [`FunctionBody`], buffering the one legitimate global effect (a self-rename)
-/// for the driver to replay at the
-/// barrier. With no path to global mutable state, workers can run these in
+/// [`FunctionBody`], returning global effects for the driver to replay at the
+/// barrier. Missing types are requested before body mutation and cause a retry
+/// after publication. With no path to global mutable state, workers can run these in
 /// parallel (Stage 6) with the `ContextView` shared and the bodies disjoint.
 ///
 /// The [`FunctionPassAdapter`] lets a `FunctionPass` be stored and driven through the
@@ -274,18 +274,41 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
         let addresses_before = address_snapshot(ctx);
         // Split the context: borrow the target body `&mut` in place and run the
         // pass over the frozen module view; the view is bodies-free, so it cannot
-        // alias the borrowed body.
-        let outcome = {
-            let (bodies, view) = ctx.split(env);
-            let mut next_minted = 0;
-            let mut local = analyses.take_local(fun_id);
-            let outcome =
-                self.run_checked(&mut bodies[fun_id], view, &mut next_minted, &mut local)?;
-            if outcome.changed || !outcome.minted.is_empty() {
-                local.invalidate(&outcome.preserved_analyses);
+        // alias the borrowed body. A missing type is requested without mutation,
+        // published at this bridge's barrier, then the pass is retried.
+        let mut next_minted = 0;
+        let mut type_request_retries = 0;
+        let outcome = loop {
+            let outcome = {
+                let (bodies, view) = ctx.split(env);
+                let mut local = analyses.take_local(fun_id);
+                let outcome =
+                    self.run_checked(&mut bodies[fun_id], view, &mut next_minted, &mut local)?;
+                if outcome.changed || !outcome.minted.is_empty() {
+                    local.invalidate(&outcome.preserved_analyses);
+                }
+                analyses.put_local(fun_id, local);
+                outcome
+            };
+            if outcome.type_requests.is_empty() {
+                break outcome;
             }
-            analyses.put_local(fun_id, local);
-            outcome
+            if outcome.changed || outcome.rename.is_some() || !outcome.minted.is_empty() {
+                return Err(format!(
+                    "{}: a type-request outcome must not also mutate IR, rename, or mint functions",
+                    T::NAME
+                ));
+            }
+            ctx.shared
+                .types
+                .create_requested_types(&outcome.type_requests);
+            type_request_retries += 1;
+            if type_request_retries >= 64 {
+                return Err(format!(
+                    "{}: type requests did not settle after 64 retries",
+                    T::NAME
+                ));
+            }
         };
         // Barrier, in the driver's order: install and resolve minted callees,
         // then apply the returned self-rename. The body was mutated in place.
@@ -566,6 +589,9 @@ pub(super) fn replay_rename<'str>(
 pub struct ModulePassOutcome {
     pub changed_functions: FxHashSet<FunctionId>,
     pub module_changed: bool,
+    /// Types needed before this module pass can mutate the program. The driver
+    /// publishes them and retries the pass immediately.
+    pub type_requests: Vec<qcode::types::TypeRequest>,
     /// Analyses preserved by this particular invocation.
     pub(crate) preserved_analyses: PreservedAnalyses,
 }
@@ -575,6 +601,7 @@ impl Default for ModulePassOutcome {
         Self {
             changed_functions: FxHashSet::default(),
             module_changed: false,
+            type_requests: Vec::new(),
             preserved_analyses: PreservedAnalyses::all(),
         }
     }
@@ -594,6 +621,7 @@ impl ModulePassOutcome {
         Self {
             changed_functions: [function].into_iter().collect(),
             module_changed: false,
+            type_requests: Vec::new(),
             preserved_analyses: PreservedAnalyses::none(),
         }
     }
@@ -606,6 +634,7 @@ impl ModulePassOutcome {
             Self {
                 changed_functions,
                 module_changed: false,
+                type_requests: Vec::new(),
                 preserved_analyses: PreservedAnalyses::none(),
             }
         }
@@ -615,6 +644,7 @@ impl ModulePassOutcome {
         Self {
             changed_functions: FxHashSet::default(),
             module_changed: true,
+            type_requests: Vec::new(),
             preserved_analyses: PreservedAnalyses::none(),
         }
     }
@@ -624,6 +654,15 @@ impl ModulePassOutcome {
             Self::module()
         } else {
             Self::default()
+        }
+    }
+
+    /// Ask the driver to publish types and rerun this pass before any module
+    /// mutation is performed.
+    pub fn requesting_types(requests: impl IntoIterator<Item = qcode::types::TypeRequest>) -> Self {
+        Self {
+            type_requests: requests.into_iter().collect(),
+            ..Self::default()
         }
     }
 

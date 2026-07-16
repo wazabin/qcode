@@ -33,7 +33,10 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
     space::MemorySpaceId,
-    value::insn::{Binop, IntBinop},
+    value::{
+        FunctionId,
+        insn::{Binop, IntBinop},
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -48,6 +51,38 @@ use crate::{
     Copy, Clone, Hash, Eq, PartialEq, Debug, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
 )]
 pub struct TypeId(u32);
+
+/// A structural type a function pass needs published before it can rewrite its
+/// body. Requests are returned to the pipeline driver and created at the module
+/// barrier; the requesting pass is then rerun against the new publication.
+///
+/// This avoids temporary/sentinel [`TypeId`] values in IR and keeps assignment
+/// deterministic under parallel function passes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TypeRequest {
+    Aggregate { fields: Vec<AggregateField> },
+    StructPointer { size: usize, pointee: TypeId },
+    Array { elem: TypeId, count: usize },
+    List { elem: TypeId, bound: Option<usize> },
+}
+
+impl TypeRequest {
+    pub fn aggregate(fields: Vec<AggregateField>) -> Self {
+        Self::Aggregate { fields }
+    }
+
+    pub const fn struct_pointer(size: usize, pointee: TypeId) -> Self {
+        Self::StructPointer { size, pointee }
+    }
+
+    pub const fn array(elem: TypeId, count: usize) -> Self {
+        Self::Array { elem, count }
+    }
+
+    pub const fn list(elem: TypeId, bound: Option<usize>) -> Self {
+        Self::List { elem, bound }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Type trait
@@ -70,6 +105,11 @@ pub trait Type: Send + Sync {
 
     /// The name of this type, if it is a nominal [`StructType`].
     fn struct_name(&self) -> Option<&str> {
+        None
+    }
+
+    /// Owning function when this is its unique, editable return-record type.
+    fn function_return_owner(&self) -> Option<FunctionId> {
         None
     }
 
@@ -179,6 +219,15 @@ pub enum TypeRepr {
     List {
         elem: TypeId,
         bound: Option<usize>,
+    },
+    /// A function-owned return record. Unlike structural [`Aggregate`](Self::Aggregate)
+    /// values, identity belongs to `owner`: two functions with identical fields
+    /// still have distinct types, and the owner may revise the fields later while
+    /// preserving the same [`TypeId`]. Kept last to preserve the existing bincode
+    /// discriminants of previously persisted type variants.
+    FunctionReturn {
+        owner: FunctionId,
+        fields: Vec<AggregateField>,
     },
 }
 
@@ -304,6 +353,43 @@ impl Type for SpaceAddress {
 struct AggregateType {
     fields: Vec<AggregateField>,
     size: usize,
+}
+
+/// A unique, editable return-record declaration owned by one function.
+///
+/// Mutation replaces the declaration object at a module barrier while preserving
+/// its TypeId. Published generations keep the previous object alive for readers
+/// that began before the barrier.
+#[derive(Clone)]
+struct FunctionReturnType {
+    owner: FunctionId,
+    fields: Vec<AggregateField>,
+    size: usize,
+}
+
+impl Type for FunctionReturnType {
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    fn fields(&self) -> Option<&[AggregateField]> {
+        Some(&self.fields)
+    }
+
+    fn function_return_owner(&self) -> Option<FunctionId> {
+        Some(self.owner)
+    }
+
+    fn clone_box(&self) -> Box<dyn Type> {
+        Box::new(self.clone())
+    }
+
+    fn repr(&self) -> TypeRepr {
+        TypeRepr::FunctionReturn {
+            owner: self.owner,
+            fields: self.fields.clone(),
+        }
+    }
 }
 
 impl Type for AggregateType {
@@ -476,14 +562,33 @@ fn default_named_fields(fields: Vec<TypeId>) -> Vec<AggregateField> {
         .collect()
 }
 
+fn validate_unique_fields(fields: &[AggregateField]) -> Result<(), String> {
+    for (i, field) in fields.iter().enumerate() {
+        if fields[..i]
+            .iter()
+            .any(|previous| previous.name == field.name)
+        {
+            return Err(format!(
+                "aggregate field names must be unique; duplicate `{}`",
+                field.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Registry that owns all [`Type`] objects and hands out interned [`TypeId`]s.
 ///
-/// Types are created once (at context construction or when the architecture is
-/// configured) and never removed. All methods that *only read* types take
-/// `&self`; methods that may create new `Int` types on demand take `&mut self`.
+/// Type identities are created once and never removed. Most definitions are
+/// immutable; function-owned return declarations may be replaced at an exclusive
+/// module barrier while preserving their TypeId. Superseded objects stay alive
+/// for older published readers.
 #[derive(Clone)]
 struct TypeManagerInner {
     types: Vec<Box<dyn Type>>,
+    /// Superseded function-owned declarations retained because an older
+    /// lock-free publication generation may still point at them.
+    retired_types: Vec<Box<dyn Type>>,
     /// Fast lookup: Int size → TypeId.
     int_by_size: HashMap<usize, TypeId>,
     /// The interned `bool` type, once created.
@@ -492,6 +597,8 @@ struct TypeManagerInner {
     space_address: HashMap<(usize, MemorySpaceId), TypeId>,
     /// Fast lookup: named field-type list → Aggregate TypeId.
     aggregate_by_fields: HashMap<Vec<AggregateField>, TypeId>,
+    /// One unique editable return-record declaration per function.
+    function_return: HashMap<FunctionId, TypeId>,
     /// Nominal lookup: struct name → StructType TypeId.
     struct_by_name: HashMap<String, TypeId>,
     /// Fast lookup: (size, pointee) → StructPointer TypeId.
@@ -512,10 +619,12 @@ impl TypeManagerInner {
     fn new() -> Self {
         Self {
             types: Vec::new(),
+            retired_types: Vec::new(),
             int_by_size: HashMap::default(),
             bool_id: None,
             space_address: HashMap::default(),
             aggregate_by_fields: HashMap::default(),
+            function_return: HashMap::default(),
             struct_by_name: HashMap::default(),
             struct_pointer: HashMap::default(),
             array_by_elem_count: HashMap::default(),
@@ -577,12 +686,7 @@ impl TypeManagerInner {
     /// already be registered (it always is in practice: you build the field
     /// types before grouping them).
     pub fn get_or_make_named_aggregate(&mut self, fields: Vec<AggregateField>) -> TypeId {
-        for (i, field) in fields.iter().enumerate() {
-            assert!(
-                !fields[..i].iter().any(|prev| prev.name == field.name),
-                "aggregate field names must be unique"
-            );
-        }
+        validate_unique_fields(&fields).expect("aggregate field names must be unique");
         if let Some(&id) = self.aggregate_by_fields.get(&fields) {
             return id;
         }
@@ -593,6 +697,49 @@ impl TypeManagerInner {
         }));
         self.aggregate_by_fields.insert(fields, id);
         id
+    }
+
+    fn create_function_return(
+        &mut self,
+        owner: FunctionId,
+        fields: Vec<AggregateField>,
+    ) -> Result<TypeId, String> {
+        validate_unique_fields(&fields)?;
+        if let Some(&existing) = self.function_return.get(&owner) {
+            return Err(format!(
+                "function {owner:?} already owns return type {existing:?}"
+            ));
+        }
+        let size = fields.iter().map(|field| self.size_of(field.type_id)).sum();
+        let id = self.register(Box::new(FunctionReturnType {
+            owner,
+            fields,
+            size,
+        }));
+        self.function_return.insert(owner, id);
+        Ok(id)
+    }
+
+    fn edit_function_return(
+        &mut self,
+        owner: FunctionId,
+        fields: Vec<AggregateField>,
+    ) -> Result<TypeId, String> {
+        validate_unique_fields(&fields)?;
+        let id = self
+            .function_return
+            .get(&owner)
+            .copied()
+            .ok_or_else(|| format!("function {owner:?} has no owned return type"))?;
+        let size = fields.iter().map(|field| self.size_of(field.type_id)).sum();
+        let replacement: Box<dyn Type> = Box::new(FunctionReturnType {
+            owner,
+            fields,
+            size,
+        });
+        let old = std::mem::replace(&mut self.types[id.0 as usize], replacement);
+        self.retired_types.push(old);
+        Ok(id)
     }
 
     /// Returns the nominal [`StructType`] named `name`, creating it if it does
@@ -728,7 +875,7 @@ impl TypeManagerInner {
     }
 }
 
-/// The type interner: a global, append-only table of interned [`Type`]s behind a
+/// The type registry: a global, append-only table of [`TypeId`] identities behind a
 /// [`RwLock`] so that types can be minted through a shared `&` reference (a
 /// prerequisite for running function passes in parallel against a shared
 /// `ContextView`). Reads — including the `get_or_make_*` hit path — take a read
@@ -736,13 +883,13 @@ impl TypeManagerInner {
 /// Interned [`TypeId`]s are globally stable and never remapped.
 pub struct TypeManager {
     inner: RwLock<TypeManagerInner>,
-    /// Lock-free read index over the append-only type objects in `inner`.
+    /// Lock-free read index over the currently published type objects in `inner`.
     ///
     /// Publishing replaces this pointer after a successful mint. Old indexes
     /// stay owned by `published_generations`, so a reader that raced with a
     /// publication can safely finish through the generation it loaded. The
-    /// pointed-to `Type` objects themselves live in `inner.types`; those are
-    /// boxed, append-only, and therefore never move or disappear.
+    /// pointed-to `Type` objects live in `inner.types` or `inner.retired_types`;
+    /// those boxes never move or disappear.
     published: AtomicPtr<PublishedTypes>,
     // Each generation needs its own stable heap address after this Vec grows.
     #[allow(clippy::vec_box)]
@@ -813,7 +960,7 @@ impl TypeManager {
         self.inner.write().expect("type manager RwLock poisoned")
     }
 
-    /// Publish the current append-only type table for lock-free readers.
+    /// Publish the current type table for lock-free readers.
     /// Caller holds the write lock, so only one generation can be constructed
     /// at a time and every registered type is fully initialized first.
     fn publish(&self, inner: &TypeManagerInner) {
@@ -821,6 +968,22 @@ impl TypeManager {
         let ptr = (&*generation as *const PublishedTypes).cast_mut();
         self.published_generations
             .lock()
+            .expect("type publication generation lock poisoned")
+            .push(generation);
+        self.published.store(ptr, Ordering::Release);
+    }
+
+    /// Publish after an exclusive module-barrier mutation. Taking `&mut self`
+    /// makes creation/editing unavailable through a function pass's shared
+    /// `ContextView` by construction.
+    fn publish_exclusive(&mut self) {
+        let generation = {
+            let inner = self.inner.get_mut().expect("type manager RwLock poisoned");
+            Box::new(PublishedTypes::from_inner(inner))
+        };
+        let ptr = (&*generation as *const PublishedTypes).cast_mut();
+        self.published_generations
+            .get_mut()
             .expect("type publication generation lock poisoned")
             .push(generation);
         self.published.store(ptr, Ordering::Release);
@@ -888,6 +1051,74 @@ impl TypeManager {
         }
         self.mint(|inner| inner.get_or_make_named_aggregate(fields))
     }
+
+    /// Create a fresh nominal return-record type owned by `owner`.
+    ///
+    /// This never structurally deduplicates: identical records owned by two
+    /// functions receive distinct TypeIds. Exclusive access confines publication
+    /// to a module barrier; function passes will eventually return this request as
+    /// an effect for the driver to apply through the same API.
+    pub fn create_function_return(
+        &mut self,
+        owner: FunctionId,
+        fields: Vec<AggregateField>,
+    ) -> Result<TypeId, String> {
+        let id = self
+            .inner
+            .get_mut()
+            .expect("type manager RwLock poisoned")
+            .create_function_return(owner, fields)?;
+        self.publish_exclusive();
+        Ok(id)
+    }
+
+    /// Replace an owned return record's fields while preserving its TypeId.
+    /// Readers that began before this exclusive barrier retain the previous
+    /// published declaration; subsequent reads observe the replacement.
+    pub fn edit_function_return(
+        &mut self,
+        owner: FunctionId,
+        fields: Vec<AggregateField>,
+    ) -> Result<TypeId, String> {
+        let id = self
+            .inner
+            .get_mut()
+            .expect("type manager RwLock poisoned")
+            .edit_function_return(owner, fields)?;
+        self.publish_exclusive();
+        Ok(id)
+    }
+
+    /// Create a batch of types requested by function passes, in request order,
+    /// then publish one new read generation. This is the module-barrier creation
+    /// path; workers only use the corresponding `get_*` accessors.
+    pub fn create_requested_types(&mut self, requests: &[TypeRequest]) -> Vec<TypeId> {
+        if requests.is_empty() {
+            return Vec::new();
+        }
+        let (ids, changed) = {
+            let inner = self.inner.get_mut().expect("type manager RwLock poisoned");
+            let before = inner.types.len();
+            let ids = requests
+                .iter()
+                .map(|request| match *request {
+                    TypeRequest::Aggregate { ref fields } => {
+                        inner.get_or_make_named_aggregate(fields.clone())
+                    }
+                    TypeRequest::StructPointer { size, pointee } => {
+                        inner.get_or_make_struct_pointer(size, pointee)
+                    }
+                    TypeRequest::Array { elem, count } => inner.get_or_make_array(elem, count),
+                    TypeRequest::List { elem, bound } => inner.get_or_make_list_opt(elem, bound),
+                })
+                .collect();
+            (ids, inner.types.len() != before)
+        };
+        if changed {
+            self.publish_exclusive();
+        }
+        ids
+    }
     pub fn get_or_make_struct(
         &self,
         name: impl Into<String>,
@@ -906,11 +1137,38 @@ impl TypeManager {
         }
         self.mint(|inner| inner.get_or_make_struct_pointer(size, pointee))
     }
+    /// Access an already-published struct-pointer type without creating state.
+    pub fn get_struct_pointer(&self, size: usize, pointee: TypeId) -> Option<TypeId> {
+        self.read().struct_pointer.get(&(size, pointee)).copied()
+    }
+
+    /// Access an already-published structural aggregate without creating state.
+    pub fn get_named_aggregate(&self, fields: &[AggregateField]) -> Option<TypeId> {
+        self.read().aggregate_by_fields.get(fields).copied()
+    }
     pub fn get_or_make_array(&self, elem: TypeId, count: usize) -> TypeId {
         if let Some(&id) = self.read().array_by_elem_count.get(&(elem, count)) {
             return id;
         }
         self.mint(|inner| inner.get_or_make_array(elem, count))
+    }
+
+    /// Access an already-published array type without creating shared state.
+    pub fn get_array(&self, elem: TypeId, count: usize) -> Option<TypeId> {
+        self.read().array_by_elem_count.get(&(elem, count)).copied()
+    }
+    /// Access an already-published list type without creating shared state.
+    pub fn get_list(&self, elem: TypeId, bound: Option<usize>) -> Option<TypeId> {
+        self.read().list_by_elem_bound.get(&(elem, bound)).copied()
+    }
+
+    /// Access an already-published sequence type of the requested kind.
+    pub fn get_seq(&self, elem: TypeId, len: usize, is_list: bool) -> Option<TypeId> {
+        if is_list {
+            self.get_list(elem, Some(len))
+        } else {
+            self.get_array(elem, len)
+        }
     }
     pub fn get_or_make_list(&self, elem: TypeId, bound: usize) -> TypeId {
         if let Some(&id) = self.read().list_by_elem_bound.get(&(elem, Some(bound))) {
@@ -946,14 +1204,36 @@ impl TypeManager {
     pub fn bool_id(&self) -> Option<TypeId> {
         self.read().bool_id()
     }
+    /// Access an already-published canonical integer type.
+    ///
+    /// Function passes use this instead of silently creating shared state. A
+    /// missing width means the pass failed to derive its type from published IR.
+    pub fn get_int(&self, size: usize) -> TypeId {
+        self.read()
+            .int_by_size
+            .get(&size)
+            .copied()
+            .unwrap_or_else(|| panic!("canonical integer type i{} is not published", size * 8))
+    }
+    /// Access the already-published canonical boolean type.
+    pub fn get_bool(&self) -> TypeId {
+        self.bool_id()
+            .expect("canonical bool type is not published")
+    }
     pub fn struct_by_name(&self, name: &str) -> Option<TypeId> {
         self.read().struct_by_name(name)
+    }
+    pub fn function_return(&self, owner: FunctionId) -> Option<TypeId> {
+        self.read().function_return.get(&owner).copied()
     }
 
     // --- Published TypeId reads (lock-free) ------------------------------
 
     pub fn is_bool(&self, id: TypeId) -> bool {
         matches!(self.get(id).repr(), TypeRepr::Bool)
+    }
+    pub fn function_return_owner(&self, id: TypeId) -> Option<FunctionId> {
+        self.get(id).function_return_owner()
     }
     pub fn size_of(&self, id: TypeId) -> usize {
         self.get(id).size()
@@ -1010,14 +1290,15 @@ impl TypeManager {
             .position(|field| field.name == name)
     }
 
-    // --- reference reads (built on the append-only-stable `get`) ----------
+    // --- reference reads (built on publication-stable `get`) --------------
 
     /// Returns a reference to the concrete [`Type`] for `id`.
     ///
     /// The lookup loads one immutable published index generation and takes no
     /// lock. The reference remains valid across later publications because the
-    /// type table is append-only: types are created once and never removed, and
-    /// each `Box<dyn Type>` pointee is heap-allocated and never moved.
+    /// TypeIds are never removed, and each published `Box<dyn Type>` pointee is
+    /// heap-allocated and never moved or freed, including superseded owned
+    /// declarations retained for older generations.
     pub fn get(&self, id: TypeId) -> &dyn Type {
         let entries = &self.published().entries;
         let ptr = *entries.get(id.0 as usize).unwrap_or_else(|| {
@@ -1027,8 +1308,8 @@ impl TypeManager {
             )
         });
         // SAFETY: publication records pointers to immutable boxed type objects.
-        // The table is append-only and the boxes remain owned by `inner.types`
-        // until this manager is dropped.
+        // Every published box remains owned by `inner.types` or
+        // `inner.retired_types` until this manager is dropped.
         unsafe { &*ptr }
     }
 
@@ -1286,5 +1567,152 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn requested_types_are_created_and_published_as_one_barrier_batch() {
+        let mut tm = TypeManager::new();
+        let byte = tm.get_or_make_int(1);
+        let requests = [
+            TypeRequest::array(byte, 4),
+            TypeRequest::array(byte, 8),
+            TypeRequest::array(byte, 4),
+        ];
+        assert_eq!(tm.get_array(byte, 4), None);
+
+        let ids = tm.create_requested_types(&requests);
+
+        assert_eq!(ids[0], ids[2], "duplicate requests must intern once");
+        assert_eq!(tm.get_array(byte, 4), Some(ids[0]));
+        assert_eq!(tm.get_array(byte, 8), Some(ids[1]));
+        assert_eq!(tm.array_of(ids[0]), Some((byte, 4)));
+        assert_eq!(tm.array_of(ids[1]), Some((byte, 8)));
+    }
+
+    #[test]
+    fn function_return_types_are_unique_owned_and_editable() {
+        let mut tm = TypeManager::new();
+        let i32 = tm.get_or_make_int(4);
+        let fields = vec![AggregateField::new("value", i32)];
+        let first_owner = FunctionId::from(0usize);
+        let second_owner = FunctionId::from(1usize);
+
+        let first = tm
+            .create_function_return(first_owner, fields.clone())
+            .unwrap();
+        let second = tm
+            .create_function_return(second_owner, fields.clone())
+            .unwrap();
+
+        assert_ne!(first, second, "owned declarations must not deduplicate");
+        assert_eq!(tm.function_return(first_owner), Some(first));
+        assert_eq!(tm.function_return(second_owner), Some(second));
+        assert_eq!(tm.function_return_owner(first), Some(first_owner));
+        assert_eq!(tm.function_return_owner(second), Some(second_owner));
+        assert!(
+            tm.create_function_return(first_owner, fields.clone())
+                .is_err(),
+            "one function cannot acquire a second return identity"
+        );
+
+        let edited = tm
+            .edit_function_return(
+                first_owner,
+                vec![
+                    AggregateField::new("value", i32),
+                    AggregateField::new("status", i32),
+                ],
+            )
+            .unwrap();
+        assert_eq!(edited, first, "editing must preserve nominal identity");
+        assert_eq!(tm.size_of(first), 8);
+        assert_eq!(tm.aggregate_fields(first).unwrap().len(), 2);
+        assert_eq!(tm.size_of(second), 4, "the other owner must not change");
+        assert_eq!(tm.aggregate_fields(second).unwrap(), fields.as_slice());
+    }
+
+    #[test]
+    fn function_return_type_round_trips_with_owner_and_identity() {
+        let mut tm = TypeManager::new();
+        let i16 = tm.get_or_make_int(2);
+        let owner = FunctionId::from(7usize);
+        let return_type = tm
+            .create_function_return(owner, vec![AggregateField::new("result", i16)])
+            .unwrap();
+
+        let bytes = bincode::serde::encode_to_vec(&tm, bincode::config::standard()).unwrap();
+        let (mut restored, _): (TypeManager, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+
+        assert_eq!(restored.function_return(owner), Some(return_type));
+        assert_eq!(restored.function_return_owner(return_type), Some(owner));
+        assert_eq!(restored.size_of(return_type), 2);
+        assert_eq!(
+            restored
+                .edit_function_return(
+                    owner,
+                    vec![
+                        AggregateField::new("result", i16),
+                        AggregateField::new("carry", i16),
+                    ],
+                )
+                .unwrap(),
+            return_type
+        );
+        assert_eq!(restored.size_of(return_type), 4);
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TypeManager {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let reprs = Vec::<TypeRepr>::deserialize(deserializer)?;
+        let mut manager = TypeManager::new();
+        for repr in reprs {
+            match repr {
+                TypeRepr::Int { size } => {
+                    manager.get_or_make_int(size);
+                }
+                TypeRepr::Bool => {
+                    manager.get_or_make_bool();
+                }
+                TypeRepr::SpaceAddress { size, space } => {
+                    manager.get_or_make_space_address(size, space);
+                }
+                // Field types have lower TypeIds (built before the aggregate),
+                // so replaying in order guarantees they already exist here.
+                TypeRepr::Aggregate { fields } => {
+                    manager.get_or_make_named_aggregate(fields);
+                }
+                TypeRepr::FunctionReturn { owner, fields } => {
+                    manager
+                        .create_function_return(owner, fields)
+                        .map_err(serde::de::Error::custom)?;
+                }
+                TypeRepr::Struct { name, size, fields } => {
+                    manager.get_or_make_struct(name, size, fields);
+                }
+                // The pointee has a lower TypeId (built before the pointer),
+                // so replaying in order guarantees it already exists here.
+                TypeRepr::StructPointer { size, pointee } => {
+                    manager.get_or_make_struct_pointer(size, pointee);
+                }
+                // The element type has a lower TypeId (built before the array),
+                // so replaying in order guarantees it already exists here.
+                TypeRepr::Array { elem, count } => {
+                    manager.get_or_make_array(elem, count);
+                }
+                // The element type has a lower TypeId (built before the list),
+                // so replaying in order guarantees it already exists here.
+                TypeRepr::List { elem, bound } => match bound {
+                    Some(b) => {
+                        manager.get_or_make_list(elem, b);
+                    }
+                    None => {
+                        manager.get_or_make_unbounded_list(elem);
+                    }
+                },
+            }
+        }
+        Ok(manager)
     }
 }

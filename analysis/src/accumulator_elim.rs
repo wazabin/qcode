@@ -315,7 +315,7 @@ fn transform<'str>(
         // counterpart so cloned `cond`/`stepD` expressions read g's params.
         let mut driver_subst: HashMap<ValueId, LocalValueId> = HashMap::default();
         for &i in &p.d_slots {
-            let ty = minted.shr().types.get_or_make_int(p.head_sizes[i]);
+            let ty = minted.shr().types.get_int(p.head_sizes[i]);
             let pid = push_param_local(&mut minted, g_head, ty);
             driver_subst.insert(ValueId::BlockParam(p.head_params[i]), pid);
         }

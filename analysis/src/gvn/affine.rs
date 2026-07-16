@@ -433,7 +433,7 @@ fn build_value<'str>(
     }
     let int_ty = match form {
         NormalForm::Affine { width, .. } | NormalForm::Mask { width, .. } => {
-            cx.shr().types.get_or_make_int(*width)
+            cx.shr().types.get_int(*width)
         }
         NormalForm::Opaque(_) => unreachable!("opaque forms are never materialized"),
     };

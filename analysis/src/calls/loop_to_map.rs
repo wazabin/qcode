@@ -294,7 +294,8 @@ fn apply<'str>(
     // element type is the loop's stored value.
     let map_val = {
         let body_ret = m.body_view(body).type_of(mm.ca.stored_val);
-        let ty = crate::calls::outline::seq_result_type(m.body_view(body), src, body_ret);
+        let ty = crate::calls::outline::seq_result_type(m.body_view(body), src, body_ret)
+            .expect("map result type must be published before rewriting");
         let id = body.push_mnemonic_with_type(
             Mnemonic::Map(qcode::value::insn::Map {
                 body: body_fn,
@@ -429,6 +430,54 @@ impl FunctionPass for LoopToMap {
         m: ContextView<'_, 'str>,
         next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
+        let fid = f.id();
+        if m.body_view(f).function_ref(fid).is_pure()
+            && let Some(mm) = try_match(m.body_view(f), fid)
+        {
+            let host = m.body_view(f);
+            let src_ty = host.type_of(mm.init_arr);
+            let body_ret = host.type_of(mm.ca.stored_val);
+            if let Some((_, len, is_list)) = host.shared().types.seq_of(src_ty)
+                && host
+                    .shared()
+                    .types
+                    .get_seq(body_ret, len, is_list)
+                    .is_none()
+            {
+                let request = if is_list {
+                    qcode::types::TypeRequest::list(body_ret, Some(len))
+                } else {
+                    qcode::types::TypeRequest::array(body_ret, len)
+                };
+                return Ok(Outcome::requesting_type(request));
+            }
+            if body_uses_index(host, mm.ca.stored_val, mm.ca.index, mm.elem_read)
+                && let Some((elem, len, is_list)) = host.shared().types.seq_of(src_ty)
+            {
+                let fields = vec![
+                    qcode::types::AggregateField::new("index", host.shared().types.get_int(8)),
+                    qcode::types::AggregateField::new("elem", elem),
+                ];
+                let Some(tuple_ty) = host.shared().types.get_named_aggregate(&fields) else {
+                    return Ok(Outcome::requesting_type(
+                        qcode::types::TypeRequest::aggregate(fields),
+                    ));
+                };
+                if host
+                    .shared()
+                    .types
+                    .get_seq(tuple_ty, len, is_list)
+                    .is_none()
+                {
+                    let request = if is_list {
+                        qcode::types::TypeRequest::list(tuple_ty, Some(len))
+                    } else {
+                        qcode::types::TypeRequest::array(tuple_ty, len)
+                    };
+                    return Ok(Outcome::requesting_type(request));
+                }
+            }
+        }
         let mut minted = Vec::new();
         let changed = recognize_total_map(m, f, next_minted, &mut minted);
         Ok(Outcome::with_minted(changed, minted))

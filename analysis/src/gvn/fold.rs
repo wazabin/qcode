@@ -99,6 +99,9 @@ pub(super) fn constant_folding(
     m: &Mnemonic,
     output_size: usize,
 ) -> Option<ValueId> {
+    // This helper models an instruction with a canonical integer result. The
+    // real pass receives the instruction's already-created TypeId via InsnCtx.
+    ctx.shared.types.get_or_make_int(output_size);
     // Test-only: the test mnemonics hold shared literal operands, which carry no
     // function, so any func qualifies them unchanged.
     constant_folding_with_location(
@@ -217,8 +220,12 @@ fn constant_folding_with_location<'ctx, 'str: 'ctx>(
             let out_type = host.shared().types.binop_result(lhs_type, op, rhs_type);
             let out_type = if host.shared().types.size_of(out_type) == output_size {
                 out_type
+            } else if let Some(location) = location {
+                // Folding replaces this instruction's value. Preserve its
+                // declared type exactly, including owned/named identities.
+                location.type_id
             } else {
-                host.shared().types.get_or_make_int(output_size)
+                host.shared().types.get_int(output_size)
             };
             Some(host.shared().get_typed_const(value, out_type))
         }

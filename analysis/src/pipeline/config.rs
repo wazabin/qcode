@@ -25,7 +25,7 @@ use super::pass::{
 };
 use super::{
     AnalysisManager, ContextSplit, ContextView, FunctionBody, LocalAnalysisManager, Outcome,
-    PipelineProgress, PreservedAnalyses, ProgressSink, YieldSignal,
+    PipelineProgress, PreservedAnalyses,
 };
 
 /// The canonical default pipeline, compiled into the binary. Used by
@@ -454,23 +454,12 @@ impl Pipeline {
     /// empty closure when neither matters.
     pub fn run(
         &self,
-        ctx: &mut Context<'_>,
+        ctx: &mut Context,
         env: &PipelineEnv,
         round: usize,
-        progress: &mut impl ProgressSink,
-    ) -> Result<(), String> {
-        pollster::block_on(self.run_async(ctx, env, round, progress))
-    }
-
-    pub async fn run_async(
-        &self,
-        ctx: &mut Context<'_>,
-        env: &PipelineEnv,
-        round: usize,
-        progress: &mut impl ProgressSink,
+        progress: &mut impl FnMut(PipelineProgress),
     ) -> Result<(), String> {
         self.run_stages(0..self.stages.len(), ctx, env, round, progress)
-            .await
     }
 
     /// Run the clean-IR lifting stages before the `code-discovery-fixpoint`
@@ -478,22 +467,11 @@ impl Pipeline {
     /// services for TOML-visible lifting passes.
     pub fn run_lifting_phase(
         &self,
-        ctx: &mut Context<'_>,
+        ctx: &mut Context,
         env: &PipelineEnv,
         services: &mut PipelineServices<'_>,
         round: usize,
-        progress: &mut impl ProgressSink,
-    ) -> Result<(), String> {
-        pollster::block_on(self.run_lifting_phase_async(ctx, env, services, round, progress))
-    }
-
-    pub async fn run_lifting_phase_async(
-        &self,
-        ctx: &mut Context<'_>,
-        env: &PipelineEnv,
-        services: &mut PipelineServices<'_>,
-        round: usize,
-        progress: &mut impl ProgressSink,
+        progress: &mut impl FnMut(PipelineProgress),
     ) -> Result<(), String> {
         let end = self.barrier_index().unwrap_or(self.stages.len());
         let mut dirty_functions = Some(HashSet::default());
@@ -512,8 +490,7 @@ impl Pipeline {
                         &mut analyses,
                         round,
                         progress,
-                    )
-                    .await?;
+                    )?;
                     dirty_functions = if outcome.module_changed {
                         None
                     } else {
@@ -532,8 +509,7 @@ impl Pipeline {
                         &mut analyses,
                         round,
                         progress,
-                    )
-                    .await?);
+                    )?);
                 }
             }
             self.verify_after_stage(ctx, stage)?;
@@ -559,24 +535,11 @@ impl Pipeline {
     /// handful of new addresses.
     pub fn run_address_discovery_phase(
         &self,
-        ctx: &mut Context<'_>,
+        ctx: &mut Context,
         env: &PipelineEnv,
         restrict: Option<&HashSet<FunctionId>>,
         round: usize,
-        progress: &mut impl ProgressSink,
-    ) -> Result<(), String> {
-        pollster::block_on(
-            self.run_address_discovery_phase_async(ctx, env, restrict, round, progress),
-        )
-    }
-
-    pub async fn run_address_discovery_phase_async(
-        &self,
-        ctx: &mut Context<'_>,
-        env: &PipelineEnv,
-        restrict: Option<&HashSet<FunctionId>>,
-        round: usize,
-        progress: &mut impl ProgressSink,
+        progress: &mut impl FnMut(PipelineProgress),
     ) -> Result<(), String> {
         let start = self.barrier_index().map(|i| i + 1).unwrap_or(0);
         let mut dirty_functions = Some(HashSet::default());
@@ -598,8 +561,7 @@ impl Pipeline {
                         &mut analyses,
                         round,
                         progress,
-                    )
-                    .await?);
+                    )?);
                     self.verify_after_stage(ctx, stage)?;
                     if reaches_discovery_pass {
                         return Ok(());
@@ -636,13 +598,13 @@ impl Pipeline {
         Ok(())
     }
 
-    async fn run_stages(
+    fn run_stages(
         &self,
         range: std::ops::Range<usize>,
-        ctx: &mut Context<'_>,
+        ctx: &mut Context,
         env: &PipelineEnv,
         round: usize,
-        progress: &mut impl ProgressSink,
+        progress: &mut impl FnMut(PipelineProgress),
     ) -> Result<(), String> {
         let mut dirty_functions = Some(HashSet::default());
         let mut cache = FixpointCache::default();
@@ -659,8 +621,7 @@ impl Pipeline {
                         &mut analyses,
                         round,
                         progress,
-                    )
-                    .await?;
+                    )?;
                     dirty_functions = if outcome.module_changed {
                         None
                     } else {
@@ -679,8 +640,7 @@ impl Pipeline {
                         &mut analyses,
                         round,
                         progress,
-                    )
-                    .await?);
+                    )?);
                 }
             }
             self.verify_after_stage(ctx, stage)?;
@@ -716,12 +676,6 @@ fn resolve_function_passes(sc: &StageConfig) -> Result<Vec<Box<dyn DynFunctionPa
                     sc.name
                 ));
             }
-            Some(RegisteredPass::Decompile(_)) => {
-                return Err(format!(
-                    "pass \"{name}\" in stage \"{}\" is a decompilation pass, not usable in an IR stage",
-                    sc.name
-                ));
-            }
             None => return Err(unknown_pass(name, &sc.name)),
         }
     }
@@ -736,12 +690,6 @@ fn resolve_module_passes(sc: &StageConfig) -> Result<Vec<Box<dyn DynPass>>, Stri
             Some(RegisteredPass::Function(_)) => {
                 return Err(format!(
                     "pass \"{name}\" in stage \"{}\" is a per-function pass, but the stage is scope=module",
-                    sc.name
-                ));
-            }
-            Some(RegisteredPass::Decompile(_)) => {
-                return Err(format!(
-                    "pass \"{name}\" in stage \"{}\" is a decompilation pass, not usable in an IR stage",
                     sc.name
                 ));
             }
@@ -789,15 +737,16 @@ struct ModuleStageOutcome {
 
 /// Run a whole-program stage; if `repeat_until` is set, loop the stage (OR-ing
 /// the passes' change flags) until nothing changes or the iteration cap is hit.
-async fn run_module_stage(
-    ctx: &mut Context<'_>,
+#[allow(clippy::too_many_arguments)]
+fn run_module_stage(
+    ctx: &mut Context,
     env: &PipelineEnv,
     stage: &Stage,
     passes: &[Box<dyn DynPass>],
     cache: &mut FixpointCache,
     analyses: &mut AnalysisManager,
     round: usize,
-    progress: &mut impl ProgressSink,
+    progress: &mut impl FnMut(PipelineProgress),
 ) -> Result<ModuleStageOutcome, String> {
     dump_stage_inputs(ctx, &stage.dump, &stage.name);
     let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
@@ -812,7 +761,7 @@ async fn run_module_stage(
         let mut round_changed = false;
         let mut round_module_changed = false;
         for p in passes {
-            progress.report(PipelineProgress::WholeProgramPhase {
+            progress(PipelineProgress::WholeProgramPhase {
                 round,
                 stage: stage_name.clone(),
                 pass: p.name(),
@@ -820,31 +769,53 @@ async fn run_module_stage(
             let _scope = qcode::pass_scope::enter(p.name());
             #[cfg(not(target_arch = "wasm32"))]
             let started = std::time::Instant::now();
-            let outcome = if let Some(inner) = p.as_module_fn() {
-                let eligible: Vec<_> = round_targets
-                    .iter()
-                    .copied()
-                    .filter(|&id| {
-                        let function = FunctionBody::from_id(ctx, id);
-                        (stage.include_external || !function.is_external())
-                            && !ctx.is_function_ignored(function.address())
-                    })
-                    .collect();
-                super::pass::ModulePassOutcome::functions(run_module_fn_adapter(
-                    ctx,
-                    env,
-                    stage,
-                    inner,
-                    &eligible,
-                    cache,
-                    analyses,
-                    round,
-                    resolve_threads(),
-                    progress,
-                )?)
-            } else {
-                p.run_with_analyses(ctx, env, &round_targets, analyses)
-                    .map_err(|e| format!("{}: {e}", p.name()))?
+            let mut type_request_retries = 0;
+            let outcome = loop {
+                let outcome = if let Some(inner) = p.as_module_fn() {
+                    let eligible: Vec<_> = round_targets
+                        .iter()
+                        .copied()
+                        .filter(|&id| {
+                            let function = FunctionBody::from_id(ctx, id);
+                            (stage.include_external || !function.is_external())
+                                && !ctx.is_function_ignored(function.address())
+                        })
+                        .collect();
+                    super::pass::ModulePassOutcome::functions(run_module_fn_adapter(
+                        ctx,
+                        env,
+                        stage,
+                        inner,
+                        &eligible,
+                        cache,
+                        analyses,
+                        round,
+                        resolve_threads(),
+                        progress,
+                    )?)
+                } else {
+                    p.run_with_analyses(ctx, env, &round_targets, analyses)
+                        .map_err(|e| format!("{}: {e}", p.name()))?
+                };
+                if outcome.type_requests.is_empty() {
+                    break outcome;
+                }
+                if outcome.changed() {
+                    return Err(format!(
+                        "{}: a type-request outcome must not also mutate the module",
+                        p.name()
+                    ));
+                }
+                ctx.shared
+                    .types
+                    .create_requested_types(&outcome.type_requests);
+                type_request_retries += 1;
+                if type_request_retries >= MAX_FIXPOINT_ITERS {
+                    return Err(format!(
+                        "{}: type requests did not settle after {MAX_FIXPOINT_ITERS} retries",
+                        p.name()
+                    ));
+                }
             };
             let pass_changed = outcome.changed();
             if pass_changed {
@@ -1006,8 +977,9 @@ pub(super) fn run_standalone_module_fn(
 /// Run a clean-IR whole-program stage during recursive lifting. Most passes are
 /// ordinary analysis passes; the two lifting pass names are TOML-visible
 /// adapters over the caller-provided lifter service.
-async fn run_lifting_module_stage(
-    ctx: &mut Context<'_>,
+#[allow(clippy::too_many_arguments)]
+fn run_lifting_module_stage(
+    ctx: &mut Context,
     env: &PipelineEnv,
     services: &mut PipelineServices<'_>,
     stage: &Stage,
@@ -1015,7 +987,7 @@ async fn run_lifting_module_stage(
     cache: &mut FixpointCache,
     analyses: &mut AnalysisManager,
     round: usize,
-    progress: &mut impl ProgressSink,
+    progress: &mut impl FnMut(PipelineProgress),
 ) -> Result<ModuleStageOutcome, String> {
     dump_stage_inputs(ctx, &stage.dump, &stage.name);
     let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
@@ -1034,7 +1006,7 @@ async fn run_lifting_module_stage(
         let mut next_set = HashSet::default();
         let mut round_module_changed = false;
         for p in passes {
-            progress.report(PipelineProgress::WholeProgramPhase {
+            progress(PipelineProgress::WholeProgramPhase {
                 round,
                 stage: stage_name.clone(),
                 pass: p.name(),
@@ -1306,8 +1278,8 @@ impl FixpointTracer {
 /// run the stage's passes; if `repeat_until` is set, loop that function's passes
 /// to a fixpoint before moving to the next function.
 #[allow(clippy::too_many_arguments)]
-async fn run_function_stage(
-    ctx: &mut Context<'_>,
+fn run_function_stage(
+    ctx: &mut Context,
     env: &PipelineEnv,
     stage: &Stage,
     passes: &[Box<dyn DynFunctionPass>],
@@ -1320,7 +1292,7 @@ async fn run_function_stage(
     cache: &mut FixpointCache,
     analyses: &mut AnalysisManager,
     round: usize,
-    progress: &mut impl ProgressSink,
+    progress: &mut impl FnMut(PipelineProgress),
 ) -> Result<HashSet<FunctionId>, String> {
     run_function_stage_with_threads(
         ctx,
@@ -1407,217 +1379,119 @@ fn run_function_worklist(
     let mut elapsed: HashMap<&'static str, (std::time::Duration, usize, usize)> =
         HashMap::default();
     let mut dirty = HashSet::default();
+    let mut pending = fun_ids.to_vec();
+    let mut type_request_rounds = 0;
 
     // Every function pass is driven over a body borrowed in place from the bodies
     // registry (`run_one_function`) — the shape Stage 6 runs on worker threads.
 
-    /*
-    /*
-    /*
-    for (index, fun_id) in fun_ids.into_iter().enumerate() {
-        let function: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
-        /*
-        let mut iters = 0;
-        let mut function_changed = false;
-        // Engaged only once this function's fixpoint is clearly struggling
-        // (`FIXPOINT_WATCH_ITERS`); traces which passes keep moving the IR and
-        // flags a proven cycle. Cheap on the common path (never allocates until a
-        // pass changes the IR past the threshold).
-        let mut tracer = FixpointTracer::default();
-        let tracer_label = format!("stage {} fn {function}", stage.name);
-        'fixpoint: loop {
-            let watching = stage.repeat_until.is_some() && iters >= FIXPOINT_WATCH_ITERS;
-            let mut changed = false;
-            for p in passes {
-                // Skip a pass that already reached a fixpoint on this function and
-                // has not been dirtied since (by an earlier pass this iteration, a
-                // prior stage, or — via `invalidate_all` — a module pass).
-                if cache.is_clean(fun_id, p.name()) {
+    while !pending.is_empty() {
+        let fun_ids = pending.as_slice();
+        let mut retry = Vec::new();
+
+        // Parallelize the stage across threads once the worklist is worth the fan-out
+        // cost. Strict IR locality (context-split ruling 2) is established at the
+        // optimization entry and every discovery round, so every function body is
+        // closed over its own blocks — there are no cross-function edges to entangle
+        // two checked-out bodies, and every function is parallel-eligible. Tiny
+        // worklists, `QCODE_THREADS=1`, and wasm fall through to the sequential loop
+        // below, byte-for-byte identical.
+        let parallel_set: HashSet<FunctionId> =
+            if threads > 1 && fun_ids.len() >= PARALLEL_THRESHOLD {
+                run_stage_parallel(
+                    ctx,
+                    env,
+                    stage,
+                    passes,
+                    fun_ids,
+                    &stage_name,
+                    total,
+                    round,
+                    cache,
+                    analyses,
+                    &mut elapsed,
+                    &mut dirty,
+                    threads,
+                    repeat_until,
+                    progress,
+                    &mut retry,
+                )?;
+                fun_ids.iter().copied().collect()
+            } else {
+                HashSet::default()
+            };
+
+        // The sequential lane: every function when the stage did not parallelize;
+        // nothing when it did (all were handled in parallel above).
+        {
+            for (index, fun_id) in fun_ids.iter().copied().enumerate() {
+                if parallel_set.contains(&fun_id) {
                     continue;
                 }
-                progress.report(PipelineProgress::FunctionPass {
-                    round,
-                    stage: stage_name.clone(),
-                    function: function.clone(),
-                    index: index + 1,
-                    total,
-                    pass: p.name(),
-                });
-                let _scope = qcode::pass_scope::enter(p.name());
-                #[cfg(not(target_arch = "wasm32"))]
-                let started = std::time::Instant::now();
-                let pass_changed = p
-                    .run(ctx, fun_id, env)
-                    .map_err(|e| format!("{}: {e}", p.name()))?;
-                if pass_changed {
-                    // The function moved: invalidate every pass's fixpoint mark.
-                    cache.mark_dirty(fun_id);
-                } else {
-                    cache.mark_clean(fun_id, p.name());
+                let function: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
+                let mut local_analyses = analyses.take_local(fun_id);
+                // Split the context: borrow this function's body `&mut` in place from
+                // the bodies registry and run its whole pass fixpoint on it over the
+                // frozen module view; then drop the split borrow and do the barrier work
+                // (install minted callees and replay the buffered rename).
+                let outcome = {
+                    let (bodies, view) = ctx.split(env);
+                    run_one_function(
+                        passes,
+                        &mut bodies[fun_id],
+                        view,
+                        cache,
+                        &mut local_analyses,
+                        &mut elapsed,
+                        &stage.name,
+                        &function,
+                        repeat_until,
+                        |pass| {
+                            progress(PipelineProgress::FunctionPass {
+                                round,
+                                stage: stage_name.clone(),
+                                function: function.clone(),
+                                index: index + 1,
+                                total,
+                                pass,
+                            });
+                        },
+                    )?
+                };
+                analyses.put_local(fun_id, local_analyses);
+                if !outcome.type_requests.is_empty() {
+                    ctx.shared
+                        .types
+                        .create_requested_types(&outcome.type_requests);
+                    retry.push(fun_id);
                 }
-                let entry = elapsed.entry(p.name()).or_default();
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    entry.0 += started.elapsed();
+                let installed = install_minted(ctx, &stage.name, outcome.minted)?;
+                let patched = resolve_minted_callees(ctx, &stage.name, fun_id, &installed)?;
+                replay_rename(ctx, &stage.name, fun_id, outcome.rename)?;
+                // Minted functions are new work for downstream `only_dirty` stages.
+                dirty.extend(installed);
+                // Opt-in `QCODE_VERIFY` check once the split borrow has ended — the body
+                // is reachable through `ctx` again — pinning any invariant break to this
+                // stage. A no-op unless `QCODE_VERIFY` is set.
+                crate::verify::verify_after(ctx, &stage.name);
+                if outcome.changed || patched {
+                    analyses.invalidate_globals(&outcome.preserved_analyses);
+                    dirty.insert(fun_id);
                 }
-                entry.1 += 1;
-                entry.2 += pass_changed as usize;
-                // Between-pass invariant check (opt-in via `QCODE_VERIFY`).
-                crate::verify::verify_after(ctx, p.name());
-                // Trace the fingerprint after every pass that moved the IR, so a
-                // struggling fixpoint reveals which passes keep fighting and whether
-                // the IR is truly cycling (a recurring fingerprint) vs. slowly churning.
-                if watching && pass_changed {
-                    let fp = function_fingerprint(ctx, fun_id);
-                    if tracer.observe(&tracer_label, iters + 1, p.name(), fp) {
-                        // A proven cycle cannot converge; leave this function at
-                        // the recurring state and move on to the next one instead
-                        // of spinning to the iteration cap.
-                        log::warn!(
-                            target: "pipeline::fixpoint",
-                            "stage {} fn {function}: stopping best-effort on the proven \
-                             cycle at iteration {}",
-                            stage.name,
-                            iters + 1,
-                        );
-                        function_changed = true;
-                        break 'fixpoint;
-                    }
-                }
-                changed |= pass_changed;
-            }
-            function_changed |= changed;
-            iters += 1;
-            if stage.repeat_until.is_none() || !changed {
-                break;
-            }
-            if iters >= MAX_FIXPOINT_ITERS {
-                log::warn!(
-                    target: "pipeline::fixpoint",
-                    "stage {} fn {function} hit the {MAX_FIXPOINT_ITERS}-iteration cap; \
-                     see the `pipeline::fixpoint` trace above for the fighting passes",
-                    stage.name,
-                );
-                return Err(nonconvergence_error(&stage.name, Some(&function)));
-            }
-        }
-        */
-        let function_changed = if all_v2 {
-            // Check the function out, run its whole pass fixpoint on the owned body,
-            // then reinstall it and replay any buffered effects — the sequential
-            // form of the parallel check-in protocol.
-            let fun = ctx.checkout_function(fun_id);
-            let mut body = FunctionBody::new(fun_id, fun, Vec::new());
-            let function_changed = {
-                let view = ModuleView::new(ctx, env);
-                run_one_function(
-    */
-    */
-    // Function-minting reservations (`PARALLEL_PASSES.md` ruling 3): when a stage
-    // contains a minting pass, reserve `MINT_RESERVE` ids per worklist function up
-    // front, in worklist order — the identical discipline on both lanes, so minted
-    // ids are byte-identical between the sequential and parallel runs. Unused ids
-    // are collected per function at the barrier and recycled (in worklist order) at
-    // the end of the stage, for the next stage to consume.
-    let mut reservations: HashMap<FunctionId, Vec<FunctionId>> = HashMap::default();
-    let mut leftover: HashMap<FunctionId, Vec<FunctionId>> = HashMap::default();
-    if passes.iter().any(|p| p.mints()) {
-        for &fun_id in &fun_ids {
-            let ids = pool.reserve(ctx, MINT_RESERVE);
-            reservations.insert(fun_id, ids);
-        }
-    }
-
-    */
-    // Parallelize the stage across threads once the worklist is worth the fan-out
-    // cost. Strict IR locality (context-split ruling 2) is established at the
-    // optimization entry and every discovery round, so every function body is
-    // closed over its own blocks — there are no cross-function edges to entangle
-    // two checked-out bodies, and every function is parallel-eligible. Tiny
-    // worklists, `QCODE_THREADS=1`, and wasm fall through to the sequential loop
-    // below, byte-for-byte identical.
-    let parallel_set: HashSet<FunctionId> = if threads > 1 && fun_ids.len() >= PARALLEL_THRESHOLD {
-        run_stage_parallel(
-            ctx,
-            env,
-            stage,
-            passes,
-            fun_ids,
-            &stage_name,
-            total,
-            round,
-            cache,
-            analyses,
-            &mut elapsed,
-            &mut dirty,
-            threads,
-            repeat_until,
-            progress,
-        )?;
-        fun_ids.iter().copied().collect()
-    } else {
-        HashSet::default()
-    };
-
-    // The sequential lane: every function when the stage did not parallelize;
-    // nothing when it did (all were handled in parallel above).
-    {
-        for (index, fun_id) in fun_ids.iter().copied().enumerate() {
-            if parallel_set.contains(&fun_id) {
-                continue;
-            }
-            let function: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
-            let mut local_analyses = analyses.take_local(fun_id);
-            // Split the context: borrow this function's body `&mut` in place from
-            // the bodies registry and run its whole pass fixpoint on it over the
-            // frozen module view; then drop the split borrow and do the barrier work
-            // (install minted callees and replay the buffered rename).
-            let outcome = {
-                let (bodies, view) = ctx.split(env);
-                run_one_function(
-                    passes,
-                    &mut bodies[fun_id],
-                    view,
-                    cache,
-                    &mut local_analyses,
-                    &mut elapsed,
-                    &stage.name,
-                    &function,
-                    repeat_until,
-                    |pass| {
-                        progress(PipelineProgress::FunctionPass {
-                            round,
-                            stage: stage_name.clone(),
-                            function: function.clone(),
-                            index: index + 1,
-                            total,
-                            pass,
-                        });
-                    },
-                )?
-            };
-            analyses.put_local(fun_id, local_analyses);
-            let installed = install_minted(ctx, &stage.name, outcome.minted)?;
-            let patched = resolve_minted_callees(ctx, &stage.name, fun_id, &installed)?;
-            replay_rename(ctx, &stage.name, fun_id, outcome.rename)?;
-            // Minted functions are new work for downstream `only_dirty` stages.
-            dirty.extend(installed);
-            // Opt-in `QCODE_VERIFY` check once the split borrow has ended — the body
-            // is reachable through `ctx` again — pinning any invariant break to this
-            // stage. A no-op unless `QCODE_VERIFY` is set.
-            crate::verify::verify_after(ctx, &stage.name);
-            if outcome.changed || patched {
-                analyses.invalidate_globals(&outcome.preserved_analyses);
-                dirty.insert(fun_id);
             }
         }
 
-        // Cooperative yield point: one per function (never per pass). The default
-        // sink returns immediately; a wasm sink may suspend until the next frame
-        // and can cancel, in which case we stop early and return the work done so far.
-        if let YieldSignal::Cancelled = progress.yield_now().await {
-            return Ok(dirty);
+        if retry.is_empty() {
+            break;
         }
+        type_request_rounds += 1;
+        if type_request_rounds >= MAX_FIXPOINT_ITERS {
+            return Err(format!(
+                "stage {}: type requests did not settle after {MAX_FIXPOINT_ITERS} barrier rounds",
+                stage.name
+            ));
+        }
+        pending = retry;
     }
 
     if log::log_enabled!(target: "pipeline", log::Level::Debug) {
@@ -1668,6 +1542,7 @@ fn run_one_function<'str>(
     // tracked as `function_changed` and folded in at return.
     let mut agg_rename: Option<std::borrow::Cow<'str, str>> = None;
     let mut agg_minted: Vec<super::Minted<'str>> = Vec::new();
+    let mut agg_type_requests: Vec<qcode::types::TypeRequest> = Vec::new();
     let mut preserved_analyses = PreservedAnalyses::all();
     let mut tracer = FixpointTracer::default();
     let tracer_label = format!("stage {stage_name} fn {function_name}");
@@ -1685,6 +1560,16 @@ fn run_one_function<'str>(
             let outcome = p
                 .run_checked(body, cx, &mut next_minted, analyses)
                 .map_err(|e| format!("{}: {e}", p.name()))?;
+            if !outcome.type_requests.is_empty() {
+                if outcome.changed || outcome.rename.is_some() || !outcome.minted.is_empty() {
+                    return Err(format!(
+                        "{}: a type-request outcome must not also mutate IR, rename, or mint functions",
+                        p.name()
+                    ));
+                }
+                agg_type_requests.extend(outcome.type_requests);
+                break 'fixpoint;
+            }
             // Minting is an observable stage mutation even when a pass forgot to
             // set its body-change bit. Keep the producer dirty and continue a
             // requested fixpoint rather than caching it as clean while publishing
@@ -1745,6 +1630,7 @@ fn run_one_function<'str>(
         changed: function_changed,
         rename: agg_rename,
         minted: agg_minted,
+        type_requests: agg_type_requests,
         preserved_analyses,
     })
 }
@@ -1819,6 +1705,7 @@ fn run_stage_parallel(
     threads: usize,
     repeat_until: bool,
     progress: &mut impl FnMut(PipelineProgress),
+    retry: &mut Vec<FunctionId>,
 ) -> Result<(), String> {
     // 1. Snapshot per-function display names before the split borrow freezes the
     //    context.
@@ -1959,6 +1846,12 @@ fn run_stage_parallel(
     //    mutated in place, so there is nothing to reinstall.
     for (fun_id, outcome, local_analyses) in results {
         analyses.put_local(fun_id, local_analyses);
+        if !outcome.type_requests.is_empty() {
+            ctx.shared
+                .types
+                .create_requested_types(&outcome.type_requests);
+            retry.push(fun_id);
+        }
         let installed = install_minted(ctx, &stage.name, outcome.minted)?;
         let patched = resolve_minted_callees(ctx, &stage.name, fun_id, &installed)?;
         replay_rename(ctx, &stage.name, fun_id, outcome.rename)?;
@@ -2016,6 +1909,7 @@ mod tests {
     enum ScriptedReport {
         Functions(Vec<FunctionId>),
         PreservedFunctions(Vec<FunctionId>),
+        TypeRequests(Vec<qcode::types::TypeRequest>),
         Module,
         None,
     }
@@ -2051,6 +1945,9 @@ mod tests {
                 ScriptedReport::Functions(ids) => crate::ModulePassOutcome::functions(ids),
                 ScriptedReport::PreservedFunctions(ids) => {
                     crate::ModulePassOutcome::functions(ids).preserving_local::<TargetLocal>()
+                }
+                ScriptedReport::TypeRequests(requests) => {
+                    crate::ModulePassOutcome::requesting_types(requests)
                 }
                 ScriptedReport::Module => crate::ModulePassOutcome::module(),
                 ScriptedReport::None => crate::ModulePassOutcome::default(),
@@ -2341,6 +2238,25 @@ mod tests {
     }
 
     #[test]
+    fn module_type_requests_publish_and_retry_immediately() {
+        let mut ctx = Context::new();
+        let foo = FunctionBody::make_at_addr(&mut ctx, 0x1000, Some("foo".into())).id;
+        let byte = ctx.shared.types.get_or_make_int(1);
+        let request = qcode::types::TypeRequest::array(byte, 17);
+        let (pass, seen) = ScriptedModulePass::new([
+            ScriptedReport::TypeRequests(vec![request]),
+            ScriptedReport::None,
+        ]);
+
+        let outcome = run_test_module_stage(&mut ctx, &repeated_module_stage(), &[Box::new(pass)]);
+
+        assert!(!outcome.module_changed);
+        assert!(outcome.changed_functions.is_empty());
+        assert!(ctx.shared.types.get_array(byte, 17).is_some());
+        assert_eq!(*seen.lock().unwrap(), vec![vec![foo], vec![foo]]);
+    }
+
+    #[test]
     fn exact_multi_function_reporting_controls_the_next_round() {
         let mut ctx = Context::new();
         let foo = FunctionBody::make_at_addr(&mut ctx, 0x1000, Some("foo".into())).id;
@@ -2368,7 +2284,7 @@ mod tests {
         FunctionBody::from_id_mut(&mut ctx, bar)
             .set_root(entry)
             .unwrap();
-        ctx.builder(entry).push_call(foo);
+        (&mut ctx).builder(entry).push_call(foo);
         assert_eq!(crate::CallGraph::analyze(&ctx).callers(foo), vec![bar]);
 
         let (pass, seen) =
@@ -2387,7 +2303,7 @@ mod tests {
         FunctionBody::from_id_mut(&mut ctx, bar)
             .set_root(entry)
             .unwrap();
-        ctx.builder(entry).push_call(foo);
+        (&mut ctx).builder(entry).push_call(foo);
 
         let (pass, seen) = ScriptedModulePass::new([
             ScriptedReport::Functions(vec![foo, bar]),
@@ -2772,7 +2688,7 @@ mod tests {
             last: expected as u64 - 1,
             lifted: 0,
         };
-        let env = PipelineEnv::headless(&ctx);
+        let env = PipelineEnv::headless(&mut ctx);
         let mut services = PipelineServices::with_lifter(&mut lifter);
 
         pipeline
@@ -2827,7 +2743,7 @@ mod tests {
         let _dummy_b = FunctionBody::make_at_addr(&mut ctx, 0x3000, None).id;
         let thunk = FunctionBody::make_at_addr(&mut ctx, 0x4000, None).id;
         let block = BasicBlock::make(&mut ctx, thunk).with_address(0x4000).id;
-        ctx.builder(block).push_tail_call(callee);
+        (&mut ctx).builder(block).push_tail_call(callee);
         FunctionBody::from_id_mut(&mut ctx, thunk)
             .set_root(block)
             .unwrap();
@@ -2873,6 +2789,87 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct RequestArrayType;
+
+    impl FunctionPass for RequestArrayType {
+        const NAME: &'static str = "test_request_array_type";
+
+        fn description(&self) -> &'static str {
+            "Request one owner-specific array type, then rename after publication"
+        }
+
+        fn run<'str>(
+            &self,
+            f: &mut FunctionBody<'str>,
+            cx: ContextView<'_, 'str>,
+            _next_minted: &mut u32,
+        ) -> Result<Outcome<'str>, String> {
+            let elem = cx.shr().types.get_int(1);
+            let count = usize::from(f.id()) + 1;
+            if cx.shr().types.get_array(elem, count).is_none() {
+                return Ok(Outcome::requesting_type(qcode::types::TypeRequest::array(
+                    elem, count,
+                )));
+            }
+            Ok(Outcome::renamed(format!("typed_{count}").into()))
+        }
+    }
+
+    crate::register_function_pass!(RequestArrayType);
+
+    #[test]
+    fn returned_type_requests_are_published_deterministically() {
+        let pipeline = Pipeline::parse(
+            r#"
+            [[stage]]
+            name = "request-types"
+            scope = "function"
+            passes = ["test_request_array_type"]
+            include_external = true
+            "#,
+        )
+        .expect("test pipeline parses");
+        let mut base = Context::new();
+        let byte = base.shared.types.get_or_make_int(1);
+        for index in 0..PARALLEL_THRESHOLD.max(4) {
+            FunctionBody::make(&mut base, format!("f{index}").into()).unwrap();
+        }
+        let mut sequential = base.clone();
+        let mut parallel = base;
+
+        run_function_only_pipeline_with_threads(&pipeline, &mut sequential, 1);
+        run_function_only_pipeline_with_threads(&pipeline, &mut parallel, 4);
+
+        let sequential_types: Vec<_> = sequential
+            .function_ids()
+            .into_iter()
+            .map(|fid| {
+                sequential
+                    .shared
+                    .types
+                    .get_array(byte, usize::from(fid) + 1)
+            })
+            .collect();
+        let parallel_types: Vec<_> = parallel
+            .function_ids()
+            .into_iter()
+            .map(|fid| parallel.shared.types.get_array(byte, usize::from(fid) + 1))
+            .collect();
+        assert!(sequential_types.iter().all(Option::is_some));
+        assert_eq!(sequential_types, parallel_types);
+        assert_eq!(
+            sequential
+                .functions()
+                .map(|f| f.name().to_owned())
+                .collect::<Vec<_>>(),
+            parallel
+                .functions()
+                .map(|f| f.name().to_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[derive(Default)]
     struct MintWithoutChanged;
 
     impl FunctionPass for MintWithoutChanged {
@@ -2905,7 +2902,7 @@ mod tests {
     fn minting_counts_as_a_pass_change() {
         let mut ctx = Context::new();
         let owner = FunctionBody::make(&mut ctx, "owner".into()).unwrap().id;
-        let env = PipelineEnv::headless(&ctx);
+        let env = PipelineEnv::headless(&mut ctx);
         let passes: Vec<Box<dyn DynFunctionPass>> = vec![Box::new(FunctionPassAdapter::<
             MintWithoutChanged,
         >::default())];

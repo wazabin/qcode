@@ -28,7 +28,7 @@ use rustc_hash::FxHashSet as HashSet;
 use qcode::{
     builder::Builder,
     space::{LocalMemorySpaceId, Space, SpaceType},
-    types::TypeId,
+    types::{TypeId, TypeRequest},
     value::{
         BlockId, FunctionId, QCodeView, TempSpaceId, ValueId,
         insn::{Branch, CBranch, InstructionId, IntrinsicApp, IntrinsicId, Load, Mnemonic},
@@ -535,17 +535,26 @@ fn last_insn<'str>(host: &BodyMut<'_, 'str>, block: BlockId) -> InstructionId {
 }
 
 /// Concrete version of array_promote core using FunctionBody+ContextView (stage 5b-ii).
-fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &PromoteMatch) -> bool {
+fn apply<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    m: &PromoteMatch,
+    arr_ty: TypeId,
+) -> bool {
     let mut host = cx.host(body);
-    apply_generic(&mut host, m)
+    apply_generic(&mut host, m, arr_ty)
 }
 
 /// Rewrites the matched region onto array intrinsics, over the pass's checked-out
 /// body.
-fn apply_generic<'str>(host: &mut BodyMut<'_, 'str>, m: &PromoteMatch) -> bool {
+fn apply_generic<'str>(host: &mut BodyMut<'_, 'str>, m: &PromoteMatch, arr_ty: TypeId) -> bool {
     let esz = m.elem_size;
-    let elem_ty = host.shr().types.get_or_make_int(esz);
-    let arr_ty = host.shr().types.get_or_make_array(elem_ty, m.count);
+    let (elem_ty, count) = host
+        .shr()
+        .types
+        .array_of(arr_ty)
+        .expect("array promotion requires a published array type");
+    debug_assert_eq!(count, m.count);
     let arr_sz = m.count * esz;
 
     let insert_id = IntrinsicId::from_name("insert").expect("insert registered");
@@ -731,8 +740,17 @@ impl FunctionPass for ArrayPromote {
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
         match try_match(m.body_view(f), fid) {
-            Some(matched) => Ok(Outcome::changed(apply(f, m, &matched))
-                .preserving_global::<crate::AddressAnalysis>()),
+            Some(matched) => {
+                let elem_ty = m.shr().types.get_int(matched.elem_size);
+                let Some(arr_ty) = m.shr().types.get_array(elem_ty, matched.count) else {
+                    return Ok(Outcome::requesting_type(TypeRequest::array(
+                        elem_ty,
+                        matched.count,
+                    )));
+                };
+                Ok(Outcome::changed(apply(f, m, &matched, arr_ty))
+                    .preserving_global::<crate::AddressAnalysis>())
+            }
             None => Ok(Outcome::unchanged()),
         }
     }

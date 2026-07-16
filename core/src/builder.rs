@@ -1352,6 +1352,45 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             .shr()
             .types
             .get_or_make_named_aggregate(aggregate_fields);
+        self.push_named_tuple_local_with_type(fields, ty)
+    }
+
+    /// Build a named tuple using an explicitly selected aggregate-like type.
+    /// Used for nominal function-return records whose identity must not be
+    /// structurally interned by [`push_named_tuple_local`](Self::push_named_tuple_local).
+    pub fn push_named_tuple_with_type(
+        &mut self,
+        fields: Vec<(String, ValueId)>,
+        ty: TypeId,
+    ) -> InstructionRef<'str, '_, BodyView<'_, 'str>> {
+        let fields = fields
+            .into_iter()
+            .map(|(name, value)| (name, self.loc(value)))
+            .collect();
+        let local = self.push_named_tuple_local_with_type(fields, ty);
+        self.insn_ref(local)
+    }
+
+    /// Body-local sibling of [`push_named_tuple_with_type`](Self::push_named_tuple_with_type).
+    pub fn push_named_tuple_local_with_type(
+        &mut self,
+        fields: Vec<(String, LocalValueId)>,
+        ty: TypeId,
+    ) -> LocalInsnId {
+        debug_assert_eq!(
+            self.shr().types.aggregate_fields(ty).map(<[_]>::len),
+            Some(fields.len()),
+            "explicit tuple type must declare every tuple field"
+        );
+        debug_assert!(fields.iter().enumerate().all(|(index, (name, value))| {
+            self.shr()
+                .types
+                .aggregate_fields(ty)
+                .and_then(|declared| declared.get(index))
+                .is_some_and(|declared| {
+                    declared.name == *name && declared.type_id == self.ltype_of(*value)
+                })
+        }));
         let values = fields.into_iter().map(|(_, value)| value).collect();
         self.store_insn_with_type(Mnemonic::Tuple(Tuple { fields: values }), ty)
     }

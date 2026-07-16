@@ -339,11 +339,11 @@ pub(crate) fn seq_result_type<'a, 'str: 'a>(
     host: impl QCodeView<'a, 'str>,
     src: ValueId,
     body_ret: TypeId,
-) -> TypeId {
+) -> Option<TypeId> {
     let src_ty = host.type_of(src);
     match host.shared().types.seq_of(src_ty) {
-        Some((_, len, is_list)) => host.shared().types.get_or_make_seq(body_ret, len, is_list),
-        None => src_ty,
+        Some((_, len, is_list)) => host.shared().types.get_seq(body_ret, len, is_list),
+        None => Some(src_ty),
     }
 }
 
@@ -438,7 +438,11 @@ fn outline_core<'str>(
             .collect()
     };
     let dummy_ptr = m.shr().get_const(0, 8);
-    let ret_ty = m.shr().types.get_or_make_int(1);
+    // The outlined function returns the source expression verbatim, so its
+    // return instruction must carry that expression's existing semantic type.
+    // Reconstructing an integer from its byte width would both discard named
+    // type identity and require an unrelated canonical integer to be present.
+    let ret_ty = m.body_view(body).type_of(result);
 
     let (own, mut minted) = crate::pipeline::host_with_minted(body, minted_out, m, callee);
     // Root block, set as the minted function's entry, named for display (block

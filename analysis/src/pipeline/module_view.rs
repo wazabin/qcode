@@ -4,11 +4,11 @@
 //! A function pass reads the module's *published interface* through a shared
 //! [`ContextView`] and mutates *only its own function* through a `&mut`
 //! [`FunctionBody`] — the body borrowed `&mut` in place from the bodies registry
-//! by the driver's [`split`](ContextSplit::split). The one effect on global state
-//! a pass legitimately needs (a self-rename) is **returned** in [`Outcome::rename`]
-//! and applied by the driver at the post-run barrier, so the pass itself touches
-//! no global mutable state — which is what lets workers run in parallel with the
-//! `ContextView` `&`-shared and the bodies disjoint `&mut`.
+//! by the driver's [`split`](ContextSplit::split). Global effects are **returned**:
+//! self-renames, detached functions, and pre-mutation type requests are applied by
+//! the driver at the post-run barrier. The pass itself touches no global mutable
+//! state, which lets workers run in parallel with the `ContextView` `&`-shared and
+//! the bodies disjoint `&mut`.
 //!
 //! The driver `split`s the context once, borrows every worklist body disjointly
 //! (worklist order) via [`select_mut`](jstd::registry::Registry::select_mut), runs
@@ -21,6 +21,7 @@ use std::borrow::Cow;
 use jstd::registry::Registry;
 use qcode::{
     context::{Context, Shared},
+    types::TypeRequest,
     value::{
         BodyView, FunctionBody, FunctionId, FunctionKind,
         function::FunctionInterface,
@@ -67,8 +68,8 @@ impl<'str> Minted<'str> {
     }
 }
 
-/// The result of one function-pass run (context-split ruling 3): whether it
-/// changed the IR, an optional self-rename claim, and any functions it minted.
+/// The result of one function-pass run: whether it changed the IR, an optional
+/// self-rename claim, functions it minted, and types it needs published.
 ///
 /// Returned **by value** from [`FunctionPass::run`](super::FunctionPass::run), so
 /// a pass touches no wrapper scratch: `rename` subsumes the old `Effects` buffer
@@ -87,6 +88,10 @@ pub struct Outcome<'str> {
     /// the barrier. Concatenated across a function's pass fixpoint; entry `k`
     /// carries slot `k`, allocated by the driver's per-owner stage cursor.
     pub minted: Vec<Minted<'str>>,
+    /// Types this pass needs before it can safely rewrite its body. A requesting
+    /// outcome must carry no body/global mutation: the driver publishes these at
+    /// the barrier and reruns the owner against the new type generation.
+    pub type_requests: Vec<TypeRequest>,
     /// Analyses preserved across the changing runs aggregated into this outcome.
     pub(crate) preserved_analyses: super::PreservedAnalyses,
 }
@@ -97,6 +102,7 @@ impl Default for Outcome<'_> {
             changed: false,
             rename: None,
             minted: Vec::new(),
+            type_requests: Vec::new(),
             preserved_analyses: super::PreservedAnalyses::all(),
         }
     }
@@ -122,6 +128,7 @@ impl<'str> Outcome<'str> {
                 changed: true,
                 rename: None,
                 minted: Vec::new(),
+                type_requests: Vec::new(),
                 preserved_analyses: super::PreservedAnalyses::none(),
             }
         } else {
@@ -136,6 +143,7 @@ impl<'str> Outcome<'str> {
             changed: true,
             rename: Some(name),
             minted: Vec::new(),
+            type_requests: Vec::new(),
             preserved_analyses: super::PreservedAnalyses::none(),
         }
     }
@@ -145,6 +153,20 @@ impl<'str> Outcome<'str> {
         let mut outcome = Self::changed(changed || !minted.is_empty());
         outcome.minted = minted;
         outcome
+    }
+
+    /// Ask the driver to publish `request` at the barrier and rerun this
+    /// function. Call this before mutating the body.
+    pub fn requesting_type(request: TypeRequest) -> Self {
+        Self::requesting_types([request])
+    }
+
+    /// Batch sibling of [`requesting_type`](Self::requesting_type).
+    pub fn requesting_types(requests: impl IntoIterator<Item = TypeRequest>) -> Self {
+        Self {
+            type_requests: requests.into_iter().collect(),
+            ..Self::default()
+        }
     }
 
     /// Report that this particular invocation preserved global analysis `A`.

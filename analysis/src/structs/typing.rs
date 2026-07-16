@@ -21,7 +21,7 @@ use std::borrow::Cow;
 
 use qcode::{
     space::{LocalMemorySpaceId, Space, SpaceType},
-    types::TypeId,
+    types::{TypeId, TypeRequest},
     value::{
         FunctionId, QCodeView, ValueId,
         insn::{Binary, Binop, Gep, InstructionId, IntBinop, Mnemonic},
@@ -50,9 +50,124 @@ impl FunctionPass for StructTyping {
         _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
+        let requests = missing_pointer_types(cx.body_view(f), fid);
+        if !requests.is_empty() {
+            return Ok(Outcome::requesting_types(requests));
+        }
         Ok(Outcome::changed(struct_typing(f, cx, fid))
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>())
+    }
+}
+
+/// Simulate the pass's type propagation without editing IR. If a `gep` result
+/// pointer is absent, return its creation request before the mutating fixpoint
+/// starts. A retry can expose a deeper field chain, so the driver repeats this
+/// preflight after each publication until it settles.
+fn missing_pointer_types<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    fun_id: FunctionId,
+) -> Vec<TypeRequest> {
+    let ids: Vec<_> = host
+        .function_ref(fun_id)
+        .blocks()
+        .flat_map(|block| block.instruction_ids().to_vec())
+        .collect();
+    let mut inferred: rustc_hash::FxHashMap<ValueId, TypeId> = ids
+        .iter()
+        .filter_map(|&id| {
+            host.stored_type_of(ValueId::Instruction(id))
+                .map(|ty| (ValueId::Instruction(id), ty))
+        })
+        .collect();
+    let value_type = |value: ValueId, inferred: &rustc_hash::FxHashMap<ValueId, TypeId>| {
+        inferred
+            .get(&value)
+            .copied()
+            .or_else(|| host.stored_type_of(value))
+    };
+
+    loop {
+        let mut changed = false;
+        let mut requests = rustc_hash::FxHashSet::default();
+        for &id in &ids {
+            let result = ValueId::Instruction(id);
+            let inferred_ty = match host.insn_ref(id).mnemonic() {
+                Mnemonic::Binop(Binary {
+                    op: Binop::Int(IntBinop::Add),
+                    lhs,
+                    rhs,
+                }) => {
+                    let mut result_ty = None;
+                    for (base, off_op) in [
+                        (lhs.qualify(fun_id), rhs.qualify(fun_id)),
+                        (rhs.qualify(fun_id), lhs.qualify(fun_id)),
+                    ] {
+                        let Some(base_ty) = value_type(base, &inferred) else {
+                            continue;
+                        };
+                        let Some(pointee) = host.shared().types.pointee_of(base_ty) else {
+                            continue;
+                        };
+                        let Some(offset) = const_offset(host, off_op) else {
+                            continue;
+                        };
+                        let Some((_, field)) = host.shared().types.field_by_offset(pointee, offset)
+                        else {
+                            continue;
+                        };
+                        let width = host.shared().types.size_of(base_ty);
+                        match host.shared().types.get_struct_pointer(width, field.type_id) {
+                            Some(ty) => result_ty = Some(ty),
+                            None => {
+                                requests.insert(TypeRequest::struct_pointer(width, field.type_id));
+                            }
+                        }
+                        break;
+                    }
+                    result_ty
+                }
+                Mnemonic::Load(load) if is_register_space(host, load.space) => {
+                    let reg = load.ptr.qualify(fun_id);
+                    value_type(reg, &inferred).filter(|&ty| {
+                        host.shared().types.pointee_of(ty).is_some()
+                            && host.shared().types.size_of(ty) == load.size
+                    })
+                }
+                Mnemonic::Load(load) => {
+                    let ptr = load.ptr.qualify(fun_id);
+                    value_type(ptr, &inferred)
+                        .and_then(|ty| host.shared().types.pointee_of(ty))
+                        .filter(|&ty| host.shared().types.size_of(ty) == load.size)
+                }
+                _ => None,
+            };
+            if let Some(ty) = inferred_ty
+                && inferred.insert(result, ty) != Some(ty)
+            {
+                changed = true;
+            }
+        }
+        if !requests.is_empty() {
+            let mut requests: Vec<_> = requests.into_iter().collect();
+            requests.sort_by(|left, right| match (left, right) {
+                (
+                    TypeRequest::StructPointer {
+                        size: left_size,
+                        pointee: left_pointee,
+                    },
+                    TypeRequest::StructPointer {
+                        size: right_size,
+                        pointee: right_pointee,
+                    },
+                ) => (left_size, left_pointee).cmp(&(right_size, right_pointee)),
+                _ => std::cmp::Ordering::Equal,
+            });
+            return requests;
+        }
+        if !changed {
+            return Vec::new();
+        }
     }
 }
 
@@ -299,7 +414,11 @@ fn try_add_to_gep<'a, 'str>(
             None => continue,
         };
         let width = cx.shr().types.size_of(base_ty);
-        let result_ty = cx.shr().types.get_or_make_struct_pointer(width, field_ty);
+        let result_ty = cx
+            .shr()
+            .types
+            .get_struct_pointer(width, field_ty)
+            .expect("struct-typing preflight must publish field-pointer types");
         body.replace_instruction_mnemonic(
             id,
             Mnemonic::Gep(Gep {

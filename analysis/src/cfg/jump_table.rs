@@ -142,6 +142,7 @@ impl HandleJumpTables {
         Ok(crate::ModulePassOutcome {
             module_changed: !changed.is_empty(),
             changed_functions: changed,
+            type_requests: Vec::new(),
             preserved_analyses: crate::PreservedAnalyses::none(),
         })
     }

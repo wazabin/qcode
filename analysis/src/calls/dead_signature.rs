@@ -278,10 +278,17 @@ fn trim_dead_return_fields(
         new_index[old_i] = Some(new_i);
     }
 
-    // The trimmed aggregate type, shared by the call results and the callee
-    // return tuples (same field names/types ⇒ same structural type).
+    // Preserve a function-owned return record's identity while revising its
+    // fields. Legacy structural aggregates still use structural interning.
     let new_fields: Vec<AggregateField> = kept.iter().map(|&i| fields[i].clone()).collect();
-    let new_ty = ctx.shared.types.get_or_make_named_aggregate(new_fields);
+    let new_ty = if ctx.shared.types.function_return(fid) == Some(agg_ty) {
+        ctx.shared
+            .types
+            .edit_function_return(fid, new_fields)
+            .expect("owned function return type must remain editable")
+    } else {
+        ctx.shared.types.get_or_make_named_aggregate(new_fields)
+    };
 
     // Rewrite each callee return: trim the tuple to the kept fields, or drop the
     // returned value entirely when nothing survives.
@@ -390,7 +397,7 @@ crate::register_module_pass!(DeadSignature);
 #[cfg(test)]
 mod tests {
     use qcode::{
-        types::TypeId,
+        types::{AggregateField, TypeId},
         value::{BasicBlock, BlockId, Varnode, VarnodeId, insn::Call},
     };
     use qcode_macro::qcode;
@@ -438,10 +445,20 @@ mod tests {
         else {
             unreachable!()
         };
+        let return_fields = fields
+            .iter()
+            .map(|(name, value)| AggregateField::new(name.clone(), tc.ctx.type_of(*value)))
+            .collect();
+        let return_type = tc
+            .ctx
+            .shared
+            .types
+            .create_function_return(fid, return_fields)
+            .unwrap();
         let tuple = {
             let mut b = tc.ctx.builder(ret_block);
             b.set_insert_point_before(ret_id);
-            b.push_named_tuple(fields).id
+            b.push_named_tuple_with_type(fields, return_type).id
         };
         tc.ctx.replace_instruction_mnemonic(
             ret_id,
@@ -452,7 +469,7 @@ mod tests {
         );
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_input_regs(inputs);
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
-        tc.ctx.stored_type_of(ValueId::Instruction(tuple)).unwrap()
+        return_type
     }
 
     /// Field count of `fid`'s single return write-set tuple, or `None` if the
@@ -616,6 +633,16 @@ mod tests {
             return_field_count(&tc, f),
             Some(1),
             "the callee return tuple keeps only the live field"
+        );
+        assert_eq!(
+            tc.ctx.shared.types.function_return(f),
+            Some(agg),
+            "trimming must preserve the function-owned return identity"
+        );
+        assert_eq!(tc.ctx.shared.types.aggregate_fields(agg).unwrap().len(), 1);
+        assert_eq!(
+            tc.ctx.stored_type_of(ValueId::Instruction(call_id)),
+            Some(agg)
         );
         let Mnemonic::Extract(Extract { index, .. }) = tc.ctx.get_insn(extract_id).mnemonic()
         else {

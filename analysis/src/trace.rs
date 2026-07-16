@@ -186,7 +186,7 @@ fn insert_trace_assert(
     // Generate the negation if needed — canonically `condition == false`.
     let condition = if negate {
         let f = ctx.get_bool_const(false).id();
-        let bool_ty = ctx.shared.types.get_or_make_bool();
+        let bool_ty = ctx.shared.types.get_bool();
         let not_id = InstructionRef::from_mnemonic_with_type(
             ctx,
             block_id.func,

@@ -38,6 +38,7 @@ pub(super) struct InsnCtx<'a> {
     pub insn_id: InstructionId,
     /// The instruction's value id (what its uses refer to).
     pub id: ValueId,
+    pub type_id: qcode::types::TypeId,
     pub size: usize,
     pub mnemonic: &'a Mnemonic,
     pub aliases: Option<&'a AliasResult>,
@@ -119,7 +120,7 @@ impl Editor {
         mnemonic: Mnemonic,
         size: usize,
     ) -> InstructionId {
-        let type_id = cx.body_view(body).shared().types.get_or_make_int(size);
+        let type_id = cx.body_view(body).shared().types.get_int(size);
         self.replace_with_new_insn_typed(body, cx, block_id, at, mnemonic, type_id)
     }
 
@@ -236,14 +237,20 @@ fn run_block<'str>(
     let insns: Vec<InstructionId> = cx.body_view(body).block_ref(block_id).instruction_ids();
 
     for insn_id in insns {
-        let (id, size, mnemonic) = {
+        let (id, type_id, size, mnemonic) = {
             let insn = cx.body_view(body).insn_ref(insn_id);
-            (insn.id(), insn.size(), insn.mnemonic().clone())
+            (
+                insn.id(),
+                insn.type_id(),
+                insn.size(),
+                insn.mnemonic().clone(),
+            )
         };
         let ic = InsnCtx {
             block_id,
             insn_id,
             id,
+            type_id,
             size,
             mnemonic: &mnemonic,
             aliases,
