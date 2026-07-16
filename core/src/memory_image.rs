@@ -1,17 +1,14 @@
 //! A serializable snapshot of a binary's initialized memory.
 //!
-//! Analysis passes only ever receive a [`Context`](crate::context::Context); the
-//! rich loader-side `BinaryFormat` (ELF/PE parsers) lives a crate up and cannot
-//! be persisted. [`MemoryImage`] is the small, `Serialize`-able subset of that
-//! memory-read surface that a pass needs: "give me the bytes / a little-endian
-//! integer at a virtual address, and tell me whether that address is
-//! executable". The lifter copies the binary's mapped regions into it once, and
-//! it then rides inside the serialized `Context` (so a saved session is
-//! self-describing).
+//! [`MemoryImage`] is the persistence/test form of the byte surface: it
+//! implements [`binfmt::BinaryFormat`], so a snapshot (built from a live
+//! format's `mapped_regions()` at save time) or a test-seeded image can be
+//! `Arc`-wrapped and handed to the pipeline as `PipelineEnv.binary`, exactly
+//! like a live ELF/PE handle. During a live lift the bytes stay in the loader's
+//! format object only — nothing is copied into the `Context`.
 //!
-//! The motivating consumer is the jump-table pass
-//! ([`crate::context::Context::read_uint`] reads table entries straight out of
-//! `.rodata`).
+//! The motivating consumer is the jump-table pass, which reads table entries
+//! straight out of `.rodata` through the shared handle.
 
 /// One contiguous mapped region of the binary image.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -152,6 +149,73 @@ impl MemoryImage {
     /// loading idempotent across fixpoint rounds.
     pub fn is_empty(&self) -> bool {
         self.segments.is_empty()
+    }
+}
+
+/// The persistence/test backing of the byte surface: a reloaded `.harbinger`
+/// snapshot (or a `qcode!`-DSL test that seeded segments) wraps its
+/// `MemoryImage` in an `Arc` and hands it to `PipelineEnv.binary`, so passes
+/// read initialized memory through one trait regardless of whether a live
+/// container format is behind it.
+impl binfmt::BinaryFormat for MemoryImage {
+    fn load_address(&self) -> u64 {
+        self.segments.first().map(|s| s.start).unwrap_or(0)
+    }
+
+    fn byte_at(&self, addr: u64) -> Option<u8> {
+        let seg = self.segment_at(addr)?;
+        seg.bytes.get((addr - seg.start) as usize).copied()
+    }
+
+    fn bytes_at(&self, addr: u64) -> Option<&[u8]> {
+        let seg = self.segment_at(addr)?;
+        seg.bytes.get((addr - seg.start) as usize..)
+    }
+
+    /// An image records mapped bytes, not entry metadata.
+    fn entry_points(&self) -> Vec<u64> {
+        Vec::new()
+    }
+
+    /// Images do not record an architecture; x86-64 is the workspace default
+    /// (mirrors [`Blob`]'s placeholder). Consumers of `PipelineEnv.binary`
+    /// read bytes and permissions, never the architecture.
+    ///
+    /// [`Blob`]: binfmt::blob::Blob
+    fn architecture(&self) -> binfmt::Arch {
+        binfmt::Arch::X86_64
+    }
+
+    fn segment_bounds(&self, addr: u64) -> Option<(u64, u64)> {
+        MemoryImage::segment_bounds(self, addr)
+    }
+
+    fn is_executable(&self, addr: u64) -> bool {
+        MemoryImage::is_executable(self, addr)
+    }
+
+    /// Answers straight from the per-segment flag: an image is only ever built
+    /// from an authoritative container format's `mapped_regions` (or a test's
+    /// explicit `add_segment`), so the flags need no separate establishment
+    /// step. (The inherent [`MemoryImage::is_known_writable`] keeps the legacy
+    /// `protections_known` gate for its remaining callers.)
+    fn is_known_writable(&self, addr: u64) -> bool {
+        self.segment_at(addr).is_some_and(|s| s.writable)
+    }
+
+    fn mapped_regions(&self) -> Vec<(u64, Vec<u8>, bool, bool)> {
+        self.segments
+            .iter()
+            .map(|s| (s.start, s.bytes.clone(), s.executable, s.writable))
+            .collect()
+    }
+
+    fn read_bytes(&self, addr: u64, n: usize) -> Option<Vec<u8>> {
+        MemoryImage::read_bytes(self, addr, n)
+    }
+
+    fn read_uint(&self, addr: u64, size: usize) -> Option<u64> {
+        MemoryImage::read_uint(self, addr, size)
     }
 }
 

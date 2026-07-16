@@ -108,6 +108,17 @@ impl TestContext {
     }
 }
 
+/// Wrap a test-seeded [`MemoryImage`](crate::memory_image::MemoryImage) as the
+/// shared binary handle (`PipelineEnv.binary`), the test-side analogue of the
+/// loader's `Arc<dyn BinaryFormat>`. `qcode!`-DSL tests seed segments with
+/// [`MemoryImage::add_segment`](crate::memory_image::MemoryImage::add_segment)
+/// and hand the result to the env through this.
+pub fn image_binary(
+    image: crate::memory_image::MemoryImage,
+) -> std::sync::Arc<dyn binfmt::BinaryFormat> {
+    std::sync::Arc::new(image)
+}
+
 impl Default for TestContext {
     fn default() -> Self {
         Self::new()

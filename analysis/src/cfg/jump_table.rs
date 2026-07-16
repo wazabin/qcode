@@ -4,8 +4,8 @@
 //! For each block terminated by a [`BranchInd`], the pass recognizes the
 //! address computation feeding the indirect jump, bounds the table index with
 //! the value-range analysis ([`crate::value_range`]), reads each table entry
-//! straight out of the binary's initialized memory
-//! ([`Context::read_uint`](qcode::context::Context::read_uint)), and connects
+//! straight out of the binary's initialized memory (through the pipeline's
+//! shared [`binfmt::BinaryFormat`] handle, `env.binary`), and connects
 //! the block to every resolved target with a real CFG edge.
 //!
 //! Two table encodings are handled:
@@ -97,22 +97,22 @@ impl Pass for HandleJumpTables {
     fn run(
         &self,
         ctx: &mut Context,
-        _env: &PipelineEnv,
+        env: &PipelineEnv,
         targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         let mut addresses = AddressIndex::analyze(ctx);
-        self.run_indexed(ctx, targets, &mut addresses)
+        self.run_indexed(ctx, env.binary.as_deref(), targets, &mut addresses)
     }
 
     fn run_with_analyses(
         &self,
         ctx: &mut Context,
-        _env: &PipelineEnv,
+        env: &PipelineEnv,
         targets: &[FunctionId],
         analyses: &mut crate::AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
         let mut addresses = analyses.take_global::<crate::AddressAnalysis>(ctx);
-        let result = self.run_indexed(ctx, targets, &mut addresses);
+        let result = self.run_indexed(ctx, env.binary.as_deref(), targets, &mut addresses);
         analyses.put_global::<crate::AddressAnalysis>(addresses);
         result.map(|outcome| outcome.preserving_global::<crate::AddressAnalysis>())
     }
@@ -122,9 +122,19 @@ impl HandleJumpTables {
     fn run_indexed(
         &self,
         ctx: &mut Context,
+        binary: Option<&dyn binfmt::BinaryFormat>,
         targets: &[FunctionId],
         addresses: &mut AddressIndex,
     ) -> Result<crate::ModulePassOutcome, String> {
+        // No binary handle (headless/textual run): initialized memory is
+        // unreadable, so no table can resolve.
+        let Some(binary) = binary else {
+            return Ok(crate::ModulePassOutcome {
+                module_changed: false,
+                changed_functions: rustc_hash::FxHashSet::default(),
+                preserved_analyses: crate::PreservedAnalyses::all(),
+            });
+        };
         let fun_ids: Vec<FunctionId> = targets
             .iter()
             .copied()
@@ -135,7 +145,7 @@ impl HandleJumpTables {
             .collect();
         let mut changed = rustc_hash::FxHashSet::default();
         for fun_id in fun_ids {
-            if Self::resolve_function_indexed(ctx, addresses, fun_id)? {
+            if Self::resolve_function_indexed(ctx, binary, addresses, fun_id)? {
                 changed.insert(fun_id);
             }
         }
@@ -154,9 +164,13 @@ impl HandleJumpTables {
     /// changed. This is the body that ran once per function while the pass was a
     /// `FunctionPass`.
     #[cfg(test)]
-    fn resolve_function(ctx: &mut Context, fun_id: FunctionId) -> Result<bool, String> {
+    fn resolve_function(
+        ctx: &mut Context,
+        binary: &dyn binfmt::BinaryFormat,
+        fun_id: FunctionId,
+    ) -> Result<bool, String> {
         let mut addresses = AddressIndex::analyze(ctx);
-        Self::resolve_function_indexed(ctx, &mut addresses, fun_id)
+        Self::resolve_function_indexed(ctx, binary, &mut addresses, fun_id)
     }
 
     /// Indexed implementation shared by the whole-module pass and focused
@@ -164,6 +178,7 @@ impl HandleJumpTables {
     /// complete topology-mutation operation.
     fn resolve_function_indexed(
         ctx: &mut Context,
+        binary: &dyn binfmt::BinaryFormat,
         addresses: &mut AddressIndex,
         fun_id: FunctionId,
     ) -> Result<bool, String> {
@@ -195,7 +210,7 @@ impl HandleJumpTables {
         for id in block_ids {
             let block = BasicBlock::from_id_mut(ctx, id);
 
-            if let Some(mut block_edits) = resolve_block(block) {
+            if let Some(mut block_edits) = resolve_block(block, binary) {
                 match block_edits.len() {
                     1 => {
                         let e = block_edits.pop().unwrap();
@@ -445,7 +460,7 @@ fn discover(ctx: &mut Context, fn_entry: Option<u64>, source_block: Option<u64>,
 
 /// If `block_id` ends in an indirect branch whose table the pass can resolve,
 /// push one [`Edit`] per case target onto `edits`.
-fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
+fn resolve_block(mut block: BlockMutRef, binary: &dyn binfmt::BinaryFormat) -> Option<Vec<Edit>> {
     // A block still terminated by `BranchInd` is re-resolved every round, even
     // once the lifter has connected its targets in the clean IR: those edges let
     // function-splitting follow the switch, but the terminator itself is only
@@ -469,7 +484,7 @@ fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
     // Indirect jump through a single fixed pointer slot: `goto [load(const)]`.
     // Not a table (there is no index), but the slot is immutable data, so it
     // resolves to one concrete target.
-    if let Some(edits) = resolve_constant_load(&mut block, ptr) {
+    if let Some(edits) = resolve_constant_load(&mut block, binary, ptr) {
         return Some(edits);
     }
 
@@ -518,7 +533,7 @@ fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
         // A table in writable memory is not trustworthy data (see
         // `resolve_constant_load`); bail on the whole table rather than resolve
         // against bytes the runtime may rewrite.
-        if block.ctx().is_known_writable_addr(entry_addr) {
+        if binary.is_known_writable(entry_addr) {
             log::debug!(target: "jump_table", "skipping table: entry {entry_addr:x} is writable");
             return None;
         }
@@ -531,9 +546,7 @@ fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
             return None;
         }
 
-        let ctx = block.ctx();
-
-        let Some(raw) = ctx.read_uint(entry_addr, table.slot_width) else {
+        let Some(raw) = binary.read_uint(entry_addr, table.slot_width) else {
             log::debug!(target: "jump_table", "skipping table: slot {entry_addr:x} unmapped");
             return None;
         };
@@ -543,7 +556,7 @@ fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
             None => raw,
         };
 
-        if !ctx.is_executable_addr(target) {
+        if !binary.is_executable(target) {
             log::debug!(target: "jump_table", "skipping table: target {target:x} not executable");
             return None;
         }
@@ -570,7 +583,11 @@ fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
 ///
 /// Returns a one-element edit list on success so the caller's single-target
 /// path rewrites the `BranchInd` into a direct `Branch`.
-fn resolve_constant_load(block: &mut BlockMutRef, ptr: ValueId) -> Option<Vec<Edit>> {
+fn resolve_constant_load(
+    block: &mut BlockMutRef,
+    binary: &dyn binfmt::BinaryFormat,
+    ptr: ValueId,
+) -> Option<Vec<Edit>> {
     let ctx = block.ctx();
     let (load, load_func) = as_load(ctx, ptr)?;
     let addr = numeric_const(ctx, load.ptr.qualify(load_func))?;
@@ -581,7 +598,7 @@ fn resolve_constant_load(block: &mut BlockMutRef, ptr: ValueId) -> Option<Vec<Ed
     // stub), so resolving to it would fabricate a bogus direct branch and, worse,
     // make the stub look like a pure, side-effect-free function. Leave the
     // `BranchInd` in place so the stub stays an opaque external transfer.
-    if ctx.is_known_writable_addr(addr) {
+    if binary.is_known_writable(addr) {
         log::debug!(target: "jump_table", "skipping constant load: slot {addr:x} is writable");
         return None;
     }
@@ -594,13 +611,12 @@ fn resolve_constant_load(block: &mut BlockMutRef, ptr: ValueId) -> Option<Vec<Ed
         return None;
     }
 
-    let ctx = block.ctx();
-    let Some(target) = ctx.read_uint(addr, load.size) else {
+    let Some(target) = binary.read_uint(addr, load.size) else {
         log::debug!(target: "jump_table", "skipping constant load: slot {addr:x} unmapped");
         return None;
     };
 
-    if !ctx.is_executable_addr(target) {
+    if !binary.is_executable(target) {
         log::debug!(target: "jump_table", "skipping constant load: target {target:x} not executable");
         return None;
     }
@@ -807,18 +823,22 @@ mod tests {
         BasicBlock::from_id(ctx, block).successors().count()
     }
 
-    /// Seed `ctx` with an executable code region `[start, start+len)`.
-    fn add_code(ctx: &mut Context, start: u64, len: usize) {
-        ctx.shared
-            .memory_image
-            .add_segment(start, vec![0u8; len], true, false);
+    /// The test-side binary image (`MemoryImage` implements [`BinaryFormat`]),
+    /// handed to the pass exactly as `env.binary` would be.
+    ///
+    /// [`BinaryFormat`]: binfmt::BinaryFormat
+    fn image() -> qcode::memory_image::MemoryImage {
+        qcode::memory_image::MemoryImage::default()
     }
 
-    /// Seed `ctx` with a read-only data region holding `bytes`.
-    fn add_rodata(ctx: &mut Context, start: u64, bytes: Vec<u8>) {
-        ctx.shared
-            .memory_image
-            .add_segment(start, bytes, false, false);
+    /// Seed `image` with an executable code region `[start, start+len)`.
+    fn add_code(image: &mut qcode::memory_image::MemoryImage, start: u64, len: usize) {
+        image.add_segment(start, vec![0u8; len], true, false);
+    }
+
+    /// Seed `image` with a read-only data region holding `bytes`.
+    fn add_rodata(image: &mut qcode::memory_image::MemoryImage, start: u64, bytes: Vec<u8>) {
+        image.add_segment(start, bytes, false, false);
     }
 
     /// Materialize already-lifted local targets. Jump-table resolution may only
@@ -835,6 +855,7 @@ mod tests {
     #[test]
     fn resolves_absolute_table() {
         let mut ctx = Context::new();
+        let mut image = image();
         let targets = [0x1100u64, 0x1200, 0x1300];
 
         qcode!(
@@ -857,15 +878,15 @@ mod tests {
         );
 
         // Executable code the targets live in, plus the rodata table itself.
-        add_code(&mut ctx, 0x1000, 0x1000);
+        add_code(&mut image, 0x1000, 0x1000);
         let mut table = Vec::new();
         for t in targets {
             table.extend_from_slice(&t.to_le_bytes());
         }
-        add_rodata(&mut ctx, 0x2000, table);
+        add_rodata(&mut image, 0x2000, table);
         add_local_targets(&mut ctx, fun, &targets);
 
-        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, &image, fun).unwrap();
         assert!(changed);
 
         // The dispatch block gained one successor per case target.
@@ -887,7 +908,7 @@ mod tests {
         // every fixpoint iteration. Re-running against the already-connected
         // block must be a no-op reporting no change — otherwise any
         // `repeat_until` stage containing this pass never converges.
-        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, &image, fun).unwrap();
         assert!(
             !changed,
             "re-resolving an already-connected table reported a change"
@@ -901,6 +922,7 @@ mod tests {
     #[test]
     fn resolves_constant_pointer_load() {
         let mut ctx = Context::new();
+        let mut image = image();
 
         qcode!(
             ctx,
@@ -913,11 +935,11 @@ mod tests {
             "
         );
 
-        add_code(&mut ctx, 0x1000, 0x1000);
-        add_rodata(&mut ctx, 0x2000, 0x1100u64.to_le_bytes().to_vec());
+        add_code(&mut image, 0x1000, 0x1000);
+        add_rodata(&mut image, 0x2000, 0x1100u64.to_le_bytes().to_vec());
         add_local_targets(&mut ctx, fun, &[0x1100]);
 
-        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, &image, fun).unwrap();
         assert!(changed);
 
         // The indirect branch is now a direct jump to the one resolved target.
@@ -940,6 +962,7 @@ mod tests {
     #[test]
     fn resolves_relative_table() {
         let mut ctx = Context::new();
+        let mut image = image();
 
         qcode!(
             ctx,
@@ -963,15 +986,15 @@ mod tests {
         );
 
         // Targets are 0x3000 + {0x100, 0x200, 0x300}.
-        add_code(&mut ctx, 0x3000, 0x1000);
+        add_code(&mut image, 0x3000, 0x1000);
         let mut table = Vec::new();
         for off in [0x100i32, 0x200, 0x300] {
             table.extend_from_slice(&off.to_le_bytes());
         }
-        add_rodata(&mut ctx, 0x5000, table);
+        add_rodata(&mut image, 0x5000, table);
         add_local_targets(&mut ctx, fun, &[0x3100, 0x3200, 0x3300]);
 
-        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, &image, fun).unwrap();
         assert!(changed);
 
         assert_eq!(successor_count(&ctx, disp), 3);
@@ -985,6 +1008,7 @@ mod tests {
     #[test]
     fn unbounded_index_is_left_alone() {
         let mut ctx = Context::new();
+        let mut image = image();
 
         qcode!(
             ctx,
@@ -999,10 +1023,10 @@ mod tests {
                 goto [%t];
             "
         );
-        add_code(&mut ctx, 0x1000, 0x1000);
-        add_rodata(&mut ctx, 0x2000, vec![0u8; 0x100]);
+        add_code(&mut image, 0x1000, 0x1000);
+        add_rodata(&mut image, 0x2000, vec![0u8; 0x100]);
 
-        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, &image, fun).unwrap();
         assert!(!changed);
         assert_eq!(successor_count(&ctx, disp), 0);
     }
@@ -1010,6 +1034,7 @@ mod tests {
     #[test]
     fn missing_target_is_discovered_without_mutating_ir() {
         let mut ctx = Context::new();
+        let mut image = image();
 
         qcode!(
             ctx,
@@ -1040,11 +1065,11 @@ mod tests {
             .set_address(0x1010)
             .unwrap();
 
-        add_code(&mut ctx, 0x1000, 0x1000);
-        add_rodata(&mut ctx, 0x2000, 0x1100u64.to_le_bytes().to_vec());
+        add_code(&mut image, 0x1000, 0x1000);
+        add_rodata(&mut image, 0x2000, 0x1100u64.to_le_bytes().to_vec());
         let blocks_before = ctx.blocks().count();
 
-        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, &image, fun).unwrap();
 
         assert!(!changed);
         assert!(matches!(terminator(&ctx, disp), Mnemonic::BranchInd(_)));
@@ -1073,6 +1098,7 @@ mod tests {
     #[test]
     fn collapses_single_target_to_branch() {
         let mut ctx = Context::new();
+        let mut image = image();
 
         qcode!(
             ctx,
@@ -1093,11 +1119,11 @@ mod tests {
             "
         );
 
-        add_code(&mut ctx, 0x1000, 0x1000);
-        add_rodata(&mut ctx, 0x2000, 0x1100u64.to_le_bytes().to_vec());
+        add_code(&mut image, 0x1000, 0x1000);
+        add_rodata(&mut image, 0x2000, 0x1100u64.to_le_bytes().to_vec());
         add_local_targets(&mut ctx, fun, &[0x1100]);
 
-        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, &image, fun).unwrap();
         assert!(changed);
 
         // BranchInd became a direct Branch to the single target.
@@ -1114,6 +1140,7 @@ mod tests {
     #[test]
     fn two_targets_with_zero_case() {
         let mut ctx = Context::new();
+        let mut image = image();
         let targets = [0x1100u64, 0x1200];
 
         qcode!(
@@ -1135,15 +1162,15 @@ mod tests {
             "
         );
 
-        add_code(&mut ctx, 0x1000, 0x1000);
+        add_code(&mut image, 0x1000, 0x1000);
         let mut table = Vec::new();
         for t in targets {
             table.extend_from_slice(&t.to_le_bytes());
         }
-        add_rodata(&mut ctx, 0x2000, table);
+        add_rodata(&mut image, 0x2000, table);
         add_local_targets(&mut ctx, fun, &targets);
 
-        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, &image, fun).unwrap();
         assert!(changed);
 
         assert_eq!(successor_count(&ctx, disp), 2);
@@ -1162,6 +1189,7 @@ mod tests {
     #[test]
     fn bitwise_and_index_resolves_two_targets() {
         let mut ctx = Context::new();
+        let mut image = image();
         let targets = [0x1100u64, 0x1200];
 
         qcode!(
@@ -1184,15 +1212,15 @@ mod tests {
             "
         );
 
-        add_code(&mut ctx, 0x1000, 0x1000);
+        add_code(&mut image, 0x1000, 0x1000);
         let mut table = Vec::new();
         for t in targets {
             table.extend_from_slice(&t.to_le_bytes());
         }
-        add_rodata(&mut ctx, 0x2000, table);
+        add_rodata(&mut image, 0x2000, table);
         add_local_targets(&mut ctx, fun, &targets);
 
-        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, &image, fun).unwrap();
         assert!(changed);
 
         assert_eq!(successor_count(&ctx, disp), 2);
@@ -1210,6 +1238,7 @@ mod tests {
     #[test]
     fn rewrites_already_connected_branch() {
         let mut ctx = Context::new();
+        let mut image = image();
         let targets = [0x1100u64, 0x1200];
 
         qcode!(
@@ -1231,12 +1260,12 @@ mod tests {
             "
         );
 
-        add_code(&mut ctx, 0x1000, 0x1000);
+        add_code(&mut image, 0x1000, 0x1000);
         let mut table = Vec::new();
         for t in targets {
             table.extend_from_slice(&t.to_le_bytes());
         }
-        add_rodata(&mut ctx, 0x2000, table);
+        add_rodata(&mut image, 0x2000, table);
 
         // Pre-connect the dispatch block to its targets, mimicking the edges the
         // lifter materializes in the clean IR before this pass re-runs. The targets
@@ -1249,7 +1278,7 @@ mod tests {
         }
         assert_eq!(successor_count(&ctx, disp), 2);
 
-        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, &image, fun).unwrap();
         assert!(changed);
 
         // Rewritten to a CBranch with exactly two successors (no doubling).
@@ -1262,6 +1291,7 @@ mod tests {
     #[test]
     fn two_targets_without_zero_case() {
         let mut ctx = Context::new();
+        let mut image = image();
 
         // `%j = idx + 5`, with idx bounded to {0,1}, gives index range {5,6}.
         qcode!(
@@ -1284,15 +1314,15 @@ mod tests {
             "
         );
 
-        add_code(&mut ctx, 0x1000, 0x1000);
+        add_code(&mut image, 0x1000, 0x1000);
         // Slots 0..=6; only slots 5 and 6 are read.
         let mut table = vec![0u8; 7 * 8];
         table[5 * 8..6 * 8].copy_from_slice(&0x1100u64.to_le_bytes());
         table[6 * 8..7 * 8].copy_from_slice(&0x1200u64.to_le_bytes());
-        add_rodata(&mut ctx, 0x2000, table);
+        add_rodata(&mut image, 0x2000, table);
         add_local_targets(&mut ctx, fun, &[0x1100, 0x1200]);
 
-        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, &image, fun).unwrap();
         assert!(changed);
 
         assert_eq!(successor_count(&ctx, disp), 2);

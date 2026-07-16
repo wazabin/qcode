@@ -145,11 +145,14 @@ pub struct Shared<'str> {
     /// Type registry: owns all [`Type`] objects and hands out [`TypeId`]s.
     pub types: TypeManager,
 
-    /// Initialized memory of the loaded binary (read-only data, code, …),
-    /// populated by the lifter. Lets analysis passes read constants such as
-    /// jump-table entries straight out of `.rodata` without the loader-side
-    /// `BinaryFormat`. Empty for synthetically-built contexts.
-    pub memory_image: crate::memory_image::MemoryImage,
+    /// Whether the binary's per-segment protection flags are authoritative
+    /// (the `memory_protections` pass has run). Until then the lifter treats
+    /// every mapped byte as potentially executable (default r/x); once known,
+    /// [`Context::assume_executable`] narrows to the real flags reported by
+    /// the loaded binary. Serialized so a reloaded snapshot keeps the
+    /// established state.
+    #[serde(default)]
+    pub(crate) protections_known: bool,
 
     /// The binary format's primary entrypoint, when the loader supplied one.
     /// Analysis passes use this for narrow loader-shaped recognizers such as
@@ -422,50 +425,23 @@ impl<'str> Context<'str> {
         self.shared.spaces = spaces;
     }
 
-    /// Read `n` bytes of initialized binary memory at virtual address `addr`,
-    /// or `None` if any byte is unmapped. See [`MemoryImage::read_bytes`].
-    ///
-    /// [`MemoryImage::read_bytes`]: crate::memory_image::MemoryImage::read_bytes
-    pub fn read_bytes(&self, addr: u64, n: usize) -> Option<Vec<u8>> {
-        self.shared.memory_image.read_bytes(addr, n)
-    }
-
-    /// Read a little-endian unsigned integer of `size` bytes from initialized
-    /// binary memory at `addr`. See [`MemoryImage::read_uint`].
-    ///
-    /// [`MemoryImage::read_uint`]: crate::memory_image::MemoryImage::read_uint
-    pub fn read_uint(&self, addr: u64, size: usize) -> Option<u64> {
-        self.shared.memory_image.read_uint(addr, size)
-    }
-
-    /// True if `addr` lies in an executable region of the loaded binary.
-    pub fn is_executable_addr(&self, addr: u64) -> bool {
-        self.shared.memory_image.is_executable(addr)
-    }
-
-    /// True only if `addr` is in a region *known* to be writable (protections
-    /// established and the segment writable). Passes that fold a value out of
-    /// initialized memory use this to refuse mutable memory — e.g. a GOT slot the
-    /// dynamic linker overwrites at load time, whose file bytes are the lazy PLT
-    /// resolver stub, not the real target. See
-    /// [`MemoryImage::is_known_writable`](crate::memory_image::MemoryImage::is_known_writable).
-    pub fn is_known_writable_addr(&self, addr: u64) -> bool {
-        self.shared.memory_image.is_known_writable(addr)
-    }
-
     /// Mark the binary's memory protections as established (the
     /// `memory_protections` pass has run), so executability checks narrow from the
     /// permissive default to the real per-segment flags.
     pub fn mark_protections_known(&mut self) {
-        self.shared.memory_image.mark_protections_known();
+        self.shared.protections_known = true;
+    }
+
+    /// Whether the binary's per-segment protection flags are authoritative.
+    pub fn protections_known(&self) -> bool {
+        self.shared.protections_known
     }
 
     /// The lifter's pre-decode executability gate, modeling executability as a
     /// [`Proposition::ExecutableMemory`]. Returns whether `addr` should be lifted:
     ///
-    /// - protections not yet established → optimistic default r/x (`true`); the
-    ///   memory image may be empty (the lifter reads bytes from the binary format,
-    ///   not the image), so it is *not* consulted in this case;
+    /// - protections not yet established → optimistic default r/x (`true`);
+    ///   the binary's segment flags are *not* consulted in this case;
     /// - protections known and the region is executable → `true`;
     /// - protections known and the region is non-executable (or unmapped) →
     ///   `false` (skip), recording the proven fact
@@ -479,16 +455,14 @@ impl<'str> Context<'str> {
     /// A *known* value for the containing region (a proven fact, or a user
     /// override seeded as known) wins over the raw segment flags, so the user can
     /// force a region executable or non-executable from the Assumptions panel.
-    pub fn assume_executable(&mut self, addr: u64) -> bool {
-        let bounds = self.shared.memory_image.segment_bounds(addr);
+    pub fn assume_executable(&mut self, binary: &dyn binfmt::BinaryFormat, addr: u64) -> bool {
+        let bounds = binary.segment_bounds(addr);
         if let Some((start, end)) = bounds
             && let Some(known) = self.known(Proposition::ExecutableMemory { start, end })
         {
             return known;
         }
-        if !self.shared.memory_image.protections_known()
-            || self.shared.memory_image.is_executable(addr)
-        {
+        if !self.shared.protections_known || binary.is_executable(addr) {
             return true;
         }
         if let Some((start, end)) = bounds {
@@ -2972,27 +2946,28 @@ mod tests {
     #[test]
     fn assume_executable_narrows_once_protections_known() {
         let mut ctx = Context::new();
-        ctx.shared
-            .memory_image
-            .add_segment(0x1000, vec![0u8; 4], true, false); // code
-        ctx.shared
-            .memory_image
-            .add_segment(0x2000, vec![0u8; 4], false, true); // data
+        let mut image = crate::memory_image::MemoryImage::default();
+        image.add_segment(0x1000, vec![0u8; 4], true, false); // code
+        image.add_segment(0x2000, vec![0u8; 4], false, true); // data
+        let binary: &dyn binfmt::BinaryFormat = &image;
 
         // Default r/x while protections unknown: everything is permissive, even
         // unmapped (the lifter reads bytes from the format, not the image).
-        assert!(ctx.assume_executable(0x1000));
-        assert!(ctx.assume_executable(0x2000));
-        assert!(ctx.assume_executable(0x9999));
+        assert!(ctx.assume_executable(binary, 0x1000));
+        assert!(ctx.assume_executable(binary, 0x2000));
+        assert!(ctx.assume_executable(binary, 0x9999));
 
         ctx.mark_protections_known();
-        assert!(ctx.assume_executable(0x1000), "code region stays liftable");
         assert!(
-            !ctx.assume_executable(0x2000),
+            ctx.assume_executable(binary, 0x1000),
+            "code region stays liftable"
+        );
+        assert!(
+            !ctx.assume_executable(binary, 0x2000),
             "data region is skipped once protections are known"
         );
         assert!(
-            !ctx.assume_executable(0x9999),
+            !ctx.assume_executable(binary, 0x9999),
             "unmapped is skipped once known"
         );
         // The skip records the proven fact for the whole containing segment.
@@ -3008,12 +2983,10 @@ mod tests {
     #[test]
     fn assume_executable_honors_region_override() {
         let mut ctx = Context::new();
-        ctx.shared
-            .memory_image
-            .add_segment(0x1000, vec![0u8; 4], true, false); // code
-        ctx.shared
-            .memory_image
-            .add_segment(0x2000, vec![0u8; 4], false, true); // data
+        let mut image = crate::memory_image::MemoryImage::default();
+        image.add_segment(0x1000, vec![0u8; 4], true, false); // code
+        image.add_segment(0x2000, vec![0u8; 4], false, true); // data
+        let binary: &dyn binfmt::BinaryFormat = &image;
         ctx.mark_protections_known();
 
         // Force the data region executable and the code region non-executable.
@@ -3035,11 +3008,11 @@ mod tests {
         );
 
         assert!(
-            ctx.assume_executable(0x2000),
+            ctx.assume_executable(binary, 0x2000),
             "override wins over the non-executable segment flag"
         );
         assert!(
-            !ctx.assume_executable(0x1000),
+            !ctx.assume_executable(binary, 0x1000),
             "override wins over the executable segment flag"
         );
     }
