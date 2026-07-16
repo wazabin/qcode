@@ -1207,25 +1207,40 @@ impl<'str> FunctionBody<'str> {
         name: Cow<'str, str>,
         old_name: Option<&str>,
     ) -> Result<()> {
-        let existing = match id.name_scope_function() {
-            Some(_) => self.names.get(&name).map(|id| id.qualify(self.id())),
-            None => shared.get_named(&name),
-        };
-        if let Some(existing) = existing {
+        if id.name_scope_function().is_none() {
+            return match shared.get_named(&name) {
+                Some(existing) if existing == id => Ok(()),
+                Some(_) => Err(Error::spanless(ErrorTy::DuplicateName(name.to_string()))),
+                None => unimplemented!(
+                    "a function body cannot register a global name (shared is read-only)"
+                ),
+            };
+        }
+        self.register_body_name(id, name, old_name)
+    }
+
+    /// Register `name` for the function-scoped `id` (block/instruction/param/Temp)
+    /// in this body's local name table. The shared-arm-free canon behind
+    /// [`register_local_name`](Self::register_local_name); panics on a
+    /// global-scoped `id`. Errors only on a duplicate name.
+    pub fn register_body_name(
+        &mut self,
+        id: ValueId,
+        name: Cow<'str, str>,
+        old_name: Option<&str>,
+    ) -> Result<()> {
+        assert!(
+            id.name_scope_function().is_some(),
+            "register_body_name on a global-scoped value {id:?}"
+        );
+        if let Some(existing) = self.names.get(&name).map(|id| id.qualify(self.id())) {
             return if existing == id {
                 Ok(())
             } else {
                 Err(Error::spanless(ErrorTy::DuplicateName(name.to_string())))
             };
         }
-        match id.name_scope_function() {
-            Some(_) => self.names.register(name, id.localize(self.id()), old_name),
-            None => {
-                unimplemented!(
-                    "a function body cannot register a global name (shared is read-only)"
-                )
-            }
-        }
+        self.names.register(name, id.localize(self.id()), old_name)
     }
 
     /// Gets a reference to a function from its ID

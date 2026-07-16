@@ -147,19 +147,10 @@ impl<'a, 'str> BodyMut<'a, 'str> {
         self.view().function_ref(id)
     }
 
-    // ---- derived arena accessors --------------------------------------------
-
-    pub fn instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
-        &mut self.function_mut(id.func).insns[id.local]
-    }
-    pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
-        &mut self.function_mut(id.func).blocks[id.local]
-    }
-    pub fn block_param_mut(&mut self, id: BlockParamId) -> &mut BlockParam<'str> {
-        &mut self.function_mut(id.func).params[id.local]
-    }
-
     // ---- births -------------------------------------------------------------
+    //
+    // (The derived mut accessors — `instruction_mut`/`block_mut`/
+    // `block_param_mut` — are [`QCodeMut`](crate::value::QCodeMut) defaults.)
 
     pub fn push_edge(&mut self, edge: EdgeData) -> EdgeId {
         self.fun.edges.push(edge)

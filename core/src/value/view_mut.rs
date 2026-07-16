@@ -19,11 +19,16 @@
 use jstd::registry::Registry;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use std::borrow::Cow;
+
 use crate::{
     context::{Context, Shared},
+    error::Result,
     value::{
-        BodyView, FunctionBody, FunctionId, ModuleView, QCodeView, ValueId,
+        BasicBlock, BodyView, FunctionBody, FunctionId, Instruction, ModuleView, QCodeView,
+        ValueId,
         block::{BlockId, EdgeId},
+        block_param::BlockParam,
         block_param::BlockParamId,
         function::FunctionInterface,
         insn::{InstructionId, LocalInsnId, Mnemonic},
@@ -57,7 +62,42 @@ pub trait QCodeMut<'str> {
     /// The static immutable provider for reads over this host.
     fn view(&self) -> Self::View<'_>;
 
+    // ---- derived arena accessors ---------------------------------------------
+
+    /// Mutably borrows the instruction `id` from its owning function's arena.
+    fn instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
+        &mut self.function_mut(id.func).insns[id.local]
+    }
+
+    /// Mutably borrows the block `id` from its owning function's arena.
+    fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
+        &mut self.function_mut(id.func).blocks[id.local]
+    }
+
+    /// Mutably borrows the block parameter `id` from its owning function's arena.
+    fn block_param_mut(&mut self, id: BlockParamId) -> &mut BlockParam<'str> {
+        &mut self.function_mut(id.func).params[id.local]
+    }
+
     // ---- body-local verbs (canon: inherent methods on `FunctionBody`) -------
+
+    /// Register `name` for the function-scoped `id` (block/instruction/param/
+    /// Temp) in its owning function's local name table. Panics on a
+    /// global-scoped `id` — shared-name registration is a module-only operation
+    /// outside this trait's body-local contract. Errors only on a duplicate
+    /// name.
+    fn register_body_name(
+        &mut self,
+        id: ValueId,
+        name: Cow<'str, str>,
+        old_name: Option<&str>,
+    ) -> Result<()> {
+        let func = id
+            .name_scope_function()
+            .expect("register_body_name on a global-scoped value");
+        self.function_mut(func)
+            .register_body_name(id, name, old_name)
+    }
 
     /// Physically removes a block parameter and its local bookkeeping.
     /// Positional block and edge-argument rewrites belong to the caller and may

@@ -2,6 +2,7 @@
 //! Each instruction has a mnemonic, which is the operation that it performs, and a size
 //! in bytes of the value it defines.
 //! Instructions that do not define a value (e.g. terminators) have a size of 0.
+use crate::value::QCodeMut;
 use crate::{
     context::Context,
     error::Result,
