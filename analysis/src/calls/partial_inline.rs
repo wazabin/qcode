@@ -80,11 +80,13 @@ fn partial_inline_changed_functions(
     let target_set: rustc_hash::FxHashSet<_> = targets.iter().copied().collect();
     let graph = crate::CallGraph::analyze(ctx);
     for fid in ctx.function_ids() {
+        if !FunctionBody::from_id(ctx, fid).is_pure_reg() {
+            continue;
+        }
         let callers = graph.callers(fid);
         if !callers.is_empty()
             && callers.iter().all(|id| target_set.contains(id))
-            && FunctionBody::from_id(ctx, fid).is_pure_reg()
-            && try_partial_inline(ctx, fid)
+            && try_partial_inline(ctx, fid, &super::direct_call_sites(ctx, &graph, fid))
         {
             changed.extend(callers);
         }
@@ -210,12 +212,11 @@ struct Inlinable {
     order: Vec<InstructionId>,
 }
 
-fn try_partial_inline(ctx: &mut Context, fid: FunctionId) -> bool {
+fn try_partial_inline(ctx: &mut Context, fid: FunctionId, call_sites: &[InstructionId]) -> bool {
     let Some(root) = FunctionBody::from_id(ctx, fid).root().map(|b| b.id) else {
         return false;
     };
 
-    let call_sites = super::fresh_direct_call_sites(ctx, fid);
     if call_sites.is_empty() {
         return false;
     }
@@ -281,26 +282,27 @@ fn try_partial_inline(ctx: &mut Context, fid: FunctionId) -> bool {
     }
 
     let mut changed = false;
-    for call_id in call_sites {
+    for &call_id in call_sites {
         let Mnemonic::Call(c) = ctx.get_insn(call_id).mnemonic().clone() else {
             continue;
         };
         let args: Vec<ValueId> = c.args.iter().map(|a| a.qualify(call_id.func)).collect();
         let result = ValueId::Instruction(call_id);
 
+        // Index all projections once. Scanning the result's users separately
+        // for every inlinable field is quadratic in the returned field count.
+        let mut extracts_by_index: HashMap<usize, Vec<InstructionId>> = HashMap::default();
+        for user in ctx.users(result) {
+            if let Mnemonic::Extract(Extract { agg, index }) = ctx.get_insn(user).mnemonic()
+                && agg.qualify(user.func) == result
+            {
+                extracts_by_index.entry(*index).or_default().push(user);
+            }
+        }
+
         for inl in &inlinable {
             // Every `extract` of this field at this call site (usually one).
-            let extracts: Vec<InstructionId> = ctx
-                .users(result)
-                .iter()
-                .copied()
-                .filter(|&u| {
-                    matches!(ctx.get_insn(u).mnemonic(),
-                        Mnemonic::Extract(Extract { agg, index }) if agg.qualify(u.func) == result && *index == inl.index)
-                })
-                .collect();
-
-            for extract_id in extracts {
+            for extract_id in extracts_by_index.remove(&inl.index).unwrap_or_default() {
                 let clone = clone_expr(ctx, extract_id, inl.value, &inl.order, &inputs, &args);
                 ctx.replace_all_uses_with(ValueId::Instruction(extract_id), clone);
                 ctx.remove_instruction(extract_id);
