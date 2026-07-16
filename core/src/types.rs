@@ -24,7 +24,10 @@
 //!
 //! - Pointer types for RAM/register spaces.
 
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{
+    Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    atomic::{AtomicPtr, Ordering},
+};
 
 use rustc_hash::FxHashMap as HashMap;
 
@@ -630,11 +633,6 @@ impl TypeManagerInner {
         id
     }
 
-    /// The pointee type of `id`, if `id` is a [`StructPointer`].
-    pub fn pointee_of(&self, id: TypeId) -> Option<TypeId> {
-        self.get(id).pointee()
-    }
-
     /// Returns the [`TypeId`] for an [`ArrayType`] of `count` elements of type
     /// `elem`, creating it if it does not yet exist. `elem` must already be
     /// registered (it always is: you build the element type first).
@@ -646,11 +644,6 @@ impl TypeManagerInner {
         let id = self.register(Box::new(ArrayType { elem, count, size }));
         self.array_by_elem_count.insert((elem, count), id);
         id
-    }
-
-    /// The `(elem, count)` of `id`, if `id` is an [`ArrayType`].
-    pub fn array_of(&self, id: TypeId) -> Option<(TypeId, usize)> {
-        self.get(id).array()
     }
 
     /// Returns the [`TypeId`] for a *bounded* [`ListType`] — a variable-length
@@ -682,87 +675,6 @@ impl TypeManagerInner {
         id
     }
 
-    /// The `(elem, bound)` of `id`, if `id` is a [`ListType`]; `bound` is `None`
-    /// for an unbounded (pointer-sourced) list.
-    pub fn list_of(&self, id: TypeId) -> Option<(TypeId, Option<usize>)> {
-        self.get(id).list()
-    }
-
-    /// Unified view of any *sequence* type — a fixed [`array`](Type::array) or a
-    /// variable-length [`list`](Type::list) — as `(elem, len, is_list)`, where
-    /// `len` is the count (array) or bound (list). `None` for non-sequences. This
-    /// is what lets `map`/`enumerate`/`take_while` operate on either kind: read
-    /// the operand with `seq_of`, rebuild the result with
-    /// [`get_or_make_seq`](Self::get_or_make_seq) preserving the kind.
-    pub fn seq_of(&self, id: TypeId) -> Option<(TypeId, usize, bool)> {
-        if let Some((elem, count)) = self.array_of(id) {
-            return Some((elem, count, false));
-        }
-        // Only a *bounded* list reports a static length for seq-preserving rebuilds
-        // (`map`/`enumerate`); an unbounded pointer-sourced list declines here.
-        if let Some((elem, Some(bound))) = self.list_of(id) {
-            return Some((elem, bound, true));
-        }
-        None
-    }
-
-    /// The element type of any *sequence* — a fixed [`array`](Type::array) or a
-    /// [`list`](Type::list) of any bound, *including an unbounded* `[T;*]` list
-    /// that [`seq_of`](Self::seq_of) declines (because it has no static length).
-    /// This is the accessor length-erased code (`scanl`/`iota`/`concat` results,
-    /// `at`) uses when it needs the element type but not the count.
-    pub fn seq_elem_of(&self, id: TypeId) -> Option<TypeId> {
-        if let Some((elem, _)) = self.array_of(id) {
-            return Some(elem);
-        }
-        if let Some((elem, _)) = self.list_of(id) {
-            return Some(elem);
-        }
-        None
-    }
-
-    /// A short display name for `id`, used by the IR formatters in place of the
-    /// raw `i<bits>` width. Nominal structs print their name and struct pointers
-    /// print `Pointee*`; everything else (integers, stack/space addresses, and
-    /// the structural aggregates used by `argpromote`) keeps its width-based
-    /// `i<bits>` form, so existing IR/signature assertions are unaffected.
-    pub fn type_name(&self, id: TypeId) -> String {
-        match self.get(id).repr() {
-            TypeRepr::Bool => "bool".to_string(),
-            TypeRepr::Struct { name, .. } => name,
-            TypeRepr::StructPointer { pointee, .. } => format!("{}*", self.type_name(pointee)),
-            TypeRepr::Array { elem, count } => format!("[{};{}]", self.type_name(elem), count),
-            TypeRepr::List { elem, bound } => match bound {
-                Some(b) => format!("[{};<={}]", self.type_name(elem), b),
-                None => format!("[{};*]", self.type_name(elem)),
-            },
-            _ => format!("i{}", self.size_of(id) * 8),
-        }
-    }
-
-    /// The ordered named fields of `id`, or `None` if `id` is not an aggregate.
-    /// Only used internally by [`field_type`](Self::field_type)/
-    /// [`field_index`](Self::field_index); the wrapper exposes the public
-    /// reference-returning accessors.
-    fn aggregate_fields(&self, id: TypeId) -> Option<&[AggregateField]> {
-        self.get(id).fields()
-    }
-
-    /// The type of field `index` of aggregate `id`, if `id` is an aggregate with
-    /// at least `index + 1` fields.
-    pub fn field_type(&self, id: TypeId, index: usize) -> Option<TypeId> {
-        self.aggregate_fields(id)?
-            .get(index)
-            .map(|field| field.type_id)
-    }
-
-    /// The index of field `name` of aggregate `id`, if it exists.
-    pub fn field_index(&self, id: TypeId, name: &str) -> Option<usize> {
-        self.aggregate_fields(id)?
-            .iter()
-            .position(|field| field.name == name)
-    }
-
     /// Returns a reference to the concrete [`Type`] for `id`.
     pub fn get(&self, id: TypeId) -> &dyn Type {
         &*self.types[id.0 as usize]
@@ -771,12 +683,6 @@ impl TypeManagerInner {
     /// Returns the byte width of values with type `id`.
     pub fn size_of(&self, id: TypeId) -> usize {
         self.get(id).size()
-    }
-
-    /// Returns the memory space associated with `id`, if any. Non-`None` only for
-    /// [`SpaceAddress`]/[`StructPointer`] pointer types.
-    pub fn space_of(&self, id: TypeId) -> Option<MemorySpaceId> {
-        self.get(id).space()
     }
 
     /// Computes the result [`TypeId`] for a binary operation on `lhs op rhs`.
@@ -830,6 +736,46 @@ impl TypeManagerInner {
 /// Interned [`TypeId`]s are globally stable and never remapped.
 pub struct TypeManager {
     inner: RwLock<TypeManagerInner>,
+    /// Lock-free read index over the append-only type objects in `inner`.
+    ///
+    /// Publishing replaces this pointer after a successful mint. Old indexes
+    /// stay owned by `published_generations`, so a reader that raced with a
+    /// publication can safely finish through the generation it loaded. The
+    /// pointed-to `Type` objects themselves live in `inner.types`; those are
+    /// boxed, append-only, and therefore never move or disappear.
+    published: AtomicPtr<PublishedTypes>,
+    // Each generation needs its own stable heap address after this Vec grows.
+    #[allow(clippy::vec_box)]
+    published_generations: Mutex<Vec<Box<PublishedTypes>>>,
+}
+
+/// One immutable generation of the lock-free TypeId -> Type pointer index.
+///
+/// The raw trait-object pointers target `Box<dyn Type>` pointees owned by the
+/// corresponding [`TypeManagerInner`]. They are immutable, `Send + Sync`, and
+/// remain allocated for the manager's entire lifetime. A generation is never
+/// modified after publication.
+struct PublishedTypes {
+    entries: Box<[*const dyn Type]>,
+}
+
+// SAFETY: every entry points to an immutable `dyn Type + Send + Sync` allocation
+// owned for the full lifetime of the enclosing TypeManager. PublishedTypes never
+// mutates an entry or the pointee after construction.
+unsafe impl Send for PublishedTypes {}
+// SAFETY: see the `Send` implementation above; concurrent access is read-only.
+unsafe impl Sync for PublishedTypes {}
+
+impl PublishedTypes {
+    fn from_inner(inner: &TypeManagerInner) -> Self {
+        Self {
+            entries: inner
+                .types
+                .iter()
+                .map(|ty| &**ty as *const dyn Type)
+                .collect(),
+        }
+    }
 }
 
 impl Default for TypeManager {
@@ -840,16 +786,22 @@ impl Default for TypeManager {
 
 impl Clone for TypeManager {
     fn clone(&self) -> Self {
-        Self {
-            inner: RwLock::new(self.read().clone()),
-        }
+        Self::from_inner(self.read().clone())
     }
 }
 
 impl TypeManager {
     pub fn new() -> Self {
+        Self::from_inner(TypeManagerInner::new())
+    }
+
+    fn from_inner(inner: TypeManagerInner) -> Self {
+        let generation = Box::new(PublishedTypes::from_inner(&inner));
+        let published = AtomicPtr::new((&*generation as *const PublishedTypes).cast_mut());
         Self {
-            inner: RwLock::new(TypeManagerInner::new()),
+            inner: RwLock::new(inner),
+            published,
+            published_generations: Mutex::new(vec![generation]),
         }
     }
 
@@ -859,6 +811,40 @@ impl TypeManager {
 
     fn write(&self) -> RwLockWriteGuard<'_, TypeManagerInner> {
         self.inner.write().expect("type manager RwLock poisoned")
+    }
+
+    /// Publish the current append-only type table for lock-free readers.
+    /// Caller holds the write lock, so only one generation can be constructed
+    /// at a time and every registered type is fully initialized first.
+    fn publish(&self, inner: &TypeManagerInner) {
+        let generation = Box::new(PublishedTypes::from_inner(inner));
+        let ptr = (&*generation as *const PublishedTypes).cast_mut();
+        self.published_generations
+            .lock()
+            .expect("type publication generation lock poisoned")
+            .push(generation);
+        self.published.store(ptr, Ordering::Release);
+    }
+
+    fn published(&self) -> &PublishedTypes {
+        let ptr = self.published.load(Ordering::Acquire);
+        debug_assert!(!ptr.is_null(), "type publication pointer is null");
+        // SAFETY: `from_inner` installs the initial generation before the manager
+        // becomes observable. Every later generation is retained in
+        // `published_generations` for the manager's lifetime and is immutable.
+        unsafe { &*ptr }
+    }
+
+    /// Run one double-checked mint operation and publish only when it appended a
+    /// new type. Cache hits therefore retain the current generation unchanged.
+    fn mint(&self, f: impl FnOnce(&mut TypeManagerInner) -> TypeId) -> TypeId {
+        let mut inner = self.write();
+        let old_len = inner.types.len();
+        let id = f(&mut inner);
+        if inner.types.len() != old_len {
+            self.publish(&inner);
+        }
+        id
     }
 
     // --- mint path (double-checked: read-lock hit, write-lock miss) -------
@@ -872,13 +858,13 @@ impl TypeManager {
         if let Some(&id) = self.read().int_by_size.get(&size) {
             return id;
         }
-        self.write().get_or_make_int(size)
+        self.mint(|inner| inner.get_or_make_int(size))
     }
     pub fn get_or_make_bool(&self) -> TypeId {
         if let Some(id) = self.read().bool_id {
             return id;
         }
-        self.write().get_or_make_bool()
+        self.mint(TypeManagerInner::get_or_make_bool)
     }
     pub fn get_or_make_space_address(
         &self,
@@ -889,7 +875,7 @@ impl TypeManager {
         if let Some(&id) = self.read().space_address.get(&(size, space)) {
             return id;
         }
-        self.write().get_or_make_space_address(size, space)
+        self.mint(|inner| inner.get_or_make_space_address(size, space))
     }
     /// Returns the [`TypeId`] for an [`AggregateType`] with default field names
     /// (`field1`, `field2`, ...), creating it if it does not yet exist.
@@ -900,7 +886,7 @@ impl TypeManager {
         if let Some(&id) = self.read().aggregate_by_fields.get(&fields) {
             return id;
         }
-        self.write().get_or_make_named_aggregate(fields)
+        self.mint(|inner| inner.get_or_make_named_aggregate(fields))
     }
     pub fn get_or_make_struct(
         &self,
@@ -912,31 +898,31 @@ impl TypeManager {
         if let Some(&id) = self.read().struct_by_name.get(&name) {
             return id;
         }
-        self.write().get_or_make_struct(name, size, fields)
+        self.mint(|inner| inner.get_or_make_struct(name, size, fields))
     }
     pub fn get_or_make_struct_pointer(&self, size: usize, pointee: TypeId) -> TypeId {
         if let Some(&id) = self.read().struct_pointer.get(&(size, pointee)) {
             return id;
         }
-        self.write().get_or_make_struct_pointer(size, pointee)
+        self.mint(|inner| inner.get_or_make_struct_pointer(size, pointee))
     }
     pub fn get_or_make_array(&self, elem: TypeId, count: usize) -> TypeId {
         if let Some(&id) = self.read().array_by_elem_count.get(&(elem, count)) {
             return id;
         }
-        self.write().get_or_make_array(elem, count)
+        self.mint(|inner| inner.get_or_make_array(elem, count))
     }
     pub fn get_or_make_list(&self, elem: TypeId, bound: usize) -> TypeId {
         if let Some(&id) = self.read().list_by_elem_bound.get(&(elem, Some(bound))) {
             return id;
         }
-        self.write().get_or_make_list(elem, bound)
+        self.mint(|inner| inner.get_or_make_list(elem, bound))
     }
     pub fn get_or_make_unbounded_list(&self, elem: TypeId) -> TypeId {
         if let Some(&id) = self.read().list_by_elem_bound.get(&(elem, None)) {
             return id;
         }
-        self.write().get_or_make_unbounded_list(elem)
+        self.mint(|inner| inner.get_or_make_unbounded_list(elem))
     }
     /// Build the sequence type of the given kind: a [`List`](Self::get_or_make_list)
     /// when `is_list`, else a fixed [`Array`](Self::get_or_make_array). The inverse
@@ -952,69 +938,97 @@ impl TypeManager {
         if let Some(id) = self.read().binop_result_probe(lhs, op, rhs) {
             return id;
         }
-        self.write().binop_result(lhs, op, rhs)
+        self.mint(|inner| inner.binop_result(lhs, op, rhs))
     }
 
-    // --- Copy/owned reads (read lock) ------------------------------------
+    // --- Registry-key reads (interner lock) ------------------------------
 
     pub fn bool_id(&self) -> Option<TypeId> {
         self.read().bool_id()
     }
-    pub fn is_bool(&self, id: TypeId) -> bool {
-        self.read().is_bool(id)
-    }
     pub fn struct_by_name(&self, name: &str) -> Option<TypeId> {
         self.read().struct_by_name(name)
     }
+
+    // --- Published TypeId reads (lock-free) ------------------------------
+
+    pub fn is_bool(&self, id: TypeId) -> bool {
+        matches!(self.get(id).repr(), TypeRepr::Bool)
+    }
     pub fn size_of(&self, id: TypeId) -> usize {
-        self.read().size_of(id)
+        self.get(id).size()
     }
     pub fn space_of(&self, id: TypeId) -> Option<MemorySpaceId> {
-        self.read().space_of(id)
+        self.get(id).space()
     }
     pub fn pointee_of(&self, id: TypeId) -> Option<TypeId> {
-        self.read().pointee_of(id)
+        self.get(id).pointee()
     }
     pub fn array_of(&self, id: TypeId) -> Option<(TypeId, usize)> {
-        self.read().array_of(id)
+        self.get(id).array()
     }
     pub fn list_of(&self, id: TypeId) -> Option<(TypeId, Option<usize>)> {
-        self.read().list_of(id)
+        self.get(id).list()
     }
     pub fn seq_of(&self, id: TypeId) -> Option<(TypeId, usize, bool)> {
-        self.read().seq_of(id)
+        if let Some((elem, count)) = self.array_of(id) {
+            return Some((elem, count, false));
+        }
+        self.list_of(id)
+            .and_then(|(elem, bound)| bound.map(|bound| (elem, bound, true)))
     }
     pub fn seq_elem_of(&self, id: TypeId) -> Option<TypeId> {
-        self.read().seq_elem_of(id)
+        self.array_of(id)
+            .map(|(elem, _)| elem)
+            .or_else(|| self.list_of(id).map(|(elem, _)| elem))
     }
     pub fn type_name(&self, id: TypeId) -> String {
-        self.read().type_name(id)
+        match self.get(id).repr() {
+            TypeRepr::Bool => "bool".to_string(),
+            TypeRepr::Struct { name, .. } => name,
+            TypeRepr::StructPointer { pointee, .. } => {
+                format!("{}*", self.type_name(pointee))
+            }
+            TypeRepr::Array { elem, count } => {
+                format!("[{};{}]", self.type_name(elem), count)
+            }
+            TypeRepr::List { elem, bound } => match bound {
+                Some(bound) => format!("[{};<={}]", self.type_name(elem), bound),
+                None => format!("[{};*]", self.type_name(elem)),
+            },
+            _ => format!("i{}", self.size_of(id) * 8),
+        }
     }
     pub fn field_type(&self, id: TypeId, index: usize) -> Option<TypeId> {
-        self.read().field_type(id, index)
+        self.aggregate_fields(id)?
+            .get(index)
+            .map(|field| field.type_id)
     }
     pub fn field_index(&self, id: TypeId, name: &str) -> Option<usize> {
-        self.read().field_index(id, name)
+        self.aggregate_fields(id)?
+            .iter()
+            .position(|field| field.name == name)
     }
 
     // --- reference reads (built on the append-only-stable `get`) ----------
 
     /// Returns a reference to the concrete [`Type`] for `id`.
     ///
-    /// The reference outlives the read guard: this is sound because the type
-    /// table is **append-only** — types are created once and never removed, and
-    /// each `Box<dyn Type>` pointee is heap-allocated and never moved (growing
-    /// the backing `Vec` relocates the boxes, not the objects they own). So the
-    /// pointee lives as long as `self`, and the read lock only needs to guard the
-    /// `Vec` indexing.
+    /// The lookup loads one immutable published index generation and takes no
+    /// lock. The reference remains valid across later publications because the
+    /// type table is append-only: types are created once and never removed, and
+    /// each `Box<dyn Type>` pointee is heap-allocated and never moved.
     pub fn get(&self, id: TypeId) -> &dyn Type {
-        let ptr: *const dyn Type = {
-            let inner = self.read();
-            &*inner.types[id.0 as usize] as *const dyn Type
-        };
-        // SAFETY: `ptr` points at a `Box<dyn Type>` pointee that is never moved or
-        // freed for the life of `self` (see the method doc), so dereferencing it
-        // after the read guard drops — and tying the borrow to `&self` — is sound.
+        let entries = &self.published().entries;
+        let ptr = *entries.get(id.0 as usize).unwrap_or_else(|| {
+            panic!(
+                "missing published type {id:?}; published type count is {}",
+                entries.len()
+            )
+        });
+        // SAFETY: publication records pointers to immutable boxed type objects.
+        // The table is append-only and the boxes remain owned by `inner.types`
+        // until this manager is dropped.
         unsafe { &*ptr }
     }
 
@@ -1050,7 +1064,16 @@ impl TypeManager {
 
 impl serde::Serialize for TypeManager {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let reprs: Vec<TypeRepr> = self.read().types.iter().map(|t| t.repr()).collect();
+        let reprs: Vec<TypeRepr> = self
+            .published()
+            .entries
+            .iter()
+            .map(|&ptr| {
+                // SAFETY: the same publication invariant used by `get` applies
+                // to every pointer in this immutable generation.
+                unsafe { &*ptr }.repr()
+            })
+            .collect();
         reprs.serialize(serializer)
     }
 }
@@ -1234,5 +1257,34 @@ mod tests {
             bincode::serde::decode_from_slice(&bytes, config).unwrap();
         assert_eq!(back.list_of(list), Some((i8, None)));
         assert_eq!(back.array_of(list), None);
+    }
+
+    #[test]
+    fn newly_minted_type_is_published_before_return() {
+        let tm = TypeManager::new();
+        let i16 = tm.get_or_make_int(2);
+        let array = tm.get_or_make_array(i16, 7);
+
+        assert_eq!(tm.size_of(array), 14);
+        assert_eq!(tm.array_of(array), Some((i16, 7)));
+    }
+
+    #[test]
+    fn concurrent_mint_and_published_reads_are_consistent() {
+        let tm = TypeManager::new();
+        let byte = tm.get_or_make_int(1);
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for count in 1..=128 {
+                        let array = tm.get_or_make_array(byte, count);
+                        assert_eq!(tm.size_of(array), count);
+                        assert_eq!(tm.array_of(array), Some((byte, count)));
+                        assert_eq!(tm.size_of(byte), 1);
+                    }
+                });
+            }
+        });
     }
 }
