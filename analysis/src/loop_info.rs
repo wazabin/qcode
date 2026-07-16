@@ -16,6 +16,7 @@
 //! complex is simply not recognized (the passes decline, they never miscompile).
 
 use jstd::graph::analysis::compute_dominators;
+use qcode::value::QCodeMut;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{

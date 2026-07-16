@@ -159,13 +159,6 @@ impl<'a, 'str> BodyMut<'a, 'str> {
         &mut self.function_mut(id.func).params[id.local]
     }
 
-    /// Physically removes a block parameter and its local bookkeeping.
-    /// Positional block and edge-argument rewrites belong to the caller and may
-    /// complete later in the same transformation.
-    pub fn remove_block_param(&mut self, id: BlockParamId) {
-        self.function_mut(id.func).remove_block_param(id);
-    }
-
     // ---- births -------------------------------------------------------------
 
     pub fn push_edge(&mut self, edge: EdgeData) -> EdgeId {
@@ -201,61 +194,17 @@ impl<'a, 'str> BodyMut<'a, 'str> {
         self.fun.push_mnemonic_with_type(mnemonic, type_id)
     }
 
-    pub fn insert_insn_before(
-        &mut self,
-        block: BlockId,
-        before: InstructionId,
-        insn: InstructionId,
-    ) {
-        self.function_mut(block.func)
-            .insert_insn_before(block, before, insn)
-    }
-
     // ---- CFG / use-map verbs ------------------------------------------------
+    //
+    // The body-local mutation verbs live on the [`QCodeMut`] trait
+    // (`value::view_mut`), shared with the module host. Only the verbs whose
+    // spelling diverges between hosts stay inherent here.
 
-    pub fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
-        self.function_mut(from.func).add_cfg_edge(from, to)
-    }
-
+    /// Remove CFG edge `edge_id` (unqualified; `EdgeId` is body-local). The
+    /// module-path twin is the function-qualified
+    /// [`Context::remove_cfg_edge`](crate::context::Context::remove_cfg_edge).
     pub fn remove_cfg_edge(&mut self, edge_id: EdgeId) {
         self.fun.remove_cfg_edge(edge_id)
-    }
-
-    pub fn replace_all_uses_with(&mut self, old: ValueId, new: ValueId) {
-        if old == new {
-            return;
-        }
-        let Some(func) = old.owning_function() else {
-            return;
-        };
-        self.function_mut(func).replace_all_uses_with(old, new)
-    }
-
-    pub fn remove_instruction(&mut self, id: InstructionId) {
-        self.function_mut(id.func).remove_instruction(id)
-    }
-
-    pub fn rehome_outgoing_edges(&mut self, keep: BlockId, remove: BlockId) {
-        self.function_mut(keep.func)
-            .rehome_outgoing_edges(keep, remove)
-    }
-
-    pub fn replace_instruction_mnemonic(&mut self, id: InstructionId, mnemonic: Mnemonic) {
-        self.function_mut(id.func)
-            .replace_instruction_mnemonic(id, mnemonic)
-    }
-
-    pub fn unroster_block(&mut self, block: BlockId) {
-        self.function_mut(block.func).unroster_block(block)
-    }
-
-    pub fn delete_block(&mut self, block: BlockId) {
-        self.function_mut(block.func).delete_block(block)
-    }
-
-    pub fn absorb_block(&mut self, keep: BlockId, other: BlockId, edge_ab: EdgeId) {
-        self.function_mut(keep.func)
-            .absorb_block(keep, other, edge_ab)
     }
 
     // ---- names --------------------------------------------------------------

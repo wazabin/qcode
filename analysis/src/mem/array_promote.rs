@@ -22,6 +22,7 @@
 //! and every region access is accounted for (seed, lane store, region loads, exit
 //! reads) — any unmodelled region access declines the promotion.
 
+use qcode::value::QCodeMut;
 use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{

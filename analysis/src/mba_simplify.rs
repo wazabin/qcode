@@ -42,6 +42,7 @@
 //! 32→64 widened-multiply idiom (`(sext·sext)[0:4]`) is left to a separate
 //! narrowing canonicalization to expose; here it simply reads as opaque leaves.
 
+use qcode::value::QCodeMut;
 use rustc_hash::FxHashMap as HashMap;
 
 use qcode::value::{
