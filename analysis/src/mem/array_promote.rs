@@ -651,8 +651,7 @@ fn apply_generic<'str>(host: &mut BodyMut<'_, 'str>, m: &PromoteMatch) -> bool {
             }),
             elem_ty,
         );
-        host.replace_all_uses_with(ValueId::Instruction(load_id), at_val);
-        host.remove_instruction(load_id);
+        host.replace_instruction(load_id, at_val);
     }
 
     // Body write: arr_next = insert(arr_b, index+store_delta, stored_val), before the branch.
@@ -688,8 +687,7 @@ fn apply_generic<'str>(host: &mut BodyMut<'_, 'str>, m: &PromoteMatch) -> bool {
             }),
             elem_ty,
         );
-        host.replace_all_uses_with(ValueId::Instruction(load_id), at_val);
-        host.remove_instruction(load_id);
+        host.replace_instruction(load_id, at_val);
     }
 
     // Exit write-back: store(region, base(+origin) <- arr_e) at the *top* of the exit

@@ -567,8 +567,7 @@ fn apply_strlen_ptr<'str>(
         let tw = b.push_intrinsic(tw_id, vec![m.base]).id();
         b.push_intrinsic(len_id, vec![tw]).id()
     };
-    body.replace_all_uses_with(ValueId::Instruction(m.diff_id), len_val);
-    body.remove_instruction(m.diff_id);
+    body.replace_instruction(m.diff_id, len_val);
     // The scan now produces nothing used outside it; later DCE removes the dead loop.
     true
 }

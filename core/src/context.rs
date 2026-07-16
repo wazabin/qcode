@@ -2361,8 +2361,7 @@ mod tests {
             .unwrap();
         let e = ctx_a.add_cfg_edge(entry, bb1);
         ctx_a.remove_cfg_edge(entry.func, e);
-        ctx_a.replace_all_uses_with(ValueId::Instruction(a), ValueId::Instruction(b));
-        ctx_a.remove_instruction(a);
+        ctx_a.replace_instruction(a, ValueId::Instruction(b));
         BlockParam::from_id_mut(&mut ctx_a, param).set_size(4);
         let snap_a = snap(&ctx_a, fid);
 
@@ -2380,8 +2379,7 @@ mod tests {
             r.rename("start".into()).unwrap();
             let e = host.add_cfg_edge(entry_b, bb1_b);
             host.remove_cfg_edge(e);
-            host.replace_all_uses_with(ValueId::Instruction(a_b), ValueId::Instruction(b_b));
-            host.remove_instruction(a_b);
+            host.replace_instruction(a_b, ValueId::Instruction(b_b));
             let mut r = BaseRef::new(host.reborrow(), param_b);
             r.set_size(4);
         }

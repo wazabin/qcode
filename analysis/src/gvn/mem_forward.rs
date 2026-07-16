@@ -860,9 +860,7 @@ mod tests {
         // deleting the redundant instruction. `%ptr` itself remains live, but
         // the precomputed form still decomposes it as `%old + 4`.
         let replacement = tc.ctx.get_const(0x1000, 8).id();
-        tc.ctx
-            .replace_all_uses_with(ValueId::Instruction(old), replacement);
-        tc.ctx.remove_instruction(old);
+        tc.ctx.replace_instruction(old, replacement);
         assert!(!tc.ctx.contains_instruction(old));
 
         let space: LocalMemorySpaceId = tc.ctx.shared.default_space.into();

@@ -122,8 +122,7 @@ impl PureCall {
         };
 
         let lit = ctx.get_const(value, ic.size).id();
-        ctx.replace_all_uses_with(ValueId::Instruction(ic.insn_id), lit);
-        ctx.remove_instruction(ic.insn_id);
+        ctx.replace_instruction(ic.insn_id, lit);
         true
     }
 }

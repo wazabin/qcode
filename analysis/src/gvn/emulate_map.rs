@@ -51,8 +51,7 @@ impl EmulateMap {
         };
         match folded {
             Some(bytes) => {
-                ctx.replace_all_uses_with(ValueId::Instruction(ic.insn_id), bytes);
-                ctx.remove_instruction(ic.insn_id);
+                ctx.replace_instruction(ic.insn_id, bytes);
                 true
             }
             None => false,

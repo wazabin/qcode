@@ -87,8 +87,7 @@ impl crate::Pass for ArrayProject {
 crate::register_module_pass!(ArrayProject);
 
 fn replace(ctx: &mut Context, insn: qcode::value::InstructionId, with: ValueId) {
-    ctx.replace_all_uses_with(ValueId::Instruction(insn), with);
-    ctx.remove_instruction(insn);
+    ctx.replace_instruction(insn, with);
 }
 
 impl ArrayProject {

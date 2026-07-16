@@ -305,8 +305,7 @@ fn try_partial_inline(ctx: &mut Context, fid: FunctionId, call_sites: &[Instruct
             // Every `extract` of this field at this call site (usually one).
             for extract_id in extracts_by_index.remove(&inl.index).unwrap_or_default() {
                 let clone = clone_expr(ctx, extract_id, inl.value, &inl.order, &inputs, &args);
-                ctx.replace_all_uses_with(ValueId::Instruction(extract_id), clone);
-                ctx.remove_instruction(extract_id);
+                ctx.replace_instruction(extract_id, clone);
                 changed = true;
             }
         }

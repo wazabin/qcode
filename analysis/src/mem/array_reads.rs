@@ -249,8 +249,7 @@ fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &Rea
             at_ty,
         );
         body.insert_insn_before(block, *load_id, at_val);
-        body.replace_all_uses_with(ValueId::Instruction(*load_id), ValueId::Instruction(at_val));
-        body.remove_instruction(*load_id);
+        body.replace_instruction(*load_id, ValueId::Instruction(at_val));
     }
     body.remove_instruction(m.seed_id);
     true

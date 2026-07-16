@@ -1724,9 +1724,7 @@ impl<'str> Mem2Reg<'_, 'str> {
                         state.consumed_stores.insert(store_id);
                     }
                     load_value = self.resize_forwarded_load_value(block, insn_id, load_value, size);
-                    self.body
-                        .replace_all_uses_with(ValueId::Instruction(insn_id), load_value);
-                    self.body.remove_instruction(insn_id);
+                    self.body.replace_instruction(insn_id, load_value);
                     state.changed = true;
                 }
 

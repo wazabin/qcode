@@ -166,6 +166,15 @@ pub trait QCodeMut<'str> {
         self.function_mut(id.func).remove_instruction(id);
     }
 
+    /// Replace every use of instruction `id` with `new`, then remove `id` —
+    /// the standard "rewrite to a cheaper value" epilogue
+    /// ([`replace_all_uses_with`](Self::replace_all_uses_with) +
+    /// [`remove_instruction`](Self::remove_instruction)).
+    fn replace_instruction(&mut self, id: InstructionId, new: impl Into<ValueId>) {
+        self.function_mut(id.func)
+            .replace_instruction(id, new.into());
+    }
+
     /// Physically removes a set of instructions after pruning their operands
     /// from the reverse-use maps, grouped per owning function. Call after
     /// removing them from their parent blocks and unlinking any CFG edges owned
