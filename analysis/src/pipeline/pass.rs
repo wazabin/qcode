@@ -64,6 +64,13 @@ pub struct PipelineEnv {
     /// The stack-pointer *varnode* (`cfg.stack_pointer` resolved through
     /// `ctx.shared.registers`), cached so passes don't re-resolve it each call.
     pub sp_varnode: Option<VarnodeId>,
+    /// The loaded binary, shared with the loader when this is a live lift.
+    /// Passes read initialized memory (jump-table slots, `.rodata` constants)
+    /// through it. `None` for headless/textual runs; reloaded snapshots wrap
+    /// the deserialized `MemoryImage` instead. `Arc<dyn ...>` (the trait
+    /// carries `Send + Sync` bounds) so `&PipelineEnv` stays `Sync` for the
+    /// parallel driver.
+    pub binary: Option<std::sync::Arc<dyn binfmt::BinaryFormat>>,
     /// Function-independent register/varnode alias base, built once on first use and
     /// shared by reference across the per-function GVN/LICM/DCE/mem2reg runs (see
     /// [`PipelineEnv::alias_base`]). A `OnceLock` (not `RefCell`) so `&PipelineEnv`
@@ -75,9 +82,15 @@ pub struct PipelineEnv {
 impl PipelineEnv {
     /// Resolve the stack-pointer varnode from `cfg` against `ctx` once. No lifter:
     /// the lifting passes will be inert.
-    pub fn new(ctx: &Context, cfg: ArchConfig) -> Self {
+    pub fn new(
+        ctx: &Context,
+        cfg: ArchConfig,
+        binary: Option<std::sync::Arc<dyn binfmt::BinaryFormat>>,
+    ) -> Self {
         let sp_varnode = ctx.shared.registers[&cfg.stack_pointer];
-        Self::from_parts(cfg, sp_varnode)
+        let mut env = Self::from_parts(cfg, sp_varnode);
+        env.binary = binary;
+        env
     }
 
     /// Build an env for running arch-agnostic passes on hand-written IR (CLI and
@@ -104,6 +117,7 @@ impl PipelineEnv {
         Self {
             cfg,
             sp_varnode: sp_varnode.into(),
+            binary: None,
             alias_base: OnceLock::new(),
         }
     }

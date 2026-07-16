@@ -27,6 +27,7 @@ struct Args {
     passes: Vec<String>,
     input: Option<String>,
     output: Option<String>,
+    assume_libs: Vec<String>,
     list: bool,
 }
 
@@ -35,6 +36,7 @@ fn parse_args() -> Result<Args, String> {
         passes: Vec::new(),
         input: None,
         output: None,
+        assume_libs: Vec::new(),
         list: false,
     };
     let mut it = std::env::args().skip(1);
@@ -49,6 +51,12 @@ fn parse_args() -> Result<Args, String> {
             }
             "-o" | "--output" => {
                 args.output = Some(it.next().ok_or("expected a path after -o")?);
+            }
+            "--assume-libs" => {
+                let libs = it
+                    .next()
+                    .ok_or("expected library names after --assume-libs")?;
+                args.assume_libs.extend(libs.split(',').map(str::to_owned));
             }
             "-l" | "--list" => args.list = true,
             "-h" | "--help" => {
@@ -71,6 +79,8 @@ OPTIONS:
     -p, --pass <NAME>    Pass to run (repeatable; run in order over every function)
     -i, --input <FILE>   Read IR from FILE instead of stdin
     -o, --output <FILE>  Write IR to FILE instead of stdout
+    --assume-libs <A,B>  Assume the IR links these libraries (comma-separated),
+                         seeding the context's linked-libraries metadata
     -l, --list           List all registered passes and exit
     -h, --help           Show this help";
 
@@ -101,7 +111,12 @@ fn run() -> Result<(), String> {
     let mut ctx = Context::new();
     qcode::lower::lower_str(&mut ctx, &source).map_err(|e| format!("parse/lower: {e}"))?;
 
-    let env = PipelineEnv::headless(&ctx);
+    // Textual IR carries no import metadata; let the user assert it.
+    if !args.assume_libs.is_empty() && ctx.linked_libraries().is_empty() {
+        ctx.set_linked_libraries(args.assume_libs.clone());
+    }
+
+    let env = PipelineEnv::headless(&mut ctx);
     let mut analyses = qcode_analysis::AnalysisManager::default();
     for pass in &args.passes {
         let resolved = make_pass(pass)
@@ -114,7 +129,8 @@ fn run() -> Result<(), String> {
                 }
             }
             RegisteredPass::Module(p) => {
-                p.run_with_analyses(&mut ctx, &env, &mut analyses)
+                let targets = ctx.function_ids();
+                p.run_with_analyses(&mut ctx, &env, &targets, &mut analyses)
                     .map_err(|e| format!("pass `{pass}` failed: {e}"))?;
             }
         }

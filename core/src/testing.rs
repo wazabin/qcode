@@ -93,6 +93,19 @@ impl TestContext {
             r0_byte3,
         }
     }
+
+    /// Seed the context's linked-libraries metadata, the test-side analogue of
+    /// `--assume-libs` (synthetic contexts have no binary format to report
+    /// `DT_NEEDED`/import DLLs). Builder-style for one-line test setup.
+    pub fn assume_libs<I, S>(&mut self, libs: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.ctx
+            .set_linked_libraries(libs.into_iter().map(Into::into).collect());
+        self
+    }
 }
 
 impl Default for TestContext {

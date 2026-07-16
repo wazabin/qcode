@@ -49,9 +49,8 @@ pub use analysis_manager::{
 };
 pub(crate) use pass::with_body_mut;
 pub use pass::{
-    DecompilePass, DynDecompilePass, DynFunctionPass, DynPass, FunctionPass, FunctionPassAdapter,
-    ModulePassOutcome, Pass, PassRegistration,
-    PipelineEnv, RegisteredPass, known_pass_names, make_pass,
+    DynFunctionPass, DynPass, FunctionPass, FunctionPassAdapter, ModulePassOutcome, Pass,
+    PassRegistration, PipelineEnv, RegisteredPass, known_pass_names, make_pass,
 };
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -66,6 +65,11 @@ use crate::{
     assume_call_returns, learn_stack_facts, seed_stack_facts, verify_args_disjoint_caller_frame,
     verify_assumptions, verify_forced_returns,
 };
+
+/// A shared handle to the loaded binary, threaded from the lift entry points
+/// into every [`PipelineEnv`] the driver builds. `None` for headless/textual
+/// runs; reloaded snapshots wrap the deserialized `MemoryImage`.
+pub type BinaryHandle = std::sync::Arc<dyn binfmt::BinaryFormat>;
 
 /// Maximum checkpoint+replay rounds the overrides-aware driver attempts before
 /// giving up with [`PipelineError::NoConvergence`].
@@ -199,68 +203,26 @@ pub enum PipelineProgress {
     Finished,
 }
 
-/// Sink for [`PipelineProgress`] events emitted while a pipeline runs.
-///
-/// Replaces the bare `FnMut(PipelineProgress)` the driver used to thread through
-/// every stage. A blanket impl makes any such closure a `ProgressSink`, so callers
-/// (tests, the C ABI, the GUI) keep passing plain closures unchanged. Splitting it
-/// into a trait is what lets a later step add a cooperative yield hook alongside
-/// `report` without disturbing these call sites.
-pub trait ProgressSink {
-    /// Report one progress event. Synchronous; must not block.
-    fn report(&mut self, ev: PipelineProgress);
-
-    /// Cooperative yield point, awaited by the async driver between units of work
-    /// (once per function in `run_function_stage`). The default never suspends and
-    /// never cancels, so the synchronous `block_on` path and plain closures pay
-    /// nothing. A wasm sink overrides it to await the next animation frame and to
-    /// surface cancellation.
-    fn yield_now(&mut self) -> impl std::future::Future<Output = YieldSignal> + '_ {
-        std::future::ready(YieldSignal::Continue)
-    }
-}
-
-/// Result of a cooperative [`ProgressSink::yield_now`]: either keep running or stop
-/// early because the caller cancelled the in-flight analysis.
-pub enum YieldSignal {
-    Continue,
-    Cancelled,
-}
-
-impl<F: FnMut(PipelineProgress)> ProgressSink for F {
-    #[inline]
-    fn report(&mut self, ev: PipelineProgress) {
-        self(ev)
-    }
-}
-
 /// The default analysis pipeline system entry point: run the canonical
 /// [`DEFAULT_PIPELINE_TOML`] pipeline over the whole program under checkpoint+replay.
 ///
 /// `baseline` is the freshly-lifted IR (no speculation); the converged, optimized
 /// context is returned.
-pub fn analyze_default<'s>(baseline: &Context<'s>, cfg: &ArchConfig) -> Context<'s> {
-    pollster::block_on(analyze_default_async(baseline, cfg))
-}
-
-pub async fn analyze_default_async<'s>(baseline: &Context<'s>, cfg: &ArchConfig) -> Context<'s> {
-    analyze_default_with_progress_async(baseline, cfg, |_| {}).await
+pub fn analyze_default<'s>(
+    baseline: &Context<'s>,
+    cfg: &ArchConfig,
+    binary: Option<BinaryHandle>,
+) -> Context<'s> {
+    analyze_default_with_progress(baseline, cfg, binary, |_| {})
 }
 
 pub fn analyze_default_with_progress<'s>(
     baseline: &Context<'s>,
     cfg: &ArchConfig,
-    progress: impl ProgressSink,
+    binary: Option<BinaryHandle>,
+    progress: impl FnMut(PipelineProgress),
 ) -> Context<'s> {
-    pollster::block_on(analyze_default_with_progress_async(baseline, cfg, progress))
-}
-
-pub async fn analyze_default_with_progress_async<'s>(
-    baseline: &Context<'s>,
-    cfg: &ArchConfig,
-    progress: impl ProgressSink,
-) -> Context<'s> {
-    analyze_with_pipeline_with_progress_async(baseline, cfg, &Pipeline::default(), progress).await
+    analyze_with_pipeline_with_progress(baseline, cfg, &Pipeline::default(), binary, progress)
 }
 
 /// Run an arbitrary parsed `pipeline` over the whole program under the same
@@ -269,43 +231,26 @@ pub fn analyze_with_pipeline<'s>(
     baseline: &Context<'s>,
     cfg: &ArchConfig,
     pipeline: &Pipeline,
+    binary: Option<BinaryHandle>,
 ) -> Context<'s> {
-    pollster::block_on(analyze_with_pipeline_async(baseline, cfg, pipeline))
-}
-
-pub async fn analyze_with_pipeline_async<'s>(
-    baseline: &Context<'s>,
-    cfg: &ArchConfig,
-    pipeline: &Pipeline,
-) -> Context<'s> {
-    analyze_with_pipeline_with_progress_async(baseline, cfg, pipeline, |_| {}).await
+    analyze_with_pipeline_with_progress(baseline, cfg, pipeline, binary, |_| {})
 }
 
 pub fn analyze_with_pipeline_with_progress<'s>(
     baseline: &Context<'s>,
     cfg: &ArchConfig,
     pipeline: &Pipeline,
-    progress: impl ProgressSink,
+    binary: Option<BinaryHandle>,
+    progress: impl FnMut(PipelineProgress),
 ) -> Context<'s> {
-    pollster::block_on(analyze_with_pipeline_with_progress_async(
-        baseline, cfg, pipeline, progress,
-    ))
-}
-
-pub async fn analyze_with_pipeline_with_progress_async<'s>(
-    baseline: &Context<'s>,
-    cfg: &ArchConfig,
-    pipeline: &Pipeline,
-    progress: impl ProgressSink,
-) -> Context<'s> {
-    analyze_and_lift_with_progress_async(
+    analyze_and_lift_with_progress(
         baseline,
         cfg,
         pipeline,
         PipelineServices::none(),
+        binary,
         progress,
     )
-    .await
 }
 
 /// The checkpoint+replay driver, with two contexts and lifting folded in.
@@ -325,29 +270,18 @@ pub fn analyze_and_lift_with_progress<'s>(
     cfg: &ArchConfig,
     pipeline: &Pipeline,
     services: PipelineServices<'_>,
-    progress: impl ProgressSink,
+    binary: Option<BinaryHandle>,
+    progress: impl FnMut(PipelineProgress),
 ) -> Context<'s> {
-    pollster::block_on(analyze_and_lift_with_progress_async(
-        baseline, cfg, pipeline, services, progress,
-    ))
-}
-
-pub async fn analyze_and_lift_with_progress_async<'s>(
-    baseline: &Context<'s>,
-    cfg: &ArchConfig,
-    pipeline: &Pipeline,
-    services: PipelineServices<'_>,
-    progress: impl ProgressSink,
-) -> Context<'s> {
-    analyze_with_progress_async(
+    analyze_with_progress(
         baseline,
         cfg,
         pipeline,
         services,
+        binary,
         &std::collections::HashMap::default(),
         progress,
     )
-    .await
     .expect("a run with no overrides is infallible")
 }
 
@@ -369,30 +303,18 @@ pub fn analyze_with_progress<'s>(
     baseline: &Context<'s>,
     cfg: &ArchConfig,
     pipeline: &Pipeline,
-    services: PipelineServices<'_>,
-    overrides: &std::collections::HashMap<Proposition, bool>,
-    progress: impl ProgressSink,
-) -> Result<Context<'s>, PipelineError> {
-    pollster::block_on(analyze_with_progress_async(
-        baseline, cfg, pipeline, services, overrides, progress,
-    ))
-}
-
-pub async fn analyze_with_progress_async<'s>(
-    baseline: &Context<'s>,
-    cfg: &ArchConfig,
-    pipeline: &Pipeline,
     mut services: PipelineServices<'_>,
+    binary: Option<BinaryHandle>,
     overrides: &std::collections::HashMap<Proposition, bool>,
-    mut progress: impl ProgressSink,
+    mut progress: impl FnMut(PipelineProgress),
 ) -> Result<Context<'s>, PipelineError> {
     let lifting = services.lifter.is_some();
-    progress.report(PipelineProgress::Started);
+    progress(PipelineProgress::Started);
 
     if !lifting {
         let analyzed =
-            run_analysis_fixpoint(baseline, cfg, pipeline, overrides, &mut progress).await?;
-        progress.report(PipelineProgress::Finished);
+            run_analysis_fixpoint(baseline, cfg, pipeline, &binary, overrides, &mut progress)?;
+        progress(PipelineProgress::Finished);
         return Ok(analyzed);
     }
 
@@ -406,17 +328,17 @@ pub async fn analyze_with_progress_async<'s>(
             cfg,
             pipeline,
             &mut services,
+            &binary,
             &mut discovery_round,
             &mut progress,
-        )
-        .await;
+        );
 
         let mut analyzed =
-            run_analysis_fixpoint(&clean, cfg, pipeline, overrides, &mut progress).await?;
+            run_analysis_fixpoint(&clean, cfg, pipeline, &binary, overrides, &mut progress)?;
         // Stop on a clean fixpoint, or bail out best-effort if lifting could not
         // converge (round cap / error) — never panic on input-dependent paths.
         if !converged || analyzed.has_no_discoveries() {
-            progress.report(PipelineProgress::Finished);
+            progress(PipelineProgress::Finished);
             return Ok(analyzed);
         }
 
@@ -430,21 +352,22 @@ pub async fn analyze_with_progress_async<'s>(
         "analyze/lift did not converge after {MAX_ANALYZE_LIFT_ROUNDS} rounds; returning best-effort analysis of the most-grown IR ({} pending discoveries)",
         clean.discoveries().count(),
     );
-    let analyzed = run_analysis_fixpoint(&clean, cfg, pipeline, overrides, &mut progress).await?;
-    progress.report(PipelineProgress::Finished);
+    let analyzed = run_analysis_fixpoint(&clean, cfg, pipeline, &binary, overrides, &mut progress)?;
+    progress(PipelineProgress::Finished);
     Ok(analyzed)
 }
 
 /// Grow the clean IR until address discovery is quiet for this analysis round.
 /// Returns `true` on a clean fixpoint, `false` if it bailed best-effort (round
 /// cap reached) so the caller can return the most-grown analysis without panicking.
-async fn lift_and_discover_until_quiet(
+fn lift_and_discover_until_quiet(
     clean: &mut Context<'_>,
     cfg: &ArchConfig,
     pipeline: &Pipeline,
     services: &mut PipelineServices<'_>,
+    binary: &Option<BinaryHandle>,
     discovery_round: &mut usize,
-    progress: &mut impl ProgressSink,
+    progress: &mut impl FnMut(PipelineProgress),
 ) -> bool {
     // Fingerprint of each function's clean IR as analyzed in the previous discovery
     // round. Address discovery is function-local and deterministic, so a function whose
@@ -464,7 +387,7 @@ async fn lift_and_discover_until_quiet(
         }
         *discovery_round += 1;
         let round = *discovery_round;
-        progress.report(PipelineProgress::AssumptionRound { round });
+        progress(PipelineProgress::AssumptionRound { round });
         log::info!(target: "pipeline", "discovery round {round} starting");
         #[cfg(not(target_arch = "wasm32"))]
         let started = std::time::Instant::now();
@@ -472,11 +395,8 @@ async fn lift_and_discover_until_quiet(
         // Lifting phase: grow the raw clean IR through the TOML-configured
         // pre-barrier stages. Newly discovered addresses are drained by the
         // ordinary `lift_new_addresses` pass.
-        let env = PipelineEnv::new(clean, cfg.clone());
-        if let Err(e) = pipeline
-            .run_lifting_phase_async(clean, &env, services, round, progress)
-            .await
-        {
+        let env = PipelineEnv::new(clean, cfg.clone(), binary.clone());
+        if let Err(e) = pipeline.run_lifting_phase(clean, &env, services, round, progress) {
             log::warn!(target: "pipeline", "lifting phase failed, continuing best-effort: {e}");
         }
 
@@ -509,17 +429,14 @@ async fn lift_and_discover_until_quiet(
         // Discoveries found here are the only durable output; analysis residue is
         // discarded so newly lifted blocks invalidate the whole owning function.
         let mut ctx = clean.clone();
-        let analysis_env = PipelineEnv::new(clean, cfg.clone());
-        if let Err(e) = pipeline
-            .run_address_discovery_phase_async(
-                &mut ctx,
-                &analysis_env,
-                Some(&restrict),
-                round,
-                progress,
-            )
-            .await
-        {
+        let analysis_env = PipelineEnv::new(clean, cfg.clone(), binary.clone());
+        if let Err(e) = pipeline.run_address_discovery_phase(
+            &mut ctx,
+            &analysis_env,
+            Some(&restrict),
+            round,
+            progress,
+        ) {
             log::warn!(target: "pipeline", "address discovery pass failed, continuing best-effort: {e}");
         }
 
@@ -562,19 +479,20 @@ async fn lift_and_discover_until_quiet(
 /// facts to contradict) and the loop is unbounded.
 ///
 /// Emits no `Started`/`Finished` progress — the top-level driver brackets those.
-async fn run_analysis_fixpoint<'s>(
+fn run_analysis_fixpoint<'s>(
     baseline: &Context<'s>,
     cfg: &ArchConfig,
     pipeline: &Pipeline,
+    binary: &Option<BinaryHandle>,
     overrides: &std::collections::HashMap<Proposition, bool>,
-    progress: &mut impl ProgressSink,
+    progress: &mut impl FnMut(PipelineProgress),
 ) -> Result<Context<'s>, PipelineError> {
     // Strict IR locality (context-split ruling 2) is an invariant of construction:
     // the lifter emits tail calls for inter-procedural transfers and splits at
     // shared/mid-function landings, so `baseline` — whether lifted, parsed from
     // textual IR, or wasm-produced — already holds no foreign block reference. No
     // entry normalization is needed.
-    let env = PipelineEnv::new(baseline, cfg.clone());
+    let env = PipelineEnv::new(baseline, cfg.clone(), binary.clone());
     let bounded = !overrides.is_empty();
     // User overrides carry a synthetic "override" provenance so the converged
     // context attributes a forced fact to the user, not the re-seeding driver.
@@ -586,7 +504,7 @@ async fn run_analysis_fixpoint<'s>(
 
     loop {
         round += 1;
-        progress.report(PipelineProgress::AssumptionRound { round });
+        progress(PipelineProgress::AssumptionRound { round });
         log::info!(target: "pipeline", "assumption round {round} starting");
         #[cfg(not(target_arch = "wasm32"))]
         let started = std::time::Instant::now();
@@ -610,9 +528,9 @@ async fn run_analysis_fixpoint<'s>(
         // here on the raw baseline. It is verified below (and rolled back if a
         // caller is proven to pass a colliding pointer).
         let sp_reg = ctx.shared.registers.get(&cfg.stack_pointer).copied();
-        progress.report(PipelineProgress::AssumptionsRecorded { round, count });
+        progress(PipelineProgress::AssumptionsRecorded { round, count });
 
-        if let Err(e) = pipeline.run_async(&mut ctx, &env, round, progress).await {
+        if let Err(e) = pipeline.run(&mut ctx, &env, round, progress) {
             // A `repeat_until` stage that never settles is an input-dependent
             // property of one function's IR, not a compiler bug. Rather than
             // panic and lose everything, halt the pipeline best-effort: the
@@ -633,7 +551,7 @@ async fn run_analysis_fixpoint<'s>(
             panic!("pipeline pass failed: {e}");
         }
 
-        progress.report(PipelineProgress::WholeProgramPhase {
+        progress(PipelineProgress::WholeProgramPhase {
             round,
             stage: "verify".into(),
             pass: "verify_assumptions",
@@ -720,14 +638,16 @@ pub fn analyze_with_overrides_with_progress<'s>(
     baseline: &Context<'s>,
     cfg: &ArchConfig,
     pipeline: &Pipeline,
+    binary: Option<BinaryHandle>,
     overrides: &std::collections::HashMap<Proposition, bool>,
-    progress: impl ProgressSink,
+    progress: impl FnMut(PipelineProgress),
 ) -> Result<Context<'s>, PipelineError> {
     analyze_with_progress(
         baseline,
         cfg,
         pipeline,
         PipelineServices::none(),
+        binary,
         overrides,
         progress,
     )

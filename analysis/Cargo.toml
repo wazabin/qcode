@@ -12,6 +12,7 @@ win32 = ["cabi/win32"]
 
 [dependencies]
 jstd.workspace = true
+binfmt.workspace = true
 qcode.workspace = true
 cabi.workspace = true
 serde.workspace = true

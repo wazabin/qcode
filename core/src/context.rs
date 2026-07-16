@@ -173,6 +173,14 @@ pub struct Shared<'str> {
     #[serde(default)]
     pub(crate) target_os: TargetOs,
 
+    /// Library names the loaded binary links against (ELF `DT_NEEDED` sonames,
+    /// PE import-directory DLL names), stamped by the loader alongside
+    /// `target_os`, or seeded via `--assume-libs` when the format reports none.
+    /// Serialized so reloaded snapshots re-run prototype-table selection
+    /// correctly. Empty for synthetic contexts.
+    #[serde(default)]
+    pub(crate) linked_libraries: Vec<String>,
+
     /// Entry addresses of functions the user asked to skip optimizing (via the
     /// `--ignore` flag). Such functions are still lifted, but every per-function
     /// analysis pass skips them. Rides through clone so it survives the
@@ -395,6 +403,18 @@ impl<'str> Context<'str> {
     /// The loaded binary's operating system, or [`TargetOs::Unknown`].
     pub fn target_os(&self) -> TargetOs {
         self.shared.target_os
+    }
+
+    /// Records the library names the binary links against (set by the loader
+    /// from the container format, or by `--assume-libs`).
+    pub fn set_linked_libraries(&mut self, libs: Vec<String>) {
+        self.shared.linked_libraries = libs;
+    }
+
+    /// Library names the loaded binary links against (ELF `DT_NEEDED` sonames,
+    /// PE import DLL names). Empty when unknown.
+    pub fn linked_libraries(&self) -> &[String] {
+        &self.shared.linked_libraries
     }
 
     /// Replaces the spaces registry wholesale. Intended for initialization from a pre-built spec.
