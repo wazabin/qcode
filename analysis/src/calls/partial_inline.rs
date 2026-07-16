@@ -70,16 +70,17 @@ const MAX_INLINE_INSNS: usize = 10;
 /// fields is left to [`dead_signature`](super::dead_signature).
 pub fn partial_inline(ctx: &mut Context) -> bool {
     let targets = ctx.function_ids();
-    !partial_inline_changed_functions(ctx, &targets).is_empty()
+    let graph = crate::CallGraph::analyze(ctx);
+    !partial_inline_changed_functions(ctx, &targets, &graph).is_empty()
 }
 
 fn partial_inline_changed_functions(
     ctx: &mut Context,
     targets: &[FunctionId],
+    graph: &crate::CallGraph,
 ) -> rustc_hash::FxHashSet<FunctionId> {
     let mut changed = rustc_hash::FxHashSet::default();
     let target_set: rustc_hash::FxHashSet<_> = targets.iter().copied().collect();
-    let graph = crate::CallGraph::analyze(ctx);
     for fid in ctx.function_ids() {
         if !FunctionBody::from_id(ctx, fid).is_pure_reg() {
             continue;
@@ -87,7 +88,7 @@ fn partial_inline_changed_functions(
         let callers = graph.callers(fid);
         if !callers.is_empty()
             && callers.iter().all(|id| target_set.contains(id))
-            && try_partial_inline(ctx, fid, &super::direct_call_sites(ctx, &graph, fid))
+            && try_partial_inline(ctx, fid, &super::direct_call_sites(ctx, graph, fid))
         {
             changed.extend(callers);
         }
@@ -382,9 +383,30 @@ impl Pass for PartialInline {
         _env: &PipelineEnv,
         targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        let graph = crate::CallGraph::analyze(ctx);
         Ok(
-            crate::ModulePassOutcome::functions(partial_inline_changed_functions(ctx, targets))
-                .preserving_global::<crate::AddressAnalysis>(),
+            crate::ModulePassOutcome::functions(partial_inline_changed_functions(
+                ctx, targets, &graph,
+            ))
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>(),
+        )
+    }
+
+    fn run_with_analyses(
+        &self,
+        ctx: &mut Context,
+        _env: &PipelineEnv,
+        targets: &[FunctionId],
+        analyses: &mut crate::AnalysisManager,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        let graph = analyses.global::<crate::CallGraphAnalysis>(ctx);
+        Ok(
+            crate::ModulePassOutcome::functions(partial_inline_changed_functions(
+                ctx, targets, graph,
+            ))
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>(),
         )
     }
 }

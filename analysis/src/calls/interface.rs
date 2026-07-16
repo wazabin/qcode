@@ -112,7 +112,7 @@ pub fn append_caller_arg(
     append_caller_arg_at_sites(ctx, &call_sites, build)
 }
 
-fn append_caller_arg_at_sites(
+pub(crate) fn append_caller_arg_at_sites(
     ctx: &mut Context,
     call_sites: &[InstructionId],
     mut build: impl FnMut(&mut Context, InstructionId, BlockId) -> Option<ValueId>,

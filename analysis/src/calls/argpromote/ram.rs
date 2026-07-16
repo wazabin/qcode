@@ -1,4 +1,3 @@
-use qcode::value::QCodeMut;
 use std::borrow::Cow;
 use std::collections::HashSet;
 
@@ -87,13 +86,18 @@ pub fn argpromote(ctx: &mut Context) -> bool {
 /// frame locals are destroyed at return, so the caller can never observe writes to
 /// them (they are dead on exit). The redirected shadow store is left to DCE.
 pub fn argpromote_with_sp(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> bool {
-    !argpromote_changed_functions_with_sp(ctx, sp_reg).is_empty()
+    let targets = ctx.function_ids();
+    let graph = crate::CallGraph::analyze(ctx);
+    !argpromote_changed_functions_with_sp(ctx, sp_reg, &targets, &graph).is_empty()
 }
 
 fn argpromote_changed_functions_with_sp(
     ctx: &mut Context,
     sp_reg: Option<VarnodeId>,
+    targets: &[FunctionId],
+    graph: &crate::CallGraph,
 ) -> FxHashSet<FunctionId> {
+    let target_set: FxHashSet<_> = targets.iter().copied().collect();
     let mut changed = FxHashSet::default();
     // Both channels gate every function on being address-taken; build that set once
     // (O(instructions)) instead of rescanning the whole program per function. It
@@ -104,19 +108,25 @@ fn argpromote_changed_functions_with_sp(
     // callee (see [`function_makes_blocking_call`]), and that callee must already
     // be promoted — its own loads gone — for the caller to qualify. One visit per
     // function (no fixpoint), so an already-promoted body is never re-promoted.
-    let graph = crate::CallGraph::analyze(ctx);
-    let order = callee_first_order(ctx, &graph);
+    let order = callee_first_order(ctx, graph);
     for fid in order {
+        if !target_set.contains(&fid) {
+            continue;
+        }
+        let callers = graph.callers(fid);
+        if callers.iter().any(|id| !target_set.contains(id)) {
+            continue;
+        }
         // Lift constant-address (global) accesses into params first, so the freshly
         // param-relative derefs are visible to `try_promote`'s footprint scan in the
         // same visit.
         if super::globals::globalize_constants(ctx, &address_taken, fid) {
             changed.insert(fid);
-            changed.extend(graph.callers(fid));
+            changed.extend(callers.iter().copied());
         }
-        if try_promote(ctx, fid, sp_reg, &address_taken) {
+        if try_promote(ctx, fid, sp_reg, &address_taken, graph) {
             changed.insert(fid);
-            changed.extend(graph.callers(fid));
+            changed.extend(callers);
         }
     }
     changed
@@ -218,6 +228,7 @@ fn try_promote(
     fid: FunctionId,
     sp_reg: Option<VarnodeId>,
     address_taken: &FxHashSet<FunctionId>,
+    graph: &crate::CallGraph,
 ) -> bool {
     let f = FunctionBody::from_id(ctx, fid);
     if f.is_external() {
@@ -380,7 +391,8 @@ fn try_promote(
             "argpromote {}: partial (inputs-only) — footprint not fully modelled",
             FunctionBody::from_id(ctx, fid).name(),
         );
-        return apply_partial(ctx, fid, &promoted);
+        let call_sites = crate::calls::direct_call_sites(ctx, graph, fid);
+        return apply_partial(ctx, fid, &promoted, &call_sites);
     }
     qcode::pass_log!(
         debug,
@@ -401,7 +413,8 @@ fn try_promote(
         return false;
     }
 
-    apply(ctx, fid, promoted, sp_reg)
+    let call_sites = crate::calls::direct_call_sites(ctx, graph, fid);
+    apply(ctx, fid, promoted, sp_reg, &call_sites)
 }
 
 /// Whether every real-memory (default-space) load/store in `fid` is captured by
@@ -716,8 +729,8 @@ fn apply(
     fid: FunctionId,
     mut promoted: Vec<Promoted>,
     sp_reg: Option<VarnodeId>,
+    call_sites: &[InstructionId],
 ) -> bool {
-    let call_sites = crate::calls::fresh_direct_call_sites(ctx, fid);
     if call_sites.is_empty() {
         return false;
     }
@@ -883,7 +896,7 @@ fn apply(
             Some(name),
             None,
             s.type_id,
-            None,
+            Some(call_sites),
             shadow,
             move |b| seed_addr(b, base, base_size, offset),
             move |ctx, call_id, block| {
@@ -939,7 +952,7 @@ fn apply(
         ctx,
         fid,
         &write_slots,
-        None,
+        Some(call_sites),
         true,
         |i, _| {
             vec![
@@ -993,8 +1006,12 @@ fn seed_addr(b: &mut Builder<'_, '_>, base: ValueId, base_size: usize, offset: i
 /// skipped, so re-visiting an already-partially-promoted function adds nothing and
 /// the `mark-pure` `repeat_until = no_change` loop settles. Returns `true` only if a
 /// new snapshot was added.
-fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> bool {
-    let call_sites = crate::calls::fresh_direct_call_sites(ctx, fid);
+fn apply_partial(
+    ctx: &mut Context,
+    fid: FunctionId,
+    promoted: &[Promoted],
+    call_sites: &[InstructionId],
+) -> bool {
     if call_sites.is_empty() {
         return false;
     }
@@ -1085,7 +1102,7 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
     // Each snapshot is loaded from `arg + offset` in real ram — the same address the
     // callee re-seeds, relocated to the caller (faithful: the base is a by-value
     // param identical on both sides).
-    for call_id in call_sites {
+    for &call_id in call_sites {
         let Some(call_block) = ctx.get_insn(call_id).parent().map(|b| b.id) else {
             continue;
         };
@@ -1149,12 +1166,34 @@ impl Pass for ArgPromote {
         &self,
         ctx: &mut Context,
         env: &PipelineEnv,
+        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         let sp_reg = ctx.shared.registers.get(&env.cfg.stack_pointer).copied();
+        let graph = crate::CallGraph::analyze(ctx);
         Ok(
-            crate::ModulePassOutcome::functions(argpromote_changed_functions_with_sp(ctx, sp_reg))
-                .preserving_global::<crate::CallGraphAnalysis>()
-                .preserving_global::<crate::AddressAnalysis>(),
+            crate::ModulePassOutcome::functions(argpromote_changed_functions_with_sp(
+                ctx, sp_reg, targets, &graph,
+            ))
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>(),
+        )
+    }
+
+    fn run_with_analyses(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+        targets: &[FunctionId],
+        analyses: &mut crate::AnalysisManager,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        let sp_reg = ctx.shared.registers.get(&env.cfg.stack_pointer).copied();
+        let graph = analyses.global::<crate::CallGraphAnalysis>(ctx);
+        Ok(
+            crate::ModulePassOutcome::functions(argpromote_changed_functions_with_sp(
+                ctx, sp_reg, targets, graph,
+            ))
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>(),
         )
     }
 }

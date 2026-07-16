@@ -323,9 +323,8 @@ impl<'str> Walk<'_, 'str> {
         body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         block_id: BlockId,
-        inherited: &[Box<dyn Any>],
+        mut states: Vec<Box<dyn Any>>,
     ) {
-        let mut states = clone_states(self.passes, inherited);
         let is_shared = self.shared.contains(&block_id);
         for (pass, state) in self.passes.iter().zip(states.iter_mut()) {
             pass.on_block_entry(
@@ -358,11 +357,30 @@ impl<'str> Walk<'_, 'str> {
                 self.numbering,
             );
         }
-        for &child in self.tree.children_of(block_id) {
+        let owner = self.owner;
+        let mut children = self
+            .tree
+            .children_of(block_id)
+            .iter()
+            .copied()
             // Ownership is derived from the storing arena (`child.func`).
-            if child.func == self.owner {
-                self.rec(body, cx, child, &states);
-            }
+            .filter(|child| child.func == owner)
+            .peekable();
+        let mut remaining_states = Some(states);
+        while let Some(child) = children.next() {
+            // The parent snapshot is dead after its children have been seeded.
+            // Clone it only for sibling branches; the final child can take the
+            // original state. Linear dominator chains therefore allocate no
+            // state clones at all.
+            let child_states = if children.peek().is_some() {
+                clone_states(
+                    self.passes,
+                    remaining_states.as_ref().expect("parent GVN state"),
+                )
+            } else {
+                remaining_states.take().expect("parent GVN state")
+            };
+            self.rec(body, cx, child, child_states);
         }
     }
 }
@@ -415,7 +433,7 @@ pub(super) fn run_dominator_walk<'str>(
             owner: func_id,
             changed: false,
         };
-        walk.rec(body, cx, entry, &init_states(passes));
+        walk.rec(body, cx, entry, init_states(passes));
         changed |= walk.changed;
     }
     changed
@@ -423,6 +441,9 @@ pub(super) fn run_dominator_walk<'str>(
 
 #[cfg(test)]
 mod tests {
+    use std::{any::Any, cell::Cell, rc::Rc};
+
+    use super::{Claim, Editor, InsnCtx, SubPass, run_dominator_walk};
     use crate::AliasResult;
     use crate::gvn::gvn_function;
     use qcode::{
@@ -431,6 +452,56 @@ mod tests {
         value::{BasicBlock, FunctionBody, Value, ValueId},
     };
     use qcode_macro::qcode;
+
+    struct CountStateClones(Rc<Cell<usize>>);
+
+    impl<'str> SubPass<'str> for CountStateClones {
+        fn init_state(&self) -> Box<dyn Any> {
+            Box::new(())
+        }
+
+        fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
+            self.0.set(self.0.get() + 1);
+            Box::new(())
+        }
+
+        fn on_insn(
+            &self,
+            _body: &mut FunctionBody<'str>,
+            _cx: crate::ContextView<'_, 'str>,
+            _state: &mut dyn Any,
+            _ic: &InsnCtx,
+            _ed: &mut Editor,
+        ) -> Claim {
+            Claim::Pass
+        }
+    }
+
+    #[test]
+    fn linear_dominator_walk_moves_state_without_cloning() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                fn linear:
+                    <entry>
+                        goto <middle>;
+                    <middle>
+                        goto <exit>;
+                    <exit>
+                        return at 0x1000;
+            "
+        );
+
+        let clones = Rc::new(Cell::new(0));
+        let passes: Vec<Box<dyn SubPass<'_>>> =
+            vec![Box::new(CountStateClones(Rc::clone(&clones)))];
+        crate::with_body_mut(&mut ctx, linear, |body, cx| {
+            run_dominator_walk(body, cx, linear, &passes, None);
+        });
+
+        assert_eq!(clones.get(), 0);
+    }
 
     /// A `call` is a block terminator with no CFG edge to its fall-through, so
     /// the post-call block is unreachable from the function root. `gvn_function`

@@ -30,7 +30,6 @@
 //! As with `argpromote`, a caller in code we never disassembled would still bind
 //! to the old shape; that gap is accepted and unguarded.
 
-use qcode::value::QCodeMut;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{
@@ -42,10 +41,7 @@ use qcode::{
     },
 };
 
-use crate::{
-    AnalysisManager, CallGraph, CallGraphAnalysis, Pass, PipelineEnv,
-    calls::interface::remove_entry_params_at_sites,
-};
+use crate::{CallGraph, Pass, PipelineEnv, calls::interface::remove_entry_params_at_sites};
 
 /// Bound on worklist iterations: each *changing* iteration strictly removes at
 /// least one param or returned field (a quantity bounded by the module), so this
@@ -55,15 +51,21 @@ const MAX_ITERS: usize = 100_000;
 /// Trim dead args and dead returned fields from every `pure_reg` function,
 /// rewriting all direct call sites. Returns `true` if anything changed.
 pub fn dead_signature(ctx: &mut Context) -> bool {
+    let targets = ctx.function_ids();
     let graph = CallGraph::analyze(ctx);
-    !dead_signature_changed_functions(ctx, &graph).is_empty()
+    !dead_signature_changed_functions(ctx, &targets, &graph).is_empty()
 }
 
-fn dead_signature_changed_functions(ctx: &mut Context, graph: &CallGraph) -> HashSet<FunctionId> {
+fn dead_signature_changed_functions(
+    ctx: &mut Context,
+    targets: &[FunctionId],
+    graph: &CallGraph,
+) -> HashSet<FunctionId> {
     let mut changed = HashSet::default();
-    let mut worklist: Vec<FunctionId> = ctx
-        .function_ids()
-        .into_iter()
+    let target_set: HashSet<_> = targets.iter().copied().collect();
+    let mut worklist: Vec<FunctionId> = targets
+        .iter()
+        .copied()
         .filter(|&f| FunctionBody::from_id(ctx, f).is_pure_reg())
         .collect();
     let mut queued: HashSet<_> = worklist.iter().copied().collect();
@@ -82,6 +84,12 @@ fn dead_signature_changed_functions(ctx: &mut Context, graph: &CallGraph) -> Has
             break;
         }
         if !FunctionBody::from_id(ctx, fid).is_pure_reg() {
+            continue;
+        }
+        if direct_call_sites(ctx, fid, &call_index)
+            .iter()
+            .any(|site| !target_set.contains(&site.func))
+        {
             continue;
         }
 
@@ -347,12 +355,15 @@ impl Pass for DeadSignature {
         &self,
         ctx: &mut Context,
         _env: &PipelineEnv,
+        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         let graph = CallGraph::analyze(ctx);
         Ok(
-            crate::ModulePassOutcome::functions(dead_signature_changed_functions(ctx, &graph))
-                .preserving_global::<CallGraphAnalysis>()
-                .preserving_global::<crate::AddressAnalysis>(),
+            crate::ModulePassOutcome::functions(dead_signature_changed_functions(
+                ctx, targets, &graph,
+            ))
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>(),
         )
     }
 
@@ -360,13 +371,16 @@ impl Pass for DeadSignature {
         &self,
         ctx: &mut Context,
         _env: &PipelineEnv,
-        analyses: &mut AnalysisManager,
+        targets: &[FunctionId],
+        analyses: &mut crate::AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
-        let graph = analyses.global::<CallGraphAnalysis>(ctx);
+        let graph = analyses.global::<crate::CallGraphAnalysis>(ctx);
         Ok(
-            crate::ModulePassOutcome::functions(dead_signature_changed_functions(ctx, graph))
-                .preserving_global::<CallGraphAnalysis>()
-                .preserving_global::<crate::AddressAnalysis>(),
+            crate::ModulePassOutcome::functions(dead_signature_changed_functions(
+                ctx, targets, graph,
+            ))
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>(),
         )
     }
 }
@@ -470,12 +484,12 @@ mod tests {
     #[test]
     fn drops_unread_argument() {
         let mut tc = qcode::testing::TestContext::new();
-        let (vr0, vr1, vr2) = (tc.r0, tc.r1, tc.r2);
+        let (vr0, vr1) = (tc.r0, tc.r1);
         qcode!(
             tc.ctx,
             "
             fn f:
-                <entry @r0:i64 @r1:i64 @r2:i64>
+                <entry @r0:i64 @r1:i64>
                     return at i64 0;
 
             fn g:
@@ -491,30 +505,29 @@ mod tests {
         // Production names each promoted register param after its register (so
         // `input_arg_name(i)` matches the param); the qcode macro leaves them
         // unnamed, so mirror the naming here. Params are positional: [0]↔r0,
-        // [1]↔r1, [2]↔r2.
+        // [1]↔r1.
         let param_ids: Vec<ValueId> = BasicBlock::from_id(&tc.ctx, entry)
             .params()
             .map(|p| p.id())
             .collect();
-        for (pv, name) in param_ids.iter().zip(["r0", "r1", "r2"]) {
+        for (pv, name) in param_ids.iter().zip(["r0", "r1"]) {
             if let ValueId::BlockParam(pid) = pv {
                 tc.ctx.block_param_mut(*pid).name = Some(std::borrow::Cow::Owned(name.into()));
             }
         }
-        // f returns a one-field write-set of its r1 param; r0 and r2 are unused
+        // f returns a one-field write-set of its r1 param; the r0 param is unused
         // (the post-mem2reg pure-reg shape: the body reads params, not varnodes).
         let r1_param = param_ids[1];
         let agg = make_pure_reg_return(
             &mut tc,
             f,
-            vec![vr0, vr1, vr2],
+            vec![vr0, vr1],
             vec![("o0".to_owned(), r1_param)],
         );
 
         let a = tc.ctx.get_const(0x10, 8).id();
         let b = tc.ctx.get_const(0x20, 8).id();
-        let c = tc.ctx.get_const(0x30, 8).id();
-        let call_id = set_call(&mut tc, g_call, f, vec![a, b, c]);
+        let call_id = set_call(&mut tc, g_call, f, vec![a, b]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
         // Keep the single return field live so only the arg trim fires.
         Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg);

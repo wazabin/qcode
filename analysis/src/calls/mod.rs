@@ -35,6 +35,7 @@ pub use argpromote::{
 pub use call_graph::{CallEdge, CallEdgeId, CallGraph, CallGraphAnalysis, CallKind, CallTarget};
 pub use clobbered::{compute_clobbered_regs, set_clobbered_regs};
 pub use dead_signature::dead_signature;
+pub(crate) use interface::append_caller_arg_at_sites;
 pub use interface::{append_caller_arg, append_entry_param, remove_entry_param};
 pub use mem_effects::set_all_written_spaces;
 pub(crate) use outline::inline_pure_body;

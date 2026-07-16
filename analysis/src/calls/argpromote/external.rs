@@ -27,7 +27,7 @@ use qcode::{
 
 use cabi::{AbiTarget, CType, Platform};
 
-use super::super::append_caller_arg;
+use super::super::append_caller_arg_at_sites;
 use crate::pipeline::CallingConvention;
 use crate::{Pass, PipelineEnv};
 
@@ -164,7 +164,10 @@ fn plan_args(
 fn argpromote_external_changed_functions(
     ctx: &mut Context,
     env: &PipelineEnv,
+    targets: &[FunctionId],
+    graph: &crate::CallGraph,
 ) -> rustc_hash::FxHashSet<FunctionId> {
+    let target_set: rustc_hash::FxHashSet<_> = targets.iter().copied().collect();
     let platform = match env.cfg.os {
         qcode::context::TargetOs::Windows => Platform::Windows,
         _ => Platform::Linux,
@@ -183,38 +186,51 @@ fn argpromote_external_changed_functions(
     // target is the external. Filtering on the direct call-site index (an O(1) map
     // lookup) skips the `cabi::lookup` and the whole-program instruction scan for
     // every imported-but-unreferenced symbol — the bulk of an import table.
-    let graph = crate::CallGraph::analyze(ctx);
     let externals: Vec<FunctionId> = ctx
         .functions()
         .filter(|f| f.is_external())
         .map(|f| f.id)
-        .filter(|&id| !crate::calls::direct_call_sites(ctx, &graph, id).is_empty())
+        .filter(|&id| !crate::calls::direct_call_sites(ctx, graph, id).is_empty())
         .collect();
     let callers: rustc_hash::FxHashMap<FunctionId, Vec<FunctionId>> = externals
         .iter()
         .map(|&fid| (fid, graph.callers(fid)))
         .collect();
-    drop(graph);
-
     if externals.is_empty() {
         return rustc_hash::FxHashSet::default();
     }
 
     let mut changed = rustc_hash::FxHashSet::default();
     for fid in externals {
+        if callers[&fid]
+            .iter()
+            .any(|caller| !target_set.contains(caller))
+        {
+            continue;
+        }
         let raw = FunctionBody::from_id(ctx, fid).name().to_string();
         let sym = raw.split('@').next().unwrap_or(&raw);
         let Some(proto) = cabi::lookup(target, sym) else {
             continue;
         };
+        let call_sites = crate::calls::direct_call_sites(ctx, graph, fid);
         let Some(plan) = plan_args(proto, &env.cfg.abi, ptr_width, stack_only) else {
             continue;
         };
-        if bind_external_args(ctx, fid, &plan, sp, sp_space, default_space, ptr_width) {
+        if bind_external_args(
+            ctx,
+            fid,
+            &plan,
+            sp,
+            sp_space,
+            default_space,
+            ptr_width,
+            &call_sites,
+        ) {
             changed.extend(callers[&fid].iter().copied());
         }
         if let Some(ret) = return_slot(proto, &env.cfg.abi, ptr_width)
-            && bind_external_return(ctx, fid, ret)
+            && bind_external_return(ctx, ret, &call_sites)
         {
             changed.extend(callers[&fid].iter().copied());
         }
@@ -244,15 +260,17 @@ fn return_slot(
 /// argpromote's returned write-set (`res = foo(); store(reg <- res)`), for a
 /// single ABI return register. Idempotent: a call whose continuation already
 /// stores its result to `ret` is left untouched.
-fn bind_external_return(ctx: &mut Context, fid: FunctionId, ret: VarnodeId) -> bool {
+fn bind_external_return(
+    ctx: &mut Context,
+    ret: VarnodeId,
+    call_sites: &[qcode::value::insn::InstructionId],
+) -> bool {
     let ret_space = Varnode::from_id(&*ctx, ret).space().id;
     let size = Varnode::from_id(&*ctx, ret).size();
     let int_ty = ctx.shared.types.get_or_make_int(size);
 
-    let call_sites = crate::calls::fresh_direct_call_sites(ctx, fid);
-
     let mut changed = false;
-    for call_id in call_sites {
+    for &call_id in call_sites {
         // The call's fall-through continuation, where the return register becomes
         // live. A call with no successor (e.g. a noreturn tail) is skipped.
         let Some(cont) = ctx
@@ -292,6 +310,7 @@ fn bind_external_return(ctx: &mut Context, fid: FunctionId, ret: VarnodeId) -> b
 /// arguments aligned and the pass idempotent. Also records the planned argument
 /// names on `fid` so each call site renders them (e.g. `@return_address=…`,
 /// `@hwnd=…`).
+#[allow(clippy::too_many_arguments)]
 fn bind_external_args(
     ctx: &mut Context,
     fid: FunctionId,
@@ -300,6 +319,7 @@ fn bind_external_args(
     sp_space: SpaceId,
     default_space: SpaceId,
     ptr_width: usize,
+    call_sites: &[qcode::value::insn::InstructionId],
 ) -> bool {
     FunctionBody::from_id_mut(ctx, fid)
         .set_input_arg_names(plan.iter().map(|a| a.name.clone()).collect());
@@ -307,7 +327,7 @@ fn bind_external_args(
     let mut changed = false;
     for (idx, arg) in plan.iter().enumerate() {
         let slot = arg.slot;
-        changed |= append_caller_arg(ctx, fid, |ctx, call_id, block| {
+        changed |= append_caller_arg_at_sites(ctx, call_sites, |ctx, call_id, block| {
             let Mnemonic::Call(c) = ctx.get_insn(call_id).mnemonic() else {
                 return None;
             };
@@ -354,11 +374,32 @@ impl Pass for ArgPromoteExternal {
         &self,
         ctx: &mut Context,
         env: &PipelineEnv,
+        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        let graph = crate::CallGraph::analyze(ctx);
         Ok(
-            crate::ModulePassOutcome::functions(argpromote_external_changed_functions(ctx, env))
-                .preserving_global::<crate::CallGraphAnalysis>()
-                .preserving_global::<crate::AddressAnalysis>(),
+            crate::ModulePassOutcome::functions(argpromote_external_changed_functions(
+                ctx, env, targets, &graph,
+            ))
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>(),
+        )
+    }
+
+    fn run_with_analyses(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+        targets: &[FunctionId],
+        analyses: &mut crate::AnalysisManager,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        let graph = analyses.global::<crate::CallGraphAnalysis>(ctx);
+        Ok(
+            crate::ModulePassOutcome::functions(argpromote_external_changed_functions(
+                ctx, env, targets, graph,
+            ))
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>(),
         )
     }
 }
