@@ -18,6 +18,7 @@
 //! the params carry the interface), so [`append_entry_param`] does not touch it;
 //! [`remove_entry_param`] trims it only defensively, when it happens to be set.
 
+use qcode::value::QCodeMut;
 use std::borrow::Cow;
 
 use qcode::{

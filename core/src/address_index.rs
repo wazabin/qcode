@@ -145,6 +145,7 @@ impl From<AddressTarget> for ValueId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::QCodeMut;
     use crate::value::{BasicBlock, FunctionBody};
 
     #[test]

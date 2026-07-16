@@ -1,3 +1,4 @@
+use crate::value::QCodeMut;
 use crate::{
     context::Context,
     error::Result,
@@ -886,18 +887,6 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         for id in removed {
             self.ctx.remove_instruction(id);
         }
-    }
-
-    /// Adds an edge (body-local id) to this block's edge set.
-    /// DO NOT USE THIS
-    pub(crate) fn add_edge(&mut self, edge_id: EdgeId) {
-        self.inner_mut().edges.insert(edge_id);
-    }
-
-    /// Removes an edge (body-local id) from this block's edge set.
-    /// DO NOT USE THIS
-    pub(crate) fn remove_edge(&mut self, edge_id: EdgeId) {
-        self.inner_mut().edges.remove(&edge_id);
     }
 
     /// Removes the last instruction from this block.

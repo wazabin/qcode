@@ -1949,6 +1949,7 @@ impl<'str> Mem2Reg<'_, 'str> {
 
 #[cfg(test)]
 mod tests {
+    use qcode::value::QCodeMut;
 
     use jstd::graph::analysis::compute_dominators;
     use qcode::value::{

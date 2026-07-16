@@ -30,6 +30,7 @@
 //! As with `argpromote`, a caller in code we never disassembled would still bind
 //! to the old shape; that gap is accepted and unguarded.
 
+use qcode::value::QCodeMut;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{

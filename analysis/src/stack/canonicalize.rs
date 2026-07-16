@@ -16,6 +16,7 @@
 //! the affine `@SP ± N` form; `@stack_base` literals are left to the legacy path,
 //! so this is inert until brighten is removed.
 
+use qcode::value::QCodeMut;
 use std::collections::{BTreeSet, HashMap};
 
 use qcode::{

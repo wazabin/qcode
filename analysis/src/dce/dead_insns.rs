@@ -207,6 +207,7 @@ fn remove_unused_no_pred_block_params<'a, 'str>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qcode::value::QCodeMut;
 
     use qcode::{
         builder::Builder,

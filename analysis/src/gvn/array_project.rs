@@ -21,6 +21,7 @@
 //! * **`Extract(Tuple{fields…}, i)` ⇒ `fields[i]`.** Reads a field straight out
 //!   of a freshly-packed tuple, so `enumerate(arr)[k].elem` reduces to `src[k]`.
 
+use qcode::value::QCodeMut;
 use qcode::{
     context::Context,
     value::{
@@ -335,6 +336,7 @@ impl ArrayProject {
 
 #[cfg(test)]
 mod tests {
+    use qcode::value::QCodeMut;
     use qcode::{
         testing::TestContext,
         types::TypeId,

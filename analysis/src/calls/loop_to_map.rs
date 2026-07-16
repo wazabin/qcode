@@ -440,6 +440,7 @@ register_function_pass!(LoopToMap);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qcode::value::QCodeMut;
     use qcode::value::insn::{Binop, IntBinop, Mnemonic};
     use qcode::{
         context::Context,

@@ -829,6 +829,7 @@ impl MemForward {
 mod tests {
     use super::*;
     use qcode::testing::TestContext;
+    use qcode::value::QCodeMut;
     use qcode::value::{BasicBlock, FunctionBody, ModuleView, TempSpace};
     use qcode_macro::qcode;
 

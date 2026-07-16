@@ -15,6 +15,7 @@
 //! Symbolic arguments are bound to a poison value (`0`) for emulation; the
 //! projection guarantees the harvested field is independent of that choice.
 
+use qcode::value::QCodeMut;
 use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{

@@ -24,6 +24,7 @@
 //! TODO: when the index cannot be bounded, scan the table for a run of
 //! addresses "close to" one another to recover the size heuristically.
 
+use qcode::value::QCodeMut;
 use qcode::{
     address_index::{AddressIndex, AddressTarget},
     assumption::Proposition,

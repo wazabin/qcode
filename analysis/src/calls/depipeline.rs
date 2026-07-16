@@ -43,6 +43,7 @@
 //! authorized: assume the C contract). It is `Assumed`, not `Known`; a future
 //! verifier could refute it for a provably-overlapping caller.
 
+use qcode::value::QCodeMut;
 use rustc_hash::FxHashSet as HashSet;
 
 use jstd::graph::analysis::{DominatorTree, compute_dominators};

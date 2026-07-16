@@ -49,6 +49,7 @@
 //! from memory (`**pp`), lifting register/stack effects, and effectful-callee
 //! composition. See `ARGPROMOTE_DESIGN.md`.
 
+use qcode::value::QCodeMut;
 use qcode::{
     builder::Builder,
     context::Context,

@@ -14,6 +14,7 @@
 //! detection, shadow promotion) handles the memory behind it; this step only
 //! functionalizes the *address*.
 
+use qcode::value::QCodeMut;
 use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{

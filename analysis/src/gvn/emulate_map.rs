@@ -15,6 +15,7 @@
 //!   element the `enumerate` tuple, fed to the body via
 //!   [`BodyArg::Aggregate`](qcode_emulator::BodyArg) so its `Extract`s resolve.
 
+use qcode::value::QCodeMut;
 use qcode::{
     context::Context,
     types::TypeId,
@@ -343,6 +344,7 @@ fn read_le(data: &[u8], start: usize, size: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use qcode::value::QCodeMut;
     use qcode::{
         testing::TestContext,
         types::TypeId,

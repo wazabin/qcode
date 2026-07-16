@@ -126,6 +126,7 @@ fn first_size_mismatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qcode::value::QCodeMut;
 
     use qcode::{
         testing::TestContext,

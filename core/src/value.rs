@@ -119,8 +119,10 @@ pub mod temp;
 pub mod util;
 pub mod varnode;
 pub mod view;
+pub mod view_mut;
 
 pub use view::{BodyView, ModuleView, QCodeView};
+pub use view_mut::QCodeMut;
 
 /// A type-erased handle to any IR value stored in a [`Context`].
 ///

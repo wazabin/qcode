@@ -377,6 +377,7 @@ crate::register_module_pass!(ParamAttrsPass);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qcode::value::QCodeMut;
     use qcode::{
         builder::Builder,
         testing::TestContext,

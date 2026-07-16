@@ -128,6 +128,7 @@ impl<'str> SubPass<'str> for MemoryForwarding {
 mod tests {
     use crate::AliasResult;
     use crate::gvn::{constant_fold_function, gvn, gvn_function};
+    use qcode::value::QCodeMut;
     use qcode::{
         context::Context,
         testing::TestContext,

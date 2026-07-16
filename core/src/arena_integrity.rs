@@ -369,6 +369,7 @@ pub fn verify_body_arena_integrity(ctx: &Context<'_>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::value::QCodeMut;
     use std::borrow::Cow;
 
     use qcode_macro::qcode;

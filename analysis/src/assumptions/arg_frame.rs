@@ -353,6 +353,7 @@ crate::register_module_pass!(AssumeArgFrame);
 
 #[cfg(test)]
 mod tests {
+    use qcode::value::QCodeMut;
     use qcode::{
         testing::TestContext,
         value::{BasicBlock, BlockId, insn::Call},

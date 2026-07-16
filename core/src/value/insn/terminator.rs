@@ -260,6 +260,7 @@ impl MnemonicKind for ReturnValue {
 
 #[cfg(test)]
 mod tests {
+    use crate::value::QCodeMut;
     use qcode_macro::qcode;
 
     use crate::{

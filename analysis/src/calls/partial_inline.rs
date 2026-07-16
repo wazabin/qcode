@@ -48,6 +48,7 @@
 //! code we never disassembled would keep the old shape, the same accepted,
 //! unguarded gap as `argpromote` / `dead_signature`.
 
+use qcode::value::QCodeMut;
 use rustc_hash::FxHashMap as HashMap;
 
 use qcode::{

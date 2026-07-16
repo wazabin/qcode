@@ -584,6 +584,7 @@ impl FrameInfo {
 
 #[cfg(test)]
 mod tests {
+    use qcode::value::QCodeMut;
     use qcode::{
         context::Context,
         space::{Space, SpaceType},

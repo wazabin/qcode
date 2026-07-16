@@ -74,6 +74,7 @@ pub fn verify_users_map(ctx: &Context) -> Vec<String> {
 mod tests {
     use super::*;
     use qcode::context::Context;
+    use qcode::value::QCodeMut;
     use qcode_macro::qcode;
 
     /// A well-formed function built through the normal helpers verifies clean,

@@ -49,6 +49,8 @@ use qcode::value::{
 use qcode::context::Context;
 #[cfg(test)]
 use qcode::value::ModuleView;
+#[cfg(test)]
+use qcode::value::QCodeMut;
 
 use crate::{AliasResult, ContextView, FunctionBody, FunctionPass, Outcome};
 

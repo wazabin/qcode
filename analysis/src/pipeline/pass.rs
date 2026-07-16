@@ -414,6 +414,7 @@ pub(super) fn resolve_minted_callees(
 #[cfg(test)]
 mod minted_barrier_tests {
     use super::*;
+    use qcode::value::QCodeMut;
     use qcode::{
         testing::TestContext,
         value::{

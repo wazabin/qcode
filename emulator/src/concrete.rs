@@ -2485,6 +2485,7 @@ mod tests {
     use super::*;
     use qcode::context::Context;
     use qcode::space::{Space, SpaceType};
+    use qcode::value::QCodeMut;
     use qcode::value::TempSpace;
     use qcode_macro::qcode;
     use std::sync::{Arc, Mutex};

@@ -282,6 +282,7 @@ fn reaches_any(ctx: &Context, from: BlockId, targets: &HashSet<BlockId>) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qcode::value::QCodeMut;
     use qcode::{
         testing::TestContext,
         value::{FunctionBody, insn::Return},
