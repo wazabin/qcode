@@ -37,6 +37,15 @@ fn bool_literal_value(ctx: &Context, v: ValueId) -> Option<u64> {
     }
 }
 
+fn describe_value(ctx: &Context, value: ValueId) -> String {
+    match value {
+        ValueId::Instruction(id) => {
+            format!("{value:?} ({:?})", ctx.get_insn(id).mnemonic())
+        }
+        _ => format!("{value:?}"),
+    }
+}
+
 /// Run the `bool`-typing checks over every instruction.
 pub fn verify_bool_typing(ctx: &Context) -> Vec<String> {
     let mut out = Vec::new();
@@ -65,8 +74,10 @@ pub fn verify_bool_typing(ctx: &Context) -> Vec<String> {
                     {
                         let lhs = b.lhs.qualify(func);
                         let rhs = b.rhs.qualify(func);
+                        let lhs = describe_value(ctx, lhs);
+                        let rhs = describe_value(ctx, rhs);
                         out.push(format!(
-                            "instruction {:?} (parent {:?}) bitwise `{}` mixes bool and integer operands: lhs {lhs:?} is {}, rhs {rhs:?} is {}",
+                            "instruction {:?} (parent {:?}) bitwise `{}` mixes bool and integer operands: lhs {lhs} is {}, rhs {rhs} is {}",
                             insn.id,
                             insn.parent().map(|block| block.id),
                             b.op,

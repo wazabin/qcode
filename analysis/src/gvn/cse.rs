@@ -95,12 +95,14 @@ impl<'str> SubPass<'str> for Cse {
         if let Some(leader) = state.lookup(&key) {
             if leader != ic.id {
                 let view = cx.body_view(body);
-                // A mnemonic/normal form does not encode its semantic result
-                // type. In particular, identical bitwise mnemonics can produce
-                // either bool or a same-width integer. Never CSE across that
-                // boundary: forwarding an integer value to a bool leader (or
-                // vice versa) makes otherwise well-typed users ill-typed.
-                if view.type_of(leader) == view.type_of(ic.id) {
+                // A mnemonic/normal form does not encode whether its result is
+                // logical. Never CSE across the bool/non-bool boundary, but do
+                // preserve the historical forwarding between compatible
+                // non-bool semantic types (for example pointers and integers).
+                let types = &view.shared().types;
+                let leader_is_bool = types.is_bool(view.type_of(leader));
+                let current_is_bool = types.is_bool(view.type_of(ic.id));
+                if leader_is_bool == current_is_bool {
                     ed.replace(body, cx, ic.insn_id, leader);
                 }
             }

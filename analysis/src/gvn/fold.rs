@@ -355,16 +355,19 @@ fn try_fold_insn<'ctx, 'str: 'ctx>(
         .or_else(|| cast_identity(host, func, ic.mnemonic))?;
 
     let root_ty = host.type_of(ic.id);
-    if host.type_of(folded) == root_ty {
+    let folded_ty = host.type_of(folded);
+    let types = &host.shared().types;
+    if types.is_bool(folded_ty) == types.is_bool(root_ty) {
         return Some(folded);
     }
 
     // Algebraic identities such as `x & 0 = 0` historically minted an
     // ordinary integer literal from `output_size`. When the root is a logical
     // bool operation, that silently changed `bool` into same-width `i8` and
-    // made its users ill-typed. Constants can be re-interned with the root's
-    // semantic type; a non-constant of another type is not a valid direct
-    // replacement (the explicit cast must remain).
+    // made its users ill-typed. Guard only that bool/non-bool boundary: other
+    // semantic type differences are intentionally transparent to GVN.
+    // Constants crossing the boundary can be re-interned with the root type;
+    // a non-constant requires an explicit cast and cannot replace the root.
     let ValueId::Literal(lid) = folded else {
         return None;
     };

@@ -97,10 +97,7 @@ impl<'str> SubPass<'str> for MemoryForwarding {
                         let value_is_bool = types.is_bool(value_ty);
                         let same_size = types.size_of(load_ty) == types.size_of(value_ty);
 
-                        let value = if load_ty == value_ty {
-                            ed.replace(body, cx, ic.insn_id, value);
-                            value
-                        } else if value_is_bool && !load_is_bool && same_size {
+                        let value = if value_is_bool && !load_is_bool && same_size {
                             // A bool store forwarded through an ordinary i8 load
                             // is a semantic bool→integer conversion even though
                             // both occupy one byte. Preserve that boundary with
@@ -117,9 +114,10 @@ impl<'str> SubPass<'str> for MemoryForwarding {
                                 }),
                                 load_ty,
                             ))
-                        } else {
-                            // Other semantic type mismatches are not valid direct
-                            // replacements. Keep the load as the memory value.
+                        } else if value_is_bool != load_is_bool {
+                            // Other bool/non-bool crossings require a cast that
+                            // this forwarding path cannot synthesize. Keep the
+                            // load as the memory value.
                             state.define_load(
                                 cx.body_view(body),
                                 ic.insn_id.func,
@@ -129,6 +127,12 @@ impl<'str> SubPass<'str> for MemoryForwarding {
                                 ic.numbering,
                             );
                             return Claim::Done;
+                        } else {
+                            // Preserve historical forwarding among non-bool
+                            // semantic types such as pointers, stack addresses,
+                            // and same-width integers.
+                            ed.replace(body, cx, ic.insn_id, value);
+                            value
                         };
                         state.define_load(
                             cx.body_view(body),
