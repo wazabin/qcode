@@ -135,6 +135,13 @@ fn try_simplify_root<'str>(host: &mut BodyMut<'_, 'str>, root: InstructionId) ->
     if size == 0 || size > MAX_WIDTH_BYTES {
         return false;
     }
+    // rumba models fixed-width integers, while qcode's bool is a semantic type
+    // that happens to occupy one byte. Never abstract a bool as an integer MBA
+    // variable: rebuilding the solved expression could otherwise combine that
+    // bool leaf directly with an integer literal or leaf.
+    if region_contains_bool(host.view(), root, size) {
+        return false;
+    }
     let n = (size * 8) as u8;
     let mask = make_mask(n);
 
@@ -569,6 +576,29 @@ fn inlinable_child(host: BodyView<'_, '_>, region: usize, v: ValueId) -> Option<
     None
 }
 
+fn is_bool_value(host: BodyView<'_, '_>, value: ValueId) -> bool {
+    host.stored_type_of(value)
+        .is_some_and(|ty| host.shared().types.is_bool(ty))
+}
+
+/// Whether the exact region [`Extract`] would hand to rumba contains a boolean
+/// result or leaf. Boolean constants are included: they are semantic booleans,
+/// not integer zero/one literals for the purposes of rebuilding an MBA.
+fn region_contains_bool(host: BodyView<'_, '_>, iid: InstructionId, region: usize) -> bool {
+    if is_bool_value(host, ValueId::Instruction(iid)) {
+        return true;
+    }
+
+    InstructionRef::new(host, iid)
+        .operands()
+        .into_iter()
+        .any(|op| {
+            is_bool_value(host, op)
+                || inlinable_child(host, region, op)
+                    .is_some_and(|child| region_contains_bool(host, child, region))
+        })
+}
+
 /// The MBA half an instruction's operator belongs to (`None` if not modelable).
 fn mba_class(host: BodyView<'_, '_>, iid: InstructionId) -> Option<OpClass> {
     match InstructionRef::new(host, iid).mnemonic() {
@@ -591,6 +621,9 @@ fn mba_class(host: BodyView<'_, '_>, iid: InstructionId) -> Option<OpClass> {
 /// Is `iid` an integer op this pass can model? `shl` qualifies only with a
 /// constant shift below the operand width (so it is exactly `x * 2^c`).
 fn is_mba_insn(host: BodyView<'_, '_>, iid: InstructionId) -> bool {
+    if is_bool_value(host, ValueId::Instruction(iid)) {
+        return false;
+    }
     match InstructionRef::new(host, iid).mnemonic() {
         Mnemonic::Binop(b) => match b.op {
             Binop::Int(o) => match o {
@@ -892,5 +925,29 @@ mod tests {
             "
         );
         assert!(!run_mba(&mut ctx, bits));
+    }
+
+    #[test]
+    fn rejects_mba_region_with_boolean_leaf() {
+        // Model the malformed intermediate shape that used to reach this pass
+        // inside a compound stage. A bool occupies one byte, but must never be
+        // abstracted as an i8 rumba variable and rebuilt into integer bitops.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            lambda mixed_bool:
+            <entry @a:i8 @b:i8>
+                %cond = @a == 0;
+                %bits = @a & @b;
+                %mixed = %cond | %bits;
+                %r = %mixed + @a;
+                return %r;
+            "
+        );
+        let before = insn_total(&ctx, mixed_bool);
+
+        assert!(!run_mba(&mut ctx, mixed_bool));
+        assert_eq!(insn_total(&ctx, mixed_bool), before);
     }
 }

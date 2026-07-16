@@ -196,6 +196,17 @@ pub(super) fn arith_form<'a, 'str: 'a>(
     if width == 0 || width > MAX_AFFINE_WIDTH {
         return leaf(id, width);
     }
+    // Boolean And/Or/Xor are logical operations, not integer mask expressions.
+    // Integer affine materialization reconstructs constants with `get_const`,
+    // which would turn `bool ^ true` into the ill-typed `bool ^ i8 1`. Keep all
+    // bool-producing instructions opaque so syntactic CSE can still number them
+    // without crossing the bool/integer type boundary.
+    if host
+        .stored_type_of(id)
+        .is_some_and(|ty| host.shared().types.is_bool(ty))
+    {
+        return leaf(id, width);
+    }
     let m = mask_for(width);
     // Operand storage is bare-local; the producing instruction's own function
     // qualifies them (an id without one produces no mnemonic and never gets here).

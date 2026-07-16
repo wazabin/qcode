@@ -133,16 +133,15 @@ fn remove_dead_pure_call_body<'a, 'str>(
         .successors()
         .map(|(_, b)| b)
         .collect();
-    debug_assert_eq!(
-        successors.len(),
-        1,
-        "pure call block must have a single fall-through successor"
-    );
-    let Some(&fallthrough) = successors.first() else {
+    let [fallthrough] = successors.as_slice() else {
+        qcode::pass_log!(
+            warn,
+            "keeping dead pure call in {block_id:?}: expected one fall-through successor, found {successors:?}"
+        );
         return false;
     };
 
-    replace_terminator_with_branch(body, cx, block_id, fallthrough, vec![]);
+    replace_terminator_with_branch(body, cx, block_id, *fallthrough, vec![]);
     true
 }
 
@@ -444,6 +443,25 @@ mod tests {
 
         assert!(!remove_dead_pure_call(&mut ctx, call_block));
         assert!(matches!(terminator(&ctx, call_block), Mnemonic::Call(_)));
+    }
+
+    #[test]
+    fn unused_pure_call_with_ambiguous_fallthrough_is_kept() {
+        let mut ctx = TestContext::new().ctx;
+        let (call_block, first_cont) = build_call_case(&mut ctx, true, false);
+        let caller = call_block.func;
+        let second_cont = ctx.get_or_make_block(0x3000, caller);
+        ctx.add_cfg_edge(call_block, second_cont);
+
+        assert!(!remove_dead_pure_call(&mut ctx, call_block));
+        assert!(matches!(terminator(&ctx, call_block), Mnemonic::Call(_)));
+        let successors: Vec<_> = BasicBlock::from_id(&ctx, call_block)
+            .successors()
+            .map(|(_, block)| block)
+            .collect();
+        assert_eq!(successors.len(), 2);
+        assert!(successors.contains(&first_cont));
+        assert!(successors.contains(&second_cont));
     }
 
     #[test]

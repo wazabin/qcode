@@ -808,6 +808,27 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
     ) -> ValueId {
         let value_size = ValueRef::from_view(self.read(), value).size();
         if value_size == load_size {
+            let value_is_bool = self
+                .read()
+                .stored_type_of(value)
+                .is_some_and(|ty| self.read().shared().types.is_bool(ty));
+            let load_is_bool = self
+                .read()
+                .stored_type_of(ValueId::Instruction(before))
+                .is_some_and(|ty| self.read().shared().types.is_bool(ty));
+            if value_is_bool && !load_is_bool {
+                // Memory is byte-typed, not bool-typed: forwarding a stored bool
+                // through an ordinary i8 load must retain the semantic cast. A
+                // bare replacement would turn an integer consumer such as
+                // `load & i8 1` into the verifier-invalid `bool & i8 1`.
+                let mnemonic = Mnemonic::Zext(Zext {
+                    src: value.localize(before.func),
+                    size: load_size,
+                });
+                let new_id = self.body.push_mnemonic(self.cx.shr(), mnemonic, load_size);
+                self.body.insert_insn_before(block, before, new_id);
+                return ValueId::Instruction(new_id);
+            }
             return value;
         }
 
@@ -2684,6 +2705,43 @@ mod tests {
             !mem2reg(&mut tc.ctx, func, &aliases),
             "mem2reg must converge after const_fold — not re-mint the zext(v)[0:1] \
              truncation const_fold just folded to v"
+        );
+    }
+
+    #[test]
+    fn bool_store_forwarded_through_i8_load_keeps_integer_cast() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i8 slot;
+
+                fn func:
+                    <entry @x:i8>
+                        %condition = @x == i8 0x2;
+                        store(slot:1, &slot <- %condition);
+                        %loaded = load(slot:1, &slot);
+                        %masked = %loaded & i8 0x1;
+                        store(ram:1, 0x2000 <- %masked);
+                        return at 0x1000;
+            "
+        );
+
+        let aliases = AliasResult::simple_for_function(&ctx, func);
+        assert!(mem2reg(&mut ctx, func, &aliases));
+        crate::gvn::constant_fold_function(&mut ctx, func);
+
+        assert!(
+            crate::verify::verify_bool_typing(&ctx).is_empty(),
+            "mem2reg must preserve the bool-to-i8 cast across constant folding"
+        );
+        assert!(
+            FunctionBody::from_id(&ctx, func)
+                .blocks()
+                .flat_map(|block| block.iter())
+                .any(|insn| matches!(insn.mnemonic(), Mnemonic::Zext(_))),
+            "expected an explicit bool-to-i8 cast:\n{}",
+            FunctionBody::from_id(&ctx, func)
         );
     }
 

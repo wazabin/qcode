@@ -344,6 +344,28 @@ mod tests {
         assert!(block.instruction_ids().contains(&v2));
     }
 
+    #[test]
+    fn bool_xor_literal_stays_bool_typed() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                fn f:
+                    <entry>
+                        %cmp = i8 0x1 == i8 0x2;
+                        %negated = %cmp ^ true;
+                        return at 0x1000;
+            "
+        );
+
+        assert!(crate::verify::verify_bool_typing(&ctx).is_empty());
+        gvn_function(&mut ctx, f, None);
+        assert!(
+            crate::verify::verify_bool_typing(&ctx).is_empty(),
+            "GVN must not rebuild a bool literal as an integer mask"
+        );
+    }
+
     // 5. Cross-block redundancy: a+b in entry propagates to dominated successor
     #[test]
     fn test_gvn_function_cross_block_redundancy() {

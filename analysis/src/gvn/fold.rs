@@ -375,7 +375,10 @@ pub(super) fn cast_identity<'ctx, 'str: 'ctx>(
     match m {
         Mnemonic::Zext(zext) => {
             let src = zext.src.qualify(func);
-            (value_size(host, src) == zext.size).then_some(src)
+            let src_is_bool = host
+                .stored_type_of(src)
+                .is_some_and(|ty| host.shared().types.is_bool(ty));
+            (value_size(host, src) == zext.size && !src_is_bool).then_some(src)
         }
         Mnemonic::Range(range) if range.start == 0 => {
             let src = range.src.qualify(func);

@@ -63,9 +63,14 @@ pub fn verify_bool_typing(ctx: &Context) -> Vec<String> {
                     Binop::Int(IntBinop::And | IntBinop::Or | IntBinop::Xor)
                         if lhs_bool != rhs_bool =>
                     {
+                        let lhs = b.lhs.qualify(func);
+                        let rhs = b.rhs.qualify(func);
                         out.push(format!(
-                            "bitwise `{}` mixes bool and integer operands",
-                            b.op
+                            "instruction {:?} bitwise `{}` mixes bool and integer operands: lhs {lhs:?} is {}, rhs {rhs:?} is {}",
+                            insn.id,
+                            b.op,
+                            if lhs_bool { "bool" } else { "integer" },
+                            if rhs_bool { "bool" } else { "integer" },
                         ));
                     }
                     Binop::Int(IntBinop::And | IntBinop::Or | IntBinop::Xor) => {}

@@ -9,6 +9,7 @@
 mod arena_integrity;
 mod block_terminators;
 mod bool_typing;
+mod call_edges;
 mod dangling_refs;
 mod intra_function_ssa;
 mod pointer_spaces;
@@ -19,6 +20,7 @@ mod users_map;
 pub use arena_integrity::verify_body_arena_integrity;
 pub use block_terminators::verify_block_terminators;
 pub use bool_typing::verify_bool_typing;
+pub use call_edges::verify_call_edges;
 pub use dangling_refs::verify_no_dangling_refs;
 pub use intra_function_ssa::verify_intra_function_ssa;
 pub use pointer_spaces::verify_pointer_spaces;
@@ -40,6 +42,7 @@ pub fn verify(ctx: &Context<'_>) -> Vec<String> {
         return diagnostics;
     }
     diagnostics.extend(verify_block_terminators(ctx));
+    diagnostics.extend(verify_call_edges(ctx));
     diagnostics.extend(verify_no_dangling_refs(ctx));
     diagnostics.extend(verify_intra_function_ssa(ctx));
     diagnostics.extend(verify_users_map(ctx));
