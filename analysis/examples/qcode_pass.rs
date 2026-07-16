@@ -101,7 +101,7 @@ fn run() -> Result<(), String> {
     let mut ctx = Context::new();
     qcode::lower::lower_str(&mut ctx, &source).map_err(|e| format!("parse/lower: {e}"))?;
 
-    let env = PipelineEnv::headless(&mut ctx);
+    let env = PipelineEnv::headless(&ctx);
     let mut analyses = qcode_analysis::AnalysisManager::default();
     for pass in &args.passes {
         let resolved = make_pass(pass)

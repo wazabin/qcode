@@ -530,14 +530,14 @@ mod tests {
 
         // Entry ends in a `call`; no edge links it to `post_call`.
         {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             b.push_call(fun_id);
         }
 
         // Orphaned fall-through: store a register and read it straight back.
         let load_id;
         {
-            let mut b = (&mut tc.ctx).builder(post_call);
+            let mut b = tc.ctx.builder(post_call);
             let c = b.shr().get_const(0x42, 4);
             b.push_store(c, eax, reg_space);
             let loaded = b.push_load::<false>(eax, 4, reg_space).id();

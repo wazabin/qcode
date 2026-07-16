@@ -399,11 +399,11 @@ mod tests {
 
     /// Push `base - sub` (8-byte) at the start of `block` and return its value.
     fn push_sp_minus(tc: &mut TestContext, block: BlockId, base: ValueId, sub: u64) -> ValueId {
-        let mut b = (&mut tc.ctx).builder(block);
+        let mut b = tc.ctx.builder(block);
         b.set_insert_point_to_start();
         let k = b.shr().get_const(sub, 8);
-        let v = b.push_sub(base, k).id();
-        v
+
+        b.push_sub(base, k).id()
     }
 
     /// Build `f` (reads its caller-frame slot `@sp+4`, derefs pointer param `@p`)

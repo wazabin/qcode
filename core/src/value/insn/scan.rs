@@ -90,7 +90,7 @@ mod tests {
         let i32_ty = tc.ctx.shared.types.get_or_make_int(4);
         let array_ty = tc.ctx.shared.types.get_or_make_array(i32_ty, 8);
         let (init, src, cap) = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             (
                 b.push_param(4).id(),
                 b.push_param(32).id(),
@@ -102,7 +102,7 @@ mod tests {
         }
 
         let plain = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             b.push_scan(body, init, src, Vec::new()).id()
         };
         let ValueId::Instruction(plain_id) = plain else {
@@ -115,7 +115,7 @@ mod tests {
         );
 
         let with_cap = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             b.push_scan(body, init, src, vec![cap]).id()
         };
         let ValueId::Instruction(cap_id) = with_cap else {
@@ -145,7 +145,7 @@ mod tests {
         let i32_ty = tc.ctx.shared.types.get_or_make_int(4);
         let array_ty = tc.ctx.shared.types.get_or_make_array(i32_ty, 20);
         let (init, src, cap) = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             (
                 b.push_param(4).id(),
                 b.push_param(80).id(),
@@ -156,7 +156,7 @@ mod tests {
             tc.ctx.block_param_mut(pid).type_id = array_ty;
         }
         let scan_val = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             b.push_scan(body, init, src, vec![cap]).id()
         };
         let ValueId::Instruction(scan_id) = scan_val else {
@@ -180,7 +180,7 @@ mod tests {
         assert_eq!(tc.ctx.type_of(scan_val), array_ty);
 
         let new_src = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             b.push_param(80).id()
         };
         let mut rewritten = Mnemonic::Scan(m);

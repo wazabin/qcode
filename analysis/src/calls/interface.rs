@@ -13,7 +13,7 @@
 //! * [`remove_entry_param`] — the *remove* side, used by DCE's dead-param sweep
 //!   and `dead_signature` to drop an input no body reads.
 //!
-//! `signature.inputs` (`input_regs`) is the *legacy* ABI register list. It is
+//! `signature.inputs` (`input_regs`) is the conventional ABI register list. It is
 //! never populated for a `pure_reg` function (argpromote leaves it `None` and
 //! the params carry the interface), so [`append_entry_param`] does not touch it;
 //! [`remove_entry_param`] trims it only defensively, when it happens to be set.
@@ -205,10 +205,9 @@ pub(crate) fn remove_entry_params_at_sites(
     }
     ctx.block_mut(root).params = params;
 
-    // Drop the matching input-register entries. Intentional legacy-path
-    // support: only acts when `input_regs` is set (conventional functions); for
+    // Drop the matching conventional input-register entries. This only acts
+    // when `input_regs` is set (conventional functions); for
     // `pure_reg` it is `None` and this is a no-op (see the module docs).
-    #[allow(deprecated)]
     if let Some(inputs) = FunctionBody::from_id(ctx, fid).input_regs() {
         let inputs = inputs
             .iter()

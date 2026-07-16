@@ -160,9 +160,9 @@ mod tests {
             .set_root(block)
             .unwrap();
         let call_id = {
-            let mut b = (&mut tc.ctx).builder_at(0x2000);
-            let id = b.push_call(callee).id;
-            id
+            let mut b = tc.ctx.builder_at(0x2000);
+
+            b.push_call(callee).id
         };
         tc.ctx.replace_instruction_mnemonic(
             call_id,

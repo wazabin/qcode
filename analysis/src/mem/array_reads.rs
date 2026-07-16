@@ -357,7 +357,7 @@ mod tests {
             ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
         let i = ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
 
-        let mut b = (&mut tc.ctx).builder(entry);
+        let mut b = tc.ctx.builder(entry);
         b.push_store(arr, base, space); // seed
         // const-index lane `base + 2`.
         let two = b.shr().get_const(2, 8);

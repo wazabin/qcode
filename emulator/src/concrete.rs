@@ -2694,7 +2694,7 @@ mod tests {
         }
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
         let e = {
-            let mut b = (&mut ctx).builder(entry);
+            let mut b = ctx.builder(entry);
             let e = b.push_intrinsic(enum_id, vec![src]).id();
             let ptr = b.shr().get_const(0, 8);
             b.push_return(ptr);
@@ -2742,7 +2742,7 @@ mod tests {
         let i8 = ctx.shared.types.get_or_make_int(1);
         let list_ty = ctx.shared.types.get_or_make_unbounded_list(i8);
         let src = {
-            let mut b = (&mut ctx).builder(entry);
+            let mut b = ctx.builder(entry);
             b.push_param(8).id()
         };
         if let ValueId::BlockParam(pid) = src {
@@ -2772,7 +2772,7 @@ mod tests {
         };
         let ptr = ctx.get_const(0, 8).id();
         {
-            let mut b = (&mut ctx).builder(entry);
+            let mut b = ctx.builder(entry);
             b.push_return(ptr);
         }
         let rid = BasicBlock::from_id(&ctx, entry).iter().last().unwrap().id;
@@ -2822,7 +2822,7 @@ mod tests {
         let at_id = IntrinsicId::from_name("at").unwrap();
         let (ret, ptr, lane);
         {
-            let mut b = (&mut ctx).builder(entry);
+            let mut b = ctx.builder(entry);
             let arr = ValueId::BlockParam(arr_pid);
             let i = b.shr().get_const(idx, 8);
             lane = b.push_intrinsic(at_id, vec![arr, i]).id();
@@ -3271,7 +3271,7 @@ mod tests {
         let target = ctx.get_or_make_block(0x1001, block_id.func);
         let result = {
             let src = ctx.get_const(0x1234, 2).id();
-            let mut builder = (&mut ctx).builder(block_id);
+            let mut builder = ctx.builder(block_id);
             let result = builder.push_pcode_op(op, vec![src], None, 2).id;
             builder.finalize(target);
             result
@@ -3302,7 +3302,7 @@ mod tests {
         let result = {
             let x = ctx.get_const(0x1234_5678, 4).id();
             let k = ctx.get_const(8, 4).id();
-            let mut builder = (&mut ctx).builder(block_id);
+            let mut builder = ctx.builder(block_id);
             let result = builder.push_intrinsic(rol, vec![x, k]).id;
             builder.finalize(target);
             result
@@ -3330,7 +3330,7 @@ mod tests {
         };
         let target = ctx.get_or_make_block(0x1001, block_id.func);
         {
-            let mut builder = (&mut ctx).builder(block_id);
+            let mut builder = ctx.builder(block_id);
             builder.push_pcode_op(op, vec![], None, 0);
             builder.finalize(target);
         }

@@ -134,7 +134,7 @@ mod tests {
             FunctionBody::from_id_mut(&mut tc.ctx, start)
                 .set_root(block)
                 .unwrap();
-            let mut builder = (&mut tc.ctx).builder(block);
+            let mut builder = tc.ctx.builder(block);
             let main = builder.shr().get_const(0x2000, 8);
             builder.push_store(main, ValueId::Varnode(tc.r0), tc.reg_space);
             let target = builder.shr().get_const(0x3000, 8);
@@ -178,7 +178,7 @@ mod tests {
             FunctionBody::from_id_mut(&mut tc.ctx, start)
                 .set_root(block)
                 .unwrap();
-            let mut builder = (&mut tc.ctx).builder(block);
+            let mut builder = tc.ctx.builder(block);
             let main = builder.shr().get_const(0x2000, 8);
             builder.push_store(main, ValueId::Varnode(tc.r0), tc.reg_space);
             let target = builder.shr().get_const(0x3000, 8);

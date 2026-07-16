@@ -103,9 +103,9 @@ mod tests {
             .unwrap();
         {
             let zero = ctx.get_const(0, 8).id();
-            (&mut ctx).builder(tail).push_return(zero);
+            ctx.builder(tail).push_return(zero);
         }
-        (&mut ctx).builder(entry).push_branch(tail);
+        ctx.builder(entry).push_branch(tail);
 
         assert!(verify_intra_function_ssa(&ctx).is_empty());
     }

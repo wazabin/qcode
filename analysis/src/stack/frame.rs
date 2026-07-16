@@ -177,7 +177,7 @@ mod tests {
         let root = FunctionBody::from_id(&tc.ctx, fid).root().unwrap().id;
 
         let (local, caller_arg, ret_slot, aligned_slot, unrelated) = {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let c8 = b.shr().get_const(8, 8);
             let neg16 = b.shr().get_const((-16i64) as u64, 8);
             let local = b.push_sub(sp, c8).id(); // @SP - 8  → below entry SP
@@ -236,7 +236,7 @@ mod tests {
         let root = FunctionBody::from_id(&tc.ctx, fid).root().unwrap().id;
 
         let slot = {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let neg8 = b.shr().get_const((-8i64) as u64, 8);
             let k10 = b.shr().get_const(0x10, 8);
             let k270 = b.shr().get_const(0x270, 8);
@@ -248,8 +248,8 @@ mod tests {
             let s2 = b.push_sub(a1, k270).id();
             let a2 = b.push_bit_and(s2, neg8).id();
             // a slot in the innermost realigned frame: a2 - 0x658
-            let slot = b.push_sub(a2, k658).id();
-            slot
+
+            b.push_sub(a2, k658).id()
         };
 
         let nb = precompute_forms(qcode::value::ModuleView::new(&tc.ctx), fid);
@@ -274,7 +274,7 @@ mod tests {
         let root = FunctionBody::from_id(&tc.ctx, fid).root().unwrap().id;
 
         let (aligned, slot) = {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let neg8 = b.shr().get_const((-8i64) as u64, 8);
             let k10 = b.shr().get_const(0x10, 8);
             let k20 = b.shr().get_const(0x20, 8);

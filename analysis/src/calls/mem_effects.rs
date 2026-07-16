@@ -370,7 +370,7 @@ fn callee:
         let scratch = tc.ctx.bodies[fid].push_temp_space(TempSpace::new(Some("scratch"), 1, 8));
         let ptr = ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id);
         {
-            let mut b = (&mut tc.ctx).builder(block);
+            let mut b = tc.ctx.builder(block);
             let value = b.shr().get_const(1, 1);
             b.push_store(
                 value,

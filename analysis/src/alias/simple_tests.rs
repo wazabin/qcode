@@ -171,7 +171,7 @@ fn pointer_literals_are_tracked() {
         let __f = ctx.anon_function();
         ctx.get_or_make_block(0x1000, __f)
     };
-    let mut builder = (&mut ctx).builder_at(0x1000);
+    let mut builder = ctx.builder_at(0x1000);
     let literal_ptr = builder.shr().get_const(0, 8);
     builder.push_load::<false>(literal_ptr, 8, reg_space);
     drop(builder);
@@ -407,7 +407,7 @@ fn two_literal_pointers_different_spaces_do_not_alias() {
         let __f = ctx.anon_function();
         ctx.get_or_make_block(0x1000, __f)
     };
-    let mut builder = (&mut ctx).builder_at(0x1000);
+    let mut builder = ctx.builder_at(0x1000);
 
     let lit1 = builder.shr().get_const(0x20, 8);
     let lit2 = builder.shr().get_const(0xfeed_face_0000_0020, 4);
@@ -429,7 +429,7 @@ fn same_pointer_used_in_multiple_spaces_degrades_to_unknown() {
         let __f = ctx.anon_function();
         ctx.get_or_make_block(0x1000, __f)
     };
-    let mut builder = (&mut ctx).builder_at(0x1000);
+    let mut builder = ctx.builder_at(0x1000);
 
     let ptr = builder.shr().get_const(0x20, 8);
     builder.push_load::<false>(ptr, 4, reg_space);
@@ -626,7 +626,7 @@ fn untracked_value_may_alias_conservatively() {
         let __f = ctx.anon_function();
         ctx.get_or_make_block(0x1000, __f)
     };
-    let mut builder = (&mut ctx).builder_at(0x1000);
+    let mut builder = ctx.builder_at(0x1000);
 
     // Two tracked, non-overlapping literal pointers (positive control).
     let p = builder.shr().get_const(0x1000, 8);
@@ -638,7 +638,7 @@ fn untracked_value_may_alias_conservatively() {
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
 
     // Append an instruction the analysis never saw.
-    let mut builder = (&mut ctx).builder_at(0x1000);
+    let mut builder = ctx.builder_at(0x1000);
     let eight = builder.shr().get_const(8, 8);
     let q = builder.push_add(p, eight).id();
     drop(builder);

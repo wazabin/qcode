@@ -1525,15 +1525,11 @@ where
 
     /// Registers read before written (function inputs), as inferred by analysis.
     ///
-    /// Legacy ABI input-register list. It is **`None` for `pure_reg` functions**
+    /// Conventional ABI input-register list. It is **`None` for `pure_reg` functions**
     /// (argpromote never populates it); their by-value root block params are the
     /// source of truth for the call interface, so prefer the params (e.g.
-    /// [`input_arg_name`](Self::input_arg_name)). Retained only for the
+    /// [`input_arg_name`](Self::input_arg_name)). Used only by the
     /// conventional/external calling-convention path (`summaries`).
-    #[deprecated(
-        note = "legacy ABI register list; None for pure_reg functions. Use the root block params \
-                as the call interface; this remains only for the conventional/external path."
-    )]
     pub fn input_regs(&'s self) -> Option<&'ctx [VarnodeId]> {
         self.interface()
             .signature
@@ -1578,11 +1574,10 @@ where
             return Some(name.to_owned());
         }
 
-        // Fall back to the inferred input-register list: a register name, or a
+        // Fall back to the conventional input-register list: a register name, or a
         // synthesized `stack_<addr>` slot name for a stack-passed input.
-        // Intentional use of the legacy list — only reached when the param has no
-        // name (conventional functions, never `pure_reg`).
-        #[allow(deprecated)]
+        // Only reached when the param has no name (conventional functions,
+        // never `pure_reg`).
         let input = self.input_regs()?.get(index).copied()?;
         let vn = Varnode::from_id(self.view.shared(), input);
         if let Some(name) = vn.name() {
@@ -2079,12 +2074,8 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
 
     /// Records the analysis-inferred input (live-in) register set on this function.
     ///
-    /// Legacy ABI input-register list — see [`input_regs`](Self::input_regs).
+    /// Conventional ABI input-register list — see [`input_regs`](Self::input_regs).
     /// Not set for `pure_reg` functions, whose param interface supersedes it.
-    #[deprecated(
-        note = "legacy ABI register list; None for pure_reg functions. Use the root block params \
-                as the call interface; this remains only for the conventional/external path."
-    )]
     pub fn set_input_regs(&mut self, regs: Vec<VarnodeId>) {
         self.interface_mut()
             .signature

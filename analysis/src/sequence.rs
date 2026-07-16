@@ -375,7 +375,7 @@ mod tests {
             ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
         let i = ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, body).push_param(8).id);
         {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let zero = b.shr().get_const(0, 8);
             b.push_branch_with_args(body, vec![zero]);
         }
@@ -388,7 +388,7 @@ mod tests {
         let (fid, body, base, i) = setup_loop(&mut tc);
         let ram = tc.ctx.shared.default_space;
         let access = {
-            let mut b = (&mut tc.ctx).builder(body);
+            let mut b = tc.ctx.builder(body);
             let four = b.shr().get_const(4, 8);
             let scaled = b.push_mul(i, four).id();
             let addr0 = b.push_add(base, scaled).id();
@@ -403,7 +403,7 @@ mod tests {
         };
         // Add a back-edge guard so value_range can bound i to [0, 19].
         {
-            let mut b = (&mut tc.ctx).builder(body);
+            let mut b = tc.ctx.builder(body);
             let one = b.shr().get_const(1, 8);
             let ni = b.push_add(i, one).id();
             let bound = b.shr().get_const(20, 8);
@@ -433,7 +433,7 @@ mod tests {
         let (fid, body, base, i) = setup_loop(&mut tc);
         let ram = tc.ctx.shared.default_space;
         let accesses = {
-            let mut b = (&mut tc.ctx).builder(body);
+            let mut b = tc.ctx.builder(body);
             let one = b.shr().get_const(1, 8);
             let addr_a = b.push_add(base, i).id();
             let off = b.shr().get_const(32, 8);
@@ -477,7 +477,7 @@ mod tests {
         let (fid, body, base, i) = setup_loop(&mut tc);
         let ram = tc.ctx.shared.default_space;
         let accesses = {
-            let mut b = (&mut tc.ctx).builder(body);
+            let mut b = tc.ctx.builder(body);
             let one = b.shr().get_const(1, 8);
             let addr = b.push_add(base, i).id();
             let a = b.push_store(one, addr, ram).id;

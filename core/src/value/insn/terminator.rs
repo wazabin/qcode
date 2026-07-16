@@ -312,7 +312,7 @@ mod tests {
             let f = ctx.anon_function();
             BasicBlock::make(&mut ctx, f).id
         };
-        let insn = (&mut ctx).builder(block).push_tail_call(callee).id;
+        let insn = ctx.builder(block).push_tail_call(callee).id;
 
         let insn = Instruction::from_id(&ctx, insn);
         assert!(insn.is_terminator());
@@ -412,7 +412,7 @@ mod tests {
         }
         .id;
         let call_id = {
-            let mut builder = (&mut tc.ctx).builder(block);
+            let mut builder = tc.ctx.builder(block);
             builder.push_call(callee).id
         };
 
@@ -453,7 +453,7 @@ mod tests {
         }
         .id;
         let call_id = {
-            let mut builder = (&mut tc.ctx).builder(block);
+            let mut builder = tc.ctx.builder(block);
             builder.push_call(callee).id
         };
 

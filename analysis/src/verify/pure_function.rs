@@ -137,7 +137,7 @@ mod tests {
             f.add_block(entry);
         }
         {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             body(&mut b);
         }
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);

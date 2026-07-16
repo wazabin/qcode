@@ -1238,7 +1238,7 @@ mod tests {
         let block = host_block(&mut rendered_ctx, "rendered");
         let arg = rendered_ctx.get_const(1, 8).id();
         let rendered_ids = {
-            let mut builder = (&mut rendered_ctx).builder(block);
+            let mut builder = rendered_ctx.builder(block);
             let apply = builder.push_apply(Callee::Minted(1), vec![arg]).id();
             let map = builder.push_map(Callee::Minted(2), arg, Vec::new()).id();
             let scan = builder
@@ -1256,7 +1256,7 @@ mod tests {
 
         let tail_block = host_block(&mut rendered_ctx, "rendered_tail");
         let tail_id = {
-            let mut builder = (&mut rendered_ctx).builder(tail_block);
+            let mut builder = rendered_ctx.builder(tail_block);
             let value = builder
                 .push_tail_call_with_args(Callee::Minted(5), vec![arg])
                 .id();

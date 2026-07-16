@@ -54,7 +54,7 @@ mod tests {
         FunctionBody::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
-        let mut builder = (&mut tc.ctx).builder_at(0x1000);
+        let mut builder = tc.ctx.builder_at(0x1000);
         f(&mut builder);
         drop(builder);
         (tc, fun_id)

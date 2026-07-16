@@ -1151,14 +1151,9 @@ mod tests {
     use qcode::{
         builder::Builder,
         context::Context,
-        space::SpaceId,
         testing::TestContext,
         value::{BasicBlock, FunctionBody, Value},
     };
-
-    fn reg_space(ctx: &Context) -> SpaceId {
-        ctx.try_get_space("register").unwrap()
-    }
 
     fn build_block(
         f: impl FnOnce(&mut Builder<'static, '_>),
@@ -1168,7 +1163,7 @@ mod tests {
             let __f = ctx.anon_function();
             ctx.get_or_make_block(0x1000, __f)
         };
-        let mut builder = (&mut ctx).builder_at(0x1000);
+        let mut builder = ctx.builder_at(0x1000);
         f(&mut builder);
         drop(builder);
         (ctx, block_id)
@@ -1243,7 +1238,7 @@ mod tests {
             }
         };
         {
-            let mut b = (&mut tc.ctx).builder(block_id);
+            let mut b = tc.ctx.builder(block_id);
             let base = b.push_load::<false>(ValueId::Varnode(r1), 8, regsp).id();
             let store_ptr = offset_ptr(&mut b, base, store_off);
             let five = b.shr().get_const(5, 4);
@@ -1479,7 +1474,7 @@ mod tests {
             .unwrap();
         let store_id;
         {
-            let mut b = (&mut tc.ctx).builder_at(0x1000);
+            let mut b = tc.ctx.builder_at(0x1000);
             let v = b.shr().get_const(0x1u64, 8);
             store_id = b.push_store(v, ValueId::Varnode(r), reg).id;
             b.push_call(callee);
@@ -1582,7 +1577,7 @@ mod tests {
 
         let ram = tc.ctx.shared.default_space;
         {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let c18 = b.shr().get_const(0x18, 8);
             let slot = b.push_sub(sp, c18).id(); // @SP - 0x18
             let val = b.shr().get_const(0x2f45c825, 4);
@@ -1648,7 +1643,7 @@ mod tests {
 
         let ram = tc.ctx.shared.default_space;
         {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let c8 = b.shr().get_const(8, 8);
             let c10 = b.shr().get_const(0x10, 8);
             let v = b.shr().get_const(0x1234, 4);

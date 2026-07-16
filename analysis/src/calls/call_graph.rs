@@ -272,15 +272,15 @@ mod tests {
         let (second, _) = function(&mut ctx, "second");
         let ptr = ctx.get_const(0x1234, 8).id();
 
-        let direct_second = (&mut ctx).builder(block).push_call(second).id;
+        let direct_second = ctx.builder(block).push_call(second).id;
         let site = new_block(&mut ctx, caller);
-        let direct_first = (&mut ctx).builder(site).push_call(first).id;
+        let direct_first = ctx.builder(site).push_call(first).id;
         let site = new_block(&mut ctx, caller);
-        let duplicate_first = (&mut ctx).builder(site).push_call(first).id;
+        let duplicate_first = ctx.builder(site).push_call(first).id;
         let site = new_block(&mut ctx, caller);
-        let tail = (&mut ctx).builder(site).push_tail_call(second).id;
+        let tail = ctx.builder(site).push_tail_call(second).id;
         let site = new_block(&mut ctx, caller);
-        let indirect = (&mut ctx).builder(site).push_call_ind(ptr).id;
+        let indirect = ctx.builder(site).push_call_ind(ptr).id;
 
         let graph = CallGraph::analyze(&ctx);
 
@@ -331,15 +331,9 @@ mod tests {
         let (scan_body, _) = function(&mut ctx, "scan_body");
         let value = ctx.get_const(1, 8).id();
 
-        let apply = (&mut ctx)
-            .builder(block)
-            .push_apply(apply_body, vec![value])
-            .id;
-        let map = (&mut ctx)
-            .builder(block)
-            .push_map(map_body, value, Vec::new())
-            .id;
-        let scan = (&mut ctx)
+        let apply = ctx.builder(block).push_apply(apply_body, vec![value]).id;
+        let map = ctx.builder(block).push_map(map_body, value, Vec::new()).id;
+        let scan = ctx
             .builder(block)
             .push_scan(scan_body, value, value, Vec::new())
             .id;
@@ -382,14 +376,14 @@ mod tests {
         let (middle, middle_block) = function(&mut ctx, "middle");
         let (high, _) = function(&mut ctx, "high");
 
-        (&mut ctx).builder(middle_block).push_call(high);
+        ctx.builder(middle_block).push_call(high);
         let site = new_block(&mut ctx, middle);
-        (&mut ctx).builder(site).push_call(low);
+        ctx.builder(site).push_call(low);
         let site = new_block(&mut ctx, middle);
-        (&mut ctx).builder(site).push_call(high);
+        ctx.builder(site).push_call(high);
         let site = new_block(&mut ctx, middle);
-        (&mut ctx).builder(site).push_call(middle);
-        (&mut ctx).builder(low_block).push_call(high);
+        ctx.builder(site).push_call(middle);
+        ctx.builder(low_block).push_call(high);
 
         let graph = CallGraph::analyze(&ctx);
         assert_eq!(graph.callees(middle), vec![low, middle, high]);
@@ -404,7 +398,7 @@ mod tests {
         let (callee, _) = function(&mut ctx, "callee");
         let before = CallGraph::analyze(&ctx);
 
-        (&mut ctx).builder(block).push_call(callee);
+        ctx.builder(block).push_call(callee);
 
         assert!(before.callees(caller).is_empty());
         assert_eq!(CallGraph::analyze(&ctx).callees(caller), vec![callee]);
@@ -418,7 +412,7 @@ mod tests {
 
         let mut ctx = Context::new();
         let (_, block) = function(&mut ctx, "caller");
-        (&mut ctx).builder(block).push_call(Callee::Minted(0));
+        ctx.builder(block).push_call(Callee::Minted(0));
 
         let _ = CallGraph::analyze(&ctx);
     }

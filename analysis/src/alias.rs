@@ -689,7 +689,7 @@ mod tests {
         let arg = ValueId::BlockParam(arg_pid);
 
         let (local, caller_arg, arg_plus) = {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let c8 = b.shr().get_const(8, 8);
             let local = b.push_sub(sp, c8).id(); // @SP - 8  (own-frame local)
             let caller_arg = b.push_add(sp, c8).id(); // @SP + 8  (caller frame)
@@ -762,7 +762,7 @@ mod tests {
         let glob = ValueId::BlockParam(glob_pid);
 
         let (local, caller_arg, glob_plus, lit_addr, glob_addr) = {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let c8 = b.shr().get_const(8, 8);
             let local = b.push_sub(sp, c8).id(); // @SP - 8  (own-frame local)
             let caller_arg = b.push_add(sp, c8).id(); // @SP + 8  (caller frame)
@@ -855,7 +855,7 @@ mod tests {
 
         let ram = tc.ctx.shared.default_space;
         let (store_addr, snap_addr, glob_addr) = {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let p = b.push_load::<false>(glob, 4, ram).id(); // P = *@glob (the buffer pointer)
             let c4 = b.shr().get_const(4, 4);
             let store_addr = b.push_add(p, c4).id(); // P + 4 (a write through the loaded pointer)
@@ -935,7 +935,7 @@ mod tests {
 
         let ram = tc.ctx.shared.default_space;
         let addr = {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let c4 = b.shr().get_const(4, 8);
             let slot = b.push_add(sp, c4).id(); // @SP + 4 (caller-frame slot)
             let cc = b.push_load::<false>(slot, 8, ram).id(); // buf = load(@SP+4)
@@ -1004,7 +1004,7 @@ mod tests {
         let arg = ValueId::BlockParam(arg_pid);
 
         let (caller_arg, arg_plus) = {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let c8 = b.shr().get_const(8, 8);
             let caller_arg = b.push_add(sp, c8).id(); // @SP + 8  (caller-frame slot)
             let arg_plus = b.push_add(arg, c8).id(); // arg + 8  (input-derived)
@@ -1075,7 +1075,7 @@ mod tests {
         let arg = ValueId::BlockParam(arg_pid);
 
         let (local, mix, arg_plus) = {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let c8 = b.shr().get_const(8, 8);
             let local = b.push_sub(sp, c8).id(); // @SP - 8  (own-frame local)
             let sp_minus_arg = b.push_sub(sp, arg).id(); // sp - arg  (mixed)
@@ -1133,7 +1133,7 @@ mod tests {
 
         let ram = tc.ctx.shared.default_space;
         let (local, caller_arg, mix) = {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let c8 = b.shr().get_const(8, 8);
             let local = b.push_sub(sp, c8).id(); // @SP - 8 (own-frame local)
             let caller_arg = b.push_add(sp, c8).id(); // @SP + 8 (caller frame)
@@ -1211,7 +1211,7 @@ mod tests {
         let arg = ValueId::BlockParam(arg_pid);
 
         let (local, deep) = {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let c8 = b.shr().get_const(8, 8);
             let local = b.push_sub(sp, c8).id();
             // A deep peel chain over the incoming arg.
@@ -1296,7 +1296,7 @@ mod tests {
         let ram = tc.ctx.shared.default_space;
 
         let (local, loaded) = {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let c8 = b.shr().get_const(8, 8);
             let local = b.push_sub(sp, c8).id(); // @SP - 8 (own-frame local)
             let g = b.shr().get_const(0x404040, 8);
@@ -1334,7 +1334,7 @@ mod tests {
         let ram = tc.ctx.shared.default_space;
 
         let (local, loaded) = {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let c8 = b.shr().get_const(8, 8);
             let local = b.push_sub(sp, c8).id(); // @SP - 8
             let g = b.shr().get_const(0x404040, 8);
@@ -1373,7 +1373,7 @@ mod tests {
             let (fid, root, sp) = fn_with_sp(&mut tc, "f", 0x1000, sp_reg);
             let callee = configure(&mut tc, fid);
             let cid = {
-                let mut b = (&mut tc.ctx).builder(root);
+                let mut b = tc.ctx.builder(root);
                 let c8 = b.shr().get_const(8, 8);
                 let local = b.push_sub(sp, c8).id(); // @SP - 8
                 let cid = if indirect {
@@ -1452,7 +1452,7 @@ mod tests {
             let callee = callee_with_attrs(&mut tc, "g", attrs);
 
             let (local, call_result) = {
-                let mut b = (&mut tc.ctx).builder(root);
+                let mut b = tc.ctx.builder(root);
                 let c8 = b.shr().get_const(8, 8);
                 let local = b.push_sub(sp, c8).id(); // @SP - 8
                 let cr = b.push_call(callee).id;
@@ -1516,7 +1516,7 @@ mod tests {
         let glob = ValueId::BlockParam(glob_pid);
 
         let (caller_slot, mixed, glob_addr) = {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let c8 = b.shr().get_const(8, 8);
             let caller_slot = b.push_add(sp, c8).id(); // @SP + 8 (caller frame)
             let mixed = b.push_add(input, glob).id(); // INPUT ∪ GLOBAL_STATIC

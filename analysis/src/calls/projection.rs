@@ -326,7 +326,7 @@ mod tests {
         let (a, b);
         let (ret, ptr, tuple);
         {
-            let mut bld = (&mut tc.ctx).builder(entry);
+            let mut bld = tc.ctx.builder(entry);
             a = bld.push_param(8).id();
             b = bld.push_param(8).id();
             let c69 = bld.shr().get_const(69, 8);
@@ -380,7 +380,7 @@ mod tests {
 
         let a;
         {
-            let mut bld = (&mut tc.ctx).builder(entry);
+            let mut bld = tc.ctx.builder(entry);
             a = bld.push_param(8).id();
             let _b = bld.push_param(8).id();
             let zero = bld.shr().get_const(0, 8);
@@ -388,18 +388,18 @@ mod tests {
             bld.push_cbranch(cond, t, fb);
         }
         {
-            let mut bld = (&mut tc.ctx).builder(t);
+            let mut bld = tc.ctx.builder(t);
             let one = bld.shr().get_const(1, 8);
             bld.push_branch_with_args(m, vec![one]);
         }
         {
-            let mut bld = (&mut tc.ctx).builder(fb);
+            let mut bld = tc.ctx.builder(fb);
             let two = bld.shr().get_const(2, 8);
             bld.push_branch_with_args(m, vec![two]);
         }
         let (ret, ptr, tuple);
         {
-            let mut bld = (&mut tc.ctx).builder(m);
+            let mut bld = tc.ctx.builder(m);
             let x = bld.push_param(8).id();
             tuple = bld.push_tuple(vec![x]).id();
             ptr = bld.shr().get_const(0x2000, 8);
@@ -431,7 +431,7 @@ mod tests {
         let reg = ValueId::Varnode(tc.r0);
         let (ret, ptr, tuple);
         {
-            let mut bld = (&mut tc.ctx).builder(entry);
+            let mut bld = tc.ctx.builder(entry);
             tuple = bld.push_tuple(vec![reg]).id();
             ptr = bld.shr().get_const(0x2000, 8);
             ret = bld.push_return(ptr).id();

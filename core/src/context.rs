@@ -3533,15 +3533,9 @@ mod tests {
                 .set_origin(ValueId::BlockParam(param));
 
             let arg = ctx.get_const(7, 8).id();
-            let branch = (&mut ctx)
-                .builder(entry)
-                .push_branch_with_args(tail, vec![arg])
-                .id;
+            let branch = ctx.builder(entry).push_branch_with_args(tail, vec![arg]).id;
             Instruction::from_id_mut(&mut ctx, branch).set_address(0x1000);
-            let ret = (&mut ctx)
-                .builder(tail)
-                .push_return(ValueId::BlockParam(param))
-                .id;
+            let ret = ctx.builder(tail).push_return(ValueId::BlockParam(param)).id;
             Instruction::from_id_mut(&mut ctx, ret).set_address(0x2000);
             FunctionBody::from_id_mut(&mut ctx, f)
                 .set_root(entry)

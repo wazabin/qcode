@@ -364,7 +364,7 @@ mod tests {
     /// `push_return(ptr)`; map results flow through a value-carrying return).
     fn return_value(tc: &mut TestContext, entry: BlockId, value: ValueId) {
         let (ptr, ret) = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let ptr = b.shr().get_const(0, 8);
             let ret = b.push_return(ptr).id();
             (ptr, ret)
@@ -392,7 +392,7 @@ mod tests {
         }
         let (inc, ptr, ret);
         {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let elem = b.push_param(1).id();
             let one = b.shr().get_const(1, 1);
             inc = b.push_add(elem, one).id();
@@ -425,14 +425,14 @@ mod tests {
         }
         let tsz = tc.ctx.shared.types.size_of(tuple_ty);
         let t = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             b.push_param(tsz).id()
         };
         if let ValueId::BlockParam(pid) = t {
             tc.ctx.block_param_mut(pid).type_id = tuple_ty;
         }
         let (sum, ptr, ret) = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let index = b.push_extract(t, 0).id();
             let idx_lo = b.get_range(index, 0..1).unwrap().id();
             let elem = b.push_extract(t, 1).id();
@@ -491,7 +491,7 @@ mod tests {
         }
         let src = tc.ctx.get_bytes(vec![0x01, 0x02, 0x03]).id();
         let map_val = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             b.push_map(body, src, Vec::new()).id()
         };
         return_value(&mut tc, entry, map_val);
@@ -525,7 +525,7 @@ mod tests {
         let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, 4);
         let src = tc.ctx.get_typed_const(0x1f1e1d2c, arr_ty).id();
         let map_val = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             b.push_map(body, src, Vec::new()).id()
         };
         return_value(&mut tc, entry, map_val);
@@ -562,7 +562,7 @@ mod tests {
         }
         let src = tc.ctx.get_bytes(vec![0x10, 0x20, 0x30]).id();
         let map_val = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let en = b.push_intrinsic(enum_id, vec![src]).id();
             b.push_map_typed(body, en, Vec::new(), arr_ty).id()
         };
@@ -591,7 +591,7 @@ mod tests {
         }
         let tsz = tc.ctx.shared.types.size_of(tuple_ty);
         let (sum, ptr, ret) = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let acc = b.push_param(1).id(); // param 0: accumulator (i8)
             let t = b.push_param(tsz).id(); // param 1: enumerate tuple
             if let ValueId::BlockParam(pid) = t {
@@ -639,7 +639,7 @@ mod tests {
         }
         let src = tc.ctx.get_bytes(vec![0x01, 0x02, 0x03]).id();
         let scan_val = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let en = b.push_intrinsic(enum_id, vec![src]).id();
             let init = b.shr().get_const(0, 1);
             b.push_scan_typed(body, init, en, Vec::new(), arr_ty).id()

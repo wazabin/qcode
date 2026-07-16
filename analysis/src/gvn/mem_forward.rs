@@ -918,11 +918,11 @@ mod tests {
     ) -> R {
         use crate::pipeline::ContextSplit;
         let env = crate::test_util::dummy_env();
-        let out = {
+
+        {
             let (bodies, view) = tc.ctx.split(&env);
             f(&mut bodies[fid], view)
-        };
-        out
+        }
     }
 
     /// An [`AliasResult`] with a concrete interval for each listed varnode.
@@ -1079,7 +1079,7 @@ mod tests {
         // `slot = ((@SP - 0x10) & -8) - 0x78`; spill an 8-byte value into it, then
         // end the block with a direct call carrying no arguments (nothing escapes).
         let (aligned, slot_store, val) = {
-            let mut b = (&mut tc.ctx).builder(root);
+            let mut b = tc.ctx.builder(root);
             let c10 = b.shr().get_const(0x10, 8);
             let neg8 = b.shr().get_const((-8i64) as u64, 8);
             let c78 = b.shr().get_const(0x78, 8);
@@ -1149,7 +1149,7 @@ mod tests {
         let fid = tc.ctx.anon_function();
         // Hand-built 4-byte store of a 2-byte value (src width < store size).
         let store = Store {
-            space: space.into(),
+            space,
             ptr: ValueId::Varnode(tc.r0_lo32).localize(fid),
             src: narrow.localize(fid),
             size: 4,
@@ -1222,7 +1222,7 @@ mod tests {
         }
         // The block ends in a (direct) call.
         {
-            let mut b = (&mut tc.ctx).builder(block);
+            let mut b = tc.ctx.builder(block);
             b.push_call(fun_id);
         }
 
@@ -1277,7 +1277,7 @@ mod tests {
         }
         let arg = ValueId::Varnode(tc.r1);
         {
-            let mut b = (&mut tc.ctx).builder(block);
+            let mut b = tc.ctx.builder(block);
             b.push_call(callee);
         }
         // The builder makes a call with no args; set them to `[arg]`.
@@ -1379,7 +1379,7 @@ mod tests {
         // The caller block ends in a direct call to `callee`, passing a frame
         // pointer (so a pointer escapes — the no-summary path would drop the cell).
         {
-            let mut b = (&mut tc.ctx).builder(block);
+            let mut b = tc.ctx.builder(block);
             b.push_call_with_args(callee, vec![ValueId::Varnode(tc.r1)]);
         }
 

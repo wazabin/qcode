@@ -1338,7 +1338,6 @@ mod tests {
             let tgt = ctx.get_or_make_block(0x1001, block.func);
             let mut blk = BasicBlock::from_id_mut(&mut ctx, block);
             blk.pop_insn(); // drop the `goto` so we can append before re-terminating
-            drop(blk);
             let mut b = ctx.builder(block);
             let hi = b.get_range(zero.into(), 1..4).unwrap().id();
             b.push_branch(tgt);
@@ -1378,7 +1377,6 @@ mod tests {
             let tgt = ctx.get_or_make_block(0x1001, block.func);
             let mut blk = BasicBlock::from_id_mut(&mut ctx, block);
             blk.pop_insn(); // drop the `goto` so we can append before re-terminating
-            drop(blk);
             let mut b = ctx.builder(block);
             // hi3 = wide[1:4] (== 0); hi = zext(hi3); hishift = hi << 8.
             let hi3 = b.get_range(wide.into(), 1..4).unwrap().id();

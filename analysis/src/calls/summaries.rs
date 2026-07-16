@@ -426,7 +426,7 @@ pub fn compute_stack_delta(
 pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_ptr: VarnodeId) {
     // A functionalized (`pure_reg`) function's interface — its by-value input
     // params and returned write-set — is owned by `argpromote_registers`. The
-    // legacy register-ABI summary (recomputing input/clobbered/saved/stack-delta
+    // conventional register-ABI summary (recomputing input/clobbered/saved/stack-delta
     // from a conventional prologue/epilogue) does not model a functionalized body
     // and would desync `input_regs` from the arguments `argpromote_registers`
     // already bound at every call site. Leave its signature untouched.
@@ -459,9 +459,8 @@ pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_
         || function_writes_through_stack_arg(ctx, function_id, stack_ptr);
 
     let mut f = FunctionBody::from_id_mut(ctx, function_id);
-    // Legacy ABI register list, kept for the conventional (non-pure_reg) summary
+    // Conventional ABI register list for the non-pure_reg summary
     // path; functionalized callees expose their interface via block params.
-    #[allow(deprecated)]
     f.set_input_regs(inputs);
     f.set_clobbered_regs(clobbered);
     f.set_reads_unbounded_stack(reads_unbounded);
@@ -551,7 +550,7 @@ mod tests {
         FunctionBody::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
-        let mut builder = (&mut tc.ctx).builder_at(addr);
+        let mut builder = tc.ctx.builder_at(addr);
         f(&mut builder);
         drop(builder);
         fun_id
@@ -582,7 +581,7 @@ mod tests {
             .block_param_mut(pid)
             .set_origin_id(ValueId::Varnode(sp).localize(pid.func));
         let sp_param = ValueId::BlockParam(pid);
-        let mut builder = (&mut tc.ctx).builder_at(addr);
+        let mut builder = tc.ctx.builder_at(addr);
         f(&mut builder, sp_param);
         drop(builder);
         fun_id

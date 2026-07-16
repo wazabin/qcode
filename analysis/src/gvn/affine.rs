@@ -876,7 +876,7 @@ mod spike {
         let sp = ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
 
         let (s1, s2, threaded, aligned, al) = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let c8 = b.shr().get_const(8, 8);
             let c20 = b.shr().get_const(0x20, 8);
             let neg16 = b.shr().get_const((-16i64) as u64, 8);
@@ -931,7 +931,7 @@ mod spike {
         let sp = ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
 
         let (fixed, indexed, aligned_slot, unrelated) = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let c8 = b.shr().get_const(8, 8);
             let neg16 = b.shr().get_const((-16i64) as u64, 8);
             // A non-constant index loaded from a register.
@@ -992,7 +992,7 @@ mod spike {
         let p = ValueId::BlockParam(pid);
 
         let (gep, add) = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let c60 = b.shr().get_const(0x60, 8);
             let gep = b.push_gep(p, 0x60).id(); // gep(p + 0x60)
             let add = b.push_add(p, c60).id(); // p + 0x60

@@ -218,7 +218,7 @@ mod tests {
         }
         let (ret, ptr, tuple);
         {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let a = b.push_param(8).id();
             let bp = b.push_param(8).id();
             let c69 = b.shr().get_const(69, 8);
@@ -273,7 +273,7 @@ mod tests {
         }
         let (a_in, b_arg, call_id);
         {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             a_in = b.push_param(8).id();
             b_arg = match b_const {
                 Some(v) => b.shr().get_const(v, 8),
@@ -296,7 +296,7 @@ mod tests {
         tc.ctx.add_cfg_edge(entry, cont);
         let (r0, r1, reg_space) = (tc.r0, tc.r1, tc.reg_space);
         {
-            let mut b = (&mut tc.ctx).builder(cont);
+            let mut b = tc.ctx.builder(cont);
             let cr = ValueId::Instruction(call_id);
             let e0 = b.push_extract(cr, 0).id();
             let e1 = b.push_extract(cr, 1).id();
@@ -384,7 +384,7 @@ mod tests {
         let at_id = qcode::value::insn::IntrinsicId::from_name("at").expect("at registered");
         let (ret, ptr, tuple);
         {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let sp = ValueId::BlockParam(sp_pid);
             let arr = ValueId::BlockParam(arr_pid);
             // `at(arr, 0)` bridges the array param to a scalar lane (byte 0),
@@ -438,7 +438,7 @@ mod tests {
         }
         let (sp_arg, arr_arg, call_id);
         {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             sp_arg = b.shr().get_const(0x40ea20, 4);
             arr_arg = b.shr().get_const(0x2f76bfc2, 4);
             let ValueId::Instruction(id) = b.push_call(dec).id() else {
@@ -458,7 +458,7 @@ mod tests {
         tc.ctx.add_cfg_edge(entry, cont);
         let (r1, reg_space) = (tc.r1, tc.reg_space);
         {
-            let mut b = (&mut tc.ctx).builder(cont);
+            let mut b = tc.ctx.builder(cont);
             let cr = ValueId::Instruction(call_id);
             let e1 = b.push_extract(cr, 1).id();
             b.push_store(e1, ValueId::Varnode(r1), reg_space);

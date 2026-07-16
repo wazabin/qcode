@@ -1153,7 +1153,7 @@ impl<'str> Mem2Reg<'_, 'str> {
         // set: the only thing that would turn such a var into a root param is the
         // root-param path in `insert_block_params`, and with no live-in var promoted it
         // never fires (and is asserted away below). These inputs stay as plain loads —
-        // correct (emulation reads the real incoming value); the legacy register-ABI
+        // correct (emulation reads the real incoming value); the conventional register-ABI
         // summary still recognizes register inputs by raw-IR liveness
         // (`compute_input_regs`), independent of any mem2reg param. A var written before
         // it is read (RMW / local scratch) is not live-in and still promotes normally.
@@ -2309,7 +2309,7 @@ mod tests {
         tc.ctx.block_param_mut(full_param).name = Some("r0".into());
 
         {
-            let mut b = (&mut tc.ctx).builder_at(0x1000);
+            let mut b = tc.ctx.builder_at(0x1000);
             b.push_store(
                 ValueId::BlockParam(full_param),
                 ValueId::Varnode(tc.r0),
@@ -2353,7 +2353,7 @@ mod tests {
         tc.ctx.block_param_mut(pid).name = Some("RSP".into());
         let sp = ValueId::BlockParam(pid);
 
-        let mut b = (&mut tc.ctx).builder_at(0x1000);
+        let mut b = tc.ctx.builder_at(0x1000);
         let v = b.shr().get_const(0x1234, 8);
         let c8 = b.shr().get_const(8, 8);
         let addr_store = b.push_sub(sp, c8).id();
@@ -2427,7 +2427,7 @@ mod tests {
         let sp = ValueId::BlockParam(pid);
 
         {
-            let mut b = (&mut tc.ctx).builder_at(0x1000);
+            let mut b = tc.ctx.builder_at(0x1000);
             let v = b.shr().get_const(0x1234, 8);
             let c8 = b.shr().get_const(8, 8);
             // A promotable local: store then reload `@SP - 8`.
@@ -2483,7 +2483,7 @@ mod tests {
         let zero_store;
         let full_load;
         {
-            let mut b = (&mut tc.ctx).builder_at(0x1000);
+            let mut b = tc.ctx.builder_at(0x1000);
             let zero = b.shr().get_const(0, 4);
             let one = b.shr().get_const(1, 1);
             zero_store = b.push_store(zero, full, tc.reg_space).id;
@@ -2539,7 +2539,7 @@ mod tests {
         let byte_store;
         let byte_load;
         {
-            let mut b = (&mut tc.ctx).builder_at(0x1000);
+            let mut b = tc.ctx.builder_at(0x1000);
             let value = b.shr().get_const(0x12345678, 4);
             b.push_store(value, full, tc.reg_space);
             let full_load = b.push_load::<false>(full, 4, tc.reg_space).id();
@@ -2754,7 +2754,7 @@ mod tests {
             .set_root(cbody)
             .unwrap();
         {
-            let mut b = (&mut tc.ctx).builder_at(0x2000);
+            let mut b = tc.ctx.builder_at(0x2000);
             let v = b.shr().get_const(0x99u64, 8);
             b.push_store(v, ValueId::Varnode(r0), reg);
             let ret = b.shr().get_const(0u64, 8);
@@ -2779,7 +2779,7 @@ mod tests {
         FunctionBody::from_id_mut(&mut tc.ctx, caller).add_block(cont);
         let post_load;
         {
-            let mut b = (&mut tc.ctx).builder_at(0x1000);
+            let mut b = tc.ctx.builder_at(0x1000);
             let pre = b.shr().get_const(0x1u64, 8);
             b.push_store(pre, ValueId::Varnode(r0), reg);
             b.push_call(callee);
@@ -2841,7 +2841,7 @@ mod tests {
 
         let (c1_store, byte_load);
         {
-            let mut b = (&mut tc.ctx).builder_at(0x1000);
+            let mut b = tc.ctx.builder_at(0x1000);
             // Compute a wide value into r0 (the `ECX` build).
             let v = b.push_load::<false>(ValueId::Varnode(r2), 8, reg).id();
             let one = b.shr().get_const(1u64, 8);
@@ -2896,7 +2896,7 @@ mod tests {
             .set_root(cbody)
             .unwrap();
         {
-            let mut b = (&mut tc.ctx).builder_at(0x2000);
+            let mut b = tc.ctx.builder_at(0x2000);
             let v = b.shr().get_const(0x99u64, 8);
             b.push_store(v, ValueId::Varnode(r0), reg);
             let ret = b.shr().get_const(0u64, 8);
@@ -2915,7 +2915,7 @@ mod tests {
         FunctionBody::from_id_mut(&mut tc.ctx, caller).add_block(cont);
         let pre_store;
         {
-            let mut b = (&mut tc.ctx).builder_at(0x1000);
+            let mut b = tc.ctx.builder_at(0x1000);
             let pre = b.shr().get_const(0x1u64, 8);
             pre_store = b.push_store(pre, ValueId::Varnode(r0), reg).id;
             b.push_call(callee);
@@ -2953,7 +2953,7 @@ mod tests {
             .set_root(cbody)
             .unwrap();
         {
-            let mut b = (&mut tc.ctx).builder_at(0x2000);
+            let mut b = tc.ctx.builder_at(0x2000);
             let v = b.shr().get_const(0x99u64, 8);
             b.push_store(v, ValueId::Varnode(r0), reg);
             let ret = b.shr().get_const(0u64, 8);
@@ -2970,7 +2970,7 @@ mod tests {
         FunctionBody::from_id_mut(&mut tc.ctx, caller).add_block(cont);
         let pre_store;
         {
-            let mut b = (&mut tc.ctx).builder_at(0x1000);
+            let mut b = tc.ctx.builder_at(0x1000);
             let v1 = b.shr().get_const(0x1u64, 8);
             pre_store = b.push_store(v1, ValueId::Varnode(r0), reg).id; // dead
             b.push_call(callee);
@@ -3007,7 +3007,7 @@ mod tests {
             .set_root(callee_body)
             .unwrap();
         {
-            let mut b = (&mut tc.ctx).builder_at(0x2000);
+            let mut b = tc.ctx.builder_at(0x2000);
             let v = b.shr().get_const(0x99u64, 8);
             b.push_store(v, ValueId::Varnode(r0), reg);
             let ret = b.shr().get_const(0u64, 8);
@@ -3031,29 +3031,29 @@ mod tests {
         }
 
         {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let one = b.shr().get_const(1u64, 8);
             let cond = b.shr().get_const(1u64, 1);
             b.push_store(one, ValueId::Varnode(r0), reg);
             b.push_cbranch(cond, left, right);
         }
         {
-            let mut b = (&mut tc.ctx).builder(left);
+            let mut b = tc.ctx.builder(left);
             b.push_call(callee);
         }
         tc.ctx.add_cfg_edge(left, left_cont);
         {
-            let mut b = (&mut tc.ctx).builder(left_cont);
+            let mut b = tc.ctx.builder(left_cont);
             b.push_branch(join);
         }
         {
-            let mut b = (&mut tc.ctx).builder(right);
+            let mut b = tc.ctx.builder(right);
             let two = b.shr().get_const(2u64, 8);
             b.push_store(two, ValueId::Varnode(r0), reg);
             b.push_branch(join);
         }
         {
-            let mut b = (&mut tc.ctx).builder(join);
+            let mut b = tc.ctx.builder(join);
             let loaded = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
             b.push_store(loaded, ValueId::Varnode(r1), reg);
             let ret = b.shr().get_const(0u64, 8);
@@ -3293,7 +3293,7 @@ mod tests {
 
         let entry_store;
         {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let one = b.shr().get_const(1u64, 8);
             let cond = b.shr().get_const(1u64, 1);
             entry_store = b.push_store(one, ValueId::Varnode(r0), reg).id;
@@ -3301,18 +3301,18 @@ mod tests {
         }
         {
             // Left arm overwrites r0 before reading it.
-            let mut b = (&mut tc.ctx).builder(left);
+            let mut b = tc.ctx.builder(left);
             let two = b.shr().get_const(2u64, 8);
             b.push_store(two, ValueId::Varnode(r0), reg);
             b.push_branch(join);
         }
         {
             // Right arm never touches r0: it leaves the function with the entry value.
-            let mut b = (&mut tc.ctx).builder(right);
+            let mut b = tc.ctx.builder(right);
             b.push_branch(join);
         }
         {
-            let mut b = (&mut tc.ctx).builder(join);
+            let mut b = tc.ctx.builder(join);
             let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
         }
@@ -3359,7 +3359,7 @@ mod tests {
 
         let zero;
         {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             zero = b.shr().get_const(0u64, 8);
             let target = b.shr().get_const(0x1100u64, 8);
             b.push_store(zero, ValueId::Varnode(r0), reg);
@@ -3372,7 +3372,7 @@ mod tests {
         // redefines r0 to a distinct value that must not leak to its sibling.
         let sink1;
         {
-            let mut b = (&mut tc.ctx).builder(s1);
+            let mut b = tc.ctx.builder(s1);
             let loaded = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
             sink1 = b.push_store(loaded, ValueId::Varnode(r1), reg).id;
             let one = b.shr().get_const(1u64, 8);
@@ -3381,7 +3381,7 @@ mod tests {
         }
         let sink2;
         {
-            let mut b = (&mut tc.ctx).builder(s2);
+            let mut b = tc.ctx.builder(s2);
             let loaded = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
             sink2 = b.push_store(loaded, ValueId::Varnode(r2), reg).id;
             let two = b.shr().get_const(2u64, 8);
@@ -3389,7 +3389,7 @@ mod tests {
             b.push_branch(exit);
         }
         {
-            let mut b = (&mut tc.ctx).builder(exit);
+            let mut b = tc.ctx.builder(exit);
             let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
         }
@@ -3429,7 +3429,7 @@ mod tests {
 
         let mismatched_load;
         {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let val = b.shr().get_const(0x1122_3344_5566_7788u64, 8);
             b.push_store(val, ValueId::Varnode(r0), reg); // 8-byte store: matches r0
             // 4-byte load through the 8-byte r0 — a width mismatch that must
@@ -3479,7 +3479,7 @@ mod tests {
         // entry stores r0, then an indirect jump that can land on `join` directly
         // (an argument-less edge) or on `other`.
         {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let zero = b.shr().get_const(0u64, 8);
             let target = b.shr().get_const(0x1200u64, 8);
             b.push_store(zero, ValueId::Varnode(r0), reg);
@@ -3488,14 +3488,14 @@ mod tests {
         tc.ctx.add_cfg_edge(entry, join); // implicit (BranchInd) edge into the join
         tc.ctx.add_cfg_edge(entry, other);
         {
-            let mut b = (&mut tc.ctx).builder(other);
+            let mut b = tc.ctx.builder(other);
             let one = b.shr().get_const(1u64, 8);
             b.push_store(one, ValueId::Varnode(r0), reg);
             b.push_branch(join); // arg-carrying edge into the join
         }
         let join_load;
         {
-            let mut b = (&mut tc.ctx).builder(join);
+            let mut b = tc.ctx.builder(join);
             join_load = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
             b.push_store(join_load, ValueId::Varnode(r1), reg);
             let ret = b.shr().get_const(0u64, 8);
@@ -3543,7 +3543,7 @@ mod tests {
         }
 
         let temp = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             let temp = b.make_temp(4);
             let val = b.shr().get_const(7u64, 4);
             let space = qcode::space::LocalMemorySpaceId::Temp(
@@ -3555,7 +3555,7 @@ mod tests {
             temp
         };
         let load_id = {
-            let mut b = (&mut tc.ctx).builder(orphan);
+            let mut b = tc.ctx.builder(orphan);
             let space = qcode::space::LocalMemorySpaceId::Temp(
                 TempRef::new(b.view(), temp).space().id.localize(f),
             );

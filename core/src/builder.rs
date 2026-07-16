@@ -2411,7 +2411,7 @@ mod tests {
         let fid_a = FunctionBody::make(&mut ctx_a, "foo".into()).unwrap().id;
         let entry_a = FunctionBody::from_id_mut(&mut ctx_a, fid_a).make_root().id;
         {
-            let mut b = (&mut ctx_a).builder(entry_a);
+            let mut b = ctx_a.builder(entry_a);
             body(&mut b);
         }
         let snap_a = snap(&ctx_a, fid_a);
@@ -2512,7 +2512,7 @@ mod tests {
         let src = ValueId::BlockParam(src_pid);
 
         let map_ty = {
-            let mut b = (&mut ctx).builder(hentry);
+            let mut b = ctx.builder(hentry);
             b.push_map(body, src, Vec::new()).type_id()
         };
 
@@ -2647,7 +2647,7 @@ mod tests {
     #[test]
     fn test_named_temp_duplicate() {
         let mut ctx = Context::new();
-        let mut builder = (&mut ctx).builder_at(0x1000);
+        let mut builder = ctx.builder_at(0x1000);
 
         let value = builder.make_named_temp("dup".into(), 4);
         let other_value = builder.make_named_temp("dup".into(), 4);
@@ -2669,14 +2669,14 @@ mod tests {
         let mut ctx = Context::new();
 
         let first = {
-            let mut builder = (&mut ctx).builder_at(0x1000);
+            let mut builder = ctx.builder_at(0x1000);
             let temp = builder.make_temp_labeled(7, 4);
             let target = builder.current_block();
             builder.finalize(target);
             temp
         };
         let second = {
-            let mut builder = (&mut ctx).builder_at(0x2000);
+            let mut builder = ctx.builder_at(0x2000);
             let temp = builder.make_temp_labeled(7, 4);
             let target = builder.current_block();
             builder.finalize(target);
@@ -2731,7 +2731,7 @@ mod tests {
             let __f = ctx.anon_function();
             ctx.get_or_make_block(0x1000, __f)
         };
-        let mut builder = (&mut ctx).builder(block_id);
+        let mut builder = ctx.builder(block_id);
 
         let p0 = builder.push_param(8);
         let p0_id = p0;
@@ -2758,7 +2758,7 @@ mod tests {
         let param_val = BasicBlock::from_id_mut(&mut ctx, dst_id).push_param(8).id();
 
         {
-            let mut builder = (&mut ctx).builder(src_id);
+            let mut builder = ctx.builder(src_id);
             builder.push_branch_with_args(dst_id, vec![param_val]);
         }
 
@@ -2778,7 +2778,7 @@ mod tests {
         let id_42 = ctx.get_const(42, 8).id();
 
         let not_insn_id = {
-            let source = (&mut ctx).builder_at(0x1000).current_block();
+            let source = ctx.builder_at(0x1000).current_block();
             let target = ctx.get_or_make_block(0x1001, source.func);
             let mut builder = ctx.builder(source);
             builder.set_address(0x1000);
@@ -2800,7 +2800,7 @@ mod tests {
         assert!(FunctionBody::from_id(&ctx, func).root().is_none());
 
         let block = {
-            let builder = (&mut ctx).builder_at(0x2000);
+            let builder = ctx.builder_at(0x2000);
             builder.current_block()
         };
 
@@ -2817,7 +2817,7 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut ctx = Context::new();
             let value = ctx.get_const(0, 1).id();
-            let source = (&mut ctx).builder_at(0x4010).current_block();
+            let source = ctx.builder_at(0x4010).current_block();
             let target = ctx.get_or_make_block(0x4020, source.func);
             let mut builder = ctx.builder(source);
 
@@ -2849,7 +2849,7 @@ mod tests {
 
         {
             let target = ctx.get_or_make_block(0x1001, block_id.func);
-            let mut builder = (&mut ctx).builder(block_id);
+            let mut builder = ctx.builder(block_id);
             let src = builder.make_named_temp("src".into(), 9);
             let dst = builder.make_named_temp("dst".into(), 9);
             builder.push_copy(src.into(), dst);
@@ -2878,13 +2878,13 @@ mod tests {
         let val = ctx.get_const(0, 8).id();
 
         let existing_id = {
-            let mut b = (&mut ctx).builder(block_id);
-            let id = b.push_bit_negate(val).id;
-            id
+            let mut b = ctx.builder(block_id);
+
+            b.push_bit_negate(val).id
         };
 
         let prepended_id = {
-            let mut b = (&mut ctx).builder(block_id);
+            let mut b = ctx.builder(block_id);
             b.set_insert_point_to_start();
             b.push_bit_negate(val).id
         };
@@ -2903,13 +2903,13 @@ mod tests {
         let val = ctx.get_const(0, 8).id();
 
         let existing_id = {
-            let mut b = (&mut ctx).builder(block_id);
-            let id = b.push_bit_negate(val).id;
-            id
+            let mut b = ctx.builder(block_id);
+
+            b.push_bit_negate(val).id
         };
 
         let (id0, id1, id2) = {
-            let mut b = (&mut ctx).builder(block_id);
+            let mut b = ctx.builder(block_id);
             b.set_insert_point_to_start();
             (
                 b.push_bit_negate(val).id,
@@ -2932,12 +2932,12 @@ mod tests {
         let val = ctx.get_const(0, 8).id();
 
         let (first_id, target_id) = {
-            let mut b = (&mut ctx).builder(block_id);
+            let mut b = ctx.builder(block_id);
             (b.push_bit_negate(val).id, b.push_bit_negate(val).id)
         };
 
         let (inserted0, inserted1) = {
-            let mut b = (&mut ctx).builder(block_id);
+            let mut b = ctx.builder(block_id);
             b.set_insert_point_before(target_id);
             (b.push_bit_negate(val).id, b.push_bit_negate(val).id)
         };
@@ -2953,7 +2953,7 @@ mod tests {
 
         let val = ctx.get_const(1, 1).id();
         let new_id = {
-            let mut b = (&mut ctx).builder(entry);
+            let mut b = ctx.builder(entry);
             b.set_insert_point_to_start();
             b.push_bit_negate(val).id
         };
@@ -2974,7 +2974,7 @@ mod tests {
         let val = ctx.get_const(0, 8).id();
 
         let (first_id, middle_id, last_id) = {
-            let mut b = (&mut ctx).builder(block_id);
+            let mut b = ctx.builder(block_id);
             let first = b.push_bit_negate(val).id; // appended → index 0
             b.set_insert_point_to_start();
             let middle = b.push_bit_negate(val).id; // inserted at 0, first shifts to 1

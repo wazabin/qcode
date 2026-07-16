@@ -76,7 +76,7 @@ mod tests {
         let i8 = tc.ctx.shared.types.get_or_make_int(1);
         let array_ty = tc.ctx.shared.types.get_or_make_array(i8, 8);
         let (src, cap) = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             (b.push_param(8).id(), b.push_param(4).id())
         };
         if let ValueId::BlockParam(pid) = src {
@@ -84,7 +84,7 @@ mod tests {
         }
 
         let plain = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             b.push_map(body, src, Vec::new()).id()
         };
         let ValueId::Instruction(plain_id) = plain else {
@@ -97,7 +97,7 @@ mod tests {
         );
 
         let with_cap = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             b.push_map(body, src, vec![cap]).id()
         };
         let ValueId::Instruction(cap_id) = with_cap else {
@@ -129,7 +129,7 @@ mod tests {
         let array_ty = tc.ctx.shared.types.get_or_make_array(i8, 20);
 
         let (src, cap) = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             (b.push_param(20).id(), b.push_param(4).id())
         };
         // Type the source as the array (params default to int of their width)
@@ -138,7 +138,7 @@ mod tests {
             tc.ctx.block_param_mut(pid).type_id = array_ty;
         }
         let map_val = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             b.push_map(body, src, vec![cap]).id()
         };
         let ValueId::Instruction(map_id) = map_val else {
@@ -167,7 +167,7 @@ mod tests {
 
         // replace_value rewrites operands but never the body symbol.
         let new_src = {
-            let mut b = (&mut tc.ctx).builder(entry);
+            let mut b = tc.ctx.builder(entry);
             b.push_param(20).id()
         };
         let mut rewritten = Mnemonic::Map(m);

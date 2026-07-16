@@ -439,7 +439,7 @@ mod tests {
             unreachable!()
         };
         let tuple = {
-            let mut b = (&mut tc.ctx).builder(ret_block);
+            let mut b = tc.ctx.builder(ret_block);
             b.set_insert_point_before(ret_id);
             b.push_named_tuple(fields).id
         };
@@ -533,7 +533,7 @@ mod tests {
         Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg);
         {
             let reg_space = tc.reg_space;
-            let mut bld = (&mut tc.ctx).builder(g_cont);
+            let mut bld = tc.ctx.builder(g_cont);
             bld.set_insert_point_to_start();
             let f0 = bld.push_extract(ValueId::Instruction(call_id), 0).id();
             bld.push_store(f0, ValueId::Varnode(vr0), reg_space);
@@ -598,7 +598,7 @@ mod tests {
         Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg);
         // The caller projects only field 1 (the second output).
         let extract_id = {
-            let mut bld = (&mut tc.ctx).builder(g_cont);
+            let mut bld = tc.ctx.builder(g_cont);
             bld.set_insert_point_to_start();
             let f1 = bld.push_extract(ValueId::Instruction(call_id), 1);
             let id = f1.id;

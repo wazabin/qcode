@@ -187,9 +187,8 @@ pub fn apply_external_signature(
     };
 
     let mut f = FunctionBody::from_id_mut(ctx, fun_id);
-    // Legacy ABI register list, kept for the external/conventional path this
-    // function serves (a C prototype); pure_reg callees use block params instead.
-    #[allow(deprecated)]
+    // Conventional ABI register list for the external C-prototype path;
+    // pure_reg callees use block params instead.
     f.set_input_regs(inputs);
     f.set_output_regs(outputs);
     f.set_param_attrs(param_attrs);

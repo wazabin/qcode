@@ -196,7 +196,7 @@ mod tests {
         } else {
             LocalMemorySpaceId::Shared(tc.ctx.shared.default_space)
         };
-        let mut b = (&mut tc.ctx).builder(root);
+        let mut b = tc.ctx.builder(root);
         let v = b.shr().get_const(0x1234, 4);
         b.push_store(v, p, space);
         fid

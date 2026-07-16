@@ -212,7 +212,6 @@ mod tests {
     use qcode::{
         builder::Builder,
         context::Context,
-        space::SpaceId,
         testing::TestContext,
         value::{
             BasicBlock, BlockId, FunctionBody, ValueId,
@@ -220,17 +219,13 @@ mod tests {
         },
     };
 
-    fn reg_space(ctx: &Context) -> SpaceId {
-        ctx.try_get_space("register").unwrap()
-    }
-
     fn build_block(f: impl FnOnce(&mut Builder<'static, '_>)) -> (Context<'static>, BlockId) {
         let mut ctx = TestContext::new().ctx;
         let block_id = {
             let __f = ctx.anon_function();
             ctx.get_or_make_block(0x1000, __f)
         };
-        let mut builder = (&mut ctx).builder_at(0x1000);
+        let mut builder = ctx.builder_at(0x1000);
         f(&mut builder);
         drop(builder);
         (ctx, block_id)
@@ -384,8 +379,8 @@ mod tests {
 
         let call_id = {
             let mut b = (ctx).builder_at(0x1000);
-            let id = b.push_call(callee).id();
-            id
+
+            b.push_call(callee).id()
         };
 
         let cont = ctx.get_or_make_block(0x2000, caller);

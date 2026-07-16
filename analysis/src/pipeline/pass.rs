@@ -432,7 +432,7 @@ mod minted_barrier_tests {
             .set_root(block)
             .unwrap();
         {
-            let mut builder = (&mut tc.ctx).builder(block);
+            let mut builder = tc.ctx.builder(block);
             builder.push_call(callee);
         }
         let call_id = BasicBlock::from_id(&tc.ctx, block)
@@ -473,7 +473,7 @@ mod minted_barrier_tests {
             .set_root(block)
             .unwrap();
         let sibling_call = {
-            let mut builder = (&mut tc.ctx).builder(block);
+            let mut builder = tc.ctx.builder(block);
             builder.push_call(sibling);
             drop(builder);
             BasicBlock::from_id(&tc.ctx, block)

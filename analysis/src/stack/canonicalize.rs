@@ -276,12 +276,12 @@ mod tests {
 
         // `load(@SP - 8)` in each block — distinct Sub ValueIds.
         let load_in = |block, tc: &mut TestContext| {
-            let mut b = (&mut tc.ctx).builder(block);
+            let mut b = tc.ctx.builder(block);
             let c8 = b.shr().get_const(8, 8);
             let addr = b.push_sub(sp, c8).id();
             let load = b.push_load::<false>(addr, 8, ram);
-            let id = load.id();
-            id
+
+            load.id()
         };
         let l0 = load_in(root, &mut tc);
         let l1 = load_in(other, &mut tc);

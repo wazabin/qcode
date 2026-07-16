@@ -274,7 +274,7 @@ mod tests {
         let function = FunctionBody::make(&mut ctx, "f".into()).unwrap().id;
         let block = BasicBlock::make(&mut ctx, function).id;
         let value = ctx.get_const(7, 8).id();
-        let insn = (&mut ctx).builder(block).push_return(value).id;
+        let insn = ctx.builder(block).push_return(value).id;
 
         let module = ModuleView::new(&ctx);
         let body = BodyView::new(&ctx.bodies[function], &ctx.shared, &ctx.interfaces);

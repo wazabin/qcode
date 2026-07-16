@@ -214,7 +214,7 @@ mod tests {
         let v = ctx.get_const(0x77, 4).id();
         let insert_id = IntrinsicId::from_name("insert").unwrap();
         let ins = {
-            let mut b = (&mut ctx).builder(blk);
+            let mut b = ctx.builder(blk);
             b.push_intrinsic(insert_id, vec![ValueId::BlockParam(a), i, v])
                 .id()
         };
@@ -244,7 +244,7 @@ mod tests {
         let v = ctx.get_const(0x77, 4).id();
         let insert_id = IntrinsicId::from_name("insert").unwrap();
         let ins = {
-            let mut b = (&mut ctx).builder(blk);
+            let mut b = ctx.builder(blk);
             b.push_intrinsic(insert_id, vec![ValueId::BlockParam(a), i, v])
                 .id()
         };
@@ -274,7 +274,7 @@ mod tests {
             ctx.get_or_make_block(0x1000, __f)
         };
         let sing = {
-            let mut b = (&mut ctx).builder(blk);
+            let mut b = ctx.builder(blk);
             b.push_intrinsic(sing_id, vec![v]).id()
         };
         let idx = ctx.get_const(0, 8).id();
@@ -305,7 +305,7 @@ mod tests {
         ctx.block_param_mut(b).type_id = b_ty;
         let concat_id = IntrinsicId::from_name("concat").unwrap();
         let cat = {
-            let mut bl = (&mut ctx).builder(blk);
+            let mut bl = ctx.builder(blk);
             bl.push_intrinsic(
                 concat_id,
                 vec![ValueId::BlockParam(a), ValueId::BlockParam(b)],

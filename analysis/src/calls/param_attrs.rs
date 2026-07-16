@@ -407,7 +407,7 @@ mod tests {
             let pid = BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id;
             params.push(ValueId::BlockParam(pid));
         }
-        let mut b = (&mut tc.ctx).builder_at(addr);
+        let mut b = tc.ctx.builder_at(addr);
         body(&mut b, &params);
         drop(b);
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
