@@ -377,24 +377,19 @@ pub(super) fn resolve_minted_callees(
     installed: &[FunctionId],
 ) -> Result<bool, String> {
     let mut changed = false;
-    for (slot, &real) in installed.iter().enumerate() {
-        let slot = u32::try_from(slot).expect("more than u32::MAX minted functions installed");
-        changed |= ctx.bodies[owner].resolve_minted_callee(slot, real) != 0;
-        for &minted_id in installed {
-            changed |= ctx.bodies[minted_id].resolve_minted_callee(slot, real) != 0;
-        }
-    }
     for fun_id in std::iter::once(owner).chain(installed.iter().copied()) {
-        // Inspect the whole live instruction arena, not just instructions linked
-        // into rostered blocks. A temporarily detached instruction is still live
-        // pass state and must not carry an unresolved placeholder past the
-        // barrier.
-        let unresolved = ctx.bodies[fun_id].minted_callee_slots().into_iter().next();
-        if let Some(slot) = unresolved {
-            return Err(format!(
-                "{pass}: function {fun_id:?} references minted callee #{slot}, but only {} were installed",
-                installed.len()
-            ));
+        // The walk covers the whole live instruction arena, not just
+        // instructions linked into rostered blocks. A temporarily detached
+        // instruction is still live pass state and must not carry an
+        // unresolved placeholder past the barrier.
+        match ctx.bodies[fun_id].resolve_minted_callees(installed) {
+            Ok(patched) => changed |= patched != 0,
+            Err(slot) => {
+                return Err(format!(
+                    "{pass}: function {fun_id:?} references minted callee #{slot}, but only {} were installed",
+                    installed.len()
+                ));
+            }
         }
     }
     Ok(changed)

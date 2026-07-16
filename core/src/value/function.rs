@@ -294,12 +294,27 @@ impl<'str> FunctionBody<'str> {
         patched
     }
 
-    /// Unresolved direct-callee slots still present in live instructions.
-    pub fn minted_callee_slots(&self) -> Vec<u32> {
-        self.insns
-            .iter()
-            .filter_map(|insn| insn.mnemonic().minted_callee_slot())
-            .collect()
+    /// Resolve every pass-local callee slot in this body against the installed
+    /// mapping (`installed[k]` is the real function for slot `k`) in one arena
+    /// walk. Returns the number of call-like instructions patched, or the first
+    /// slot with no installed function.
+    pub fn resolve_minted_callees(
+        &mut self,
+        installed: &[FunctionId],
+    ) -> std::result::Result<usize, u32> {
+        let mut patched = 0;
+        for mut insn in self.insns.iter_mut() {
+            let mnemonic = insn.mnemonic_mut();
+            let Some(slot) = mnemonic.minted_callee_slot() else {
+                continue;
+            };
+            let Some(&real) = installed.get(slot as usize) else {
+                return Err(slot);
+            };
+            mnemonic.resolve_minted_callee(slot, real);
+            patched += 1;
+        }
+        Ok(patched)
     }
 
     /// An empty function *body* carrying the identity `id`. Used for bodies
