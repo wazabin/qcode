@@ -8,8 +8,7 @@ use crate::{
         block::{BlockId, BlockRef},
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
-            body_mut::BodyMut,
-            named::{Named, Renameable, update_context_name},
+            named::{Named, Renameable},
         },
     },
 };
@@ -329,40 +328,32 @@ impl<'str, 'ctx> BlockParamMutRef<'str, 'ctx> {
     }
 }
 
-// Resizing a block parameter is the same over each concrete mutation backing
-// (mint an int type in shared storage, retype the param in its owning function's
-// arena), so it is emitted for `&mut Context` (module) and `BodyMut`
-// (checked-out function pass) by the macro below.
-macro_rules! impl_param_mut_verbs {
-    (<$($l:lifetime),*> $ctx:ty) => {
-        impl<$($l),*> BaseRef<$ctx, BlockParamId> {
+// The own-param mutation verbs, written once over any [`QCodeMut`] backing —
+// `&mut Context` (module) and `BodyMut` (checked-out function pass).
+impl<'str, H: QCodeMut<'str>> BaseRef<H, BlockParamId> {
+    /// Resize this parameter: mint an int type in shared storage and retype the
+    /// param in its owning function's arena.
     pub fn set_size(&mut self, size: usize) {
         let type_id = self.ctx.shr().types.get_or_make_int(size);
         self.ctx.block_param_mut(self.id).type_id = type_id;
     }
 
     /// Renames this parameter in its owning function's local name table
-    /// (own-param edit, host-routed). Mirrors the `Renameable` impl for
-    /// [`BlockParamMutRef`]. Errors only on a duplicate name.
+    /// (own-param edit, host-routed). Errors only on a duplicate name.
     pub fn rename_local(&mut self, name: Cow<'str, str>) -> Result<()> {
         let old_name = self
             .ctx
-            .view()
+            .body(self.id.func)
             .block_param(self.id)
             .name
             .as_deref()
             .map(str::to_owned);
         self.ctx
-            .register_local_name(self.id.into(), name.clone(), old_name.as_deref())?;
+            .register_body_name(self.id.into(), name.clone(), old_name.as_deref())?;
         self.ctx.block_param_mut(self.id).name = Some(name);
         Ok(())
     }
-        }
-    };
 }
-
-impl_param_mut_verbs!(<'c, 'str> &'c mut Context<'str>);
-impl_param_mut_verbs!(<'a, 'str> BodyMut<'a, 'str>);
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for BlockParamMutRef<'str, 'ctx> {
     fn ctx(&'s self) -> &'s Context<'str> {
@@ -398,13 +389,15 @@ impl<'str, 'ctx> Value<'str, 'ctx> for BlockParamMutRef<'str, 'ctx> {
     }
 }
 
-impl<'str, 'ctx> Renameable<'str, 'ctx> for BlockParamMutRef<'str, 'ctx> {
+// Renaming works over any mutation host (param names are function-local).
+// `Named` stays concrete: its signature-pinned return lifetime needs `'str` to
+// outlive the `&self` borrow, which a generic `H` cannot prove.
+impl<'str, 'ctx, H: QCodeMut<'str>> Renameable<'str, 'ctx> for BaseRef<H, BlockParamId>
+where
+    Self: Named,
+{
     fn rename(&mut self, name: Cow<'str, str>) -> Result<()> {
-        let id = self.id.into();
-        let old_name = self.inner_mut().name.take();
-        update_context_name(id, self.ctx, name.clone(), old_name.as_deref())?;
-        self.ctx.block_param_mut(self.id).name = Some(name);
-        Ok(())
+        self.rename_local(name)
     }
 }
 

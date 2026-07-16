@@ -53,6 +53,12 @@ pub trait QCodeMut<'str> {
     /// `id` is not its own function.
     fn function_mut(&mut self, id: FunctionId) -> &mut FunctionBody<'str>;
 
+    /// The storage of the function `id` (read), tied to `&self`. The
+    /// borrow-friendly read primitive for host-generic ref code: a fully
+    /// generic `H` cannot prove `'str` outlives a [`view`](Self::view) GAT
+    /// borrow, but a plain `&self`-tied borrow needs no such proof.
+    fn body(&self, id: FunctionId) -> &FunctionBody<'str>;
+
     /// The module's shared IR state (read-only through this trait).
     fn shr(&self) -> &Shared<'str>;
 
@@ -211,6 +217,37 @@ pub trait QCodeMut<'str> {
     }
 }
 
+/// A `&mut` to a host is itself a host, so a `BaseRef<&mut Context, _>`
+/// mutation ref (whose `ctx` field is a reborrowable `&mut Context`) satisfies
+/// the same generic bound as a by-value `BodyMut` host.
+impl<'str, H: QCodeMut<'str>> QCodeMut<'str> for &mut H {
+    type View<'v>
+        = H::View<'v>
+    where
+        Self: 'v,
+        'str: 'v;
+
+    fn function_mut(&mut self, id: FunctionId) -> &mut FunctionBody<'str> {
+        (**self).function_mut(id)
+    }
+
+    fn body(&self, id: FunctionId) -> &FunctionBody<'str> {
+        (**self).body(id)
+    }
+
+    fn shr(&self) -> &Shared<'str> {
+        (**self).shr()
+    }
+
+    fn interfaces(&self) -> &Registry<FunctionId, FunctionInterface<'str>> {
+        (**self).interfaces()
+    }
+
+    fn view(&self) -> Self::View<'_> {
+        (**self).view()
+    }
+}
+
 impl<'str> QCodeMut<'str> for Context<'str> {
     type View<'v>
         = ModuleView<'v, 'str>
@@ -220,6 +257,10 @@ impl<'str> QCodeMut<'str> for Context<'str> {
 
     fn function_mut(&mut self, id: FunctionId) -> &mut FunctionBody<'str> {
         &mut self.bodies[id]
+    }
+
+    fn body(&self, id: FunctionId) -> &FunctionBody<'str> {
+        &self.bodies[id]
     }
 
     fn shr(&self) -> &Shared<'str> {
@@ -244,6 +285,10 @@ impl<'a, 'str> QCodeMut<'str> for BodyMut<'a, 'str> {
 
     fn function_mut(&mut self, id: FunctionId) -> &mut FunctionBody<'str> {
         BodyMut::function_mut(self, id)
+    }
+
+    fn body(&self, id: FunctionId) -> &FunctionBody<'str> {
+        BodyMut::function(self, id)
     }
 
     fn shr(&self) -> &Shared<'str> {

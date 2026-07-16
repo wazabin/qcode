@@ -13,7 +13,7 @@ use crate::{
         ValueId,
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
-            named::{Named, Renameable, update_context_name},
+            named::{Named, Renameable},
         },
     },
 };
@@ -250,14 +250,14 @@ where
 // `FunctionPass` can retype and rename the instructions it owns whether the
 // function lives in the module registry or has been checked out. Mirror the
 // `&mut Context`-only [`InstructionMutRef::set_type`] / `Renameable` impls.
-macro_rules! impl_insn_mut_verbs {
-    (<$($l:lifetime),*> $ctx:ty) => {
-        impl<$($l),*> BaseRef<$ctx, InstructionId> {
+// The own-instruction mutation verbs, written once over any [`QCodeMut`]
+// backing — `&mut Context` (module) and `BodyMut` (checked-out function pass).
+impl<'str, H: QCodeMut<'str>> BaseRef<H, InstructionId> {
     /// Sets this instruction's result type (own-instruction edit, host-routed).
     /// Panics on an incompatible same-nonzero-size change, exactly like
     /// [`InstructionMutRef::set_type`].
     pub fn set_result_type(&mut self, new_type: TypeId) {
-        let current = self.ctx.view().instruction(self.id).type_id;
+        let current = self.ctx.body(self.id.func).insn(self.id).type_id;
         let (current_size, new_size) = {
             let types = &self.ctx.shr().types;
             (types.size_of(current), types.size_of(new_type))
@@ -270,27 +270,21 @@ macro_rules! impl_insn_mut_verbs {
     }
 
     /// Renames this instruction in its owning function's local name table
-    /// (own-instruction edit, host-routed). Mirrors the `Renameable` impl for
-    /// [`InstructionMutRef`]. Errors only on a duplicate name.
+    /// (own-instruction edit, host-routed). Errors only on a duplicate name.
     pub fn rename_local(&mut self, name: Cow<'str, str>) -> Result<()> {
         let old_name = self
             .ctx
-            .view()
-            .instruction(self.id)
+            .body(self.id.func)
+            .insn(self.id)
             .name
             .as_deref()
             .map(str::to_owned);
         self.ctx
-            .register_local_name(self.id.into(), name.clone(), old_name.as_deref())?;
+            .register_body_name(self.id.into(), name.clone(), old_name.as_deref())?;
         self.ctx.instruction_mut(self.id).name = Some(name);
         Ok(())
     }
-        }
-    };
 }
-
-impl_insn_mut_verbs!(<'c, 'str> &'c mut Context<'str>);
-impl_insn_mut_verbs!(<'a, 'str> crate::value::util::body_mut::BodyMut<'a, 'str>);
 
 #[derive(Clone, Copy)]
 pub struct InstructionRef<'str, 'ctx, R = ModuleView<'ctx, 'str>> {
@@ -523,6 +517,9 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for InstructionMutRef<'str, 
     }
 }
 
+// Reading an instruction's name stays concrete per host: `Named::name`'s
+// signature-pinned return lifetime needs `'str` to outlive the `&self` borrow,
+// which only a host type that carries `'str` (not a generic `H`) can prove.
 impl Named for InstructionMutRef<'_, '_> {
     fn name(&self) -> Option<&str> {
         self.ctx.instruction(self.id).name.as_deref()
@@ -545,13 +542,13 @@ impl<'str, 'ctx> Value<'str, 'ctx> for InstructionMutRef<'str, 'ctx> {
     }
 }
 
-impl<'str, 'ctx> Renameable<'str, 'ctx> for InstructionMutRef<'str, 'ctx> {
+// Renaming works over any mutation host (instruction names are function-local).
+impl<'str, 'ctx, H: QCodeMut<'str>> Renameable<'str, 'ctx> for BaseRef<H, InstructionId>
+where
+    Self: Named,
+{
     fn rename(&mut self, name: Cow<'str, str>) -> Result<()> {
-        let id = self.id();
-        let old_name = self.inner_mut().name.take();
-        update_context_name(id, self.ctx_mut(), name.clone(), old_name.as_deref())?;
-        self.inner_mut().name = Some(name);
-        Ok(())
+        self.rename_local(name)
     }
 }
 

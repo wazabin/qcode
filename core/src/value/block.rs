@@ -10,7 +10,7 @@ use crate::{
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
             body_mut::BodyMut,
-            named::{Named, Renameable, update_context_name},
+            named::{Named, Renameable},
         },
     },
 };
@@ -581,26 +581,15 @@ where
 
 pub type BlockMutRef<'str, 'ctx> = BaseRef<&'ctx mut Context<'str>, BlockId>;
 
-impl<'str> BaseRef<&mut Context<'str>, BlockId> {
-    pub fn is_terminated(&self) -> bool {
-        self.ctx
-            .block_ref(self.id)
-            .iter()
-            .last()
-            .is_some_and(|insn| insn.is_terminator())
-    }
-}
-
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for BlockMutRef<'str, 'ctx> {
     fn ctx_mut(&'s mut self) -> &'s mut Context<'str> {
         self.ctx
     }
 }
 
-// Read access over a mutation host: shared reads via the host's shared context,
-// the read view via its static provider. Two concrete backings — `&mut Context`
-// (module) and `BodyMut` (checked-out function pass) — each routing through
-// the backing's inherent `shared`/`view`.
+// Read access over the module mutation host. The checked-out host (`BodyMut`)
+// carries no `&Context` at all, so it has no `WithCtx` — "the pass path never
+// reaches a whole-context read" is a fact of the types, not a runtime check.
 impl<'s, 'str> WithCtx<'s, 's, 'str> for BaseRef<&mut Context<'str>, BlockId>
 where
     'str: 's,
@@ -609,83 +598,67 @@ where
         self.ctx
     }
 }
-impl<'s, 'a, 'str> WithCtx<'s, 's, 'str> for BaseRef<BodyMut<'a, 'str>, BlockId>
-where
-    'str: 's,
-{
-    fn ctx(&'s self) -> &'s Context<'str> {
-        // A checked-out pass backing carries no `&Context`; shared-only reads go
-        // through the host's `shr()`. Nothing on the pass path reaches this.
-        panic!("whole-context read on a checked-out mutation ref: module-scope only")
-    }
-}
 
+// Reading a block's name stays concrete per host: `Named::name`'s
+// signature-pinned return lifetime needs `'str` to outlive the `&self` borrow,
+// which only a host type that carries `'str` (not a generic `H`) can prove.
 impl Named for BlockMutRef<'_, '_> {
     fn name(&self) -> Option<&str> {
         self.ctx.block(self.id).name.as_deref()
     }
 }
 
-impl<'str, 'ctx> Renameable<'str, 'ctx> for BlockMutRef<'str, 'ctx> {
-    fn rename(&mut self, name: Cow<'str, str>) -> Result<()> {
-        let id = self.id.into();
-        let old_name = self.ctx.block(self.id).name.as_deref().map(str::to_owned);
-        update_context_name(id, self.ctx, name.clone(), old_name.as_deref())?;
-        self.ctx.block_mut(self.id).name = Some(name);
-        Ok(())
-    }
-}
-
-// Naming/renaming a block through a checked-out host (concrete: a generic
-// a fully generic backing can't prove `'str` outlives the returned `&str`). Block names are
-// function-local, so this reads/writes the owned function's arena directly.
 impl<'a, 'str> Named for BaseRef<BodyMut<'a, 'str>, BlockId> {
     fn name(&self) -> Option<&str> {
         self.ctx.fun.blocks[self.id.local].name.as_deref()
     }
 }
 
-impl<'a, 'str> Renameable<'str, 'a> for BaseRef<BodyMut<'a, 'str>, BlockId> {
+// Renaming works over any mutation host (block names are function-local).
+impl<'str, 'ctx, H: QCodeMut<'str>> Renameable<'str, 'ctx> for BaseRef<H, BlockId>
+where
+    Self: Named,
+{
     fn rename(&mut self, name: Cow<'str, str>) -> Result<()> {
-        let id = self.id.into();
-        let old_name = self.ctx.fun.blocks[self.id.local]
-            .name
-            .as_deref()
-            .map(str::to_owned);
-        self.ctx
-            .register_local_name(id, name.clone(), old_name.as_deref())?;
-        self.ctx.block_mut(self.id).name = Some(name);
-        Ok(())
+        self.rename_local(name)
     }
 }
 
-// The own-block mutation verbs, emitted for each concrete mutation backing —
-// `&mut Context` (module) and `BodyMut` (checked-out function pass). Both
-// bodies are identical (they call the backing's inherent verbs); the macro keeps
-// the pair in lockstep without a shared trait bound.
-macro_rules! impl_block_mut_verbs {
-    (<$($l:lifetime),*> $ctx:ty) => {
-        impl<$($l),*> BaseRef<$ctx, BlockId> {
+// The own-block mutation verbs, written once over any [`QCodeMut`] backing —
+// `&mut Context` (module) and `BodyMut` (checked-out function pass).
+impl<'str, H: QCodeMut<'str>> BaseRef<H, BlockId> {
+    /// Whether this block currently ends in a terminator instruction.
+    pub fn is_terminated(&self) -> bool {
+        let body = self.ctx.body(self.id.func);
+        body.block(self.id)
+            .instructions
+            .last()
+            .is_some_and(|&local| {
+                body.insn(InstructionId::new(self.id.func, local))
+                    .mnemonic()
+                    .is_terminator()
+            })
+    }
+
     /// Sets (or clears) this block's comment. Own-block edit, host-routed.
     pub fn set_comment(&mut self, comment: Option<String>) {
         self.ctx.block_mut(self.id).comment = comment;
     }
 
     /// Sets this block's name and registers it in the owning function's local name
-    /// table (own-block edit, backing-routed). Mirrors the `Renameable` impls for the
-    /// concrete module / pass block refs, but works over either backing, so
+    /// table (own-block edit, backing-routed). Works over either backing, so
     /// a `FunctionPass` can name the blocks it mints. Returns an error only on a
     /// duplicate name.
     pub fn rename_local(&mut self, name: Cow<'str, str>) -> crate::error::Result<()> {
         let old_name = self
             .ctx
-            .view()
+            .body(self.id.func)
             .block(self.id)
             .name
             .as_deref()
             .map(str::to_owned);
         self.ctx
-            .register_local_name(self.id.into(), name.clone(), old_name.as_deref())?;
+            .register_body_name(self.id.into(), name.clone(), old_name.as_deref())?;
         self.ctx.block_mut(self.id).name = Some(name);
         Ok(())
     }
@@ -706,7 +679,10 @@ macro_rules! impl_block_mut_verbs {
 
     /// Pushes an instruction to the end of this block.
     pub fn push_insn(&mut self, id: InstructionId) {
-        let len = self.ctx.function(self.id.func).blocks[self.id.local]
+        let len = self
+            .ctx
+            .body(self.id.func)
+            .block(self.id)
             .instructions
             .len();
         self.insert_insn(len, id);
@@ -732,12 +708,7 @@ macro_rules! impl_block_mut_verbs {
         let id = self.id;
         self.ctx.absorb_block(id, other, edge_ab);
     }
-        }
-    };
 }
-
-impl_block_mut_verbs!(<'c, 'str> &'c mut Context<'str>);
-impl_block_mut_verbs!(<'a, 'str> BodyMut<'a, 'str>);
 
 impl Display for BlockMutRef<'_, '_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
