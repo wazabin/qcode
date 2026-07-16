@@ -65,6 +65,7 @@ fn dead_signature_changed_functions(ctx: &mut Context, graph: &CallGraph) -> Has
         .into_iter()
         .filter(|&f| FunctionBody::from_id(ctx, f).is_pure_reg())
         .collect();
+    let mut queued: HashSet<_> = worklist.iter().copied().collect();
 
     // Reverse call-site index, callee → its `Call` instructions, built in one
     // pass. Call targets never change within this pass and instructions are only
@@ -74,6 +75,7 @@ fn dead_signature_changed_functions(ctx: &mut Context, graph: &CallGraph) -> Has
 
     let mut iters = 0;
     while let Some(fid) = worklist.pop() {
+        queued.remove(&fid);
         iters += 1;
         if iters > MAX_ITERS {
             break;
@@ -94,7 +96,7 @@ fn dead_signature_changed_functions(ctx: &mut Context, graph: &CallGraph) -> Has
             for t in touched {
                 changed.insert(t);
                 dce_function(ctx, t);
-                if !worklist.contains(&t) {
+                if queued.insert(t) {
                     worklist.push(t);
                 }
             }
@@ -161,9 +163,9 @@ fn dce_function(ctx: &mut Context, fid: FunctionId) {
 
 /// Remove every input `fid` never reads. A `pure_reg` function's entry params
 /// are aligned index-for-index with `input_regs` and every caller's `Call.args`,
-/// so a param with no users is a dead argument; drop each through the shared
-/// [`remove_entry_param`], which keeps all three in lockstep. Records each caller
-/// in `touched`. Returns `true` if anything changed.
+/// so a param with no users is a dead argument; drop them together through the
+/// shared interface helper, which keeps all three in lockstep. Records each
+/// caller in `touched`. Returns `true` if anything changed.
 ///
 /// This is the same operation DCE's no-pred param sweep performs, so the two stay
 /// consistent; running it here as well lets the dead-signature worklist expose
@@ -192,12 +194,12 @@ fn trim_dead_args(
         return false;
     }
 
-    for call_id in direct_call_sites(ctx, fid, call_index) {
+    let call_sites = direct_call_sites(ctx, fid, call_index);
+    for &call_id in &call_sites {
         if let Some(caller) = ctx.get_insn(call_id).function().map(|f| f.id) {
             touched.insert(caller);
         }
     }
-    let call_sites = direct_call_sites(ctx, fid, call_index);
     remove_entry_params_at_sites(ctx, fid, &dead, &call_sites);
 
     true
