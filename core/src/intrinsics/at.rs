@@ -175,6 +175,7 @@ mod tests {
     use super::*;
 
     use crate::context::Context;
+    use crate::types::TypeRequest;
     use crate::value::insn::IntrinsicId;
     use crate::value::{BasicBlock, BodyView, FunctionId, LocalValueId, ValueId};
 
@@ -268,6 +269,10 @@ mod tests {
     fn at_forwards_through_singleton() {
         let mut ctx = Context::new();
         let v = ctx.get_const(0x99, 4).id();
+        let value_ty = ctx.shared.types.get_int(4);
+        ctx.shared
+            .types
+            .create_requested_types(&[TypeRequest::array(value_ty, 1)]);
         let sing_id = IntrinsicId::from_name("singleton").unwrap();
         let blk = {
             let __f = ctx.anon_function();
@@ -295,6 +300,9 @@ mod tests {
         let i32 = ctx.shared.types.get_or_make_int(4);
         let a_ty = ctx.shared.types.get_or_make_array(i32, 1);
         let b_ty = ctx.shared.types.get_or_make_array(i32, 3);
+        ctx.shared
+            .types
+            .create_requested_types(&[TypeRequest::array(i32, 4)]);
         let blk = {
             let __f = ctx.anon_function();
             ctx.get_or_make_block(0x1000, __f)

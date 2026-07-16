@@ -24,7 +24,9 @@ impl Intrinsic for Singleton {
 
     fn result_type(&self, types: &TypeManager, args: &[TypeId]) -> TypeId {
         // `[T; 1]` where `T` is the operand's own type.
-        types.get_or_make_array(args[0], 1)
+        types
+            .get_array(args[0], 1)
+            .expect("singleton result array type must be published")
     }
 
     fn eval(&self, args: &[(u128, usize)], _out_size: usize) -> Option<u128> {
@@ -38,6 +40,7 @@ register_intrinsic!(Singleton);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::TypeRequest;
     use crate::value::insn::IntrinsicId;
 
     #[test]
@@ -49,8 +52,9 @@ mod tests {
 
     #[test]
     fn result_type_is_one_element_array() {
-        let types = TypeManager::default();
+        let mut types = TypeManager::default();
         let i32 = types.get_or_make_int(4);
+        types.create_requested_types(&[TypeRequest::array(i32, 1)]);
         let id = IntrinsicId::from_name("singleton").unwrap();
         let ty = id.desc().result_type(&types, &[i32]);
         assert_eq!(types.array_of(ty), Some((i32, 1)));

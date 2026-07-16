@@ -19,6 +19,7 @@ use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     space::LocalMemorySpaceId,
+    types::TypeRequest,
     value::{
         BlockId, FunctionId, QCodeView, ValueId,
         insn::{
@@ -384,19 +385,6 @@ fn apply_strlen<'str>(
     true
 }
 
-/// Recognize a bounded NUL-scan in this (pure) function, rewriting its escaping
-/// count to `len(take_while(arr))`. Returns `true` if changed.
-fn recognize_strlen_at<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
-    let fid = body.id();
-    if !m.body_view(body).function_ref(fid).is_pure() {
-        return false;
-    }
-    let Some(sm) = try_match_strlen(m.body_view(body), fid) else {
-        return false;
-    };
-    apply_strlen(body, m, &sm)
-}
-
 // ===========================================================================
 // strlen recognizer (Layer 2) — raw pointer scan, no snapshot
 // ===========================================================================
@@ -572,15 +560,6 @@ fn apply_strlen_ptr<'str>(
     true
 }
 
-/// Recognize a raw-pointer NUL-scan in this function, rewriting its `end - base`
-/// length to `len(take_while(base))`. Returns `true` if changed.
-fn recognize_strlen_ptr<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
-    let Some(sm) = try_match_strlen_ptr(m.body_view(body), body.id()) else {
-        return false;
-    };
-    apply_strlen_ptr(body, m, &sm)
-}
-
 #[derive(Default)]
 pub struct Strlen;
 
@@ -596,10 +575,33 @@ impl FunctionPass for Strlen {
         _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         // Layer 1 (at-form snapshot) then Layer 2 (raw char*); mutually exclusive
-        // on any one function.
-        let mut changed = recognize_strlen_at(m, f);
-        changed |= recognize_strlen_ptr(m, f);
-        Ok(Outcome::changed(changed))
+        // on any one function. Publish the intrinsic result before mutating IR.
+        if m.body_view(f).function_ref(f.id()).is_pure()
+            && let Some(sm) = try_match_strlen(m.body_view(f), f.id())
+        {
+            let src_ty = m.body_view(f).type_of(sm.arr);
+            let (elem, bound, _) = m
+                .shr()
+                .types
+                .seq_of(src_ty)
+                .expect("bounded strlen source must be a sequence");
+            if m.shr().types.get_list(elem, Some(bound)).is_none() {
+                return Ok(Outcome::requesting_type(TypeRequest::list(
+                    elem,
+                    Some(bound),
+                )));
+            }
+            return Ok(Outcome::changed(apply_strlen(f, m, &sm)));
+        }
+
+        if let Some(sm) = try_match_strlen_ptr(m.body_view(f), f.id()) {
+            let i8 = m.shr().types.get_int(1);
+            if m.shr().types.get_list(i8, None).is_none() {
+                return Ok(Outcome::requesting_type(TypeRequest::list(i8, None)));
+            }
+            return Ok(Outcome::changed(apply_strlen_ptr(f, m, &sm)));
+        }
+        Ok(Outcome::unchanged())
     }
 }
 

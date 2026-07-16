@@ -714,6 +714,20 @@ mod tests {
         // The enumerate tuple `(index: i64, elem: i8)`, via enumerate's own rule.
         let i8 = tc.ctx.shared.types.get_or_make_int(1);
         let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, 1);
+        let i64 = tc.ctx.shared.types.get_or_make_int(8);
+        let fields = vec![
+            qcode::types::AggregateField::new("index", i64),
+            qcode::types::AggregateField::new("elem", i8),
+        ];
+        let tuple_ty = tc
+            .ctx
+            .shared
+            .types
+            .create_requested_types(&[qcode::types::TypeRequest::aggregate(fields)])[0];
+        tc.ctx
+            .shared
+            .types
+            .create_requested_types(&[qcode::types::TypeRequest::array(tuple_ty, 1)]);
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
         let enum_ty = enum_id.desc().result_type(&tc.ctx.shared.types, &[arr_ty]);
         let (tuple_ty, _) = tc.ctx.shared.types.array_of(enum_ty).unwrap();

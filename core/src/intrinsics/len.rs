@@ -33,7 +33,7 @@ impl Intrinsic for Len {
 
     fn result_type(&self, types: &TypeManager, _args: &[TypeId]) -> TypeId {
         // A count is a plain machine word, regardless of the element type.
-        types.get_or_make_int(8)
+        types.get_int(8)
     }
 
     fn eval(&self, _args: &[(u128, usize)], _out_size: usize) -> Option<u128> {
@@ -95,11 +95,9 @@ mod tests {
         let types = TypeManager::default();
         let i8 = types.get_or_make_int(1);
         let arr = types.get_or_make_array(i8, 4);
+        let i64 = types.get_or_make_int(8);
         let id = IntrinsicId::from_name("len").unwrap();
-        assert_eq!(
-            id.desc().result_type(&types, &[arr]),
-            types.get_or_make_int(8)
-        );
+        assert_eq!(id.desc().result_type(&types, &[arr]), i64);
     }
 
     /// `len` of a fixed array folds to the constant element count; `len` of a

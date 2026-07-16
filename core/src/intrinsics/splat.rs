@@ -38,7 +38,9 @@ impl Intrinsic for Splat {
         // pre-fold type is the length-erased `[T;*]`. A constant fold recovers a
         // fixed `[T; n]` (either the `Bytes` literal below or the explicit type the
         // creator attached).
-        types.get_or_make_unbounded_list(args[0])
+        types
+            .get_list(args[0], None)
+            .expect("splat result list type must be published")
     }
 
     fn eval(&self, _args: &[(u128, usize)], _out_size: usize) -> Option<u128> {

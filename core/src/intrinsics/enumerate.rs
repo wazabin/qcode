@@ -31,12 +31,17 @@ impl Intrinsic for Enumerate {
         let (elem, len, is_list) = types
             .seq_of(args[0])
             .expect("enumerate operand must be a sequence (array or list)");
-        let i64_ty = types.get_or_make_int(8);
-        let tuple = types.get_or_make_named_aggregate(vec![
+        let i64_ty = types.get_int(8);
+        let fields = vec![
             AggregateField::new("index", i64_ty),
             AggregateField::new("elem", elem),
-        ]);
-        types.get_or_make_seq(tuple, len, is_list)
+        ];
+        let tuple = types
+            .get_named_aggregate(&fields)
+            .expect("enumerate tuple type must be published");
+        types
+            .get_seq(tuple, len, is_list)
+            .expect("enumerate result sequence type must be published")
     }
 
     fn eval(&self, _args: &[(u128, usize)], _out_size: usize) -> Option<u128> {
@@ -54,7 +59,29 @@ register_intrinsic!(Enumerate);
 
 #[cfg(test)]
 mod tests {
+    use crate::types::{AggregateField, TypeRequest};
     use crate::value::insn::IntrinsicId;
+
+    fn publish_result(
+        types: &mut crate::types::TypeManager,
+        elem: crate::types::TypeId,
+        len: usize,
+        is_list: bool,
+    ) {
+        // Test setup is the publication barrier; `result_type` itself only reads.
+        types.get_or_make_int(8);
+        let fields = vec![
+            AggregateField::new("index", types.get_int(8)),
+            AggregateField::new("elem", elem),
+        ];
+        let tuple = types.create_requested_types(&[TypeRequest::aggregate(fields)])[0];
+        let request = if is_list {
+            TypeRequest::list(tuple, Some(len))
+        } else {
+            TypeRequest::array(tuple, len)
+        };
+        types.create_requested_types(&[request]);
+    }
 
     #[test]
     fn enumerate_registered_and_resolves() {
@@ -67,9 +94,10 @@ mod tests {
     /// so it composes onto a `take_while` result.
     #[test]
     fn enumerate_of_a_list_is_a_list_of_tuples() {
-        let types = crate::types::TypeManager::default();
+        let mut types = crate::types::TypeManager::default();
         let i8 = types.get_or_make_int(1);
         let list = types.get_or_make_list(i8, 4);
+        publish_result(&mut types, i8, 4, true);
 
         let id = IntrinsicId::from_name("enumerate").unwrap();
         let result = id.desc().result_type(&types, &[list]);
@@ -84,9 +112,10 @@ mod tests {
 
     #[test]
     fn result_type_is_array_of_index_elem_tuples() {
-        let types = crate::types::TypeManager::default();
+        let mut types = crate::types::TypeManager::default();
         let i8 = types.get_or_make_int(1);
         let arr = types.get_or_make_array(i8, 4);
+        publish_result(&mut types, i8, 4, false);
 
         let id = IntrinsicId::from_name("enumerate").unwrap();
         let result = id.desc().result_type(&types, &[arr]);

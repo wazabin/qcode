@@ -346,13 +346,30 @@ mod tests {
     use qcode::value::QCodeMut;
     use qcode::{
         testing::TestContext,
-        types::TypeId,
+        types::{AggregateField, TypeId, TypeRequest},
         value::{
             BasicBlock, FunctionBody, FunctionId, Value, ValueId,
             block::BlockId,
             insn::{IntrinsicId, Mnemonic, Return},
         },
     };
+
+    fn publish_enumerate_result(tc: &mut TestContext, elem: TypeId, count: usize) -> TypeId {
+        let i64 = tc.ctx.shared.types.get_or_make_int(8);
+        let fields = vec![
+            AggregateField::new("index", i64),
+            AggregateField::new("elem", elem),
+        ];
+        let tuple = tc
+            .ctx
+            .shared
+            .types
+            .create_requested_types(&[TypeRequest::aggregate(fields)])[0];
+        tc.ctx
+            .shared
+            .types
+            .create_requested_types(&[TypeRequest::array(tuple, count)])[0]
+    }
 
     fn run_emulate_map(tc: &mut TestContext) {
         let env = crate::PipelineEnv::headless(&tc.ctx);
@@ -549,6 +566,7 @@ mod tests {
         // The enumerate tuple type for an `[i8; N]` source.
         let i8 = tc.ctx.shared.types.get_or_make_int(1);
         let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, 3);
+        publish_enumerate_result(&mut tc, i8, 3);
         let enum_result_ty = enum_id.desc().result_type(&tc.ctx.shared.types, &[arr_ty]);
         let (tuple_ty, _) = tc.ctx.shared.types.array_of(enum_result_ty).unwrap();
         let body = build_index_body(&mut tc, tuple_ty);
@@ -626,6 +644,7 @@ mod tests {
 
         let i8 = tc.ctx.shared.types.get_or_make_int(1);
         let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, 3);
+        publish_enumerate_result(&mut tc, i8, 3);
         let enum_result_ty = enum_id.desc().result_type(&tc.ctx.shared.types, &[arr_ty]);
         let (tuple_ty, _) = tc.ctx.shared.types.array_of(enum_result_ty).unwrap();
         let body = build_sum_body(&mut tc, tuple_ty);

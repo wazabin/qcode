@@ -338,12 +338,29 @@ mod tests {
     use qcode::value::QCodeMut;
     use qcode::{
         testing::TestContext,
-        types::TypeId,
+        types::{AggregateField, TypeId, TypeRequest},
         value::{
             BasicBlock, FunctionBody, FunctionId, Instruction, Value, ValueId,
             insn::{IntrinsicId, Mnemonic, Return, Store},
         },
     };
+
+    fn publish_enumerate_result(tc: &mut TestContext, elem: TypeId, count: usize) -> TypeId {
+        let i64 = tc.ctx.shared.types.get_or_make_int(8);
+        let fields = vec![
+            AggregateField::new("index", i64),
+            AggregateField::new("elem", elem),
+        ];
+        let tuple = tc
+            .ctx
+            .shared
+            .types
+            .create_requested_types(&[TypeRequest::aggregate(fields)])[0];
+        tc.ctx
+            .shared
+            .types
+            .create_requested_types(&[TypeRequest::array(tuple, count)])[0]
+    }
 
     fn run_array_project(tc: &mut TestContext) {
         let env = crate::PipelineEnv::headless(&tc.ctx);
@@ -486,6 +503,7 @@ mod tests {
         }
         let i8 = tc.ctx.shared.types.get_or_make_int(1);
         let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, 4);
+        publish_enumerate_result(&mut tc, i8, 4);
 
         // src param, typed as the array `[i8; 4]`.
         let src = {
@@ -571,6 +589,10 @@ mod tests {
         let i8 = tc.ctx.shared.types.get_or_make_int(1);
         let a_ty = tc.ctx.shared.types.get_or_make_array(i8, 3);
         let b_ty = tc.ctx.shared.types.get_or_make_array(i8, 5);
+        tc.ctx
+            .shared
+            .types
+            .create_requested_types(&[TypeRequest::array(i8, 8)]);
 
         let (a, b_src) = {
             let mut builder = tc.ctx.builder(entry);
@@ -664,6 +686,7 @@ mod tests {
         }
         let i8 = tc.ctx.shared.types.get_or_make_int(1);
         let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, 4);
+        publish_enumerate_result(&mut tc, i8, 4);
 
         // The enumerate tuple type `(index: i64, elem: i8)`, via enumerate's own
         // result-type rule, so the body's param matches the lane the map yields.

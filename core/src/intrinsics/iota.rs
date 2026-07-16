@@ -34,8 +34,10 @@ impl Intrinsic for Iota {
         // The element count is `n`'s *value*, invisible to the type layer, so the
         // pre-fold type is the length-erased `[i64;*]`. A constant `n` recovers a
         // fixed `[i64; n]` in `simplify` (below).
-        let i64_ty = types.get_or_make_int(8);
-        types.get_or_make_unbounded_list(i64_ty)
+        let i64_ty = types.get_int(8);
+        types
+            .get_list(i64_ty, None)
+            .expect("iota result list type must be published")
     }
 
     fn eval(&self, _args: &[(u128, usize)], _out_size: usize) -> Option<u128> {
@@ -90,6 +92,7 @@ register_intrinsic!(Iota);
 mod tests {
     use super::*;
     use crate::context::Context;
+    use crate::types::TypeRequest;
     use crate::value::insn::IntrinsicId;
 
     #[test]
@@ -101,8 +104,9 @@ mod tests {
 
     #[test]
     fn result_type_is_unbounded_i64_list() {
-        let types = TypeManager::default();
+        let mut types = TypeManager::default();
         let i64_ty = types.get_or_make_int(8);
+        types.create_requested_types(&[TypeRequest::list(i64_ty, None)]);
         let id = IntrinsicId::from_name("iota").unwrap();
         let ty = id.desc().result_type(&types, &[i64_ty]);
         assert_eq!(types.list_of(ty), Some((i64_ty, None)));

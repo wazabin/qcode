@@ -459,6 +459,12 @@ impl FunctionPass for LoopToScan {
             if m.shr().types.get_array(result_elem_ty, src_count).is_none() {
                 requests.push(qcode::types::TypeRequest::array(result_elem_ty, src_count));
             }
+            if m.shr().types.get_array(result_elem_ty, 1).is_none() {
+                requests.push(qcode::types::TypeRequest::array(result_elem_ty, 1));
+            }
+            if m.shr().types.get_array(result_elem_ty, sm.count).is_none() {
+                requests.push(qcode::types::TypeRequest::array(result_elem_ty, sm.count));
+            }
             if !requests.is_empty() {
                 return Ok(Outcome::requesting_types(requests));
             }

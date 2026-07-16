@@ -208,7 +208,7 @@ fn simplify_rotate(
 
 /// A rotate's result is the same sized integer as its first operand.
 fn rotate_result_type(types: &TypeManager, args: &[TypeId]) -> TypeId {
-    types.get_or_make_int(types.size_of(args[0]))
+    types.get_int(types.size_of(args[0]))
 }
 
 /// `rol` — rotate left. Recognizes the `(x << c1) | (x >> c2)` idiom.

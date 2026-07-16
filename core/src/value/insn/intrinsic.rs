@@ -95,9 +95,9 @@ pub trait Intrinsic: Sync {
     fn arity(&self) -> usize;
 
     /// The result type for an application to operands of types `args`. A sized
-    /// integer is just a type, so a width-only intrinsic returns
-    /// `types.get_or_make_int(width)`; an array-producing one returns the array
-    /// type.
+    /// integer is just a type, so a width-only intrinsic accesses the published
+    /// canonical integer; sequence-producing intrinsics likewise require their
+    /// result type to have been created before this method is called.
     fn result_type(&self, types: &TypeManager, args: &[TypeId]) -> TypeId;
 
     /// Evaluate on concrete operands `(bits, byte_width)`, producing an

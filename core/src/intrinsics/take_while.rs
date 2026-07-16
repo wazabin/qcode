@@ -25,12 +25,12 @@
 //!
 //! `take_while` is the point where a finite `[T; N]` array becomes a
 //! variable-length **list**. Its result is therefore [`List<T>`] (see
-//! [`TypeManager::get_or_make_list`]) with `bound = N`: a sequence of *at most*
+//! [`TypeManager::get_list`]) with `bound = N`: a sequence of *at most*
 //! `N` elements whose actual length is the position of the first zero. The
 //! `bound` is the static storage upper bound; the length is data-dependent.
 //!
 //! [`List<T>`]: crate::types::TypeRepr::List
-//! [`TypeManager::get_or_make_list`]: crate::types::TypeManager::get_or_make_list
+//! [`TypeManager::get_list`]: crate::types::TypeManager::get_list
 //!
 //! [`Builder::push_intrinsic`]: crate::builder::Builder::push_intrinsic
 
@@ -59,10 +59,14 @@ impl Intrinsic for TakeWhile {
         // data-dependent. Either way the result kind is a list (the length is
         // data-dependent); only the static bound differs.
         if let Some((elem, len, _is_list)) = types.seq_of(args[0]) {
-            types.get_or_make_list(elem, len)
+            types
+                .get_list(elem, Some(len))
+                .expect("take_while result bounded-list type must be published")
         } else {
-            let i8 = types.get_or_make_int(1);
-            types.get_or_make_unbounded_list(i8)
+            let i8 = types.get_int(1);
+            types
+                .get_list(i8, None)
+                .expect("take_while result unbounded-list type must be published")
         }
     }
 
@@ -78,6 +82,7 @@ register_intrinsic!(TakeWhile);
 
 #[cfg(test)]
 mod tests {
+    use crate::types::TypeRequest;
     use crate::value::insn::IntrinsicId;
 
     #[test]
@@ -89,9 +94,10 @@ mod tests {
 
     #[test]
     fn result_type_is_a_list_with_the_source_bound() {
-        let types = crate::types::TypeManager::default();
+        let mut types = crate::types::TypeManager::default();
         let i8 = types.get_or_make_int(1);
         let arr = types.get_or_make_array(i8, 7);
+        types.create_requested_types(&[TypeRequest::list(i8, Some(7))]);
 
         let id = IntrinsicId::from_name("take_while").unwrap();
         let result = id.desc().result_type(&types, &[arr]);
@@ -109,9 +115,10 @@ mod tests {
     /// length) yields an **unbounded** `List<i8>` with no static footprint.
     #[test]
     fn result_type_of_a_pointer_is_an_unbounded_list() {
-        let types = crate::types::TypeManager::default();
+        let mut types = crate::types::TypeManager::default();
         let i8 = types.get_or_make_int(1);
         let ptr = types.get_or_make_int(8); // a raw pointer, not a sequence
+        types.create_requested_types(&[TypeRequest::list(i8, None)]);
 
         let id = IntrinsicId::from_name("take_while").unwrap();
         let result = id.desc().result_type(&types, &[ptr]);

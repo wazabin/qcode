@@ -38,9 +38,15 @@ impl Intrinsic for Concat {
         );
 
         match (a_len, b_len, a_list || b_list) {
-            (Some(a), Some(b), false) => types.get_or_make_array(a_elem, a + b),
-            (Some(a), Some(b), true) => types.get_or_make_list(a_elem, a + b),
-            _ => types.get_or_make_unbounded_list(a_elem),
+            (Some(a), Some(b), false) => types
+                .get_array(a_elem, a + b)
+                .expect("concat result array type must be published"),
+            (Some(a), Some(b), true) => types
+                .get_list(a_elem, Some(a + b))
+                .expect("concat result list type must be published"),
+            _ => types
+                .get_list(a_elem, None)
+                .expect("concat result unbounded-list type must be published"),
         }
     }
 
@@ -53,7 +59,7 @@ register_intrinsic!(Concat);
 
 #[cfg(test)]
 mod tests {
-    use crate::types::TypeManager;
+    use crate::types::{TypeManager, TypeRequest};
     use crate::value::insn::IntrinsicId;
 
     #[test]
@@ -65,10 +71,11 @@ mod tests {
 
     #[test]
     fn concat_arrays_yields_larger_array() {
-        let types = TypeManager::default();
+        let mut types = TypeManager::default();
         let i32 = types.get_or_make_int(4);
         let a = types.get_or_make_array(i32, 3);
         let b = types.get_or_make_array(i32, 5);
+        types.create_requested_types(&[TypeRequest::array(i32, 8)]);
 
         let id = IntrinsicId::from_name("concat").unwrap();
         let result = id.desc().result_type(&types, &[a, b]);
@@ -79,10 +86,11 @@ mod tests {
 
     #[test]
     fn concat_with_list_yields_list() {
-        let types = TypeManager::default();
+        let mut types = TypeManager::default();
         let i8 = types.get_or_make_int(1);
         let a = types.get_or_make_array(i8, 3);
         let b = types.get_or_make_list(i8, 5);
+        types.create_requested_types(&[TypeRequest::list(i8, Some(8))]);
 
         let id = IntrinsicId::from_name("concat").unwrap();
         let result = id.desc().result_type(&types, &[a, b]);
