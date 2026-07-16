@@ -409,7 +409,6 @@ mod tests {
         }
         let mut b = (&mut tc.ctx).builder_at(addr);
         body(&mut b, &params);
-        unsafe { b.dont_finalize() };
         drop(b);
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
         fid

@@ -336,7 +336,6 @@ mod tests {
             tuple = bld.push_tuple(vec![a, body]).id();
             ptr = bld.shr().get_const(0x2000, 8);
             ret = bld.push_return(ptr).id();
-            unsafe { bld.dont_finalize() };
         }
         set_return_value(&mut tc.ctx, ret, ptr, tuple);
 
@@ -387,19 +386,16 @@ mod tests {
             let zero = bld.shr().get_const(0, 8);
             let cond = bld.push_ne(a, zero).id();
             bld.push_cbranch(cond, t, fb);
-            unsafe { bld.dont_finalize() };
         }
         {
             let mut bld = (&mut tc.ctx).builder(t);
             let one = bld.shr().get_const(1, 8);
             bld.push_branch_with_args(m, vec![one]);
-            unsafe { bld.dont_finalize() };
         }
         {
             let mut bld = (&mut tc.ctx).builder(fb);
             let two = bld.shr().get_const(2, 8);
             bld.push_branch_with_args(m, vec![two]);
-            unsafe { bld.dont_finalize() };
         }
         let (ret, ptr, tuple);
         {
@@ -408,7 +404,6 @@ mod tests {
             tuple = bld.push_tuple(vec![x]).id();
             ptr = bld.shr().get_const(0x2000, 8);
             ret = bld.push_return(ptr).id();
-            unsafe { bld.dont_finalize() };
         }
         set_return_value(&mut tc.ctx, ret, ptr, tuple);
 
@@ -440,7 +435,6 @@ mod tests {
             tuple = bld.push_tuple(vec![reg]).id();
             ptr = bld.shr().get_const(0x2000, 8);
             ret = bld.push_return(ptr).id();
-            unsafe { bld.dont_finalize() };
         }
         set_return_value(&mut tc.ctx, ret, ptr, tuple);
 

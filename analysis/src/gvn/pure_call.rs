@@ -228,7 +228,6 @@ mod tests {
             tuple = b.push_tuple(vec![a, body]).id();
             ptr = b.shr().get_const(0x2000, 8);
             ret = b.push_return(ptr).id();
-            unsafe { b.dont_finalize() };
         }
         let ValueId::Instruction(iid) = ret else {
             unreachable!()
@@ -284,7 +283,6 @@ mod tests {
                 unreachable!()
             };
             call_id = id;
-            unsafe { b.dont_finalize() };
         }
         tc.ctx.replace_instruction_mnemonic(
             call_id,
@@ -397,7 +395,6 @@ mod tests {
             tuple = b.push_tuple(vec![sp, z]).id();
             ptr = b.shr().get_const(0x2000, 8);
             ret = b.push_return(ptr).id();
-            unsafe { b.dont_finalize() };
         }
         let ValueId::Instruction(iid) = ret else {
             unreachable!()
@@ -448,7 +445,6 @@ mod tests {
                 unreachable!()
             };
             call_id = id;
-            unsafe { b.dont_finalize() };
         }
         tc.ctx.replace_instruction_mnemonic(
             call_id,

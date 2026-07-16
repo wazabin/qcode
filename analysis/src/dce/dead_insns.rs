@@ -232,7 +232,6 @@ mod tests {
         };
         let mut builder = (&mut ctx).builder_at(0x1000);
         f(&mut builder);
-        unsafe { builder.dont_finalize() };
         drop(builder);
         (ctx, block_id)
     }
@@ -339,7 +338,6 @@ mod tests {
             let block_id = ctx.builder_at(0x1000).current_block();
             let mut b = ctx.builder(block_id);
             b.push_pcode_op(op_id, vec![], None, 0);
-            unsafe { b.dont_finalize() };
             drop(b);
             dead_insns(ModuleView::new(&ctx), block_id)
         };
@@ -387,7 +385,6 @@ mod tests {
         let call_id = {
             let mut b = (ctx).builder_at(0x1000);
             let id = b.push_call(callee).id();
-            unsafe { b.dont_finalize() };
             id
         };
 
@@ -400,7 +397,6 @@ mod tests {
             let rax = ctx.get_named("r0").unwrap().as_varnode().unwrap();
             let mut b = (ctx).builder_at(0x2000);
             b.push_store(call_id, ValueId::Varnode(rax), reg);
-            unsafe { b.dont_finalize() };
         }
 
         (call_block, cont)

@@ -174,7 +174,6 @@ fn pointer_literals_are_tracked() {
     let mut builder = (&mut ctx).builder_at(0x1000);
     let literal_ptr = builder.shr().get_const(0, 8);
     builder.push_load::<false>(literal_ptr, 8, reg_space);
-    unsafe { builder.dont_finalize() };
     drop(builder);
 
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
@@ -415,7 +414,6 @@ fn two_literal_pointers_different_spaces_do_not_alias() {
     builder.push_load::<false>(lit1, 4, reg_space);
     builder.push_load::<false>(lit2, 4, alt_space);
 
-    unsafe { builder.dont_finalize() };
     drop(builder);
 
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
@@ -437,7 +435,6 @@ fn same_pointer_used_in_multiple_spaces_degrades_to_unknown() {
     builder.push_load::<false>(ptr, 4, reg_space);
     builder.push_load::<false>(ptr, 4, alt_space);
 
-    unsafe { builder.dont_finalize() };
     drop(builder);
 
     // A literal interned across two spaces must not panic; the pointer degrades
@@ -636,7 +633,6 @@ fn untracked_value_may_alias_conservatively() {
     let p2 = builder.shr().get_const(0x2000, 8);
     builder.push_load::<false>(p, 4, space);
     builder.push_load::<false>(p2, 4, space);
-    unsafe { builder.dont_finalize() };
     drop(builder);
 
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
@@ -645,7 +641,6 @@ fn untracked_value_may_alias_conservatively() {
     let mut builder = (&mut ctx).builder_at(0x1000);
     let eight = builder.shr().get_const(8, 8);
     let q = builder.push_add(p, eight).id();
-    unsafe { builder.dont_finalize() };
     drop(builder);
 
     assert!(

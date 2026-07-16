@@ -56,7 +56,6 @@ mod tests {
             .unwrap();
         let mut builder = (&mut tc.ctx).builder_at(0x1000);
         f(&mut builder);
-        unsafe { builder.dont_finalize() };
         drop(builder);
         (tc, fun_id)
     }

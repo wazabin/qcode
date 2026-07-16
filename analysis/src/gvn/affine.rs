@@ -889,7 +889,6 @@ mod spike {
             // `[rsp+8]` after `and rsp, -16`: (@SP & -16) + 8.
             let aligned = b.push_bit_and(sp, neg16).id();
             let al = b.push_add(aligned, c8).id();
-            unsafe { b.dont_finalize() };
             (s1, s2, threaded, aligned, al)
         };
 
@@ -944,7 +943,6 @@ mod spike {
             let other = b.shr().get_const(0x4000, 8);
             let unrelated = b.push_add(other, idx).id(); // base + reg, no @SP
             let _ = b.push_load::<false>(indexed, 1, ram);
-            unsafe { b.dont_finalize() };
             (fixed, indexed, aligned_slot, unrelated)
         };
 
@@ -998,7 +996,6 @@ mod spike {
             let c60 = b.shr().get_const(0x60, 8);
             let gep = b.push_gep(p, 0x60).id(); // gep(p + 0x60)
             let add = b.push_add(p, c60).id(); // p + 0x60
-            unsafe { b.dont_finalize() };
             (gep, add)
         };
 

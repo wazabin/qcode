@@ -461,7 +461,6 @@ mod tests {
         {
             let mut b = (&mut tc.ctx).builder(entry);
             b.push_call(fun_id);
-            unsafe { b.dont_finalize() };
         }
 
         // Orphaned fall-through: store a register and read it straight back.
@@ -473,7 +472,6 @@ mod tests {
             let loaded = b.push_load::<false>(eax, 4, reg_space).id();
             b.push_store(loaded, other, reg_space);
             load_id = loaded;
-            unsafe { b.dont_finalize() };
         }
 
         let aliases = AliasResult::simple_for_function(&tc.ctx, fun_id);

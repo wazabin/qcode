@@ -105,7 +105,6 @@ pub fn canonicalize_sp_slots_concrete<'a, 'str>(
             };
             repr.insert(off, rep);
         }
-        unsafe { b.dont_finalize() };
     }
 
     // Point every occurrence at its representative; the now-dead per-site
@@ -196,7 +195,6 @@ pub fn canonicalize_sp_slots<'str>(
             };
             repr.insert(off, rep);
         }
-        unsafe { b.dont_finalize() };
     }
 
     // Point every occurrence at its representative; the now-dead per-site
@@ -283,7 +281,6 @@ mod tests {
             let addr = b.push_sub(sp, c8).id();
             let load = b.push_load::<false>(addr, 8, ram);
             let id = load.id();
-            unsafe { b.dont_finalize() };
             id
         };
         let l0 = load_in(root, &mut tc);

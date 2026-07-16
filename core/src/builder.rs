@@ -3,8 +3,14 @@
 //! The [`Builder`] is the primary way to construct IR. It holds a mutable
 //! reference to a block inside a [`Context`] and exposes typed `push_*` methods
 //! for every instruction kind.
-//! When the builder is dropped (or [`Builder::finalize`] is called),
-//! it verifies that the block ends with a terminator instruction.
+//!
+//! Terminating the block is the caller's responsibility ([`Builder::finalize`]
+//! pushes the final branch for the common case); the invariant that every
+//! rostered block ends in a terminator is enforced by the IR verifier, not at
+//! builder drop. Appending *past* a terminator, however, panics immediately.
+//! A builder may freely be dropped mid-block — e.g. after splicing
+//! instructions before an existing anchor via
+//! [`Builder::set_insert_point_before`].
 //!
 //! # Typical usage
 //!
@@ -84,8 +90,6 @@ pub struct Builder<'str, 'ctx> {
     /// Is the block terminated, i.e. does it end with a terminator
     /// If it is not the case, the block might be invalid
     pub(crate) is_terminated: bool,
-
-    verify_terminated: bool,
 
     /// Explicit insert position for new instructions.
     ///
@@ -263,7 +267,6 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             shared,
             interfaces,
             is_terminated,
-            verify_terminated: true,
             block,
             namespace: HashMap::default(),
             local_labels: HashMap::default(),
@@ -350,26 +353,6 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     /// Resets the insert point to append mode (the default).
     pub fn set_insert_point_to_end(&mut self) {
         self.insert_point = None;
-    }
-
-    /// Disables the termination check that runs when the builder is dropped.
-    ///
-    /// Normally dropping an un-terminated builder panics. Call this when the
-    /// caller guarantees that either:
-    /// - the block will be terminated by a *parent* builder before the overall
-    ///   IR is used (e.g. when emitting code from a macro where the macro body
-    ///   does not own the final branch), or
-    /// - the block is intentionally left open as an intermediate state.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that by the time this context's IR is inspected
-    /// or executed, the block owned by this builder is properly terminated
-    /// (i.e. its last instruction is a terminator). Failing to do so will
-    /// produce malformed IR that may panic or produce incorrect results in
-    /// downstream passes.
-    pub unsafe fn dont_finalize(&mut self) {
-        self.verify_terminated = false;
     }
 
     /// Gets a sub-value from a given value, specified by a byte range.
@@ -2369,24 +2352,6 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 }
 
-impl<'str, 'ctx> Drop for Builder<'str, 'ctx> {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            return;
-        }
-
-        if !self.is_terminated &&
-        // I don't see how this can happen, but just in case, we also check if the block is actually terminated, to avoid panicking when dropping a builder that has already been finalized
-        !self.is_terminated()
-        {
-            // This is terrible and should be done at compile time, but this is seamingly impossible in rust ?
-            // panic!(
-            //     "Builder must be finalized before drop, if you need to drop without finalizing, call `dont_finalize()` on the builder first"
-            // );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use qcode_macro::qcode;
@@ -2663,25 +2628,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "This feature is WIP"]
-    #[should_panic(
-        expected = "Builder must be finalized before drop, if you need to drop without finalizing, call `dont_finalize()` on the builder first"
-    )]
-    fn test_builder_drop() {
-        // Test code for Builder drop behavior
-        // This test will fail to compile if the drop implementation panics as expected
-        let mut ctx = Context::new();
-        let block_id = {
-            let __f = ctx.anon_function();
-            ctx.get_or_make_block(0, __f)
-        };
-        {
-            let _builder = ctx.builder(block_id);
-            // Not finalizing the builder, should panic when dropped
-        }
-    }
-
-    #[test]
     fn test_builder_finalize() {
         // Test code for Builder drop behavior
         // This test will compile and run without panicking because we finalize the builder properly
@@ -2792,7 +2738,6 @@ mod tests {
         let p1 = builder.push_param(4);
         let p1_id = p1;
 
-        unsafe { builder.dont_finalize() };
         drop(builder);
 
         let block = BasicBlock::from_id(&ctx, block_id);
@@ -2935,14 +2880,12 @@ mod tests {
         let existing_id = {
             let mut b = (&mut ctx).builder(block_id);
             let id = b.push_bit_negate(val).id;
-            unsafe { b.dont_finalize() };
             id
         };
 
         let prepended_id = {
             let mut b = (&mut ctx).builder(block_id);
             b.set_insert_point_to_start();
-            unsafe { b.dont_finalize() };
             b.push_bit_negate(val).id
         };
 
@@ -2962,14 +2905,12 @@ mod tests {
         let existing_id = {
             let mut b = (&mut ctx).builder(block_id);
             let id = b.push_bit_negate(val).id;
-            unsafe { b.dont_finalize() };
             id
         };
 
         let (id0, id1, id2) = {
             let mut b = (&mut ctx).builder(block_id);
             b.set_insert_point_to_start();
-            unsafe { b.dont_finalize() };
             (
                 b.push_bit_negate(val).id,
                 b.push_bit_negate(val).id,
@@ -2992,14 +2933,12 @@ mod tests {
 
         let (first_id, target_id) = {
             let mut b = (&mut ctx).builder(block_id);
-            unsafe { b.dont_finalize() };
             (b.push_bit_negate(val).id, b.push_bit_negate(val).id)
         };
 
         let (inserted0, inserted1) = {
             let mut b = (&mut ctx).builder(block_id);
             b.set_insert_point_before(target_id);
-            unsafe { b.dont_finalize() };
             (b.push_bit_negate(val).id, b.push_bit_negate(val).id)
         };
 
@@ -3016,7 +2955,6 @@ mod tests {
         let new_id = {
             let mut b = (&mut ctx).builder(entry);
             b.set_insert_point_to_start();
-            unsafe { b.dont_finalize() };
             b.push_bit_negate(val).id
         };
 
@@ -3037,7 +2975,6 @@ mod tests {
 
         let (first_id, middle_id, last_id) = {
             let mut b = (&mut ctx).builder(block_id);
-            unsafe { b.dont_finalize() };
             let first = b.push_bit_negate(val).id; // appended → index 0
             b.set_insert_point_to_start();
             let middle = b.push_bit_negate(val).id; // inserted at 0, first shifts to 1

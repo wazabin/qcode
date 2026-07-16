@@ -162,7 +162,6 @@ mod tests {
         let call_id = {
             let mut b = (&mut tc.ctx).builder_at(0x2000);
             let id = b.push_call(callee).id;
-            unsafe { b.dont_finalize() };
             id
         };
         tc.ctx.replace_instruction_mnemonic(

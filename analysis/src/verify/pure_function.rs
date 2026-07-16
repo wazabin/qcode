@@ -139,7 +139,6 @@ mod tests {
         {
             let mut b = (&mut tc.ctx).builder(entry);
             body(&mut b);
-            unsafe { b.dont_finalize() };
         }
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
         fid

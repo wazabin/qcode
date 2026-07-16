@@ -493,9 +493,7 @@ fn make_index<'str>(
     let width = width_of(host, index);
     let mut b = host.builder(block);
     b.set_insert_point_before(before);
-    let v = index_plus(&mut b, index, delta, width);
-    unsafe { b.dont_finalize() };
-    v
+    index_plus(&mut b, index, delta, width)
 }
 
 /// Create a typed instruction with `mnemonic` and splice it before `before` in
@@ -582,9 +580,7 @@ fn apply_generic<'str>(host: &mut BodyMut<'_, 'str>, m: &PromoteMatch) -> bool {
         let dst = {
             let mut b = host.builder(m.preheader);
             b.set_insert_point_before(term_id);
-            let dst = region_base(&mut b, m.base_root, m.origin_word, esz, base_width);
-            unsafe { b.dont_finalize() };
-            dst
+            region_base(&mut b, m.base_root, m.origin_word, esz, base_width)
         };
         insert_before(
             host,
@@ -699,7 +695,6 @@ fn apply_generic<'str>(host: &mut BodyMut<'_, 'str>, m: &PromoteMatch) -> bool {
         b.set_insert_point_before(first_id);
         let dst = region_base(&mut b, m.base_root, m.origin_word, esz, base_width);
         b.push_store(arr_e, dst, m.region_space);
-        unsafe { b.dont_finalize() };
     }
 
     // Drop the now-dead memory traffic. (Region loads were removed inline above.)

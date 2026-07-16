@@ -188,7 +188,6 @@ mod tests {
             // A pointer with no relation to @SP.
             let other = b.shr().get_const(0x4000, 8);
             let unrelated = b.push_add(other, c8).id();
-            unsafe { b.dont_finalize() };
             (local, caller_arg, ret_slot, aligned_slot, unrelated)
         };
 
@@ -250,7 +249,6 @@ mod tests {
             let a2 = b.push_bit_and(s2, neg8).id();
             // a slot in the innermost realigned frame: a2 - 0x658
             let slot = b.push_sub(a2, k658).id();
-            unsafe { b.dont_finalize() };
             slot
         };
 
@@ -284,7 +282,6 @@ mod tests {
             let up = b.push_add(sp, k10).id();
             let aligned = b.push_bit_and(up, neg8).id();
             let slot = b.push_sub(aligned, k20).id();
-            unsafe { b.dont_finalize() };
             (aligned, slot)
         };
 

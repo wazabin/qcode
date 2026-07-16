@@ -2698,7 +2698,6 @@ mod tests {
             let e = b.push_intrinsic(enum_id, vec![src]).id();
             let ptr = b.shr().get_const(0, 8);
             b.push_return(ptr);
-            unsafe { b.dont_finalize() };
             e
         };
         let ValueId::Instruction(eid) = e else {
@@ -2775,7 +2774,6 @@ mod tests {
         {
             let mut b = (&mut ctx).builder(entry);
             b.push_return(ptr);
-            unsafe { b.dont_finalize() };
         }
         let rid = BasicBlock::from_id(&ctx, entry).iter().last().unwrap().id;
         ctx.replace_instruction_mnemonic(
@@ -2830,7 +2828,6 @@ mod tests {
             lane = b.push_intrinsic(at_id, vec![arr, i]).id();
             ptr = b.shr().get_const(0, 8);
             ret = b.push_return(ptr).id();
-            unsafe { b.dont_finalize() };
         }
         let ValueId::Instruction(rid) = ret else {
             unreachable!()

@@ -199,7 +199,6 @@ mod tests {
         let mut b = (&mut tc.ctx).builder(root);
         let v = b.shr().get_const(0x1234, 4);
         b.push_store(v, p, space);
-        unsafe { b.dont_finalize() };
         fid
     }
 

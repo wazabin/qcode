@@ -1094,7 +1094,6 @@ mod tests {
                 size: 8,
             };
             b.push_call(callee);
-            unsafe { b.dont_finalize() };
             (aligned, store, val)
         };
 
@@ -1225,7 +1224,6 @@ mod tests {
         {
             let mut b = (&mut tc.ctx).builder(block);
             b.push_call(fun_id);
-            unsafe { b.dont_finalize() };
         }
 
         let ram = tc.ctx.shared.default_space;
@@ -1281,7 +1279,6 @@ mod tests {
         {
             let mut b = (&mut tc.ctx).builder(block);
             b.push_call(callee);
-            unsafe { b.dont_finalize() };
         }
         // The builder makes a call with no args; set them to `[arg]`.
         let cid = BasicBlock::from_id(&tc.ctx, block)
@@ -1384,7 +1381,6 @@ mod tests {
         {
             let mut b = (&mut tc.ctx).builder(block);
             b.push_call_with_args(callee, vec![ValueId::Varnode(tc.r1)]);
-            unsafe { b.dont_finalize() };
         }
 
         let ram_cell = Base::Symbolic(ram.into(), ValueId::Varnode(tc.r1));

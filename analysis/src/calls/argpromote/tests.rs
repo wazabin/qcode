@@ -1880,7 +1880,6 @@ mod tests {
             let _ = b.push_tuple(vec![s]).id();
             let ptr = b.shr().get_const(0x2000, 8);
             b.push_return(ptr);
-            unsafe { b.dont_finalize() };
         }
         FunctionBody::from_id_mut(&mut tc.ctx, clean).set_pure_reg(true);
 
@@ -1900,7 +1899,6 @@ mod tests {
                 .id();
             let ptr = b.shr().get_const(0x4000, 8);
             b.push_return(ptr);
-            unsafe { b.dont_finalize() };
         }
         FunctionBody::from_id_mut(&mut tc.ctx, dirty).set_pure_reg(true);
 

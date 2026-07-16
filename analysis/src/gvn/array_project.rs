@@ -375,7 +375,6 @@ mod tests {
             inc = b.push_add(elem, one).id();
             ptr = b.shr().get_const(0, 8);
             ret = b.push_return(ptr).id();
-            unsafe { b.dont_finalize() };
         }
         let ValueId::Instruction(rid) = ret else {
             unreachable!()
@@ -632,7 +631,6 @@ mod tests {
             let elem = b.push_extract(t, 1).id();
             let ptr = b.shr().get_const(0, 8);
             let ret = b.push_return(ptr).id();
-            unsafe { b.dont_finalize() };
             (elem, ptr, ret)
         };
         let ValueId::Instruction(rid) = ret else {

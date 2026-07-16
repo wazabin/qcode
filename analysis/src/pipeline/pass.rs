@@ -434,7 +434,6 @@ mod minted_barrier_tests {
         {
             let mut builder = (&mut tc.ctx).builder(block);
             builder.push_call(callee);
-            unsafe { builder.dont_finalize() };
         }
         let call_id = BasicBlock::from_id(&tc.ctx, block)
             .iter()
@@ -476,7 +475,6 @@ mod minted_barrier_tests {
         let sibling_call = {
             let mut builder = (&mut tc.ctx).builder(block);
             builder.push_call(sibling);
-            unsafe { builder.dont_finalize() };
             drop(builder);
             BasicBlock::from_id(&tc.ctx, block)
                 .iter()

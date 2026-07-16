@@ -1401,11 +1401,9 @@ impl<'str> Mem2Reg<'_, 'str> {
         let mut host = self.cx.host(self.body);
         let mut builder = host.builder(branch_block);
         builder.set_insert_point_before(branch_insn);
-        let id = builder
+        builder
             .push_load::<false>(ValueId::Varnode(vn_id), size, space)
-            .id();
-        unsafe { builder.dont_finalize() };
-        id
+            .id()
     }
 
     /// Whether `value` is a `Load` of `var` that already sits in `block` — the
@@ -2321,7 +2319,6 @@ mod tests {
                 .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, tc.reg_space)
                 .id();
             b.push_store(sub, ValueId::Varnode(tc.r1), tc.reg_space);
-            unsafe { b.dont_finalize() };
         }
 
         let aliases = AliasResult::simple_for_function(&tc.ctx, fun_id);
@@ -2363,7 +2360,6 @@ mod tests {
         b.push_store(v, addr_store, ram);
         let addr_load = b.push_sub(sp, c8).id();
         b.push_load::<false>(addr_load, 8, ram);
-        unsafe { b.dont_finalize() };
         (fun_id, sp, sp_reg)
     }
 
@@ -2442,7 +2438,6 @@ mod tests {
             // A dynamic `@SP + reloaded` access — index is not a constant.
             let dyn_ptr = b.push_add(sp, reloaded).id();
             b.push_load::<false>(dyn_ptr, 1, ram);
-            unsafe { b.dont_finalize() };
         }
 
         let loads_before = FunctionBody::from_id(&tc.ctx, fun_id)
@@ -2497,7 +2492,6 @@ mod tests {
             b.push_store(one, low_byte, tc.reg_space);
             full_load = b.push_load::<false>(full, 4, tc.reg_space).id();
             b.push_store(full_load, post_clobber_sink, tc.reg_space);
-            unsafe { b.dont_finalize() };
         }
 
         let aliases = AliasResult::simple_for_function(&tc.ctx, fun_id);
@@ -2552,7 +2546,6 @@ mod tests {
             b.push_store(full_load, full_sink, tc.reg_space);
             byte_load = b.push_load::<false>(low_byte, 1, tc.reg_space).id();
             byte_store = b.push_store(byte_load, byte_sink, tc.reg_space).id;
-            unsafe { b.dont_finalize() };
         }
 
         let aliases = AliasResult::simple_for_function(&tc.ctx, fun_id);
@@ -2766,7 +2759,6 @@ mod tests {
             b.push_store(v, ValueId::Varnode(r0), reg);
             let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
-            unsafe { b.dont_finalize() };
         }
         crate::set_all_call_clobbered_regs(&mut tc.ctx);
         assert!(
@@ -2797,7 +2789,6 @@ mod tests {
             b.push_store(post_load, ValueId::Varnode(r1), reg);
             let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
-            unsafe { b.dont_finalize() };
         }
         tc.ctx.add_cfg_edge(entry, cont);
 
@@ -2870,7 +2861,6 @@ mod tests {
             b.push_store(c2, ValueId::Varnode(r0), reg);
             let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
-            unsafe { b.dont_finalize() };
         }
 
         let aliases = AliasResult::simple_for_function(&tc.ctx, f);
@@ -2911,7 +2901,6 @@ mod tests {
             b.push_store(v, ValueId::Varnode(r0), reg);
             let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
-            unsafe { b.dont_finalize() };
         }
         crate::set_all_call_clobbered_regs(&mut tc.ctx);
 
@@ -2935,7 +2924,6 @@ mod tests {
             b.push_store(post, ValueId::Varnode(r1), reg);
             let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
-            unsafe { b.dont_finalize() };
         }
         tc.ctx.add_cfg_edge(entry, cont);
 
@@ -2970,7 +2958,6 @@ mod tests {
             b.push_store(v, ValueId::Varnode(r0), reg);
             let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
-            unsafe { b.dont_finalize() };
         }
         crate::set_all_call_clobbered_regs(&mut tc.ctx);
 
@@ -2994,7 +2981,6 @@ mod tests {
             b.push_store(v2, ValueId::Varnode(r0), reg);
             let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
-            unsafe { b.dont_finalize() };
         }
         tc.ctx.add_cfg_edge(entry, cont);
 
@@ -3026,7 +3012,6 @@ mod tests {
             b.push_store(v, ValueId::Varnode(r0), reg);
             let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
-            unsafe { b.dont_finalize() };
         }
         crate::set_all_call_clobbered_regs(&mut tc.ctx);
 

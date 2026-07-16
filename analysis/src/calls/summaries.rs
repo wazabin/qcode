@@ -553,7 +553,6 @@ mod tests {
             .unwrap();
         let mut builder = (&mut tc.ctx).builder_at(addr);
         f(&mut builder);
-        unsafe { builder.dont_finalize() };
         drop(builder);
         fun_id
     }
@@ -585,7 +584,6 @@ mod tests {
         let sp_param = ValueId::BlockParam(pid);
         let mut builder = (&mut tc.ctx).builder_at(addr);
         f(&mut builder, sp_param);
-        unsafe { builder.dont_finalize() };
         drop(builder);
         fun_id
     }

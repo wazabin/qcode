@@ -1175,7 +1175,6 @@ mod tests {
         let mut builder = (&mut ctx).builder(block_id);
         let sum = builder.push_add(param_id, param_id);
         assert_eq!(sum.size(), 8);
-        unsafe { builder.dont_finalize() };
     }
 
     #[test]

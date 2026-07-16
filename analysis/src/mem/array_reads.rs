@@ -235,9 +235,7 @@ fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &Rea
             let mut host = cx.host(body);
             let mut b = host.builder(block);
             b.set_insert_point_before(*load_id);
-            let idx = build_index(&mut b, lane);
-            unsafe { b.dont_finalize() };
-            idx
+            build_index(&mut b, lane)
         };
         // Build `at(arr, idx)` with the explicit element type and splice it before
         // the load (avoids the Builder's `context_mut` type-mint path).

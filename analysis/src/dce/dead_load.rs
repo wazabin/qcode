@@ -1170,7 +1170,6 @@ mod tests {
         };
         let mut builder = (&mut ctx).builder_at(0x1000);
         f(&mut builder);
-        unsafe { builder.dont_finalize() };
         drop(builder);
         (ctx, block_id)
     }
@@ -1252,7 +1251,6 @@ mod tests {
             let load_ptr = offset_ptr(&mut b, base, load_off);
             let v = b.push_load::<false>(load_ptr, 4, shadow).id();
             b.push_store(v, ValueId::Varnode(r1), regsp);
-            unsafe { b.dont_finalize() };
         }
         let store_id = BasicBlock::from_id(&tc.ctx, block_id)
             .instruction_ids()
@@ -1485,7 +1483,6 @@ mod tests {
             let v = b.shr().get_const(0x1u64, 8);
             store_id = b.push_store(v, ValueId::Varnode(r), reg).id;
             b.push_call(callee);
-            unsafe { b.dont_finalize() };
         }
         (tc.ctx, entry, store_id)
     }
@@ -1596,7 +1593,6 @@ mod tests {
             // Give the load a user so it is a live reader (not a pruned dead load).
             let zero = b.shr().get_const(0, 4);
             b.push_add(g, zero);
-            unsafe { b.dont_finalize() };
         }
 
         let store_ids: Vec<_> = BasicBlock::from_id(&tc.ctx, root)
@@ -1663,7 +1659,6 @@ mod tests {
             let read_local = b.push_sub(sp, c10).id(); // @SP - 0x10 (read below)
             b.push_store(v, read_local, ram); // kept (its slot is read)
             b.push_load::<false>(read_local, 4, ram);
-            unsafe { b.dont_finalize() };
         }
 
         let stores: Vec<_> = BasicBlock::from_id(&tc.ctx, root)

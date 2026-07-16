@@ -403,7 +403,6 @@ mod tests {
         b.set_insert_point_to_start();
         let k = b.shr().get_const(sub, 8);
         let v = b.push_sub(base, k).id();
-        unsafe { b.dont_finalize() };
         v
     }
 
