@@ -5,6 +5,7 @@
 //! caller-provided mutable lifter service instead of depending on `harbinger`.
 
 use qcode::{
+    address_index::AddressIndex,
     context::Context,
     discovery::{Discovery, DiscoveryKey},
 };
@@ -69,25 +70,31 @@ pub enum LiftOutcome {
 
 /// Injected disassembler/lifter. Implemented by `harbinger`.
 pub trait Lifter {
-    fn seed_binary(&mut self, ctx: &mut Context) -> Result<Vec<Discovery>, String>;
+    fn seed_binary(
+        &mut self,
+        ctx: &mut Context,
+        addresses: &mut AddressIndex,
+    ) -> Result<Vec<Discovery>, String>;
 
     /// Pre-register a function stub at `addr` (idempotent). The driver calls this
     /// for every pending `DiscoveryKind::Function` before lifting any block in a
     /// drain, so the tail-call boundary (a direct branch into a known entry stays
     /// out of the caller) is independent of the order discoveries drain in.
-    fn ensure_function(&mut self, ctx: &mut Context, addr: u64);
+    fn ensure_function(&mut self, ctx: &mut Context, addresses: &mut AddressIndex, addr: u64);
 
-    fn ensure_discovered_function(&mut self, ctx: &mut Context, discovery: &Discovery) {
-        self.ensure_function(ctx, discovery.target);
+    fn ensure_discovered_function(
+        &mut self,
+        ctx: &mut Context,
+        addresses: &mut AddressIndex,
+        discovery: &Discovery,
+    ) {
+        self.ensure_function(ctx, addresses, discovery.target);
     }
 
     fn lift_discovered(
         &mut self,
         clean_ctx: &mut Context,
+        addresses: &mut AddressIndex,
         discovery: Discovery,
     ) -> Result<LiftOutcome, String>;
-
-    fn finish_lifting(&mut self, _clean_ctx: &mut Context) -> Result<(), String> {
-        Ok(())
-    }
 }

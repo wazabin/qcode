@@ -45,7 +45,8 @@ impl Pass for ExternalSigs {
         let target = abi_target(ctx, env);
         apply_all_external_signatures(ctx, &env.cfg.abi, target);
         Ok(crate::ModulePassOutcome::functions(affected)
-            .preserving_global::<crate::CallGraphAnalysis>())
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>())
     }
 }
 

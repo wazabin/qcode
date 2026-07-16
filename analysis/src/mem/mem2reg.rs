@@ -3652,9 +3652,10 @@ impl FunctionPass for Mem2RegPass {
             (aliases, sp_param)
         };
 
-        Ok(Outcome::changed(mem2reg_host(
-            f, m, fun_id, &aliases, sp_param,
-        )))
+        Ok(
+            Outcome::changed(mem2reg_host(f, m, fun_id, &aliases, sp_param))
+                .preserving_global::<crate::AddressAnalysis>(),
+        )
     }
 }
 

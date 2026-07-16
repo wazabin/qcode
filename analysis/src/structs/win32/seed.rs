@@ -148,7 +148,8 @@ impl Pass for WindowsTebSeed {
         }
         Ok(
             crate::ModulePassOutcome::module_if(seed_teb_register(ctx, fs, 32))
-                .preserving_global::<crate::CallGraphAnalysis>(),
+                .preserving_global::<crate::CallGraphAnalysis>()
+                .preserving_global::<crate::AddressAnalysis>(),
         )
     }
 }

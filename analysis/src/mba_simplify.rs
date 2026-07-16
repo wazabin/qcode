@@ -77,7 +77,8 @@ impl FunctionPass for MbaSimplify {
     ) -> Result<Outcome<'str>, String> {
         let fid = body.id();
         let mut host = m.host(body);
-        Ok(Outcome::changed(mba_simplify(&mut host, fid)))
+        Ok(Outcome::changed(mba_simplify(&mut host, fid))
+            .preserving_global::<crate::AddressAnalysis>())
     }
 }
 

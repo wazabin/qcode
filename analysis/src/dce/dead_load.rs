@@ -2191,7 +2191,8 @@ impl FunctionPass for DeadLoad {
         let aliases = frame_aware_aliases(m, m.body_view(f), fid);
         Ok(
             Outcome::changed(remove_dead_load_insns_body(f, m, fid, Some(&aliases), &[]))
-                .preserving_global::<crate::CallGraphAnalysis>(),
+                .preserving_global::<crate::CallGraphAnalysis>()
+                .preserving_global::<crate::AddressAnalysis>(),
         )
     }
 }
@@ -2225,7 +2226,8 @@ impl FunctionPass for DeadStore {
             Some(&aliases),
             &dead_regs,
         ))
-        .preserving_global::<crate::CallGraphAnalysis>())
+        .preserving_global::<crate::CallGraphAnalysis>()
+        .preserving_global::<crate::AddressAnalysis>())
     }
 }
 

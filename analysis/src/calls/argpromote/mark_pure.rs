@@ -154,6 +154,7 @@ impl Pass for MarkPure {
                 .map(|f| f.id),
         )
         .preserving_global::<crate::CallGraphAnalysis>()
+        .preserving_global::<crate::AddressAnalysis>()
         .preserving_local::<crate::AliasAnalysis>())
     }
 }

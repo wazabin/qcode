@@ -366,7 +366,8 @@ impl Pass for ParamAttrsPass {
     ) -> Result<crate::ModulePassOutcome, String> {
         Ok(
             crate::ModulePassOutcome::functions(infer_param_attrs_changed_functions(ctx))
-                .preserving_global::<crate::CallGraphAnalysis>(),
+                .preserving_global::<crate::CallGraphAnalysis>()
+                .preserving_global::<crate::AddressAnalysis>(),
         )
     }
 }

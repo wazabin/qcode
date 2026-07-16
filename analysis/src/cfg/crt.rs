@@ -28,9 +28,10 @@ impl Pass for DiscoverLibcMain {
         env: &PipelineEnv,
         _targets: &[qcode::value::FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
-        Ok(crate::ModulePassOutcome::module_if(discover_libc_main(
-            ctx, env,
-        )))
+        Ok(
+            crate::ModulePassOutcome::module_if(discover_libc_main(ctx, env))
+                .preserving_global::<crate::AddressAnalysis>(),
+        )
     }
 }
 

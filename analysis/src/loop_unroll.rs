@@ -72,6 +72,7 @@ impl FunctionPass for RecognizeSimpleLoops {
         let fid = f.id();
         Ok(Outcome::changed(recognize_simple_loops_host(f, m, fid))
             .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>()
             .preserving_local::<crate::AliasAnalysis>())
     }
 }

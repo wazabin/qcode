@@ -51,6 +51,11 @@ fn call_graph_snapshot(ctx: &Context<'_>) -> Vec<crate::CallEdge> {
         .collect()
 }
 
+#[cfg(test)]
+fn address_snapshot(ctx: &Context<'_>) -> qcode::address_index::AddressIndex {
+    qcode::address_index::AddressIndex::analyze(ctx)
+}
+
 /// The architecture-specific inputs the register-aware passes need, resolved once
 /// per pipeline run and shared by reference with every pass.
 pub struct PipelineEnv {
@@ -265,6 +270,8 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
     ) -> Result<bool, String> {
         #[cfg(test)]
         let call_graph_before = call_graph_snapshot(ctx);
+        #[cfg(test)]
+        let addresses_before = address_snapshot(ctx);
         // Split the context: borrow the target body `&mut` in place and run the
         // pass over the frozen module view; the view is bodies-free, so it cannot
         // alias the borrowed body.
@@ -296,6 +303,15 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
                 call_graph_before,
                 call_graph_snapshot(ctx),
                 "{} reported preserving CallGraphAnalysis but changed its result",
+                T::NAME,
+            );
+        }
+        #[cfg(test)]
+        if preserved.preserves_global_analysis::<crate::AddressAnalysis>() {
+            assert_eq!(
+                addresses_before,
+                address_snapshot(ctx),
+                "{} reported preserving AddressAnalysis but changed its result",
                 T::NAME,
             );
         }
@@ -706,6 +722,8 @@ impl<T: Pass> DynPass for T {
     ) -> Result<ModulePassOutcome, String> {
         #[cfg(test)]
         let call_graph_before = call_graph_snapshot(ctx);
+        #[cfg(test)]
+        let addresses_before = address_snapshot(ctx);
         let outcome = Pass::run_with_analyses(self, ctx, env, targets, analyses)?;
         #[cfg(test)]
         if outcome
@@ -716,6 +734,18 @@ impl<T: Pass> DynPass for T {
                 call_graph_before,
                 call_graph_snapshot(ctx),
                 "{} reported preserving CallGraphAnalysis but changed its result",
+                T::NAME,
+            );
+        }
+        #[cfg(test)]
+        if outcome
+            .preserved_analyses()
+            .preserves_global_analysis::<crate::AddressAnalysis>()
+        {
+            assert_eq!(
+                addresses_before,
+                address_snapshot(ctx),
+                "{} reported preserving AddressAnalysis but changed its result",
                 T::NAME,
             );
         }

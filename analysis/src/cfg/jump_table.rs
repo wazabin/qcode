@@ -99,6 +99,31 @@ impl Pass for HandleJumpTables {
         _env: &PipelineEnv,
         targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        let mut addresses = AddressIndex::analyze(ctx);
+        self.run_indexed(ctx, targets, &mut addresses)
+    }
+
+    fn run_with_analyses(
+        &self,
+        ctx: &mut Context,
+        _env: &PipelineEnv,
+        targets: &[FunctionId],
+        analyses: &mut crate::AnalysisManager,
+    ) -> Result<crate::ModulePassOutcome, String> {
+        let mut addresses = analyses.take_global::<crate::AddressAnalysis>(ctx);
+        let result = self.run_indexed(ctx, targets, &mut addresses);
+        analyses.put_global::<crate::AddressAnalysis>(addresses);
+        result.map(|outcome| outcome.preserving_global::<crate::AddressAnalysis>())
+    }
+}
+
+impl HandleJumpTables {
+    fn run_indexed(
+        &self,
+        ctx: &mut Context,
+        targets: &[FunctionId],
+        addresses: &mut AddressIndex,
+    ) -> Result<crate::ModulePassOutcome, String> {
         let fun_ids: Vec<FunctionId> = targets
             .iter()
             .copied()
@@ -107,10 +132,9 @@ impl Pass for HandleJumpTables {
                 !f.is_external() && !ctx.is_function_ignored(f.address())
             })
             .collect();
-        let mut addresses = AddressIndex::analyze(ctx);
         let mut changed = rustc_hash::FxHashSet::default();
         for fun_id in fun_ids {
-            if Self::resolve_function_indexed(ctx, &mut addresses, fun_id)? {
+            if Self::resolve_function_indexed(ctx, addresses, fun_id)? {
                 changed.insert(fun_id);
             }
         }

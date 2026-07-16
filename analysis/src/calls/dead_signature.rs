@@ -350,7 +350,8 @@ impl Pass for DeadSignature {
         let graph = CallGraph::analyze(ctx);
         Ok(
             crate::ModulePassOutcome::functions(dead_signature_changed_functions(ctx, &graph))
-                .preserving_global::<CallGraphAnalysis>(),
+                .preserving_global::<CallGraphAnalysis>()
+                .preserving_global::<crate::AddressAnalysis>(),
         )
     }
 
@@ -363,7 +364,8 @@ impl Pass for DeadSignature {
         let graph = analyses.global::<CallGraphAnalysis>(ctx);
         Ok(
             crate::ModulePassOutcome::functions(dead_signature_changed_functions(ctx, graph))
-                .preserving_global::<CallGraphAnalysis>(),
+                .preserving_global::<CallGraphAnalysis>()
+                .preserving_global::<crate::AddressAnalysis>(),
         )
     }
 }

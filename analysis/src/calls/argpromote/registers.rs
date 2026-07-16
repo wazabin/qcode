@@ -451,7 +451,8 @@ impl Pass for ArgPromoteRegisters {
             let graph = CallGraph::analyze(ctx);
             argpromote_registers_changed_functions(ctx, &graph)
         })
-        .preserving_global::<CallGraphAnalysis>())
+        .preserving_global::<CallGraphAnalysis>()
+        .preserving_global::<crate::AddressAnalysis>())
     }
 
     fn run_with_analyses(
@@ -463,7 +464,8 @@ impl Pass for ArgPromoteRegisters {
         let graph = analyses.global::<CallGraphAnalysis>(ctx);
         Ok(
             crate::ModulePassOutcome::functions(argpromote_registers_changed_functions(ctx, graph))
-                .preserving_global::<CallGraphAnalysis>(),
+                .preserving_global::<CallGraphAnalysis>()
+                .preserving_global::<crate::AddressAnalysis>(),
         )
     }
 }

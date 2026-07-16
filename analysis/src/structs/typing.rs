@@ -51,7 +51,8 @@ impl FunctionPass for StructTyping {
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
         Ok(Outcome::changed(struct_typing(f, cx, fid))
-            .preserving_global::<crate::CallGraphAnalysis>())
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>())
     }
 }
 

@@ -236,9 +236,10 @@ impl FunctionPass for CanonicalizeSpSlots {
     ) -> std::result::Result<Outcome<'str>, String> {
         let sp_reg = cx.shr().registers[&cx.env().cfg.stack_pointer];
         let fid = f.id();
-        Ok(Outcome::changed(canonicalize_sp_slots_concrete(
-            f, cx, fid, sp_reg,
-        )))
+        Ok(
+            Outcome::changed(canonicalize_sp_slots_concrete(f, cx, fid, sp_reg))
+                .preserving_global::<crate::AddressAnalysis>(),
+        )
     }
 }
 

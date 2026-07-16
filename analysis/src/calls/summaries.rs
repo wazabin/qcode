@@ -847,7 +847,8 @@ impl Pass for SeedClobbers {
             .collect();
         set_all_call_clobbered_regs(ctx);
         Ok(crate::ModulePassOutcome::functions(affected)
-            .preserving_global::<crate::CallGraphAnalysis>())
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>())
     }
 }
 
@@ -876,7 +877,8 @@ impl Pass for Summaries {
             .collect();
         set_all_function_summaries(ctx, stack_ptr);
         Ok(crate::ModulePassOutcome::functions(affected)
-            .preserving_global::<crate::CallGraphAnalysis>())
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>())
     }
 }
 

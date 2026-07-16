@@ -65,6 +65,7 @@ impl FunctionPass for CppDemangle {
                 // Returned; the driver applies it (uniquified) at the barrier.
                 Ok(Outcome::renamed(Cow::Owned(demangled))
                     .preserving_global::<crate::CallGraphAnalysis>()
+                    .preserving_global::<crate::AddressAnalysis>()
                     .preserving_local::<crate::AliasAnalysis>())
             }
             None => Ok(Outcome::unchanged()),

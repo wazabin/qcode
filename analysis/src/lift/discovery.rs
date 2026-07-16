@@ -7,19 +7,23 @@
 use qcode::{context::Context, discovery::DiscoveryKind};
 
 use crate::{
-    Pass, PipelineEnv,
+    AddressAnalysis, AnalysisManager, Pass, PipelineEnv,
     pipeline::{LiftOutcome, LiftSummary, PipelineServices},
 };
 
 pub fn discover_addresses_in_binary(
     clean_ctx: &mut Context,
     services: &mut PipelineServices<'_>,
+    analyses: &mut AnalysisManager,
 ) -> Result<LiftSummary, String> {
     let Some(lifter) = services.lifter.as_deref_mut() else {
         return Ok(LiftSummary::default());
     };
 
-    let entries = lifter.seed_binary(clean_ctx)?;
+    let mut addresses = analyses.take_global::<AddressAnalysis>(clean_ctx);
+    let entries = lifter.seed_binary(clean_ctx, &mut addresses);
+    analyses.put_global::<AddressAnalysis>(addresses);
+    let entries = entries?;
     let mut summary = LiftSummary::default();
     for entry in entries {
         if clean_ctx.discover(entry) {
@@ -32,6 +36,7 @@ pub fn discover_addresses_in_binary(
 pub fn lift_new_addresses(
     clean_ctx: &mut Context,
     services: &mut PipelineServices<'_>,
+    analyses: &mut AnalysisManager,
 ) -> Result<LiftSummary, String> {
     let Some(lifter) = services.lifter.as_deref_mut() else {
         return Ok(LiftSummary::default());
@@ -42,48 +47,53 @@ pub fn lift_new_addresses(
         return Ok(LiftSummary::default());
     }
 
-    // Pre-register every pending function entry before lifting any block, so a
-    // direct branch into one of these entries is recognized as a tail call (left
-    // out of the branching function) regardless of the order discoveries drain in.
-    for discovery in &pending {
-        if matches!(discovery.kind, DiscoveryKind::Function { .. }) {
-            lifter.ensure_discovered_function(clean_ctx, discovery);
+    let mut addresses = analyses.take_global::<AddressAnalysis>(clean_ctx);
+    let result = (|| {
+        // Pre-register every pending function entry before lifting any block, so a
+        // direct branch into one of these entries is recognized as a tail call (left
+        // out of the branching function) regardless of the order discoveries drain in.
+        for discovery in &pending {
+            if matches!(discovery.kind, DiscoveryKind::Function { .. }) {
+                lifter.ensure_discovered_function(clean_ctx, &mut addresses, discovery);
+            }
         }
-    }
 
-    let mut summary = LiftSummary::default();
-    for discovery in pending {
-        let outcome = lifter.lift_discovered(clean_ctx, discovery)?;
-        match outcome {
-            LiftOutcome::Lifted { key, successors } => {
-                clean_ctx.mark_discovery_lifted(key);
-                summary.lifted += 1;
-                for successor in successors {
-                    if clean_ctx.discover(successor) {
-                        summary.enqueued += 1;
+        let mut summary = LiftSummary::default();
+        for discovery in pending {
+            let outcome = lifter.lift_discovered(clean_ctx, &mut addresses, discovery)?;
+            match outcome {
+                LiftOutcome::Lifted { key, successors } => {
+                    clean_ctx.mark_discovery_lifted(key);
+                    summary.lifted += 1;
+                    for successor in successors {
+                        if clean_ctx.discover(successor) {
+                            summary.enqueued += 1;
+                        }
                     }
                 }
-            }
-            LiftOutcome::AlreadyLifted { key, successors } => {
-                clean_ctx.mark_discovery_lifted(key);
-                summary.already_lifted += 1;
-                for successor in successors {
-                    if clean_ctx.discover(successor) {
-                        summary.enqueued += 1;
+                LiftOutcome::AlreadyLifted { key, successors } => {
+                    clean_ctx.mark_discovery_lifted(key);
+                    summary.already_lifted += 1;
+                    for successor in successors {
+                        if clean_ctx.discover(successor) {
+                            summary.enqueued += 1;
+                        }
                     }
                 }
-            }
-            LiftOutcome::Failed { key, reason } => {
-                clean_ctx.mark_discovery_failed(key, reason);
-                summary.failed += 1;
-            }
-            LiftOutcome::Skipped { key, reason } => {
-                clean_ctx.mark_discovery_skipped(key, reason);
-                summary.skipped += 1;
+                LiftOutcome::Failed { key, reason } => {
+                    clean_ctx.mark_discovery_failed(key, reason);
+                    summary.failed += 1;
+                }
+                LiftOutcome::Skipped { key, reason } => {
+                    clean_ctx.mark_discovery_skipped(key, reason);
+                    summary.skipped += 1;
+                }
             }
         }
-    }
-    Ok(summary)
+        Ok(summary)
+    })();
+    analyses.put_global::<AddressAnalysis>(addresses);
+    result
 }
 
 #[derive(Default)]

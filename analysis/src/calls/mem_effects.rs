@@ -194,7 +194,8 @@ impl Pass for SeedWrittenSpaces {
             .collect();
         set_all_written_spaces(ctx);
         Ok(crate::ModulePassOutcome::functions(affected)
-            .preserving_global::<crate::CallGraphAnalysis>())
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>())
     }
 }
 

@@ -357,7 +357,8 @@ impl Pass for ArgPromoteExternal {
     ) -> Result<crate::ModulePassOutcome, String> {
         Ok(
             crate::ModulePassOutcome::functions(argpromote_external_changed_functions(ctx, env))
-                .preserving_global::<crate::CallGraphAnalysis>(),
+                .preserving_global::<crate::CallGraphAnalysis>()
+                .preserving_global::<crate::AddressAnalysis>(),
         )
     }
 }

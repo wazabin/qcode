@@ -240,7 +240,8 @@ impl FunctionPass for ConstFold {
         _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fun_id = f.id();
-        Ok(Outcome::changed(constant_fold_body(f, m, fun_id)))
+        Ok(Outcome::changed(constant_fold_body(f, m, fun_id))
+            .preserving_global::<crate::AddressAnalysis>())
     }
 }
 
@@ -261,7 +262,8 @@ impl FunctionPass for Narrow {
         _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fun_id = f.id();
-        Ok(Outcome::changed(narrow_body(f, m, fun_id)))
+        Ok(Outcome::changed(narrow_body(f, m, fun_id))
+            .preserving_global::<crate::AddressAnalysis>())
     }
 }
 
@@ -308,7 +310,7 @@ impl FunctionPass for Gvn {
         // dominator-tree GVN against it.
         let aliases = build_gvn_aliases(m, m.body_view(f), fun_id);
         changed |= gvn_body(f, m, fun_id, Some(&aliases));
-        Ok(Outcome::changed(changed))
+        Ok(Outcome::changed(changed).preserving_global::<crate::AddressAnalysis>())
     }
 
     fn run_with_analyses<'str>(
@@ -328,7 +330,7 @@ impl FunctionPass for Gvn {
         }
         let aliases = analyses.get::<AliasAnalysis>(f, m);
         changed |= gvn_body(f, m, fun_id, Some(aliases));
-        Ok(Outcome::changed(changed))
+        Ok(Outcome::changed(changed).preserving_global::<crate::AddressAnalysis>())
     }
 }
 

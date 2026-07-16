@@ -1044,22 +1044,17 @@ async fn run_lifting_module_stage(
             let started = std::time::Instant::now();
             let outcome = match p.name() {
                 "discover_addresses_in_binary" => {
-                    let changed = crate::discover_addresses_in_binary(ctx, services)
+                    let changed = crate::discover_addresses_in_binary(ctx, services, analyses)
                         .map_err(|e| format!("{}: {e}", p.name()))?
                         .changed();
                     super::pass::ModulePassOutcome::module_if(changed)
+                        .preserving_global::<crate::AddressAnalysis>()
                 }
                 "lift_new_addresses" => {
-                    let summary = crate::lift_new_addresses(ctx, services)
+                    let summary = crate::lift_new_addresses(ctx, services, analyses)
                         .map_err(|e| format!("{}: {e}", p.name()))?;
-                    if summary.changed()
-                        && let Some(lifter) = services.lifter.as_deref_mut()
-                    {
-                        lifter
-                            .finish_lifting(ctx)
-                            .map_err(|e| format!("{}: {e}", p.name()))?;
-                    }
                     super::pass::ModulePassOutcome::module_if(summary.changed())
+                        .preserving_global::<crate::AddressAnalysis>()
                 }
                 _ => p
                     .run_with_analyses(ctx, env, &round_targets, analyses)
@@ -2726,15 +2721,26 @@ mod tests {
     }
 
     impl Lifter for ChainedLifter {
-        fn seed_binary(&mut self, _ctx: &mut Context) -> Result<Vec<Discovery>, String> {
+        fn seed_binary(
+            &mut self,
+            _ctx: &mut Context,
+            _addresses: &mut qcode::address_index::AddressIndex,
+        ) -> Result<Vec<Discovery>, String> {
             Ok(Vec::new())
         }
 
-        fn ensure_function(&mut self, _ctx: &mut Context, _addr: u64) {}
+        fn ensure_function(
+            &mut self,
+            _ctx: &mut Context,
+            _addresses: &mut qcode::address_index::AddressIndex,
+            _addr: u64,
+        ) {
+        }
 
         fn lift_discovered(
             &mut self,
             _ctx: &mut Context,
+            _addresses: &mut qcode::address_index::AddressIndex,
             discovery: Discovery,
         ) -> Result<LiftOutcome, String> {
             let key = discovery.key();

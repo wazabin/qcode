@@ -20,7 +20,7 @@ pub enum AddressTarget {
 }
 
 /// An immutable, disposable address-to-entity snapshot.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AddressIndex {
     targets: FxHashMap<u64, AddressTarget>,
 }

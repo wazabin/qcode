@@ -737,7 +737,8 @@ impl FunctionPass for ArrayPromote {
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
         match try_match(m.body_view(f), fid) {
-            Some(matched) => Ok(Outcome::changed(apply(f, m, &matched))),
+            Some(matched) => Ok(Outcome::changed(apply(f, m, &matched))
+                .preserving_global::<crate::AddressAnalysis>()),
             None => Ok(Outcome::unchanged()),
         }
     }

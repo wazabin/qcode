@@ -382,9 +382,10 @@ impl Pass for PartialInline {
         _env: &PipelineEnv,
         targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
-        Ok(crate::ModulePassOutcome::functions(
-            partial_inline_changed_functions(ctx, targets),
-        ))
+        Ok(
+            crate::ModulePassOutcome::functions(partial_inline_changed_functions(ctx, targets))
+                .preserving_global::<crate::AddressAnalysis>(),
+        )
     }
 }
 

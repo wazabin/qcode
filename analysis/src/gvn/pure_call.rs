@@ -152,7 +152,8 @@ impl crate::Pass for PureCall {
                 changed.insert(insn_id.func);
             }
         }
-        Ok(crate::ModulePassOutcome::functions(changed))
+        Ok(crate::ModulePassOutcome::functions(changed)
+            .preserving_global::<crate::AddressAnalysis>())
     }
 }
 

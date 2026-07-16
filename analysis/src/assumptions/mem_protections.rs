@@ -40,6 +40,7 @@ impl Pass for MemoryProtections {
         establish_memory_protections(ctx);
         Ok(crate::ModulePassOutcome::module()
             .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>()
             .preserving_local::<crate::AliasAnalysis>())
     }
 }

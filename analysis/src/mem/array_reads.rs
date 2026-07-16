@@ -300,7 +300,8 @@ impl FunctionPass for ArrayReads {
         Ok(Outcome::changed(match try_match(m.body_view(f), fid) {
             Some(matched) => apply(f, m, &matched),
             None => false,
-        }))
+        })
+        .preserving_global::<crate::AddressAnalysis>())
     }
 }
 

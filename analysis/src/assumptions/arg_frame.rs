@@ -344,7 +344,8 @@ impl Pass for AssumeArgFrame {
         Ok(crate::ModulePassOutcome::functions(
             assume_args_disjoint_caller_frame_changed_functions(ctx, env.sp_varnode),
         )
-        .preserving_global::<crate::CallGraphAnalysis>())
+        .preserving_global::<crate::CallGraphAnalysis>()
+        .preserving_global::<crate::AddressAnalysis>())
     }
 }
 

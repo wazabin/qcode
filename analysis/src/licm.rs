@@ -76,7 +76,8 @@ impl FunctionPass for Licm {
             fid,
             aliases.as_ref(),
         ))
-        .preserving_global::<crate::CallGraphAnalysis>())
+        .preserving_global::<crate::CallGraphAnalysis>()
+        .preserving_global::<crate::AddressAnalysis>())
     }
 }
 

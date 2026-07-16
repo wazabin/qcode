@@ -1152,7 +1152,8 @@ impl Pass for ArgPromote {
         let sp_reg = ctx.shared.registers.get(&env.cfg.stack_pointer).copied();
         Ok(
             crate::ModulePassOutcome::functions(argpromote_changed_functions_with_sp(ctx, sp_reg))
-                .preserving_global::<crate::CallGraphAnalysis>(),
+                .preserving_global::<crate::CallGraphAnalysis>()
+                .preserving_global::<crate::AddressAnalysis>(),
         )
     }
 }

@@ -172,6 +172,29 @@ impl AnalysisManager {
             .expect("global analysis marker returned inconsistent result type")
     }
 
+    /// Remove a global analysis result from the manager, computing it first if
+    /// necessary. Module passes that maintain derived state alongside mutations
+    /// can own the result temporarily and return it with [`Self::put_global`].
+    pub fn take_global<A: GlobalAnalysis>(&mut self, ctx: &Context<'_>) -> A::Result {
+        let value = self
+            .globals
+            .remove(&TypeId::of::<A>())
+            .unwrap_or_else(|| Box::new(A::analyze(ctx)));
+        *value
+            .downcast::<A::Result>()
+            .expect("global analysis marker returned inconsistent result type")
+    }
+
+    /// Return a global analysis result previously removed with
+    /// [`Self::take_global`].
+    pub fn put_global<A: GlobalAnalysis>(&mut self, result: A::Result) {
+        let previous = self.globals.insert(TypeId::of::<A>(), Box::new(result));
+        assert!(
+            previous.is_none(),
+            "put_global called while the analysis is already cached"
+        );
+    }
+
     pub(crate) fn take_local(&mut self, function: FunctionId) -> LocalAnalysisManager {
         self.locals.remove(&function).unwrap_or_default()
     }
@@ -256,6 +279,21 @@ mod tests {
 
         analyses.invalidate_globals(&PreservedAnalyses::none());
         assert_eq!(*analyses.global::<CountingGlobal>(&ctx), 2);
+    }
+
+    #[test]
+    fn global_analysis_can_be_taken_updated_and_returned() {
+        GLOBAL_BUILDS.store(0, Ordering::SeqCst);
+        let ctx = Context::new();
+        let mut analyses = AnalysisManager::default();
+
+        let mut value = analyses.take_global::<CountingGlobal>(&ctx);
+        assert_eq!(value, 1);
+        value = 42;
+        analyses.put_global::<CountingGlobal>(value);
+
+        assert_eq!(*analyses.global::<CountingGlobal>(&ctx), 42);
+        assert_eq!(GLOBAL_BUILDS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
