@@ -302,13 +302,9 @@ impl<'str> Shared<'str> {
 }
 
 /// The operating system of a loaded binary, inferred from its container format.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TargetOs {
-    #[default]
-    Unknown,
-    Windows,
-    Linux,
-}
+/// The enum now lives in the leaf `binfmt` crate (next to the container
+/// parsers); re-exported here so `qcode::context::TargetOs` keeps resolving.
+pub use binfmt::TargetOs;
 
 impl<'str> Context<'str> {
     /// Creates a new, empty context with a single default RAM space.
