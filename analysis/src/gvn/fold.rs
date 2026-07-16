@@ -350,9 +350,29 @@ fn try_fold_insn<'ctx, 'str: 'ctx>(
     ic: &InsnCtx,
 ) -> Option<ValueId> {
     let func = ic.insn_id.func;
-    constant_folding_with_location(host, func, ic.mnemonic, ic.size, Some(ic))
+    let folded = constant_folding_with_location(host, func, ic.mnemonic, ic.size, Some(ic))
         .or_else(|| algebraic_identity(host, func, ic.mnemonic, ic.size))
-        .or_else(|| cast_identity(host, func, ic.mnemonic))
+        .or_else(|| cast_identity(host, func, ic.mnemonic))?;
+
+    let root_ty = host.type_of(ic.id);
+    if host.type_of(folded) == root_ty {
+        return Some(folded);
+    }
+
+    // Algebraic identities such as `x & 0 = 0` historically minted an
+    // ordinary integer literal from `output_size`. When the root is a logical
+    // bool operation, that silently changed `bool` into same-width `i8` and
+    // made its users ill-typed. Constants can be re-interned with the root's
+    // semantic type; a non-constant of another type is not a valid direct
+    // replacement (the explicit cast must remain).
+    let ValueId::Literal(lid) = folded else {
+        return None;
+    };
+    let literal = &host.shared().values.literals[lid];
+    literal
+        .symbolic
+        .is_none()
+        .then(|| host.shared().get_typed_const(literal.value, root_ty))
 }
 
 /// The size in bytes of `v`'s output.
@@ -622,6 +642,29 @@ mod tests {
             4
         );
         assert_eq!(ctx.shared.values.literals[lid].value, 0xff);
+    }
+
+    #[test]
+    fn bool_annihilator_keeps_boolean_constant_type() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+                <entry @a:i8 @b:i8>
+                    %cond = @a == @b;
+                    %masked = %cond & false;
+                    %combined = %masked | %cond;
+                    return %combined;
+            "
+        );
+
+        assert!(crate::verify::verify_bool_typing(&ctx).is_empty());
+        gvn(&mut BasicBlock::from_id_mut(&mut ctx, entry), None);
+        assert!(
+            crate::verify::verify_bool_typing(&ctx).is_empty(),
+            "folding a bool annihilator must mint bool false, not i8 zero"
+        );
     }
 
     /// Constant-folding `StructPointer + Int` (the shape `windows_teb_seed`

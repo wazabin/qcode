@@ -9,7 +9,11 @@
 use jstd::graph::analysis::DominatorTree;
 
 use crate::AliasResult;
-use qcode::value::{block::BlockId, insn::Mnemonic};
+use qcode::value::{
+    QCodeView, ValueId,
+    block::BlockId,
+    insn::{Mnemonic, Zext},
+};
 
 use super::affine::Numbering;
 use std::any::Any;
@@ -85,7 +89,47 @@ impl<'str> SubPass<'str> for MemoryForwarding {
                 );
                 match forwarded {
                     Some(value) => {
-                        ed.replace(body, cx, ic.insn_id, value);
+                        let view = cx.body_view(body);
+                        let load_ty = view.type_of(ic.id);
+                        let value_ty = view.type_of(value);
+                        let types = &view.shared().types;
+                        let load_is_bool = types.is_bool(load_ty);
+                        let value_is_bool = types.is_bool(value_ty);
+                        let same_size = types.size_of(load_ty) == types.size_of(value_ty);
+
+                        let value = if load_ty == value_ty {
+                            ed.replace(body, cx, ic.insn_id, value);
+                            value
+                        } else if value_is_bool && !load_is_bool && same_size {
+                            // A bool store forwarded through an ordinary i8 load
+                            // is a semantic bool→integer conversion even though
+                            // both occupy one byte. Preserve that boundary with
+                            // an explicit cast instead of wiring the bool directly
+                            // into the load's integer users.
+                            ValueId::Instruction(ed.replace_with_new_insn_typed(
+                                body,
+                                cx,
+                                ic.block_id,
+                                ic.insn_id,
+                                Mnemonic::Zext(Zext {
+                                    src: value.localize(ic.insn_id.func),
+                                    size: ic.size,
+                                }),
+                                load_ty,
+                            ))
+                        } else {
+                            // Other semantic type mismatches are not valid direct
+                            // replacements. Keep the load as the memory value.
+                            state.define_load(
+                                cx.body_view(body),
+                                ic.insn_id.func,
+                                load,
+                                ic.id,
+                                ic.aliases,
+                                ic.numbering,
+                            );
+                            return Claim::Done;
+                        };
                         state.define_load(
                             cx.body_view(body),
                             ic.insn_id.func,
@@ -133,7 +177,7 @@ mod tests {
         context::Context,
         testing::TestContext,
         value::{
-            BasicBlock, ValueId,
+            BasicBlock, FunctionBody, ValueId,
             block::BlockId,
             function::FunctionId,
             insn::{Instruction, InstructionId, Mnemonic, Range},
@@ -376,6 +420,39 @@ mod tests {
         assert!(!block.instruction_ids().contains(&v1));
         assert!(!block.instruction_ids().contains(&v2));
         assert!(block.to_string().contains("B <- i64 0xa"));
+    }
+
+    #[test]
+    fn bool_store_forwarded_through_i8_load_inserts_cast() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i8 A;
+                fn f:
+                    <entry @a:i8>
+                        %cond = @a == 0;
+                        store(A:1, &A <- %cond);
+                        %loaded = load(A:1, &A);
+                        %masked = %loaded & i8 2;
+                        return %masked;
+            "
+        );
+
+        assert!(crate::verify::verify_bool_typing(&ctx).is_empty());
+        let aliases = AliasResult::simple_for_function(&ctx, f);
+        gvn_function(&mut ctx, f, Some(&aliases));
+
+        assert!(
+            crate::verify::verify_bool_typing(&ctx).is_empty(),
+            "GVN memory forwarding must preserve bool-to-integer conversion"
+        );
+        assert!(!ctx.contains_instruction(loaded));
+        assert!(FunctionBody::from_id(&ctx, f).blocks().any(|block| {
+            block
+                .iter()
+                .any(|insn| matches!(insn.mnemonic(), Mnemonic::Zext(_)))
+        }));
     }
 
     // -----------------------------------------------------------------------

@@ -66,8 +66,9 @@ pub fn verify_bool_typing(ctx: &Context) -> Vec<String> {
                         let lhs = b.lhs.qualify(func);
                         let rhs = b.rhs.qualify(func);
                         out.push(format!(
-                            "instruction {:?} bitwise `{}` mixes bool and integer operands: lhs {lhs:?} is {}, rhs {rhs:?} is {}",
+                            "instruction {:?} (parent {:?}) bitwise `{}` mixes bool and integer operands: lhs {lhs:?} is {}, rhs {rhs:?} is {}",
                             insn.id,
+                            insn.parent().map(|block| block.id),
                             b.op,
                             if lhs_bool { "bool" } else { "integer" },
                             if rhs_bool { "bool" } else { "integer" },

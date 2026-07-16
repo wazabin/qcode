@@ -94,7 +94,15 @@ impl<'str> SubPass<'str> for Cse {
 
         if let Some(leader) = state.lookup(&key) {
             if leader != ic.id {
-                ed.replace(body, cx, ic.insn_id, leader);
+                let view = cx.body_view(body);
+                // A mnemonic/normal form does not encode its semantic result
+                // type. In particular, identical bitwise mnemonics can produce
+                // either bool or a same-width integer. Never CSE across that
+                // boundary: forwarding an integer value to a bool leader (or
+                // vice versa) makes otherwise well-typed users ill-typed.
+                if view.type_of(leader) == view.type_of(ic.id) {
+                    ed.replace(body, cx, ic.insn_id, leader);
+                }
             }
             return Claim::Done;
         }
@@ -195,7 +203,7 @@ pub(super) fn value_id_key_local(v: LocalValueId) -> (u8, usize) {
 mod tests {
     use super::*;
     use crate::gvn::{gvn, gvn_function};
-    use qcode::value::{BasicBlock, InstructionId, insn::Binary};
+    use qcode::value::{BasicBlock, Instruction, InstructionId, insn::Binary};
     use qcode_macro::qcode;
 
     #[test]
@@ -364,6 +372,38 @@ mod tests {
             crate::verify::verify_bool_typing(&ctx).is_empty(),
             "GVN must not rebuild a bool literal as an integer mask"
         );
+    }
+
+    #[test]
+    fn cse_does_not_forward_across_bool_integer_result_types() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                fn f:
+                    <entry @a:i8 @b:i8>
+                        %a_zero = @a == 0;
+                        %b_zero = @b == 0;
+                        %logical = %a_zero | %b_zero;
+                        %integer = %a_zero | %b_zero;
+                        %sum = %integer + @a;
+                        return %sum;
+            "
+        );
+
+        // Qcode permits a bitwise mnemonic to carry a semantic result type
+        // distinct from another otherwise-identical mnemonic. Model the shape
+        // observed in lifted IR: logical and integer have identical operands,
+        // but only the former is bool-typed.
+        let int_ty = ctx.shared.types.get_or_make_int(1);
+        Instruction::from_id_mut(&mut ctx, integer).set_type(int_ty);
+        assert!(crate::verify::verify_bool_typing(&ctx).is_empty());
+
+        gvn_function(&mut ctx, f, None);
+
+        assert!(crate::verify::verify_bool_typing(&ctx).is_empty());
+        assert!(ctx.contains_instruction(integer));
+        assert!(ctx.contains_instruction(logical));
     }
 
     // 5. Cross-block redundancy: a+b in entry propagates to dominated successor
