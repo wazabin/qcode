@@ -503,6 +503,12 @@ fn fold_location<'ctx, 'str: 'ctx>(
 /// both operands to be constant: idempotent, self-inverse, identity-element and
 /// annihilator laws. Returns the value the instruction collapses to (an existing
 /// operand or an interned constant) when a law applies.
+/// Whether `v` is the literal `true`. A bool stores 0/1, so `true` plays the
+/// all-ones-mask role that `all_ones(size)` plays for integer operands.
+fn is_bool_true<'ctx, 'str: 'ctx>(host: impl QCodeView<'ctx, 'str>, v: ValueId) -> bool {
+    const_value(host.shared(), v) == Some(1) && host.shared().types.is_bool(host.type_of(v))
+}
+
 pub(super) fn algebraic_identity<'ctx, 'str: 'ctx>(
     host: impl QCodeView<'ctx, 'str>,
     func: FunctionId,
@@ -546,8 +552,23 @@ pub(super) fn algebraic_identity<'ctx, 'str: 'ctx>(
         IntBinop::Sub if r == Some(0) => {
             return Some(lhs);
         }
-        // x | 0 = x ; x ^ 0 = x  (both commutative)
-        IntBinop::Or | IntBinop::Xor => {
+        // x | 0 = x ; x | true = true (bool annihilator)
+        IntBinop::Or => {
+            if r == Some(0) {
+                return Some(lhs);
+            }
+            if l == Some(0) {
+                return Some(rhs);
+            }
+            if is_bool_true(host, rhs) {
+                return Some(rhs);
+            }
+            if is_bool_true(host, lhs) {
+                return Some(lhs);
+            }
+        }
+        // x ^ 0 = x
+        IntBinop::Xor => {
             if r == Some(0) {
                 return Some(lhs);
             }
@@ -567,7 +588,7 @@ pub(super) fn algebraic_identity<'ctx, 'str: 'ctx>(
                 return Some(rhs);
             }
         }
-        // x & 0 = 0 ; x & ~0 = x
+        // x & 0 = 0 ; x & ~0 = x ; x & true = x (bool identity)
         IntBinop::And => {
             if l == Some(0) || r == Some(0) {
                 return Some(host.shared().get_const(0, output_size));
@@ -576,6 +597,12 @@ pub(super) fn algebraic_identity<'ctx, 'str: 'ctx>(
                 return Some(lhs);
             }
             if l == Some(all_ones(output_size)) {
+                return Some(rhs);
+            }
+            if is_bool_true(host, rhs) {
+                return Some(lhs);
+            }
+            if is_bool_true(host, lhs) {
                 return Some(rhs);
             }
         }
@@ -668,6 +695,50 @@ mod tests {
             crate::verify::verify_bool_typing(&ctx).is_empty(),
             "folding a bool annihilator must mint bool false, not i8 zero"
         );
+    }
+
+    /// `true` is bool's all-ones mask, so `x & true = x` and `x | true = true`
+    /// (and `x | false = x` via the integer zero law) must all fold without
+    /// crossing the bool/integer boundary.
+    #[test]
+    fn bool_identity_and_annihilator_laws_fold() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+                <entry @a:i8 @b:i8>
+                    %cond = @a == @b;
+                    %and_true = %cond & true;
+                    %or_false = %and_true | false;
+                    %or_true = %or_false | true;
+                    return %or_true;
+            "
+        );
+
+        assert!(crate::verify::verify_bool_typing(&ctx).is_empty());
+
+        let view = ModuleView::new(&ctx);
+        assert_eq!(
+            algebraic_identity(view, f, ctx.get_insn(and_true).mnemonic(), 1),
+            Some(ValueId::Instruction(cond)),
+            "x & true must fold to x"
+        );
+        assert_eq!(
+            algebraic_identity(view, f, ctx.get_insn(or_false).mnemonic(), 1),
+            Some(ValueId::Instruction(and_true)),
+            "x | false must fold to x"
+        );
+        let folded = algebraic_identity(view, f, ctx.get_insn(or_true).mnemonic(), 1)
+            .expect("x | true must fold to true");
+        assert_eq!(const_value(&ctx.shared, folded), Some(1));
+        assert!(
+            ctx.shared.types.is_bool(view.type_of(folded)),
+            "the annihilator result must stay bool-typed"
+        );
+
+        gvn(&mut BasicBlock::from_id_mut(&mut ctx, entry), None);
+        assert!(crate::verify::verify_bool_typing(&ctx).is_empty());
     }
 
     /// Constant-folding `StructPointer + Int` (the shape `windows_teb_seed`
