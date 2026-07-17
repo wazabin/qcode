@@ -725,12 +725,18 @@ impl Solver<'_> {
             .is_some_and(|t| self.ctx.shared.types.is_bool(t))
     }
 
-    /// The value of `v` if it is a `bool` constant (`true`/`false`).
+    /// The truth value of `v` when it is a constant usable on one side of a
+    /// bool-condition equality: a `bool` literal, or an integer literal whose
+    /// value is 0/1 (the flag lowering compares a `bool` against `i8 0x0`, e.g.
+    /// `bool %c != i8 0x0`, now that GVN no longer collapses `zext(bool)`).
+    /// Wider constants are rejected: `b != 5` is not a polarity flip.
     fn bool_const(&self, v: ValueId) -> Option<bool> {
         match v {
-            ValueId::Literal(_) if self.is_bool_val(v) => {
-                numeric_const(self.ctx, v).map(|c| c != 0)
-            }
+            ValueId::Literal(_) => match numeric_const(self.ctx, v)? {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            },
             _ => None,
         }
     }

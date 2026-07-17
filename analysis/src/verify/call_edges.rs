@@ -16,10 +16,7 @@ pub fn verify_call_edges(ctx: &Context) -> Vec<String> {
             continue;
         }
 
-        let successors: Vec<_> = block
-            .successors()
-            .map(|(edge, target)| (edge, target))
-            .collect();
+        let successors: Vec<_> = block.successors().collect();
         if successors.len() > 1 {
             out.push(format!(
                 "fn {:?} call block {:?} has {} continuation edges {successors:?}; calls may have at most one continuation edge",
