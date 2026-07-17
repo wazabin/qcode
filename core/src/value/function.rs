@@ -63,6 +63,81 @@ pub struct FunctionInterface<'str> {
     /// What semantic class this function belongs to.
     #[serde(default)]
     pub kind: FunctionKind,
+
+    /// Call-graph-closed implicit *effect summary* of this function, per the
+    /// argpromote v2 design (`ARGPROMOTE_REGISTERS_V2.md`). Solved by the
+    /// effect-analysis pass and read by the materialize/regpure passes, the
+    /// emulator, alias analysis, and the verifier.
+    ///
+    /// **Engine-internal, not serialized.** It is recomputable by re-running the
+    /// analysis pass, so it is deliberately excluded from both the textual qcode
+    /// and the `.harbinger` wire shape; a loaded snapshot restores it to
+    /// [`FunctionEffects::Unsolved`].
+    #[serde(skip)]
+    pub effects: FunctionEffects,
+}
+
+/// The state of a function's register-channel effect summary (argpromote v2).
+///
+/// Purity has moved from a function flag (`pure_reg`) to per-call-site tags, but
+/// the *interface mapping* a materialized function exposes still lives on the
+/// function — the emulator's implicit call convention, alias analysis, and the
+/// verifier all consume it. This enum records how far the summary has advanced.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum FunctionEffects {
+    /// Not yet solved by the effect-analysis pass (the default / post-load
+    /// state).
+    #[default]
+    Unsolved,
+    /// ⊤ — unknowable: the function contains an unresolved indirect call, calls
+    /// a ⊤ function, or is a prototype-less external. Its register effects stay
+    /// modelled conservatively (clobbers-all) at every call site.
+    Top,
+    /// Solved to a finite effect set but the interface is not yet materialized
+    /// (no by-value params / return pack added). Call sites still bind
+    /// implicitly.
+    Solved,
+    /// Materialized: the function carries by-value register params and a return
+    /// pack, and this mapping records which register each interface slot binds.
+    /// Consumed by the dual binding convention.
+    Materialized(RegisterInterfaceMap),
+}
+
+impl FunctionEffects {
+    /// The materialized interface mapping, if this function has been
+    /// materialized.
+    pub fn materialized(&self) -> Option<&RegisterInterfaceMap> {
+        match self {
+            FunctionEffects::Materialized(map) => Some(map),
+            _ => None,
+        }
+    }
+
+    /// Whether the summary is solved (either not-yet- or already-materialized),
+    /// i.e. its register effects are known precisely rather than ⊤.
+    pub fn is_solved(&self) -> bool {
+        matches!(
+            self,
+            FunctionEffects::Solved | FunctionEffects::Materialized(_)
+        )
+    }
+}
+
+/// The ordered, machine-readable register interface of a *materialized*
+/// function: which register each by-value input parameter binds, and which
+/// register each return-pack slot stores back. Slot `i` of `inputs` is the
+/// `i`-th register param; slot `i` of `outputs` is the `i`-th pack field.
+///
+/// Both the register channel's own rewrite (regpure calls) and the emulator's
+/// implicit (zero-arg) convention read this: implicitly, param `i` is seeded
+/// from `inputs[i]` at entry and pack slot `i` is stored back to `outputs[i]`
+/// on return.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegisterInterfaceMap {
+    /// Register bound by each by-value input parameter, in parameter order.
+    pub inputs: Vec<VarnodeId>,
+    /// Register written back by each return-pack slot, in pack order.
+    pub outputs: Vec<VarnodeId>,
 }
 
 /// A function *body*: arenas, roster, root, reverse use-def, local names. The
@@ -228,6 +303,7 @@ impl<'str> FunctionInterface<'str> {
             is_external: false,
             signature: None,
             kind: FunctionKind::Machine,
+            effects: FunctionEffects::Unsolved,
         }
     }
 
@@ -1493,14 +1569,19 @@ where
             .and_then(|s| s.written_spaces.as_deref())
     }
 
-    /// Whether `argpromote_registers` has functionalized this function's register
-    /// side effects into a pure value function. See
-    /// [`FunctionSignature::pure_reg`].
+    /// Whether this function's register interface has been materialized (argpromote
+    /// v2) — i.e. its [`effects`](FunctionInterface::effects) are
+    /// [`FunctionEffects::Materialized`]. Legacy name for the register-channel
+    /// "functionalized" predicate.
     pub fn is_pure_reg(&'s self) -> bool {
-        self.interface()
-            .signature
-            .as_ref()
-            .is_some_and(|s| s.pure_reg)
+        matches!(self.interface().effects, FunctionEffects::Materialized(_))
+    }
+
+    /// This function's call-graph-closed register [`FunctionEffects`] summary.
+    /// [`FunctionEffects::Unsolved`] until the effect-analysis pass runs (and
+    /// after a snapshot load). See [`FunctionInterface::effects`].
+    pub fn effects(&'s self) -> &'ctx FunctionEffects {
+        &self.interface().effects
     }
 
     /// Whether argpromote has functionalized *every* side-effect channel of this
@@ -2115,12 +2196,29 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     }
 
     /// Marks this function as fully functionalized over its register channel.
-    /// See [`FunctionSignature::pure_reg`].
+    /// Legacy shim over the unified [`FunctionEffects`] state. `true` marks the
+    /// function's register interface materialized (preserving an existing
+    /// interface mapping); `false` resets it to unsolved. Prefer
+    /// [`set_effects`](Self::set_effects) with a real mapping; this is kept for
+    /// the tests and callers that only assert "register channel functionalized".
     pub fn set_pure_reg(&mut self, value: bool) {
-        self.interface_mut()
-            .signature
-            .get_or_insert_default()
-            .pure_reg = value;
+        if value {
+            if !matches!(
+                self.interface_mut().effects,
+                FunctionEffects::Materialized(_)
+            ) {
+                self.interface_mut().effects =
+                    FunctionEffects::Materialized(RegisterInterfaceMap::default());
+            }
+        } else {
+            self.interface_mut().effects = FunctionEffects::Unsolved;
+        }
+    }
+
+    /// Records this function's solved effect summary / materialized interface
+    /// mapping. See [`FunctionInterface::effects`].
+    pub fn set_effects(&mut self, effects: FunctionEffects) {
+        self.interface_mut().effects = effects;
     }
 
     /// Marks this function as fully functionalized over *every* side-effect

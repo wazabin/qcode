@@ -55,7 +55,8 @@ pub use mnemonic::Mnemonic;
 pub use pcode_op::{PCodeOp, PCodeOpId};
 pub use scan::Scan;
 pub use terminator::{
-    Apply, Branch, BranchInd, CBranch, Call, CallInd, Callee, Return, ReturnValue, TailCall,
+    Apply, Branch, BranchInd, CBranch, Call, CallInd, CallTag, Callee, Return, ReturnValue,
+    TailCall,
 };
 pub use unop::{Unary, Unop};
 

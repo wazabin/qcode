@@ -135,6 +135,46 @@ impl MnemonicKind for Apply {
     }
 }
 
+/// Per-call-site binding-convention tag (argpromote v2, `ARGPROMOTE_REGISTERS_V2.md`).
+///
+/// A materialized function supports two calling conventions selected per site;
+/// this tag records which one a given `Call` uses and how much of the callee's
+/// effect is already explicit at the site. **In-memory only** — not serialized
+/// to textual qcode or the `.harbinger` wire (a loaded snapshot restores
+/// [`CallTag::Opaque`], and the tag is recomputed by the argpromote passes).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum CallTag {
+    /// Implicit binding: the call reads its inputs from, and writes its outputs
+    /// back to, the register file per the callee's interface mapping (or, for a
+    /// non-materialized / ⊤ callee, clobbers conservatively). The default and
+    /// the only convention on freshly-lifted IR.
+    #[default]
+    Opaque,
+    /// The call's *register* interface is fully explicit at this site: inputs
+    /// are passed as SSA `args`, outputs are read from the SSA return pack, and
+    /// the call neither reads nor writes register space. Requires a materialized
+    /// callee whose interface mapping the `args`/pack align with 1:1.
+    RegPure,
+    /// Additionally no implicit RAM effects — every effect is threaded through
+    /// operands and results, so the call is a pure SSA operation. Strictly
+    /// stronger than [`RegPure`](Self::RegPure). (Reserved; the RAM channel that
+    /// sets it is out of scope for the register phases.)
+    Pure,
+}
+
+impl CallTag {
+    /// Whether the call's register interface is fully explicit at this site
+    /// (`RegPure` or the stronger `Pure`): no implicit register reads/writes.
+    pub fn is_regpure(self) -> bool {
+        matches!(self, CallTag::RegPure | CallTag::Pure)
+    }
+
+    /// Whether the call is a fully pure SSA operation (no implicit RAM effects).
+    pub fn is_pure(self) -> bool {
+        matches!(self, CallTag::Pure)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Call {
     pub target: Callee,
@@ -145,6 +185,10 @@ pub struct Call {
     /// reads: they are intentionally excluded from [`MnemonicKind::args`] so
     /// they do not participate in use-def bookkeeping.
     pub clobbers: Vec<LocalValueId>,
+    /// Binding-convention tag (argpromote v2). In-memory only — never
+    /// serialized (see [`CallTag`]).
+    #[serde(skip, default)]
+    pub tag: CallTag,
 }
 
 impl MnemonicKind for Call {
@@ -283,6 +327,7 @@ mod tests {
                 target: Callee::Minted(7),
                 args: vec![],
                 clobbers: vec![],
+                tag: Default::default(),
             }),
             0,
         )
@@ -424,6 +469,7 @@ mod tests {
                 target: Callee::Real(callee),
                 args: vec![first.strip_func(), second.strip_func()],
                 clobbers: vec![],
+                tag: Default::default(),
             }),
         );
 
@@ -464,6 +510,7 @@ mod tests {
                 target: Callee::Real(callee),
                 args: vec![arg.strip_func()],
                 clobbers: vec![],
+                tag: Default::default(),
             }),
         );
 

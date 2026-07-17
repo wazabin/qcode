@@ -2239,6 +2239,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 target,
                 args,
                 clobbers: vec![],
+                tag: Default::default(),
             }),
             0,
         );

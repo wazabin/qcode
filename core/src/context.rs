@@ -2671,6 +2671,7 @@ mod tests {
                 target: Callee::Real(target),
                 args: vec![],
                 clobbers: vec![],
+                tag: Default::default(),
             }),
         );
 
