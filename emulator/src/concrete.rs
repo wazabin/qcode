@@ -740,6 +740,11 @@ pub struct StandaloneEmulator {
     pub memory: EmulatedMemory,
     pub insn_values: FxHashMap<InstructionId, SizedValue>,
     pub block_param_values: FxHashMap<BlockParamId, SizedValue>,
+    /// Block params bound to **poison** (argpromote v2): a symbolic pure-call
+    /// argument whose bits are undefined. Reading one during emulation is a hard
+    /// error (`PoisonRead`), so a pure-call fold whose result actually depends on
+    /// a symbolic argument bails instead of computing on a bogus concrete value.
+    pub poison_params: FxHashSet<BlockParamId>,
     /// Field values of aggregate-typed instruction results (`Tuple` results and,
     /// on return, the call instruction that produced them). `Extract` projects a
     /// field back out. Keeps the scalar `SizedValue` domain unchanged — the
@@ -779,6 +784,7 @@ impl StandaloneEmulator {
             memory: EmulatedMemory::default(),
             insn_values: FxHashMap::default(),
             block_param_values: FxHashMap::default(),
+            poison_params: FxHashSet::default(),
             aggregate_values: FxHashMap::default(),
             block_param_aggregates: FxHashMap::default(),
             array_values: FxHashMap::default(),
@@ -910,6 +916,7 @@ impl StandaloneEmulator {
             memory: &mut self.memory,
             insn_values: &mut self.insn_values,
             block_param_values: &mut self.block_param_values,
+            poison_params: &self.poison_params,
             ctx,
         };
         tmp.get_value(id).ok().and_then(|v| v.value().ok())
@@ -1012,6 +1019,7 @@ impl StandaloneEmulator {
             memory: &mut self.memory,
             insn_values: &mut self.insn_values,
             block_param_values: &mut self.block_param_values,
+            poison_params: &self.poison_params,
             ctx,
         };
         let sv = tmp.get_value(id).ok()?;
@@ -1085,6 +1093,7 @@ impl StandaloneEmulator {
             memory: &mut self.memory,
             insn_values: &mut self.insn_values,
             block_param_values: &mut self.block_param_values,
+            poison_params: &self.poison_params,
             ctx,
         };
         args.iter()
@@ -1359,6 +1368,7 @@ impl StandaloneEmulator {
                             memory: &mut self.memory,
                             insn_values: &mut self.insn_values,
                             block_param_values: &mut self.block_param_values,
+                            poison_params: &self.poison_params,
                             ctx,
                         };
                         tmp.get_value(f.qualify(id.func))
@@ -1478,6 +1488,7 @@ impl StandaloneEmulator {
                     memory: &mut self.memory,
                     insn_values: &mut self.insn_values,
                     block_param_values: &mut self.block_param_values,
+                    poison_params: &self.poison_params,
                     ctx,
                 };
                 if let Some(value) = tmp.interpret(insn)? {
@@ -1712,6 +1723,23 @@ impl StandaloneEmulator {
         args: &[SizedValue],
         max_steps: usize,
     ) -> crate::Result<()> {
+        let opts: Vec<Option<SizedValue>> = args.iter().map(|&v| Some(v)).collect();
+        self.run_pure_partial(ctx, func, &opts, max_steps)
+    }
+
+    /// Like [`run_pure`](Self::run_pure), but each positional argument may be
+    /// [`None`] to bind that root param to **poison** (a symbolic value with
+    /// undefined bits). Reading a poison param during emulation is a hard error
+    /// (`PoisonRead`), so a consumer such as pure-call folding bails when the
+    /// result actually depends on a symbolic argument, rather than computing on a
+    /// bogus concrete value (argpromote v2, `ARGPROMOTE_REGISTERS_V2.md`).
+    pub fn run_pure_partial(
+        &mut self,
+        ctx: &Context<'_>,
+        func: FunctionId,
+        args: &[Option<SizedValue>],
+        max_steps: usize,
+    ) -> crate::Result<()> {
         let root = FunctionBody::from_id(ctx, func)
             .root()
             .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::EmptyFunctionRoot(func)))?
@@ -1720,13 +1748,21 @@ impl StandaloneEmulator {
         self.idx = 0;
         self.call_stack.push(func);
 
-        // Bind root params positionally from `args`.
+        // Bind root params positionally from `args`: a concrete `Some(v)` seeds
+        // the param value, a `None` marks it poison (read ⇒ hard error).
         let param_ids: Vec<BlockParamId> = BasicBlock::from_id(ctx, root)
             .params()
             .map(|p| p.id)
             .collect();
-        for (param_id, &value) in param_ids.into_iter().zip(args) {
-            self.block_param_values.insert(param_id, value);
+        for (param_id, arg) in param_ids.into_iter().zip(args) {
+            match arg {
+                Some(value) => {
+                    self.block_param_values.insert(param_id, *value);
+                }
+                None => {
+                    self.poison_params.insert(param_id);
+                }
+            }
         }
 
         self.drive_to_return(ctx, root, func, max_steps)
@@ -2243,6 +2279,7 @@ struct TempInterpreter<'a, 'ctx> {
     memory: &'a mut EmulatedMemory,
     insn_values: &'a mut FxHashMap<InstructionId, SizedValue>,
     block_param_values: &'a mut FxHashMap<BlockParamId, SizedValue>,
+    poison_params: &'a FxHashSet<BlockParamId>,
     ctx: &'ctx Context<'ctx>,
 }
 
@@ -2271,11 +2308,15 @@ impl<'ctx> Interpreter for TempInterpreter<'_, 'ctx> {
             ValueRef::Varnode(varnode) => Ok(SizedValue::new(varnode.address() as u64, 8)),
             ValueRef::Temp(temp) => Ok(SizedValue::new(temp.address() as u64, 8)),
             ValueRef::BasicBlock(_) => panic!("Cannot get value of a block"),
-            ValueRef::BlockParam(param) => self
-                .block_param_values
-                .get(&param.id)
-                .copied()
-                .ok_or(EmulatorErrorKind::ValueError(0)),
+            ValueRef::BlockParam(param) => {
+                if self.poison_params.contains(&param.id) {
+                    return Err(EmulatorErrorKind::PoisonRead);
+                }
+                self.block_param_values
+                    .get(&param.id)
+                    .copied()
+                    .ok_or(EmulatorErrorKind::ValueError(0))
+            }
             ValueRef::Function(f) => f
                 .address()
                 .map(SizedValue::from_u64)
@@ -2560,6 +2601,7 @@ mod tests {
             memory: &mut emu.memory,
             insn_values: &mut emu.insn_values,
             block_param_values: &mut emu.block_param_values,
+            poison_params: &emu.poison_params,
             ctx: &ctx,
         };
         assert!(matches!(

@@ -9,11 +9,17 @@
 //! the `extract` is replaced with the resulting literal. See
 //! `PURE_EMULATION_DESIGN.md`.
 //!
-//! Partial constness is supported: only the field's backward
-//! [`projection`](crate::calls::project_return) must be constant, so a call with
-//! a mix of literal and symbolic arguments can still have some fields harvested.
-//! Symbolic arguments are bound to a poison value (`0`) for emulation; the
-//! projection guarantees the harvested field is independent of that choice.
+//! Partial constness is gated by the field's backward
+//! [`projection`](crate::calls::project_return): only fields the projection
+//! proves constant over the literal arguments are considered.
+//!
+//! Symbolic arguments are bound to **poison** for emulation, not `0` (argpromote
+//! v2, P.2). Emulating the callee body demands the concrete value of every
+//! operand it touches, so a call carrying any symbolic argument that the body
+//! actually reads — including into the return tuple — bails on the poison-read
+//! trap instead of silently computing a wrong result on a fabricated `0`. This
+//! is the intended correctness shift: a fold now happens only when the emulation
+//! never reads an unknown value.
 
 use qcode::value::QCodeMut;
 use rustc_hash::FxHashSet as HashSet;
@@ -83,8 +89,6 @@ impl PureCall {
             return false;
         }
 
-        // Build the positional argument vector: literal value, or poison (0) for a
-        // symbolic argument the projection has proven irrelevant to this field.
         let Some(root) = FunctionBody::from_id(&*ctx, target)
             .root()
             .map(|block| block.id)
@@ -98,14 +102,16 @@ impl PureCall {
         if param_sizes.len() != args.len() {
             return false;
         }
-        let arg_values: Vec<SizedValue> = args
+        // Build the positional argument vector: a literal binds its concrete
+        // value, a symbolic argument binds **poison** (`None`). The projection has
+        // proven this field independent of the symbolic arguments, so a correct
+        // fold never reads the poison; if it does, the emulator's poison-read trap
+        // makes the fold bail rather than compute on a bogus value.
+        let arg_values: Vec<Option<SizedValue>> = args
             .iter()
             .zip(&param_sizes)
             .map(|(&a, &size)| {
-                SizedValue::new(
-                    const_value(&*ctx, a.qualify(ic.insn_id.func)).unwrap_or(0),
-                    size,
-                )
+                const_value(&*ctx, a.qualify(ic.insn_id.func)).map(|v| SizedValue::new(v, size))
             })
             .collect();
 
@@ -166,11 +172,12 @@ fn emulate_field(
     ctx: &Context,
     target: qcode::value::function::FunctionId,
     root: qcode::value::block::BlockId,
-    arg_values: &[SizedValue],
+    arg_values: &[Option<SizedValue>],
     index: usize,
 ) -> Option<u64> {
     let mut emu = StandaloneEmulator::new(root);
-    emu.run_pure(ctx, target, arg_values, STEP_BUDGET).ok()?;
+    emu.run_pure_partial(ctx, target, arg_values, STEP_BUDGET)
+        .ok()?;
 
     let field = return_field(ctx, emu.current_block(), index)?;
     // Scalar-only (v1): a field that is itself an aggregate is not harvested.
@@ -337,10 +344,14 @@ mod tests {
         })
     }
 
-    /// `foo(a_in, 7)`: field 1 (`b*69+42 = 525`) is harvested into a literal; field
-    /// 0 (the symbolic `a_in`) is left as a live extract.
+    /// `foo(a_in, 7)` with a symbolic `a_in`: emulating the body builds the
+    /// return tuple `(a_in, b*69+42)`, whose first field reads the **poison**
+    /// bound for `a_in` — a hard error (argpromote v2, P.2). The pure-call fold
+    /// therefore bails: neither field is harvested and no `0`-derived (or here,
+    /// `525`) constant is stored. This is the intended correctness shift — a call
+    /// with an unknown argument no longer emulates on a fabricated concrete value.
     #[test]
-    fn harvests_constant_field_from_partial_const_call() {
+    fn symbolic_arg_bails_instead_of_computing_on_poison() {
         let mut tc = TestContext::new();
         let foo = build_pure_foo(&mut tc);
         let (_g, cont) = build_caller(&mut tc, foo, Some(7));
@@ -350,13 +361,13 @@ mod tests {
 
         assert_eq!(
             stored_const(&tc, cont, r1),
-            Some(7 * 69 + 42),
-            "field 1 must be emulated to 525 and stored as a literal"
+            None,
+            "the fold must bail (poison read) rather than store a constant"
         );
         assert_eq!(
             extract_count(&tc, cont),
-            1,
-            "only the symbolic field-0 extract should remain"
+            2,
+            "both extracts survive — nothing is harvested from a poison-arg call"
         );
     }
 
