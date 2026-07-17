@@ -93,11 +93,13 @@ impl EffectChannel for RegChannel {
         // that mapping rather than recomputing — crucially the stores now include
         // the clobber set, so a materialized caller's return pack covers them
         // (bug-2-external, ARGPROMOTE_REGISTERS_V2.md Phase 3). An external
-        // without a prototype has no `Materialized` mapping and contributes empty
-        // effects (its call keeps declared-clobber semantics in the caller body),
-        // NOT ⊤.
+        // without a prototype has no `Materialized` mapping and must be ⊤:
+        // declared-clobber semantics only cover its *direct* caller's body —
+        // a solved summary for that caller would omit the external's real
+        // clobbers, letting *its* callers forward caller-saved registers
+        // across the call (bug-2-external reintroduced one level up).
         let qcode::value::FunctionEffects::Materialized(map) = f.effects() else {
-            return Some(eff);
+            return None;
         };
         eff.loads.extend(map.inputs.iter().copied());
         eff.stores.extend(map.outputs.iter().copied());
@@ -309,18 +311,22 @@ mod tests {
         assert!(eff.stores.is_empty());
     }
 
-    /// A prototype-less external is a leaf with empty effects (its call keeps the
-    /// declared-clobber modelling in the caller's body), NOT ⊤.
+    /// A prototype-less external is ⊤: declared-clobber semantics only cover
+    /// its *direct* caller's body, so an empty-effects leaf would let a solved
+    /// caller summary omit the external's real clobbers and mislead the
+    /// caller's own callers (bug-2-external one level up).
     #[test]
-    fn prototypeless_external_is_empty_not_top() {
+    fn prototypeless_external_is_top() {
         let mut tc = qcode::testing::TestContext::new();
         let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("noproto".into())).id;
         let s = solve(&tc);
-        let eff = s
-            .get(ext)
-            .as_ref()
-            .expect("a prototype-less external is empty-effects, not ⊤");
-        assert!(eff.loads.is_empty() && eff.stores.is_empty());
+        assert!(
+            matches!(
+                s.get(ext),
+                Err(crate::calls::effect_engine::TopCause::External)
+            ),
+            "a prototype-less external must be ⊤, not an empty-effects leaf"
+        );
     }
 
     /// bug-2-external: a caller of a prototyped external inherits the external's
