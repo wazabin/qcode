@@ -82,6 +82,20 @@ name = "windows-teb-seed"
 scope = "module"
 passes = ["windows_teb_seed"]
 
+# Give known external (imported) callees their C-prototype signatures + call
+# interface BEFORE the register channel solves its effect summaries: the summary
+# fixpoint treats a prototyped external as a leaf whose inputs are its argument
+# registers and whose outputs are its return register ∪ ABI clobbers
+# (`reg_summary::external_leaf`), so the prototype must exist at solve time for a
+# materialized caller's return pack to cover an external's clobbers
+# (bug-2-external, ARGPROMOTE_REGISTERS_V2.md Phase 3). Runs early here; the late
+# `signatures` stage keeps only `summaries` (a straggler external left Opaque is
+# sound, so no speculative second run).
+[[stage]]
+name = "external-sigs"
+scope = "module"
+passes = ["external_sigs"]
+
 # Functionalize register side effects while register load/stores are still
 # explicit. This mints the by-value `@SP` param (origin = the stack-pointer
 # register) and seeds `store(@SP, RSP)` at entry, giving stack arithmetic a
@@ -199,18 +213,19 @@ passes = ["licm", "gvn", "dce"]
 repeat_until = "no_change"
 
 # Interprocedural signature milestones, whole-program, after every function is
-# post-mem2reg/gvn but *before* the eliminating passes. `external_sigs` assigns
-# conventional ABI signatures to imported/unresolved callees and `summaries`
-# computes each function's input/clobber/stack-delta summary; both feed the
-# downstream `dead_signature`, `partial_inline`, `mark_pure`, and `argpromote`
-# stages. (The legacy `bind_args` register-ABI binder has been removed: register
-# inputs are threaded by `argpromote_registers` and stack/memory inputs are
-# functionalized by `argpromote`, so call sites no longer need a separate
-# argument-load binding pass.)
+# post-mem2reg/gvn but *before* the eliminating passes. `summaries` computes each
+# function's input/clobber/stack-delta summary, feeding the downstream
+# `dead_signature`, `partial_inline`, `mark_pure`, and `argpromote` stages.
+# (`external_sigs` now runs early, before `argpromote-registers`, so the register
+# channel sees external prototypes at solve time — see that stage.) (The legacy
+# `bind_args` register-ABI binder has been removed: register inputs are threaded
+# by `argpromote_registers` and stack/memory inputs are functionalized by
+# `argpromote`, so call sites no longer need a separate argument-load binding
+# pass.)
 [[stage]]
 name = "signatures"
 scope = "module"
-passes = ["external_sigs", "summaries"]
+passes = ["summaries"]
 
 # Eliminating passes, per function: drop the now-dead arg-setup stores and loads.
 # The stack pointer keeps its real `@SP`-rooted arithmetic throughout (the legacy
