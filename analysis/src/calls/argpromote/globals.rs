@@ -48,7 +48,7 @@ pub(super) fn globalize_constants(
     fid: FunctionId,
 ) -> bool {
     let f = FunctionBody::from_id(ctx, fid);
-    if f.is_external() || !f.is_pure_reg() {
+    if f.is_external() || !f.is_reg_materialized() {
         return false;
     }
     // Adding a param appends an argument at every direct caller's `Call.args`. An

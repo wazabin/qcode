@@ -172,12 +172,12 @@ fn remove_unused_no_pred_block_params<'a, 'str>(
     // this per-function sweep. A function pass must not reach across functions, so
     // leave pure_reg entry params for `dead_signature`; the *local* fallback below
     // would silently drop the param and break the interface alignment.
-    let is_pure_reg_entry = cx
+    let is_reg_materialized_entry = cx
         .body_view(body)
         .block_ref(block_id)
         .function()
-        .is_some_and(|f| f.is_pure_reg() && f.root().map(|b| b.id) == Some(block_id));
-    if is_pure_reg_entry {
+        .is_some_and(|f| f.is_reg_materialized() && f.root().map(|b| b.id) == Some(block_id));
+    if is_reg_materialized_entry {
         return false;
     }
 

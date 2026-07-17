@@ -51,7 +51,7 @@ fn infer_param_attrs_changed_functions(ctx: &mut Context) -> rustc_hash::FxHashS
         .into_iter()
         .filter_map(|fid| {
             let f = FunctionBody::from_id(ctx, fid);
-            if f.is_external() || !f.is_pure_reg() {
+            if f.is_external() || !f.is_reg_materialized() {
                 return None;
             }
             let n = f.root()?.params().count();
@@ -410,7 +410,7 @@ mod tests {
         let mut b = tc.ctx.builder_at(addr);
         body(&mut b, &params);
         drop(b);
-        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_reg_materialized(true);
         fid
     }
 

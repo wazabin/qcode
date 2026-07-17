@@ -32,7 +32,7 @@ fn mark_pure_functions_targeted(ctx: &mut Context, targets: &[FunctionId]) -> bo
         let mut round = false;
         for fid in targets.iter().copied() {
             let f = FunctionBody::from_id(ctx, fid);
-            if f.is_pure() || !f.is_pure_reg() {
+            if f.is_pure() || !f.is_reg_materialized() {
                 continue;
             }
             if body_is_pure(ctx, fid) {

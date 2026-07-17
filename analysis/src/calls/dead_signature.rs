@@ -66,7 +66,7 @@ fn dead_signature_changed_functions(
     let mut worklist: Vec<FunctionId> = targets
         .iter()
         .copied()
-        .filter(|&f| FunctionBody::from_id(ctx, f).is_pure_reg())
+        .filter(|&f| FunctionBody::from_id(ctx, f).is_reg_materialized())
         .collect();
     let mut queued: HashSet<_> = worklist.iter().copied().collect();
 
@@ -83,7 +83,7 @@ fn dead_signature_changed_functions(
         if iters > MAX_ITERS {
             break;
         }
-        if !FunctionBody::from_id(ctx, fid).is_pure_reg() {
+        if !FunctionBody::from_id(ctx, fid).is_reg_materialized() {
             continue;
         }
         if direct_call_sites(ctx, fid, &call_index)
@@ -469,7 +469,7 @@ mod tests {
             }),
         );
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_input_regs(inputs);
-        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_reg_materialized(true);
         return_type
     }
 

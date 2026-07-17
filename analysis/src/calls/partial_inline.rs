@@ -82,7 +82,7 @@ fn partial_inline_changed_functions(
     let mut changed = rustc_hash::FxHashSet::default();
     let target_set: rustc_hash::FxHashSet<_> = targets.iter().copied().collect();
     for fid in ctx.function_ids() {
-        if !FunctionBody::from_id(ctx, fid).is_pure_reg() {
+        if !FunctionBody::from_id(ctx, fid).is_reg_materialized() {
             continue;
         }
         let callers = graph.callers(fid);
@@ -486,7 +486,7 @@ mod tests {
             agg = Some(tc.ctx.type_of(ValueId::Instruction(tuple_id)));
         }
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_input_regs(inputs);
-        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_reg_materialized(true);
         agg.unwrap()
     }
 

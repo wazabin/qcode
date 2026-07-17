@@ -134,7 +134,7 @@ pub struct FunctionSignature {
     /// no loads (an untracked memory read), no calls, no architecture p-code ops,
     /// and no raw register/global reads. Stores are permitted — they produce no
     /// value, so they cannot feed a returned field. Strictly stronger than a
-    /// materialized register interface (`is_pure_reg`), which only asserts the
+    /// materialized register interface (`is_reg_materialized`), which only asserts the
     /// register channel is functionalized. Pure-function emulation in constant propagation gates on
     /// this (see `PURE_EMULATION_DESIGN.md`): such a callee may be emulated to
     /// harvest constant return-tuple fields, with the call left in place. Asserted

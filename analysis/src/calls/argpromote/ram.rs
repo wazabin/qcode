@@ -246,7 +246,7 @@ fn try_promote(
     // exist. So skip them: a conventional function is left for the legacy path, which
     // is correct (the body is unchanged). `argpromote_registers` runs earlier and
     // makes every functionalizable function `pure_reg`, so this loses no real work.
-    if !f.is_pure_reg() {
+    if !f.is_reg_materialized() {
         return false;
     }
 

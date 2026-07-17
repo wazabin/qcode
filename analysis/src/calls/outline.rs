@@ -651,7 +651,7 @@ mod tests {
         assert!(returns_value, "the outlined body returns the element");
         assert!(FunctionBody::from_id(&tc.ctx, body).is_pure());
         // Full purity implies register purity — the GUI badge keys off the latter.
-        assert!(FunctionBody::from_id(&tc.ctx, body).is_pure_reg());
+        assert!(FunctionBody::from_id(&tc.ctx, body).is_reg_materialized());
         // The root block carries a real label (not an opaque `<bb_N>` fallback).
         assert!(
             BasicBlock::from_id(&tc.ctx, root).name().is_some(),

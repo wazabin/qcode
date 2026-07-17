@@ -167,7 +167,7 @@ impl RegPurityReason {
 
 /// Report whether `fid` is eligible to be functionalized into a register-pure
 /// function (`Ok`) or, if not, the gating reason (`Err`). A function whose
-/// [`FunctionRef::is_pure_reg`](qcode::value::FunctionRef::is_pure_reg) is
+/// [`FunctionRef::is_reg_materialized`](qcode::value::FunctionRef::is_reg_materialized) is
 /// already set is necessarily `Ok`; this is the
 /// source of the "why not" shown for the rest.
 ///

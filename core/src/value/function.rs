@@ -1376,7 +1376,7 @@ impl<'str> FunctionBody<'str> {
         let mut function = Self::make(ctx, name)?;
         function.interface_mut().kind = FunctionKind::Lambda;
         function.set_is_pure(true);
-        function.set_pure_reg(true);
+        function.set_reg_materialized(true);
         Ok(function)
     }
 
@@ -1575,7 +1575,7 @@ where
     /// v2) — i.e. its [`effects`](FunctionInterface::effects) are
     /// [`FunctionEffects::Materialized`]. Legacy name for the register-channel
     /// "functionalized" predicate.
-    pub fn is_pure_reg(&'s self) -> bool {
+    pub fn is_reg_materialized(&'s self) -> bool {
         matches!(self.interface().effects, FunctionEffects::Materialized(_))
     }
 
@@ -1589,7 +1589,7 @@ where
     /// Whether argpromote has functionalized *every* side-effect channel of this
     /// function — it is a deterministic pure function of its by-value params,
     /// touching no caller-visible memory or registers. Strictly stronger than
-    /// [`is_pure_reg`](Self::is_pure_reg). See [`FunctionSignature::is_pure`].
+    /// [`is_reg_materialized`](Self::is_reg_materialized). See [`FunctionSignature::is_pure`].
     pub fn is_pure(&'s self) -> bool {
         self.interface()
             .signature
@@ -2112,7 +2112,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         self.interface_mut().kind = kind;
         if kind == FunctionKind::Lambda {
             self.set_is_pure(true);
-            self.set_pure_reg(true);
+            self.set_reg_materialized(true);
         }
     }
 
@@ -2203,7 +2203,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// interface mapping); `false` resets it to unsolved. Prefer
     /// [`set_effects`](Self::set_effects) with a real mapping; this is kept for
     /// the tests and callers that only assert "register channel functionalized".
-    pub fn set_pure_reg(&mut self, value: bool) {
+    pub fn set_reg_materialized(&mut self, value: bool) {
         if value {
             if !matches!(
                 self.interface_mut().effects,

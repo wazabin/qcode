@@ -430,7 +430,7 @@ pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_
     // from a conventional prologue/epilogue) does not model a functionalized body
     // and would desync `input_regs` from the arguments `argpromote_registers`
     // already bound at every call site. Leave its signature untouched.
-    if FunctionBody::from_id(ctx, function_id).is_pure_reg() {
+    if FunctionBody::from_id(ctx, function_id).is_reg_materialized() {
         return;
     }
 

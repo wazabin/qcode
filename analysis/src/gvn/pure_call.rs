@@ -250,8 +250,8 @@ mod tests {
             is_pure: true,
             ..Default::default()
         });
-        // Materialize the register channel (what `is_pure_reg` now reads).
-        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
+        // Materialize the register channel (what `is_reg_materialized` now reads).
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_reg_materialized(true);
         fid
     }
 
@@ -423,8 +423,8 @@ mod tests {
             is_pure: true,
             ..Default::default()
         });
-        // Materialize the register channel (what `is_pure_reg` now reads).
-        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
+        // Materialize the register channel (what `is_reg_materialized` now reads).
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_reg_materialized(true);
         fid
     }
 

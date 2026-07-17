@@ -145,7 +145,7 @@ mod tests {
         let _ = g;
 
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -181,7 +181,7 @@ mod tests {
         // conventional (non-`pure_reg`) function uses the register ABI and accrues
         // root params no caller passes positionally, so argpromote must leave it
         // untouched rather than read a non-existent argument slot. Identical setup to
-        // `promotes_single_inout_stack_param`, but WITHOUT `set_pure_reg` — so nothing
+        // `promotes_single_inout_stack_param`, but WITHOUT `set_reg_materialized` — so nothing
         // is promoted.
         let mut tc = qcode::testing::TestContext::new();
         let input = stack_input(&mut tc, 4, 8);
@@ -205,7 +205,7 @@ mod tests {
         );
         let _ = g;
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        // NB: deliberately NOT `set_pure_reg(true)`.
+        // NB: deliberately NOT `set_reg_materialized(true)`.
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -240,7 +240,7 @@ mod tests {
         );
         let _ = (f_entry, f_cont);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, caller).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, caller).set_reg_materialized(true);
         set_call(&mut tc, f_call, callee, vec![]);
         tc.ctx.add_cfg_edge(f_call, f_cont);
 
@@ -257,7 +257,7 @@ mod tests {
         );
 
         // mark_pure flags the caller once the callee is pure, order-independently.
-        FunctionBody::from_id_mut(&mut tc.ctx, caller).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, caller).set_reg_materialized(true);
         mark_pure_functions(&mut tc.ctx);
         assert!(
             FunctionBody::from_id(&tc.ctx, caller).is_pure(),
@@ -291,7 +291,7 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let call_id = set_call(&mut tc, g_call, f, vec![]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
@@ -356,7 +356,7 @@ mod tests {
                     return at i64 0;
             "
         );
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
 
         // Take f's address: store the function value somewhere in g, so f lands
         // in `address_taken_set`.
@@ -419,7 +419,7 @@ mod tests {
         );
         let _ = g;
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -473,7 +473,7 @@ mod tests {
         );
         let _ = g;
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -554,7 +554,7 @@ mod tests {
         );
         let _ = g;
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -597,7 +597,7 @@ mod tests {
         );
         let _ = g;
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -640,7 +640,7 @@ mod tests {
         let _ = g;
 
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -741,7 +741,7 @@ mod tests {
             .replace_all_uses_with(ValueId::Instruction(add_id), gep);
 
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -856,7 +856,7 @@ mod tests {
         );
         let _ = g;
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![in_p, in_q]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let b = tc.ctx.get_const(0x5000, 8).id();
         let call_id = set_call(&mut tc, g_call, f, vec![a, b]);
@@ -900,7 +900,7 @@ mod tests {
         );
         let _ = g;
         FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_reg_materialized(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, foo, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -939,7 +939,7 @@ mod tests {
         );
         let _ = g;
         FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_reg_materialized(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, foo, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -985,7 +985,7 @@ mod tests {
         );
         let _ = g;
         FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_reg_materialized(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, foo, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -1023,7 +1023,7 @@ mod tests {
         );
         let _ = g;
         FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_reg_materialized(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, foo, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -1064,7 +1064,7 @@ mod tests {
         );
         let _ = g;
         FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_reg_materialized(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, foo, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -1109,7 +1109,7 @@ mod tests {
         );
         let _ = g;
         FunctionBody::from_id_mut(&mut tc.ctx, f1).set_input_regs(vec![in_p]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f1).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f1).set_reg_materialized(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, f1, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -1150,7 +1150,7 @@ mod tests {
         // function whose ABI register list is never filled in, with a one-field
         // register write-set already on `Return::value` (set as the register
         // channel does, since `return at ..` only sets the conventional operand).
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let ret_id = FunctionBody::from_id(&tc.ctx, f)
             .iter()
             .find_map(|b| {
@@ -1247,7 +1247,7 @@ mod tests {
         tc.ctx
             .block_param_mut(pid)
             .set_origin_id(ValueId::Varnode(sp_vn).localize(pid.func));
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
 
         let sp_arg = tc.ctx.get_const(0x7000, 8).id();
         let p_arg = tc.ctx.get_const(0x4000, 8).id();
@@ -1311,7 +1311,7 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
 
         // Give the return a 1-field register write-set, as the register channel does.
         let ret_id = FunctionBody::from_id(&tc.ctx, f)
@@ -1401,7 +1401,7 @@ mod tests {
         );
         let _ = (g, r0, ret_a, ret_b);
         FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_reg_materialized(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, foo, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -1460,7 +1460,7 @@ mod tests {
         );
         let _ = (g, r0, wr, skip);
         FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_reg_materialized(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, foo, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -1893,7 +1893,7 @@ mod tests {
             let ptr = b.shr().get_const(0x2000, 8);
             b.push_return(ptr);
         }
-        FunctionBody::from_id_mut(&mut tc.ctx, clean).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, clean).set_reg_materialized(true);
 
         // A function that still loads from memory (an untracked value source).
         let dirty = FunctionBody::make(&mut tc.ctx, "dirty".into()).unwrap().id;
@@ -1912,7 +1912,7 @@ mod tests {
             let ptr = b.shr().get_const(0x4000, 8);
             b.push_return(ptr);
         }
-        FunctionBody::from_id_mut(&mut tc.ctx, dirty).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, dirty).set_reg_materialized(true);
 
         assert!(
             mark_pure_functions(&mut tc.ctx),
@@ -1971,7 +1971,7 @@ mod tests {
         let _ = (g, f_head, f_body, f_exit);
 
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -2085,7 +2085,7 @@ mod tests {
         let _ = (g, f_head, f_body, f_exit);
 
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -2164,7 +2164,7 @@ mod tests {
         let _ = (g, f_loop, f_exit);
 
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -2228,7 +2228,7 @@ mod tests {
         let _ = (g, f_head, f_body, f_exit);
 
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -2300,7 +2300,7 @@ mod tests {
         let _ = g;
 
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         let idx = tc.ctx.get_const(0x10, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr, idx]);
@@ -2392,7 +2392,7 @@ mod tests {
                 .block_param_mut(inner)
                 .set_origin_id(ValueId::Varnode(sp_reg).localize(inner.func));
         }
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let espv = tc.ctx.get_const(0x7000, 8).id();
         let bufp = tc.ctx.get_const(0x9000, 8).id();
         set_call(&mut tc, g_call, f, vec![espv, bufp]);
@@ -2491,7 +2491,7 @@ mod tests {
                 .block_param_mut(inner)
                 .set_origin_id(ValueId::Varnode(sp_reg).localize(inner.func));
         }
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let espv = tc.ctx.get_const(0x7000, 8).id();
         let v0 = tc.ctx.get_const(0x10, 8).id();
         let v4 = tc.ctx.get_const(0x9000, 8).id();
@@ -2587,7 +2587,7 @@ mod tests {
                 .block_param_mut(inner)
                 .set_origin_id(ValueId::Varnode(sp_reg).localize(inner.func));
         }
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let espv = tc.ctx.get_const(0x7000, 8).id();
         let gpv = tc.ctx.get_const(0x454df8, 8).id();
         let bufp = tc.ctx.get_const(0x9000, 8).id();
@@ -2676,7 +2676,7 @@ mod tests {
                 .block_param_mut(inner)
                 .set_origin_id(ValueId::Varnode(sp_reg).localize(inner.func));
         }
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let espv = tc.ctx.get_const(0x7000, 4).id();
         let gpv = tc.ctx.get_const(0x454df8, 4).id();
         let v0 = tc.ctx.get_const(0x10, 4).id();
@@ -2744,7 +2744,7 @@ mod tests {
         let _ = (g, f_head, f_body, f_exit);
 
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -2876,7 +2876,7 @@ mod tests {
         let _ = (g, f_head, f_body, f_exit, f_entry, r);
 
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -3008,7 +3008,7 @@ mod tests {
         let _ = (g, f_head, f_body, f_exit, f_entry, r);
 
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_reg_materialized(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);

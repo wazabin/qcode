@@ -2403,7 +2403,7 @@ mod tests {
         FunctionBody::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
-        FunctionBody::from_id_mut(&mut tc.ctx, fun_id).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fun_id).set_reg_materialized(true);
 
         let full_param = BasicBlock::from_id_mut(&mut tc.ctx, block_id)
             .push_param(8)

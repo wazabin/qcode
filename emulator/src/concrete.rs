@@ -1677,7 +1677,7 @@ impl StandaloneEmulator {
                         .last()
                         .copied()
                         .is_some_and(|call_id| call_is_regpure(ctx, call_id));
-                    if regpure_site || FunctionBody::from_id(ctx, target).is_pure_reg() {
+                    if regpure_site || FunctionBody::from_id(ctx, target).is_reg_materialized() {
                         if let Some(&call_id) = self.call_site_stack.last() {
                             self.bind_entry_params_from_args(ctx, call_id, target);
                         }

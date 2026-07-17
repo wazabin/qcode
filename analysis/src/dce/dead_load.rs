@@ -499,7 +499,7 @@ fn scan_block_aliased<'a, 'str: 'a>(
     let regs_dead_at_exit = host
         .block_ref(block_id)
         .function()
-        .is_some_and(|f| f.is_pure_reg());
+        .is_some_and(|f| f.is_reg_materialized());
 
     for &id in insns.iter().rev() {
         match host.insn_ref(id).mnemonic() {
