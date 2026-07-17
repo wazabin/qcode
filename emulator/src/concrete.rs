@@ -2601,11 +2601,22 @@ mod tests {
         assert_eq!(emu.get_value(&ctx, ret), Some(0));
     }
 
+    /// Test setup is the publication barrier: `result_type` only reads, so the
+    /// types an intrinsic resolves to must exist before it is pushed.
+    fn publish_iota_result(ctx: &mut Context) {
+        use qcode::types::TypeRequest;
+        let i64_ty = ctx.shared.types.get_or_make_int(8);
+        ctx.shared
+            .types
+            .create_requested_types(&[TypeRequest::list(i64_ty, None)]);
+    }
+
     /// `map @f arr` runs the pure unary body over every element and materializes
     /// the result buffer. `f(x) = x * 3`, `arr = [1, 2, 3, 4]` ⇒ `[3, 6, 9, 12]`.
     #[test]
     fn map_over_array_is_emulated() {
         let mut ctx = Context::new();
+        publish_iota_result(&mut ctx);
         qcode!(
             ctx,
             "
@@ -2641,6 +2652,7 @@ mod tests {
     #[test]
     fn scan_over_iota_is_emulated() {
         let mut ctx = Context::new();
+        publish_iota_result(&mut ctx);
         qcode!(
             ctx,
             "
@@ -2691,6 +2703,22 @@ mod tests {
         let src = ctx.get_bytes(data).id();
         if let ValueId::Bytes(bid) = src {
             ctx.shared.values.bytes[bid].type_id = arr_ty;
+        }
+        // Publish the `(index, elem)` tuple and its array before pushing the
+        // intrinsic: `result_type` only reads.
+        {
+            use qcode::types::{AggregateField, TypeRequest};
+            let fields = vec![
+                AggregateField::new("index", i64_ty),
+                AggregateField::new("elem", i64_ty),
+            ];
+            let tuple = ctx
+                .shared
+                .types
+                .create_requested_types(&[TypeRequest::aggregate(fields)])[0];
+            ctx.shared
+                .types
+                .create_requested_types(&[TypeRequest::array(tuple, 4)]);
         }
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
         let e = {
