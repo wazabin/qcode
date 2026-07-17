@@ -1,16 +1,23 @@
 //! External-call argument channel: resolve the arguments at call sites to
-//! bodyless **external** (imported) functions from their C prototype.
+//! bodyless **external** (imported) functions from their materialized C
+//! interface.
 //!
 //! [`argpromote_registers`](super::argpromote_registers) and the RAM channel
 //! functionalize *bodied* callees and, in doing so, thread each caller's
 //! `Call.args`. An external stub has no body, so neither runs and its calls
 //! render argument-less (`call fn SHGetSpecialFolderPathW()`). This channel
-//! fills that gap for any external callee whose prototype is known to [`cabi`]:
-//! for each one it appends the positional `Call.args` at every direct caller —
-//! a register reload (System V integer/SSE args) or an SP-relative stack load
-//! (32-bit `stdcall`/`cdecl`, and System V register overflow) — and leaves the
-//! following gvn round to forward each load to the value the caller set up
-//! (a register write, or the `push` that stored the stack slot).
+//! fills that gap for any external callee whose
+//! [`ExternInterface`](qcode::value::ExternInterface) was materialized earlier by
+//! [`external_sigs`](crate::assumptions::external_sig): for each one it appends
+//! the positional `Call.args` at every direct caller — a register reload (System
+//! V integer/SSE args) or an SP-relative stack load (32-bit `stdcall`/`cdecl`,
+//! and System V register overflow) — and leaves the following gvn round to
+//! forward each load to the value the caller set up (a register write, or the
+//! `push` that stored the stack slot).
+//!
+//! This pass no longer consults `cabi` or the binary: the whole call interface
+//! (argument slots, names, and the return register) was planned once by
+//! `external_sigs` and lives on the callee's `FunctionSignature`.
 //!
 //! It only ever *adds* arguments to a call; the bodyless callee is never
 //! touched. The `args.len() == idx` guard keeps it idempotent across pipeline
@@ -20,161 +27,23 @@ use qcode::{
     context::Context,
     space::SpaceId,
     value::{
-        BasicBlock, FunctionBody, FunctionId, Instruction, Value, ValueId, Varnode, VarnodeId,
-        insn::Mnemonic,
+        BasicBlock, ExternArg, ExternSlot, FunctionBody, FunctionId, Instruction, Value, ValueId,
+        Varnode, VarnodeId, insn::Mnemonic,
     },
 };
 
-use cabi::{AbiTarget, CType, Platform};
-
-use super::super::append_caller_arg_at_sites;
-use crate::pipeline::CallingConvention;
+use super::super::append_caller_arg;
 use crate::{Pass, PipelineEnv};
 
-/// System V scalar class of a parameter (the only two we can place).
-#[derive(Clone, Copy)]
-enum Class {
-    /// Integer/pointer — a general-purpose register, else the stack.
-    Integer,
-    /// Float/double — an SSE register, else the stack.
-    Sse,
-}
-
-/// Classify a scalar parameter type, or `None` for a by-value aggregate / type
-/// we cannot place (which forces the whole function to be skipped).
-fn classify(ty: &CType) -> Option<Class> {
-    match ty {
-        CType::Integer { .. } | CType::Pointer { .. } => Some(Class::Integer),
-        CType::Float { .. } => Some(Class::Sse),
-        CType::Void | CType::Struct { .. } | CType::Other => None,
-    }
-}
-
-/// How one argument is loaded at the call site.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Slot {
-    /// A register argument: reload the register (`size` bytes) live at the call.
-    Reg { vn: VarnodeId, size: usize },
-    /// A stack argument at `offset` bytes above the call-site stack pointer.
-    Stack { offset: i64, size: usize },
-}
-
-/// One planned positional argument: where to load it from, and the display name
-/// it should carry at the call site (the prototype parameter name, or
-/// `return_address` for the synthesized stdcall slot).
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PlannedArg {
-    slot: Slot,
-    name: Option<Box<str>>,
-}
-
-/// Plan the argument slots for `proto` under the calling convention selected by
-/// `(abi, ptr_width, stack_only)`. `None` if any parameter is unplaceable (a
-/// by-value aggregate), in which case the function is left unresolved.
-///
-/// * `stack_only` (32-bit `stdcall`/`cdecl`): every argument is a stack slot.
-/// * otherwise (x64 System V): integers fill `abi.int_args`, floats fill
-///   `abi.sse_args`, and the remainder overflow to the stack.
-///
-/// Stack slots are positional from the call-site stack pointer. On the
-/// stack-only path the lifted `call` pushes the return address and decrements
-/// the stack pointer to point *at* it, so `[SP+0]` is the return address: a
-/// synthesized leading `return_address` argument occupies that slot and the
-/// prototype's own parameters start one pointer-width above it. (Without this
-/// the first parameter would alias the return address and the last would fall
-/// off the end.) For System V register overflow the lifted `call` does not model
-/// the push, so overflow arguments begin at offset 0.
-///
-/// Each planned argument also carries the prototype parameter name for display.
-fn plan_args(
-    proto: &cabi::CFunctionProto,
-    abi: &CallingConvention,
-    ptr_width: usize,
-    stack_only: bool,
-) -> Option<Vec<PlannedArg>> {
-    let mut args = Vec::with_capacity(proto.params.len() + usize::from(stack_only));
-    let mut next_int = 0usize;
-    let mut next_sse = 0usize;
-    // On the stack-only path offset 0 is the return address (see below), so the
-    // prototype's own stack arguments start one pointer-width above it.
-    let mut next_stack = if stack_only { ptr_width as i64 } else { 0 };
-
-    if stack_only {
-        args.push(PlannedArg {
-            slot: Slot::Stack {
-                offset: 0,
-                size: ptr_width,
-            },
-            name: Some("return_address".into()),
-        });
-    }
-
-    let push_stack = |args: &mut Vec<PlannedArg>, next_stack: &mut i64, name: Option<Box<str>>| {
-        args.push(PlannedArg {
-            slot: Slot::Stack {
-                offset: *next_stack,
-                size: ptr_width,
-            },
-            name,
-        });
-        *next_stack += ptr_width as i64;
-    };
-
-    for param in &proto.params {
-        let class = classify(&param.ty)?;
-        let name = param.name.clone();
-        if stack_only {
-            push_stack(&mut args, &mut next_stack, name);
-            continue;
-        }
-        match class {
-            Class::Integer => match abi.int_args.get(next_int).and_then(|g| g.for_bytes(8)) {
-                Some(vn) => {
-                    next_int += 1;
-                    args.push(PlannedArg {
-                        slot: Slot::Reg {
-                            vn,
-                            size: ptr_width,
-                        },
-                        name,
-                    });
-                }
-                None => push_stack(&mut args, &mut next_stack, name),
-            },
-            Class::Sse => match abi.sse_args.get(next_sse).copied() {
-                Some(vn) => {
-                    next_sse += 1;
-                    args.push(PlannedArg {
-                        slot: Slot::Reg {
-                            vn,
-                            size: ptr_width,
-                        },
-                        name,
-                    });
-                }
-                None => push_stack(&mut args, &mut next_stack, name),
-            },
-        }
-    }
-    Some(args)
-}
-
 /// Append the resolved `Call.args` at every direct caller of each external
-/// function with a known prototype. Returns `true` if any call was changed.
+/// function with a materialized interface. Returns the set of changed callers.
 fn argpromote_external_changed_functions(
     ctx: &mut Context,
     env: &PipelineEnv,
     targets: &[FunctionId],
-    graph: &crate::CallGraph,
 ) -> rustc_hash::FxHashSet<FunctionId> {
     let target_set: rustc_hash::FxHashSet<_> = targets.iter().copied().collect();
-    let platform = match env.cfg.os {
-        qcode::context::TargetOs::Windows => Platform::Windows,
-        _ => Platform::Linux,
-    };
-    let target = AbiTarget::new(platform, env.cfg.bitness);
     let ptr_width = (env.cfg.bitness / 8).max(1) as usize;
-    let stack_only = env.cfg.bitness == 32;
     let Some(sp) = env.sp_varnode else {
         return rustc_hash::FxHashSet::default();
     };
@@ -184,18 +53,21 @@ fn argpromote_external_changed_functions(
     // Only externals that are actually *called* can gain arguments: both
     // `bind_external_args` and `bind_external_return` key on a direct `Call` whose
     // target is the external. Filtering on the direct call-site index (an O(1) map
-    // lookup) skips the `cabi::lookup` and the whole-program instruction scan for
-    // every imported-but-unreferenced symbol — the bulk of an import table.
+    // lookup) skips the whole-program instruction scan for every
+    // imported-but-unreferenced symbol — the bulk of an import table.
+    let graph = crate::CallGraph::analyze(ctx);
     let externals: Vec<FunctionId> = ctx
         .functions()
         .filter(|f| f.is_external())
         .map(|f| f.id)
-        .filter(|&id| !crate::calls::direct_call_sites(ctx, graph, id).is_empty())
+        .filter(|&id| !crate::calls::direct_call_sites(ctx, &graph, id).is_empty())
         .collect();
     let callers: rustc_hash::FxHashMap<FunctionId, Vec<FunctionId>> = externals
         .iter()
         .map(|&fid| (fid, graph.callers(fid)))
         .collect();
+    drop(graph);
+
     if externals.is_empty() {
         return rustc_hash::FxHashSet::default();
     }
@@ -208,49 +80,30 @@ fn argpromote_external_changed_functions(
         {
             continue;
         }
-        let raw = FunctionBody::from_id(ctx, fid).name().to_string();
-        let sym = raw.split('@').next().unwrap_or(&raw);
-        let Some(proto) = cabi::lookup(target, sym) else {
+        // The call interface materialized by `external_sigs`. An external with no
+        // interface (unknown prototype / not selected / unplaceable) is skipped.
+        let func = FunctionBody::from_id(ctx, fid);
+        let Some(iface) = func.extern_interface() else {
             continue;
         };
-        let call_sites = crate::calls::direct_call_sites(ctx, graph, fid);
-        let Some(plan) = plan_args(proto, &env.cfg.abi, ptr_width, stack_only) else {
-            continue;
-        };
-        if bind_external_args(
-            ctx,
-            fid,
-            &plan,
-            sp,
-            sp_space,
-            default_space,
-            ptr_width,
-            &call_sites,
-        ) {
+        let plan = iface.args.clone();
+        // The single ABI return register, recorded on the signature by
+        // `external_sigs` (`None` for a void/aggregate return).
+        let ret = func
+            .signature()
+            .and_then(|s| s.outputs.as_ref())
+            .and_then(|o| o.first().copied());
+
+        if bind_external_args(ctx, fid, &plan, sp, sp_space, default_space, ptr_width) {
             changed.extend(callers[&fid].iter().copied());
         }
-        if let Some(ret) = return_slot(proto, &env.cfg.abi, ptr_width)
-            && bind_external_return(ctx, ret, &call_sites)
+        if let Some(ret) = ret
+            && bind_external_return(ctx, fid, ret)
         {
             changed.extend(callers[&fid].iter().copied());
         }
     }
     changed
-}
-
-/// The register a call to this prototype returns its value in: the integer
-/// return register for an integer/pointer result, the SSE return register for a
-/// float result, `None` for `void` or an aggregate return (which we do not
-/// model). Mirrors [`plan_args`]' argument classification.
-fn return_slot(
-    proto: &cabi::CFunctionProto,
-    abi: &CallingConvention,
-    ptr_width: usize,
-) -> Option<VarnodeId> {
-    match classify(&proto.return_type)? {
-        Class::Integer => abi.int_ret.as_ref().and_then(|g| g.for_bytes(ptr_width)),
-        Class::Sse => abi.sse_ret,
-    }
 }
 
 /// Give every direct caller of resolved external `fid` a return value: type the
@@ -260,17 +113,15 @@ fn return_slot(
 /// argpromote's returned write-set (`res = foo(); store(reg <- res)`), for a
 /// single ABI return register. Idempotent: a call whose continuation already
 /// stores its result to `ret` is left untouched.
-fn bind_external_return(
-    ctx: &mut Context,
-    ret: VarnodeId,
-    call_sites: &[qcode::value::insn::InstructionId],
-) -> bool {
+fn bind_external_return(ctx: &mut Context, fid: FunctionId, ret: VarnodeId) -> bool {
     let ret_space = Varnode::from_id(&*ctx, ret).space().id;
     let size = Varnode::from_id(&*ctx, ret).size();
     let int_ty = ctx.shared.types.get_or_make_int(size);
 
+    let call_sites = crate::calls::fresh_direct_call_sites(ctx, fid);
+
     let mut changed = false;
-    for &call_id in call_sites {
+    for call_id in call_sites {
         // The call's fall-through continuation, where the return register becomes
         // live. A call with no successor (e.g. a noreturn tail) is skipped.
         let Some(cont) = ctx
@@ -307,27 +158,21 @@ fn bind_external_return(
 
 /// Thread `plan` through every direct caller of `fid`, one positional argument at
 /// a time and in order, so the `args.len() == idx` guard keeps each call's
-/// arguments aligned and the pass idempotent. Also records the planned argument
-/// names on `fid` so each call site renders them (e.g. `@return_address=…`,
-/// `@hwnd=…`).
-#[allow(clippy::too_many_arguments)]
+/// arguments aligned and the pass idempotent. Argument display names were
+/// recorded on `fid` by `external_sigs`, so this only rewrites call sites.
 fn bind_external_args(
     ctx: &mut Context,
     fid: FunctionId,
-    plan: &[PlannedArg],
+    plan: &[ExternArg],
     sp: VarnodeId,
     sp_space: SpaceId,
     default_space: SpaceId,
     ptr_width: usize,
-    call_sites: &[qcode::value::insn::InstructionId],
 ) -> bool {
-    FunctionBody::from_id_mut(ctx, fid)
-        .set_input_arg_names(plan.iter().map(|a| a.name.clone()).collect());
-
     let mut changed = false;
     for (idx, arg) in plan.iter().enumerate() {
         let slot = arg.slot;
-        changed |= append_caller_arg_at_sites(ctx, call_sites, |ctx, call_id, block| {
+        changed |= append_caller_arg(ctx, fid, |ctx, call_id, block| {
             let Mnemonic::Call(c) = ctx.get_insn(call_id).mnemonic() else {
                 return None;
             };
@@ -339,11 +184,11 @@ fn bind_external_args(
             let mut b = (ctx).builder(block);
             b.set_insert_point_before(call_id);
             let value = match slot {
-                Slot::Reg { vn, size, .. } => {
+                ExternSlot::Reg(vn, size) => {
                     let space = Varnode::from_id(b.shr(), vn).space().id;
                     b.push_load::<false>(ValueId::Varnode(vn), size, space).id()
                 }
-                Slot::Stack { offset, size } => {
+                ExternSlot::Stack { offset, size } => {
                     let sp_val = b
                         .push_load::<false>(ValueId::Varnode(sp), ptr_width, sp_space)
                         .id();
@@ -368,7 +213,7 @@ pub struct ArgPromoteExternal;
 impl Pass for ArgPromoteExternal {
     const NAME: &'static str = "argpromote_external";
     fn description(&self) -> &'static str {
-        "Resolve call arguments to external functions from their C prototype"
+        "Resolve call arguments to external functions from their materialized C interface"
     }
     fn run(
         &self,
@@ -376,27 +221,9 @@ impl Pass for ArgPromoteExternal {
         env: &PipelineEnv,
         targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
-        let graph = crate::CallGraph::analyze(ctx);
         Ok(
             crate::ModulePassOutcome::functions(argpromote_external_changed_functions(
-                ctx, env, targets, &graph,
-            ))
-            .preserving_global::<crate::CallGraphAnalysis>()
-            .preserving_global::<crate::AddressAnalysis>(),
-        )
-    }
-
-    fn run_with_analyses(
-        &self,
-        ctx: &mut Context,
-        env: &PipelineEnv,
-        targets: &[FunctionId],
-        analyses: &mut crate::AnalysisManager,
-    ) -> Result<crate::ModulePassOutcome, String> {
-        let graph = analyses.global::<crate::CallGraphAnalysis>(ctx);
-        Ok(
-            crate::ModulePassOutcome::functions(argpromote_external_changed_functions(
-                ctx, env, targets, graph,
+                ctx, env, targets,
             ))
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>(),
@@ -405,116 +232,3 @@ impl Pass for ArgPromoteExternal {
 }
 
 crate::register_module_pass!(ArgPromoteExternal);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use cabi::{CFunctionProto, CParam};
-
-    fn proto(params: Vec<CType>) -> CFunctionProto {
-        CFunctionProto {
-            name: "f".into(),
-            return_type: CType::Integer {
-                bytes: 4,
-                signed: true,
-            },
-            params: params
-                .into_iter()
-                .map(|ty| CParam { name: None, ty })
-                .collect(),
-            variadic: false,
-            header: None,
-        }
-    }
-
-    fn ptr() -> CType {
-        CType::Pointer {
-            pointee: Box::new(CType::Void),
-            const_pointee: false,
-        }
-    }
-
-    fn int() -> CType {
-        CType::Integer {
-            bytes: 4,
-            signed: true,
-        }
-    }
-
-    /// stdcall: a synthesized `return_address` slot occupies `[SP+0]` and the
-    /// prototype's own arguments are positional 4-byte stack slots starting one
-    /// pointer-width above it (matching SHGetSpecialFolderPathW: 4 args, so 5
-    /// planned slots — the return address would otherwise be mistaken for the
-    /// first argument and the last argument dropped).
-    #[test]
-    fn stdcall_places_return_address_then_all_args_on_the_stack() {
-        let p = proto(vec![ptr(), ptr(), int(), int()]);
-        let abi = CallingConvention::default();
-        let plan = plan_args(&p, &abi, 4, true).expect("placeable");
-        assert_eq!(
-            plan,
-            vec![
-                PlannedArg {
-                    slot: Slot::Stack { offset: 0, size: 4 },
-                    name: Some("return_address".into()),
-                },
-                PlannedArg {
-                    slot: Slot::Stack { offset: 4, size: 4 },
-                    name: None
-                },
-                PlannedArg {
-                    slot: Slot::Stack { offset: 8, size: 4 },
-                    name: None
-                },
-                PlannedArg {
-                    slot: Slot::Stack {
-                        offset: 12,
-                        size: 4
-                    },
-                    name: None
-                },
-                PlannedArg {
-                    slot: Slot::Stack {
-                        offset: 16,
-                        size: 4
-                    },
-                    name: None
-                },
-            ]
-        );
-    }
-
-    /// Prototype parameter names ride through onto the planned arguments.
-    #[test]
-    fn stdcall_carries_prototype_parameter_names() {
-        let mut p = proto(vec![ptr(), int()]);
-        p.params[0].name = Some("pszPath".into());
-        p.params[1].name = Some("csidl".into());
-        let plan = plan_args(&p, &CallingConvention::default(), 4, true).expect("placeable");
-        let names: Vec<_> = plan.iter().map(|a| a.name.as_deref()).collect();
-        assert_eq!(
-            names,
-            vec![Some("return_address"), Some("pszPath"), Some("csidl")]
-        );
-    }
-
-    /// A `void` (or aggregate) return has no return register, so no return value
-    /// is bound — the call stays result-less.
-    #[test]
-    fn void_or_aggregate_return_has_no_return_slot() {
-        let abi = CallingConvention::default();
-        let mut p = proto(vec![]);
-        p.return_type = CType::Void;
-        assert!(return_slot(&p, &abi, 4).is_none());
-        p.return_type = CType::Struct { name: None };
-        assert!(return_slot(&p, &abi, 4).is_none());
-    }
-
-    /// A by-value aggregate parameter is unplaceable, so the whole function is
-    /// skipped rather than mis-bound.
-    #[test]
-    fn aggregate_param_skips_the_function() {
-        let p = proto(vec![int(), CType::Struct { name: None }]);
-        assert!(plan_args(&p, &CallingConvention::default(), 4, true).is_none());
-    }
-}

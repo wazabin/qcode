@@ -8,7 +8,7 @@ use std::{
 };
 
 mod signature;
-pub use signature::{FunctionSignature, ParamAttrs};
+pub use signature::{ExternArg, ExternInterface, ExternSlot, FunctionSignature, ParamAttrs};
 
 use crate::{
     context::Context,
@@ -1537,6 +1537,16 @@ where
             .and_then(|s| s.inputs.as_deref())
     }
 
+    /// The C-prototype-derived external call interface, if `external_sigs`
+    /// planned one. Read by `argpromote_external` to rewrite call sites. See
+    /// [`FunctionSignature::extern_interface`].
+    pub fn extern_interface(&'s self) -> Option<&'ctx crate::value::ExternInterface> {
+        self.interface()
+            .signature
+            .as_ref()
+            .and_then(|s| s.extern_interface.as_ref())
+    }
+
     /// The display name for the call-site argument bound to input `index`: the
     /// register name for a register input, or a synthesized `stack_<addr>` slot
     /// name for a stack-passed input (whose varnode is a nameless stack-space
@@ -2070,6 +2080,16 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
             .signature
             .get_or_insert_default()
             .externally_resolved = value;
+    }
+
+    /// Records the C-prototype-derived external call interface on this function.
+    /// See [`FunctionSignature::extern_interface`]; set by `external_sigs`,
+    /// consumed by `argpromote_external`.
+    pub fn set_extern_interface(&mut self, iface: crate::value::ExternInterface) {
+        self.interface_mut()
+            .signature
+            .get_or_insert_default()
+            .extern_interface = Some(iface);
     }
 
     /// Records the analysis-inferred input (live-in) register set on this function.

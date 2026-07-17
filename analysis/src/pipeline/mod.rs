@@ -71,6 +71,20 @@ use crate::{
 /// runs; reloaded snapshots wrap the deserialized `MemoryImage`.
 pub type BinaryHandle = std::sync::Arc<dyn binfmt::BinaryFormat>;
 
+/// The [`cabi::AbiTarget`] a binary's prototype tables are keyed by: its
+/// container-format OS mapped to a [`cabi::Platform`], at `bits` pointer width.
+///
+/// The single home for the `TargetOs → Platform` mapping, consulted by
+/// `external_sigs` (signature materialization) and the GUI loader (doc links).
+pub fn cabi_abi_target(os: TargetOs, bits: u8) -> cabi::AbiTarget {
+    let platform = match os {
+        TargetOs::Windows => cabi::Platform::Windows,
+        // ELF/unknown binaries use the SysV/libc (host) table.
+        TargetOs::Linux | TargetOs::Unknown => cabi::Platform::Linux,
+    };
+    cabi::AbiTarget::new(platform, bits)
+}
+
 /// Maximum checkpoint+replay rounds the overrides-aware driver attempts before
 /// giving up with [`PipelineError::NoConvergence`].
 const MAX_OVERRIDE_ROUNDS: usize = 5;

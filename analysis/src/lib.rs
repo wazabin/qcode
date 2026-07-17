@@ -19,12 +19,6 @@ pub use calls::{
 
 pub mod cfg;
 
-pub mod structure;
-pub use structure::{
-    BlockExit, EdgeCondition, Program, RecoverSwitch, RefineLoops, Structure, TokenKind, TokenLine,
-    block_exit, decompile_function, emit_c, emit_tokens, lower_expr, lower_function,
-};
-
 pub mod naming;
 
 pub mod structs;
@@ -88,13 +82,12 @@ pub mod pipeline;
 pub(crate) use pipeline::with_body_mut;
 pub use pipeline::{
     AnalysisManager, ArchConfig, CallingConvention, ContextSplit, ContextView,
-    DEFAULT_PIPELINE_TOML, DecompilePass, DynDecompilePass, DynFunctionPass, DynPass, FunctionBody,
-    FunctionPass, FunctionPassAdapter, GlobalAnalysis, GpReg, LiftOutcome, LiftSummary,
-    LocalAnalysis, LocalAnalysisManager, ModulePassOutcome, Outcome, Pass, PassRegistration,
-    Pipeline, PipelineEnv, PipelineServices, PreservedAnalyses, ProgressSink, RegisteredPass,
-    YieldSignal,
-    analyze_and_lift_with_progress, analyze_default, analyze_with_pipeline, known_pass_names,
-    make_pass,
+    DEFAULT_PIPELINE_TOML, DynFunctionPass, DynPass, FunctionBody, FunctionPass,
+    FunctionPassAdapter, GlobalAnalysis, GpReg, LiftOutcome, LiftSummary, LocalAnalysis,
+    LocalAnalysisManager, ModulePassOutcome, Outcome, Pass, PassRegistration, Pipeline,
+    PipelineEnv, PipelineServices, PreservedAnalyses, RegisteredPass,
+    analyze_and_lift_with_progress, analyze_default, analyze_with_pipeline, cabi_abi_target,
+    known_pass_names, make_pass,
 };
 
 #[cfg(not(target_arch = "wasm32"))]

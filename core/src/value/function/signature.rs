@@ -36,6 +36,50 @@ impl ParamAttrs {
     };
 }
 
+/// Where one external call argument is loaded from at the call site.
+///
+/// Planned once by `external_sigs` from the C prototype + calling convention;
+/// consumed by `argpromote_external`, which turns each slot into an SSA value at
+/// every direct caller (a register reload or an SP-relative stack load).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExternSlot {
+    /// A register argument: reload the register (`size` bytes) live at the call.
+    Reg(VarnodeId, usize),
+    /// A stack argument at `offset` bytes above the call-site stack pointer.
+    Stack { offset: i64, size: usize },
+}
+
+/// One planned positional argument of an external call.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExternArg {
+    /// Where the argument value is loaded from at the call site.
+    pub slot: ExternSlot,
+    /// The display name (the C prototype parameter name, or `return_address`
+    /// for the synthesized `stdcall`/`cdecl` slot). `None` leaves it unnamed.
+    #[serde(default)]
+    pub name: Option<Box<str>>,
+    /// Per-argument pointer attributes (chiefly `readonly` from a `const`
+    /// pointee). Defaults fully conservative for non-pointer arguments.
+    #[serde(default)]
+    pub attrs: ParamAttrs,
+    /// Whether the C parameter is a pointer (drives pointer-argument handling in
+    /// alias analysis).
+    #[serde(default)]
+    pub is_pointer: bool,
+}
+
+/// C-prototype-derived call interface for an external (imported, bodyless)
+/// function, planned once by `external_sigs` and consumed by
+/// `argpromote_external`, which needs neither the binary nor `cabi` afterwards.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExternInterface {
+    /// The ordered call slots, one per positional argument.
+    pub args: Vec<ExternArg>,
+    /// Whether the prototype is variadic (`printf`-style).
+    #[serde(default)]
+    pub variadic: bool,
+}
+
 /// Optional ABI description attached to a function.
 /// All fields are `Option` — only provided fields affect analysis.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -156,4 +200,12 @@ pub struct FunctionSignature {
     /// pointer in the caller's frame survives the call and its reload forwards.
     #[serde(default)]
     pub written_spaces: Option<Vec<crate::space::SpaceId>>,
+    /// C-prototype-derived call interface for an **external** callee: the ordered
+    /// argument slots (register or stack) and variadic flag, planned once by
+    /// `external_sigs`. `argpromote_external` reads this to rewrite call sites
+    /// without re-consulting `cabi` or the binary. `None` for non-externals and
+    /// externals with no known prototype. Serde-defaulted, so older `.harbinger`
+    /// snapshots load with it absent.
+    #[serde(default)]
+    pub extern_interface: Option<ExternInterface>,
 }
