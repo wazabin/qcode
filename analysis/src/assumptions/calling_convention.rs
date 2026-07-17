@@ -33,10 +33,12 @@ use crate::{Pass, PipelineEnv};
 
 /// Compute the [`AssumedCallEffect`] the hypothesis assigns to indirect /
 /// unresolved calls from `env`'s calling convention: `reads` = every argument
-/// register (integer, widest view, ∪ SSE), `writes` = the caller-saved set. The
-/// stack pointer is excluded from both (consistent with the rest of the register
-/// channel); the frame pointer is callee-saved and so never appears in either
-/// ABI set to begin with.
+/// register (integer, widest view, ∪ SSE), `writes` = the caller-saved set ∪
+/// the arch flag registers — an ABI-conforming callee preserves no flags, so
+/// leaving them out would forward pre-call flag values across the call, an
+/// unsoundness *beyond* the hypothesis. The stack pointer is excluded from both
+/// (consistent with the rest of the register channel); the frame pointer is
+/// callee-saved and so never appears in either ABI set to begin with.
 fn convention_effect(env: &PipelineEnv) -> AssumedCallEffect {
     let abi = &env.cfg.abi;
     let excluded = |vn: VarnodeId| Some(vn) == env.sp_varnode;
@@ -55,6 +57,7 @@ fn convention_effect(env: &PipelineEnv) -> AssumedCallEffect {
         .caller_saved
         .iter()
         .copied()
+        .chain(env.cfg.dead_flag_regs.iter().filter_map(|v| v.as_varnode()))
         .filter(|&vn| !excluded(vn))
         .collect();
     writes.sort_unstable();
@@ -123,10 +126,15 @@ mod tests {
     use crate::{ArchConfig, CallingConvention, GpReg};
     use qcode::testing::TestContext;
 
-    fn env_with_abi(tc: &TestContext, abi: CallingConvention, sp: VarnodeId) -> PipelineEnv {
+    fn env_with_abi(
+        tc: &TestContext,
+        abi: CallingConvention,
+        sp: VarnodeId,
+        dead_flag_regs: Vec<qcode::value::ValueId>,
+    ) -> PipelineEnv {
         let cfg = ArchConfig {
             stack_pointer: qcode::value::RegisterId::from(0usize),
-            dead_flag_regs: Vec::new(),
+            dead_flag_regs,
             abi,
             os: qcode::context::TargetOs::Unknown,
             bitness: 64,
@@ -179,7 +187,10 @@ mod tests {
             caller_saved: vec![r1, r2, sp],
             ..CallingConvention::default()
         };
-        let env = env_with_abi(&tc, abi, sp);
+        // A (fake) flag register: flags are not in the ABI caller-saved set but
+        // must still land in the assumed write set.
+        let flag = tc.r0_byte3;
+        let env = env_with_abi(&tc, abi, sp, vec![flag.into()]);
 
         assert!(assume_calling_convention(&mut tc.ctx, &env));
         assert_eq!(
@@ -196,8 +207,12 @@ mod tests {
         assert!(eff.reads.contains(&r0), "widest arg register present");
         assert!(!eff.reads.contains(&r0_lo32), "narrow view not used");
         assert!(!eff.reads.contains(&sp), "SP never in the read set");
-        // writes = caller-saved minus sp.
+        // writes = caller-saved ∪ flag registers, minus sp.
         assert!(eff.writes.contains(&r1) && eff.writes.contains(&r2));
+        assert!(
+            eff.writes.contains(&flag),
+            "flag registers are clobbered by any ABI-conforming callee"
+        );
         assert!(!eff.writes.contains(&sp), "SP never in the write set");
     }
 }
