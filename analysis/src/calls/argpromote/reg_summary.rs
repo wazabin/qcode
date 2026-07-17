@@ -73,37 +73,31 @@ impl EffectChannel for RegChannel {
     fn external_leaf(&self, ctx: &Context, fid: FunctionId) -> Option<RegEffects> {
         let f = FunctionBody::from_id(ctx, fid);
         let mut eff = RegEffects::default();
-        // A materialized interface predicts the caller-side rewrite
-        // `argpromote_external` will perform: a `load(register, R)` per register
-        // argument (an SP reload for stack-passed ones) and a `store(register,
-        // R)` of the ABI return — count those so a promoted caller's interface
-        // covers them before they are injected. In the default pipeline the
-        // register channel runs *before* `external_sigs`, so the interface is
-        // usually absent here; an external without one still contributes empty
-        // effects rather than ⊤, because its call instruction stays in the
-        // promoted body carrying the declared-clobber semantics mem2reg models
-        // (v1-compatible; strict tainting is the Phase 3 pipeline reorder —
-        // see `ARGPROMOTE_REGISTERS_V2.md`).
-        if let Some(iface) = f.extern_interface() {
-            for arg in &iface.args {
-                match arg.slot {
-                    ExternSlot::Reg(vn, _) => {
-                        eff.loads.insert(vn);
-                    }
-                    // A stack-passed argument is materialized at the caller as
-                    // an SP reload + a ram load; only the SP read is a register
-                    // effect. Without a known SP there is nothing to record —
-                    // the ram load is the other channel's business.
-                    ExternSlot::Stack { .. } => {
-                        eff.loads.extend(self.sp);
-                    }
-                }
-            }
-        }
-        if let Some(sig) = f.signature() {
-            // The ABI return register(s): stored back into the caller by
-            // `bind_external_return`.
-            eff.stores.extend(sig.outputs.iter().flatten().copied());
+        // A prototyped external is materialized by `external_sigs`, which stamps
+        // the single source of truth (ruling 6a): `effects = Materialized(map)`
+        // with `map.inputs` = argument registers and `map.outputs` = return
+        // register(s) ∪ ABI caller-saved clobbers. Derive the leaf effects from
+        // that mapping rather than recomputing — crucially the stores now include
+        // the clobber set, so a materialized caller's return pack covers them
+        // (bug-2-external, ARGPROMOTE_REGISTERS_V2.md Phase 3). An external
+        // without a prototype has no `Materialized` mapping and contributes empty
+        // effects (its call keeps declared-clobber semantics in the caller body),
+        // NOT ⊤.
+        let qcode::value::FunctionEffects::Materialized(map) = f.effects() else {
+            return Some(eff);
+        };
+        eff.loads.extend(map.inputs.iter().copied());
+        eff.stores.extend(map.outputs.iter().copied());
+        // A stack-passed argument is materialized at the caller as an SP reload +
+        // a ram load; only the SP read is a register effect (the ram load is the
+        // other channel's business). Register args are already in `map.inputs`.
+        if let Some(iface) = f.extern_interface()
+            && iface
+                .args
+                .iter()
+                .any(|arg| matches!(arg.slot, ExternSlot::Stack { .. }))
+        {
+            eff.loads.extend(self.sp);
         }
         Some(eff)
     }
@@ -314,6 +308,76 @@ mod tests {
             .as_ref()
             .expect("a prototype-less external is empty-effects, not ⊤");
         assert!(eff.loads.is_empty() && eff.stores.is_empty());
+    }
+
+    /// bug-2-external: a caller of a prototyped external inherits the external's
+    /// ABI clobbers into its own solved write-set (via `external_leaf`'s
+    /// `Materialized` outputs), so a materialized caller's return pack covers
+    /// them. Here `ext` is a `Materialized` external clobbering `r0`; the caller
+    /// `c` (which also stores `r1`) unions `r0` into its stores.
+    #[test]
+    fn caller_inherits_external_clobber() {
+        use qcode::value::{
+            FunctionEffects, QCodeMut, RegisterInterfaceMap, ValueId,
+            insn::{Call, Callee, Mnemonic as M},
+        };
+        let mut tc = qcode::testing::TestContext::new();
+        let (r0, r1) = (tc.r0, tc.r1);
+
+        // The prototyped external, stamped Materialized with r0 in its clobber
+        // (output) pack — what `external_sigs` would produce.
+        let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("ext".into())).id;
+        FunctionBody::from_id_mut(&mut tc.ctx, ext).set_effects(FunctionEffects::Materialized(
+            RegisterInterfaceMap {
+                inputs: vec![],
+                outputs: vec![r0],
+            },
+        ));
+
+        // Caller `c`: stores r1, then calls the external.
+        let cid = FunctionBody::make(&mut tc.ctx, "c".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x4000, cid);
+        let cont = tc.ctx.get_or_make_block(0x4100, cid);
+        {
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, cid);
+            f.set_root(entry).unwrap();
+            f.add_block(entry);
+            f.add_block(cont);
+        }
+        let reg_space = tc.reg_space;
+        let call_id;
+        {
+            let mut b = tc.ctx.builder(entry);
+            let c9 = b.shr().get_const(9, 8);
+            b.push_store(c9, ValueId::Varnode(r1), reg_space);
+            let ValueId::Instruction(id) = b.push_call(ext).id() else {
+                unreachable!()
+            };
+            call_id = id;
+        }
+        tc.ctx.replace_instruction_mnemonic(
+            call_id,
+            M::Call(Call {
+                target: Callee::Real(ext),
+                args: vec![],
+                clobbers: vec![],
+                tag: Default::default(),
+            }),
+        );
+        tc.ctx.add_cfg_edge(entry, cont);
+        {
+            let mut b = tc.ctx.builder(cont);
+            let z = b.shr().get_const(0, 8);
+            b.push_return(z);
+        }
+
+        let s = solve(&tc);
+        let eff = s.get(cid).as_ref().unwrap();
+        assert!(
+            eff.stores.contains(&r0),
+            "caller must inherit the external's r0 clobber into its write-set"
+        );
+        assert!(eff.stores.contains(&r1), "caller keeps its own r1 store");
     }
 
     /// `finalize_register_effects` canonicalizes an overlapping write group to the

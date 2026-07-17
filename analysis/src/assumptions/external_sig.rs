@@ -28,7 +28,8 @@ use cabi::{CFunctionProto, CType, Config, Selection};
 use qcode::{
     context::Context,
     value::{
-        ExternArg, ExternInterface, ExternSlot, FunctionBody, FunctionId, ParamAttrs, VarnodeId,
+        ExternArg, ExternInterface, ExternSlot, FunctionBody, FunctionEffects, FunctionId,
+        ParamAttrs, RegisterInterfaceMap, VarnodeId,
     },
 };
 
@@ -312,6 +313,25 @@ pub fn apply_external_signature(
     let plan = plan_args(proto, abi, ptr_width, stack_only);
     let variadic = proto.variadic;
 
+    // The register-channel interface mapping (argpromote v2, ruling 6a): this
+    // materialized external's inputs are its argument registers and its outputs
+    // are its return register(s) ∪ the ABI caller-saved clobber set. Growing the
+    // outputs to include the clobbers is what lets a materialized caller's return
+    // pack cover them (bug-2-external). No varargs check — a prototyped variadic
+    // external materializes like any other. This is the single source of truth:
+    // `reg_summary::external_leaf` reads it, and pass 2 never grows an external
+    // branch.
+    let mut pack_outputs: Vec<VarnodeId> = outputs.clone();
+    for &clobber in &abi.caller_saved {
+        if !pack_outputs.contains(&clobber) {
+            pack_outputs.push(clobber);
+        }
+    }
+    let reg_map = RegisterInterfaceMap {
+        inputs: inputs.clone(),
+        outputs: pack_outputs,
+    };
+
     let mut f = FunctionBody::from_id_mut(ctx, fun_id);
     // Legacy ABI register list, kept for the external/conventional path this
     // function serves (a C prototype); pure_reg callees use block params instead.
@@ -319,6 +339,7 @@ pub fn apply_external_signature(
     f.set_input_regs(inputs);
     f.set_output_regs(outputs);
     f.set_param_attrs(param_attrs);
+    f.set_effects(FunctionEffects::Materialized(reg_map));
     // The prototype fully describes this callee's register effect: its inputs are
     // the arguments the caller passes (a register reload, or — for stdcall/cdecl
     // — a stack load supplied by `argpromote_external`), and its writes are the
@@ -520,6 +541,29 @@ mod tests {
         assert!(
             FunctionBody::from_id(&tc.ctx, f).signature().is_none(),
             "no libc in the linked list → no libc signature"
+        );
+    }
+
+    /// A prototyped external is stamped `Materialized` (ruling 6a): its output
+    /// mapping is the return register(s) ∪ the ABI caller-saved clobbers, so a
+    /// materialized caller's return pack can cover them (bug-2-external).
+    #[test]
+    fn prototyped_external_stamps_materialized_with_clobbers() {
+        use qcode::value::FunctionEffects;
+        let mut tc = TestContext::new();
+        let abi = toy_abi(&tc); // caller_saved = [r3], int_ret = r3
+        let f = external(&mut tc, "memcpy");
+        apply(&mut tc.ctx, f, &abi, &host_sel());
+        let func = FunctionBody::from_id(&tc.ctx, f);
+        let FunctionEffects::Materialized(map) = func.effects() else {
+            panic!("prototyped external must be stamped Materialized");
+        };
+        // memcpy's two register args (r0, r1) are the inputs.
+        assert_eq!(map.inputs, vec![tc.r0, tc.r1]);
+        // Outputs = return (r3) ∪ caller_saved (r3), deduped to just r3.
+        assert!(
+            map.outputs.contains(&tc.r3),
+            "the clobber/return register must appear in the output pack"
         );
     }
 
