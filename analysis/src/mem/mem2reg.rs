@@ -379,6 +379,32 @@ impl CallRegEffect {
     }
 }
 
+/// The register effect for an indirect / unresolved call whose callee is unknown.
+///
+/// Normally clobbers-all ([`CallRegEffect::All`]). But when the opt-in
+/// whole-program `AssumeCallingConvention` hypothesis is active (see
+/// [`Proposition::AssumeCallingConvention`](qcode::assumption::Proposition)), the
+/// call is assumed to obey the module's calling convention, so it reads only the
+/// convention's argument registers and writes only its caller-saved set — the
+/// cached [`AssumedCallEffect`](qcode::assumption::AssumedCallEffect) the
+/// `assume_calling_convention` pass installed. A deliberate, controllable
+/// unsoundness the user opted into; it lets callee-saved registers survive across
+/// such a call.
+fn unknown_call_reg_effect<'a, 'str: 'a>(view: impl QCodeView<'a, 'str>) -> CallRegEffect {
+    let shared = view.shared();
+    if shared
+        .truth(qcode::assumption::Proposition::AssumeCallingConvention)
+        .is_some_and(|t| t.value)
+        && let Some(eff) = shared.assumed_call_convention()
+    {
+        return CallRegEffect::Exact {
+            reads: eff.reads.clone(),
+            writes: eff.writes.clone(),
+        };
+    }
+    CallRegEffect::All
+}
+
 /// Classify a call terminator's register-space effect (see [`CallRegEffect`]).
 fn classify_call_reg_effect<'a, 'str: 'a>(
     view: impl QCodeView<'a, 'str>,
@@ -389,8 +415,9 @@ fn classify_call_reg_effect<'a, 'str: 'a>(
         writes: Vec::new(),
     };
     match call {
-        // An indirect call's callee is unknown: it may read and write any register.
-        Mnemonic::CallInd(_) => CallRegEffect::All,
+        // An indirect call's callee is unknown: it may read and write any register
+        // (unless the AssumeCallingConvention hypothesis refines this).
+        Mnemonic::CallInd(_) => unknown_call_reg_effect(view),
         Mnemonic::Call(c) => {
             // A regpure call is register-transparent: inputs are explicit `args`
             // and outputs are replayed as `store`s in the continuation, so the
@@ -400,7 +427,7 @@ fn classify_call_reg_effect<'a, 'str: 'a>(
             }
             let Some(target) = c.target.real() else {
                 // Minted / unresolved target: unknown effect.
-                return CallRegEffect::All;
+                return unknown_call_reg_effect(view);
             };
             let interface = view.interface(target);
             // Implicit (`Opaque`) call to a materialized callee: it reads exactly
@@ -427,8 +454,9 @@ fn classify_call_reg_effect<'a, 'str: 'a>(
                 },
                 // Externally-resolved with no recorded set: exact empty effect.
                 None if signature.is_some_and(|s| s.externally_resolved) => none(),
-                // Unresolved / unknown effect: reads and writes everything.
-                None => CallRegEffect::All,
+                // Unresolved / unknown effect: reads and writes everything (unless
+                // the AssumeCallingConvention hypothesis refines this).
+                None => unknown_call_reg_effect(view),
             }
         }
         _ => none(),
@@ -2942,6 +2970,203 @@ mod tests {
             cont_block.instruction_ids().contains(&post_load_id),
             "the post-call read of r0 must survive as a register load, not be \
              forwarded to the pre-call value:\n{cont_block}"
+        );
+    }
+
+    // ----- AssumeCallingConvention (ARGPROMOTE_REGISTERS_V2.md follow-up) ------
+
+    use qcode::assumption::{AssumedCallEffect, Proposition};
+    use qcode::value::ModuleView;
+
+    /// Install the opt-in AssumeCallingConvention hypothesis with the given
+    /// read/write register sets, exactly as the `assume_calling_convention` pass
+    /// would.
+    fn install_cc(
+        ctx: &mut Context,
+        reads: Vec<qcode::value::VarnodeId>,
+        writes: Vec<qcode::value::VarnodeId>,
+    ) {
+        ctx.set_assumed_call_convention(Some(AssumedCallEffect { reads, writes }));
+        ctx.assume_true(Proposition::AssumeCallingConvention);
+    }
+
+    /// A `CallInd` mnemonic to classify. Built by pushing an indirect call into a
+    /// throwaway block.
+    fn call_ind_mnemonic(tc: &mut qcode::testing::TestContext) -> Mnemonic {
+        let f = FunctionBody::make(&mut tc.ctx, "ci".into()).unwrap().id;
+        let blk = tc.ctx.get_or_make_block(0x9000, f);
+        FunctionBody::from_id_mut(&mut tc.ctx, f)
+            .set_root(blk)
+            .unwrap();
+        let call_vid = {
+            let mut b = tc.ctx.builder_at(0x9000);
+            let ptr = b.shr().get_const(0x1234, 8);
+            b.push_call_ind(ptr).id()
+        };
+        let ValueId::Instruction(call_id) = call_vid else {
+            unreachable!()
+        };
+        tc.ctx.get_insn(call_id).mnemonic().clone()
+    }
+
+    /// With the hypothesis OFF, an indirect call classifies as clobbers-all —
+    /// today's behavior, byte-identical.
+    #[test]
+    fn indirect_call_is_all_without_assumption() {
+        let mut tc = qcode::testing::TestContext::new();
+        let call = call_ind_mnemonic(&mut tc);
+        assert!(
+            matches!(
+                classify_call_reg_effect(ModuleView::new(&tc.ctx), &call),
+                CallRegEffect::All
+            ),
+            "without the hypothesis an indirect call must clobber everything"
+        );
+    }
+
+    /// With the hypothesis ON, an indirect call reads exactly the assumed argument
+    /// registers and writes exactly the assumed caller-saved set; SP (in neither
+    /// installed set) never appears.
+    #[test]
+    fn indirect_call_uses_assumed_effect() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (arg, saved, sp) = (tc.r1, tc.r0, tc.r3);
+        let call = call_ind_mnemonic(&mut tc);
+        install_cc(&mut tc.ctx, vec![arg], vec![saved]);
+
+        match classify_call_reg_effect(ModuleView::new(&tc.ctx), &call) {
+            CallRegEffect::Exact { reads, writes } => {
+                assert_eq!(reads, vec![arg], "reads = assumed argument registers");
+                assert_eq!(writes, vec![saved], "writes = assumed caller-saved set");
+                assert!(
+                    !reads.contains(&sp) && !writes.contains(&sp),
+                    "SP never assumed"
+                );
+            }
+            CallRegEffect::All => panic!("hypothesis active but still clobbers-all"),
+        }
+    }
+
+    /// Same refinement applies to an unresolved *direct* call (a real target with
+    /// no recorded signature / clobber set).
+    #[test]
+    fn unresolved_direct_call_uses_assumed_effect() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (arg, saved) = (tc.r1, tc.r0);
+        // A bodyless-but-real callee with no signature -> the unresolved arm.
+        let callee = FunctionBody::make(&mut tc.ctx, "opaque".into()).unwrap().id;
+        let caller = FunctionBody::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let blk = tc.ctx.get_or_make_block(0xA000, caller);
+        FunctionBody::from_id_mut(&mut tc.ctx, caller)
+            .set_root(blk)
+            .unwrap();
+        let call_vid = {
+            let mut b = tc.ctx.builder_at(0xA000);
+            b.push_call(callee).id()
+        };
+        let ValueId::Instruction(call_id) = call_vid else {
+            unreachable!()
+        };
+        let call = tc.ctx.get_insn(call_id).mnemonic().clone();
+
+        assert!(
+            matches!(
+                classify_call_reg_effect(ModuleView::new(&tc.ctx), &call),
+                CallRegEffect::All
+            ),
+            "unresolved direct call is clobbers-all without the hypothesis"
+        );
+        install_cc(&mut tc.ctx, vec![arg], vec![saved]);
+        assert!(
+            matches!(
+                classify_call_reg_effect(ModuleView::new(&tc.ctx), &call),
+                CallRegEffect::Exact { reads, writes } if reads == vec![arg] && writes == vec![saved]
+            ),
+            "unresolved direct call refined by the hypothesis"
+        );
+    }
+
+    /// End-to-end mem2reg: across an indirect call a callee-saved register (not in
+    /// the assumed write set) stored before and read after IS forwarded when the
+    /// hypothesis is ON, while a caller-saved register (in the write set) is still
+    /// clobbered. With the hypothesis OFF both survive (clobbers-all).
+    fn build_indirect_forwarding_case(
+        tc: &mut qcode::testing::TestContext,
+    ) -> (FunctionId, BlockId, InstructionId, InstructionId) {
+        use qcode::value::QCodeMut;
+        let (saved, volatile, r_use, reg) = (tc.r2, tc.r0, tc.r1, tc.reg_space);
+        let caller = FunctionBody::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000, caller);
+        let cont = tc.ctx.get_or_make_block(0x1100, caller);
+        FunctionBody::from_id_mut(&mut tc.ctx, caller)
+            .set_root(entry)
+            .unwrap();
+        FunctionBody::from_id_mut(&mut tc.ctx, caller).add_block(cont);
+        let (saved_post, volatile_post);
+        {
+            let mut b = tc.ctx.builder_at(0x1000);
+            let s = b.shr().get_const(0x11, 8);
+            b.push_store(s, ValueId::Varnode(saved), reg);
+            let v = b.shr().get_const(0x22, 8);
+            b.push_store(v, ValueId::Varnode(volatile), reg);
+            let ptr = b.shr().get_const(0x1234, 8);
+            b.push_call_ind(ptr);
+            b.switch_to_block(cont);
+            let sv = b.push_load::<false>(ValueId::Varnode(saved), 8, reg).id();
+            let vv = b
+                .push_load::<false>(ValueId::Varnode(volatile), 8, reg)
+                .id();
+            // Consume both so they are not trivially dead.
+            b.push_store(sv, ValueId::Varnode(r_use), reg);
+            b.push_store(vv, ValueId::Varnode(r_use), reg);
+            let ret = b.shr().get_const(0u64, 8);
+            b.push_return(ret);
+            let (ValueId::Instruction(s), ValueId::Instruction(v)) = (sv, vv) else {
+                unreachable!()
+            };
+            (saved_post, volatile_post) = (s, v);
+        }
+        tc.ctx.add_cfg_edge(entry, cont);
+        (caller, cont, saved_post, volatile_post)
+    }
+
+    #[test]
+    fn indirect_call_off_clobbers_all_promoted_regs() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (caller, cont, saved_post, volatile_post) = build_indirect_forwarding_case(&mut tc);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, caller);
+        mem2reg(&mut tc.ctx, caller, &aliases);
+        let cont_block = BasicBlock::from_id(&tc.ctx, cont);
+        let ids = cont_block.instruction_ids();
+        assert!(
+            ids.contains(&saved_post) && ids.contains(&volatile_post),
+            "with the hypothesis OFF an indirect call clobbers every promoted \
+             register, so neither post-call load is forwarded:\n{cont_block}"
+        );
+    }
+
+    #[test]
+    fn indirect_call_on_forwards_callee_saved_only() {
+        let mut tc = qcode::testing::TestContext::new();
+        // Assume the convention: volatile (r0) is caller-saved (clobbered);
+        // saved (r2) is not, so it survives the call.
+        let (saved, volatile) = (tc.r2, tc.r0);
+        let (caller, cont, saved_post, volatile_post) = build_indirect_forwarding_case(&mut tc);
+        install_cc(&mut tc.ctx, vec![], vec![volatile]);
+        let _ = saved;
+        let aliases = AliasResult::simple_for_function(&tc.ctx, caller);
+        mem2reg(&mut tc.ctx, caller, &aliases);
+        let cont_block = BasicBlock::from_id(&tc.ctx, cont);
+        let ids = cont_block.instruction_ids();
+        assert!(
+            !ids.contains(&saved_post),
+            "the callee-saved register is not clobbered, so its post-call load is \
+             forwarded across the indirect call:\n{cont_block}"
+        );
+        assert!(
+            ids.contains(&volatile_post),
+            "the caller-saved register is still clobbered, so its post-call load \
+             survives:\n{cont_block}"
         );
     }
 
