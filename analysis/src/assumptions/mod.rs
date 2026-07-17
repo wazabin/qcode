@@ -1,9 +1,11 @@
 mod arg_frame;
+mod calling_convention;
 mod external_sig;
 mod mem_protections;
 mod no_return;
 
 pub use arg_frame::{assume_args_disjoint_caller_frame, verify_args_disjoint_caller_frame};
+pub use calling_convention::assume_calling_convention;
 pub use external_sig::{apply_all_external_signatures, apply_external_signature};
 pub use mem_protections::{MemoryProtections, establish_memory_protections};
 pub use no_return::{

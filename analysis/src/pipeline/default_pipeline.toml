@@ -114,6 +114,20 @@ passes = ["argpromote_materialize", "argpromote_regpure_calls"]
 # loads stay in the body as an implicit RAM effect (design ruling 7a — the
 # standalone `argpromote_external` pass and `external.rs` were removed).
 
+# Immediately after the register effect-calculation stage: install the opt-in,
+# whole-program `AssumeCallingConvention` hypothesis (off by default). When the
+# user opts in (`ArchConfig::assume_calling_convention`), it caches an
+# educated-guess register effect (reads = argument registers, writes =
+# caller-saved) that the downstream `mem2reg` / alias classifier consults for
+# indirect (`CallInd`) and unresolved-direct calls, so callee-saved registers
+# survive across them instead of clobbers-all. A deliberate, controllable
+# unsoundness — a *downstream refinement only*: it does NOT feed back into the
+# register effect-summary fixpoint. Inert (records nothing) unless opted in.
+[[stage]]
+name = "assume-calling-convention"
+scope = "module"
+passes = ["assume_calling_convention"]
+
 # Promote to a fixpoint on the real incoming stack pointer `@SP` (no `@stack_base`
 # round-trip). Each round: `canonicalize_sp_slots` unifies the per-site `@SP ± N`
 # address instructions into one representative per offset; `mem2reg` forwards the

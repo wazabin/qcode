@@ -191,6 +191,16 @@ pub struct Shared<'str> {
     /// keeps honoring the request.
     #[serde(default)]
     pub(crate) ignored_functions: HashSet<u64>,
+
+    /// Register effect the opt-in `AssumeCallingConvention` hypothesis assigns to
+    /// indirect / unresolved calls (see
+    /// [`Proposition::AssumeCallingConvention`](crate::assumption::Proposition::AssumeCallingConvention)).
+    /// `None` unless the `assume_calling_convention` pass has installed it this
+    /// round — the hypothesis is off by default. Recomputed each pipeline round
+    /// from the calling convention, so it is not serialized (and a replay clone
+    /// starts empty, the pass reinstalling it).
+    #[serde(skip)]
+    pub(crate) assumed_call_convention: Option<crate::assumption::AssumedCallEffect>,
 }
 
 impl<'str> Shared<'str> {
@@ -275,6 +285,15 @@ impl<'str> Shared<'str> {
     /// maps), for `&Shared`-served pass reads.
     pub fn truth(&self, prop: Proposition) -> Option<Truth> {
         self.values.truths.get(&prop).copied()
+    }
+
+    /// The cached [`AssumedCallEffect`](crate::assumption::AssumedCallEffect) for
+    /// the opt-in `AssumeCallingConvention` hypothesis, if the
+    /// `assume_calling_convention` pass installed one this round. Shared-only
+    /// accessor so the `&Shared`-served mem2reg / alias register classifier can
+    /// consult it. `None` when the hypothesis is inactive.
+    pub fn assumed_call_convention(&self) -> Option<&crate::assumption::AssumedCallEffect> {
+        self.assumed_call_convention.as_ref()
     }
 
     /// Iterate every varnode as a [`VarnodeRef`]. Shared-only mirror of
@@ -1411,6 +1430,25 @@ impl<'str> Context<'str> {
     /// The recorded [`Truth`] of `prop`, if any.
     pub fn truth(&self, prop: Proposition) -> Option<Truth> {
         self.shared.values.truths.get(&prop).copied()
+    }
+
+    /// Install (or clear) the cached effect backing the opt-in
+    /// `AssumeCallingConvention` hypothesis — see
+    /// [`Shared::assumed_call_convention`](crate::context::Shared::assumed_call_convention).
+    /// The `assume_calling_convention` pass calls this alongside recording
+    /// [`Proposition::AssumeCallingConvention`].
+    pub fn set_assumed_call_convention(
+        &mut self,
+        effect: Option<crate::assumption::AssumedCallEffect>,
+    ) {
+        self.shared.assumed_call_convention = effect;
+    }
+
+    /// The cached [`AssumedCallEffect`](crate::assumption::AssumedCallEffect), if
+    /// the hypothesis is active this round. Mirror of
+    /// [`Shared::assumed_call_convention`](crate::context::Shared::assumed_call_convention).
+    pub fn assumed_call_convention(&self) -> Option<&crate::assumption::AssumedCallEffect> {
+        self.shared.assumed_call_convention.as_ref()
     }
 
     /// The proven value of `prop`: `Some` only for *known* entries.

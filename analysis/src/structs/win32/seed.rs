@@ -254,6 +254,7 @@ mod tests {
                 abi: CallingConvention::default(),
                 os,
                 bitness,
+                assume_calling_convention: false,
             },
             VarnodeId::from(0usize),
         )

@@ -135,6 +135,14 @@ pub struct ArchConfig {
     pub os: TargetOs,
     /// Pointer width in bits (32 or 64), derived from the default space.
     pub bitness: u8,
+    /// Opt-in: install the whole-program `AssumeCallingConvention` hypothesis
+    /// (see [`Proposition::AssumeCallingConvention`](qcode::assumption::Proposition::AssumeCallingConvention)),
+    /// giving indirect / unresolved calls an educated-guess register effect
+    /// (reads = argument registers, writes = caller-saved) instead of
+    /// clobbers-all. A deliberate, controllable unsoundness — **off by default**;
+    /// the user turns it on. Consulted only by the `assume_calling_convention`
+    /// install pass.
+    pub assume_calling_convention: bool,
 }
 
 /// A general-purpose argument/return register exposed at several byte widths

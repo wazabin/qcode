@@ -106,6 +106,7 @@ impl PipelineEnv {
             abi: CallingConvention::default(),
             os: ctx.target_os(),
             bitness,
+            assume_calling_convention: false,
         };
         Self::from_parts(cfg, None)
     }

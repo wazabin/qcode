@@ -20,6 +20,7 @@ pub(crate) fn dummy_env() -> PipelineEnv {
             abi: CallingConvention::default(),
             os: qcode::context::TargetOs::Unknown,
             bitness: 64,
+            assume_calling_convention: false,
         },
         VarnodeId::from(0usize),
     )

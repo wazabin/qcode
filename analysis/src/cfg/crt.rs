@@ -152,6 +152,7 @@ mod tests {
             },
             os: qcode::context::TargetOs::Unknown,
             bitness: 64,
+            assume_calling_convention: false,
         };
         let env = PipelineEnv::from_parts(cfg, tc.r3);
 
@@ -196,6 +197,7 @@ mod tests {
             },
             os: qcode::context::TargetOs::Unknown,
             bitness: 64,
+            assume_calling_convention: false,
         };
         let env = PipelineEnv::from_parts(cfg, tc.r3);
 

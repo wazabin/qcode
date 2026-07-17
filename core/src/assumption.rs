@@ -26,7 +26,27 @@
 //! fresh clone, and the round replays. Knowledge only ever grows, so replay
 //! terminates.
 
+use crate::value::VarnodeId;
 use crate::value::function::FunctionId;
+
+/// The register-space effect the opt-in [`Proposition::AssumeCallingConvention`]
+/// hypothesis assigns to an indirect / unresolved call, precomputed once from the
+/// module's calling convention by the `assume_calling_convention` pass and cached
+/// on the [`Shared`](crate::context::Shared) context so the mem2reg / alias
+/// register classifier can consult it without an ABI in hand.
+///
+/// `reads` is *all* convention argument registers (integer + SSE) — reads-all-args
+/// keeps pre-call argument setup live, since a variadic-arity callee may consume
+/// any of them — and `writes` is the convention's caller-saved (volatile) set. The
+/// stack- and frame-pointer varnodes are excluded from both, consistent with the
+/// rest of the register channel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AssumedCallEffect {
+    /// Argument registers the call is assumed to read.
+    pub reads: Vec<VarnodeId>,
+    /// Caller-saved registers the call is assumed to write (clobber).
+    pub writes: Vec<VarnodeId>,
+}
 
 /// A positive statement about the program whose truth a pass may assume or
 /// prove. Used as the key of the truth map on the
@@ -102,6 +122,22 @@ pub enum Proposition {
     /// retyping that base as `PtrTo<TEB>`; it is an analyst aid and override
     /// hook, with no verifier in v1 (nothing currently proves the negation).
     WindowsTeb { bitness: u8 },
+    /// Whole-program, opt-in hypothesis: every indirect (`CallInd`) and
+    /// unresolved-direct call obeys the module's calling convention, so instead
+    /// of clobbering the entire register file it reads only the convention's
+    /// argument registers and writes only its caller-saved set (the effect is
+    /// cached as an [`AssumedCallEffect`] on the context). A deliberate,
+    /// *controllable unsoundness* — an indirect callee may violate the ABI — off
+    /// by default, recorded by the `assume_calling_convention` pass when the user
+    /// opts in, and surfaced in the assumptions panel.
+    ///
+    /// It is a **downstream refinement only**: it sharpens how the mem2reg / alias
+    /// register classifier (`classify_call_reg_effect`) clobbers around such
+    /// calls, and does *not* feed back into the argpromote effect-summary fixpoint
+    /// (which keeps modelling `CallInd` as `Some(empty)`). No verifier in v1 (it is
+    /// never proven, so it is not discharged and the checkpoint+replay net never
+    /// acts on it).
+    AssumeCallingConvention,
 }
 
 /// How certain we are about a proposition's recorded value.
