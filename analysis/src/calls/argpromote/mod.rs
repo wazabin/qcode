@@ -64,7 +64,6 @@ use rustc_hash::FxHashSet;
 
 use super::{append_entry_param, interface::append_entry_param_at_sites};
 
-mod external;
 mod globals;
 mod mark_pure;
 mod ram;

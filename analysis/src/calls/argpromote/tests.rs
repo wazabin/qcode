@@ -3429,7 +3429,7 @@ mod tests {
         // Pass 3: make the one site regpure.
         let graph = crate::CallGraph::analyze(&tc.ctx);
         let site = crate::calls::direct_call_sites(&tc.ctx, &graph, f)[0];
-        rewrite_call_regpure(&mut tc.ctx, site, f);
+        rewrite_call_regpure(&mut tc.ctx, site, f, None);
 
         let aliases = crate::AliasResult::simple_for_function(&tc.ctx, g);
         crate::mem2reg(&mut tc.ctx, g, &aliases);
@@ -3584,7 +3584,7 @@ mod tests {
         // Pass 3: flip the one call site to an explicit regpure call.
         let graph = crate::CallGraph::analyze(&tc.ctx);
         let site = crate::calls::direct_call_sites(&tc.ctx, &graph, f)[0];
-        rewrite_call_regpure(&mut tc.ctx, site, f);
+        rewrite_call_regpure(&mut tc.ctx, site, f, None);
         let regpure = run(&tc.ctx);
 
         assert_eq!(pristine, 11, "r0 = 10 + 1");
@@ -3596,5 +3596,168 @@ mod tests {
             regpure, pristine,
             "regpure call preserves caller-visible r0"
         );
+    }
+
+    // ---- Phase 3: externals as regpure calls (design ruling 7a) --------------
+
+    use qcode::value::{
+        ExternArg, ExternInterface, ExternSlot, FunctionEffects, RegisterInterfaceMap,
+    };
+
+    /// Build caller `g` = `<g_entry> -> <g_call> call <ext> -> <g_cont>` and
+    /// redirect the call at `g_call` to the external `ext`. Returns `(g, g_call,
+    /// g_cont)`.
+    fn caller_of(
+        tc: &mut qcode::testing::TestContext,
+        ext: FunctionId,
+    ) -> (FunctionId, BlockId, BlockId) {
+        qcode!(
+            tc.ctx,
+            "
+            fn dummy:
+                <dummy_entry>
+                    return at i64 0;
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <dummy>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (dummy, dummy_entry, g_entry);
+        set_call(tc, g_call, ext, vec![]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        (g, g_call, g_cont)
+    }
+
+    fn call_at(tc: &qcode::testing::TestContext, block: BlockId) -> Call {
+        BasicBlock::from_id(&tc.ctx, block)
+            .iter()
+            .find_map(|i| match i.mnemonic() {
+                Mnemonic::Call(c) => Some(c.clone()),
+                _ => None,
+            })
+            .expect("a call in the block")
+    }
+
+    /// A prototyped external call site becomes `RegPure` with its args aligned
+    /// 1:1 to `map.inputs` and its result typed as the return ∪ clobbers pack;
+    /// the clobber register is replayed as a **poison** store.
+    #[test]
+    fn prototyped_external_call_becomes_regpure_with_poison_clobbers() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (r0, r1, r2) = (tc.r0, tc.r1, tc.r2);
+        // The external: one register arg (r1), return r0, clobber r2.
+        let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("ext".into())).id;
+        {
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, ext);
+            f.set_output_regs(vec![r0]);
+            f.set_effects(FunctionEffects::Materialized(RegisterInterfaceMap {
+                inputs: vec![r1],
+                outputs: vec![r0, r2],
+            }));
+        }
+        let (_g, g_call, g_cont) = caller_of(&mut tc, ext);
+
+        let graph = crate::CallGraph::analyze(&tc.ctx);
+        let targets = tc.ctx.function_ids();
+        regpure_all_sites(&mut tc.ctx, &graph, &targets, None);
+
+        let call_id = BasicBlock::from_id(&tc.ctx, g_call)
+            .iter()
+            .find(|i| matches!(i.mnemonic(), Mnemonic::Call(_)))
+            .unwrap()
+            .id;
+        let call = call_at(&tc, g_call);
+        assert!(
+            call.tag.is_regpure(),
+            "external call must be tagged RegPure"
+        );
+        assert_eq!(call.args.len(), 1, "one regpure arg, aligned to map.inputs");
+        // Result type is the 2-field return∪clobbers pack.
+        let ret_ty = tc.ctx.type_of(ValueId::Instruction(call_id));
+        assert_eq!(
+            tc.ctx
+                .shared
+                .types
+                .aggregate_fields(ret_ty)
+                .map(|f| f.len()),
+            Some(2),
+            "result is the return ∪ clobbers pack"
+        );
+        // The clobber register r2 is stored as poison in the continuation; the
+        // return register r0 is stored from an extract.
+        let stored_poison = BasicBlock::from_id(&tc.ctx, g_cont).iter().any(|i| {
+            matches!(i.mnemonic(),
+                Mnemonic::Store(s)
+                    if s.ptr.qualify(i.id.func) == ValueId::Varnode(r2)
+                        && matches!(s.src, LocalValueId::Poison(_)))
+        });
+        assert!(stored_poison, "clobber register must be replayed as poison");
+    }
+
+    /// A prototype-less external (no `Materialized` mapping) stays `Opaque`.
+    #[test]
+    fn prototypeless_external_call_stays_opaque() {
+        let mut tc = qcode::testing::TestContext::new();
+        let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("noproto".into())).id;
+        let (_g, g_call, _g_cont) = caller_of(&mut tc, ext);
+
+        let graph = crate::CallGraph::analyze(&tc.ctx);
+        let targets = tc.ctx.function_ids();
+        regpure_all_sites(&mut tc.ctx, &graph, &targets, None);
+
+        assert!(
+            !call_at(&tc, g_call).tag.is_regpure(),
+            "a prototype-less external stays Opaque"
+        );
+    }
+
+    /// A stack-arg external goes `RegPure`, and its SP-relative stack RAM load is
+    /// still present in the caller body (implicit RAM — the call is RegPure, not
+    /// Pure).
+    #[test]
+    fn stack_arg_external_regpure_keeps_stack_load() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (r0, r3) = (tc.r0, tc.r3); // use r3 as the stack pointer
+        let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("ext".into())).id;
+        {
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, ext);
+            f.set_output_regs(vec![r0]);
+            f.set_effects(FunctionEffects::Materialized(RegisterInterfaceMap {
+                inputs: vec![],
+                outputs: vec![r0],
+            }));
+            // One stack-passed argument at [SP+0].
+            f.set_extern_interface(ExternInterface {
+                args: vec![ExternArg {
+                    slot: ExternSlot::Stack { offset: 0, size: 8 },
+                    name: None,
+                    attrs: Default::default(),
+                    is_pointer: false,
+                }],
+                variadic: false,
+            });
+        }
+        let (g, g_call, _g_cont) = caller_of(&mut tc, ext);
+
+        let graph = crate::CallGraph::analyze(&tc.ctx);
+        let targets = tc.ctx.function_ids();
+        regpure_all_sites(&mut tc.ctx, &graph, &targets, Some(r3));
+
+        assert!(
+            call_at(&tc, g_call).tag.is_regpure(),
+            "stack-arg external RegPure"
+        );
+        // A load reading SP (r3) is present in the caller body (the stack-arg
+        // RAM load, left implicit).
+        let sp_load = BasicBlock::from_id(&tc.ctx, g_call).iter().any(|i| {
+            matches!(i.mnemonic(),
+                Mnemonic::Load(l) if l.ptr == LocalValueId::Varnode(r3))
+        });
+        let _ = g;
+        assert!(sp_load, "the SP-relative stack RAM load stays in the body");
     }
 }

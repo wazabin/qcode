@@ -107,16 +107,12 @@ scope = "module"
 # order-independent replacement for the v1 fused rewriter (ARGPROMOTE_REGISTERS_V2.md).
 passes = ["argpromote_materialize", "argpromote_regpure_calls"]
 
-# Resolve arguments at calls to bodyless external (imported) functions from their
-# cabi C prototype, while register/stack accesses are still explicit (like
-# argpromote-registers above): insert each argument's load just before the call —
-# a register reload (System V) or an SP-relative stack load (32-bit stdcall, and
-# System V overflow) — so the following promote/gvn forwards it onto the value the
-# caller set up (a register write, or the push that wrote the stack slot).
-[[stage]]
-name = "external-args"
-scope = "module"
-passes = ["argpromote_external"]
+# Calls to bodyless external (imported) functions are now rewritten by pass 3
+# (`argpromote_regpure_calls`, above): a prototyped external is stamped
+# `Materialized` by `external_sigs`, so its register args become explicit regpure
+# operands, its clobbers become poison pack slots, and its SP-relative stack-arg
+# loads stay in the body as an implicit RAM effect (design ruling 7a — the
+# standalone `argpromote_external` pass and `external.rs` were removed).
 
 # Promote to a fixpoint on the real incoming stack pointer `@SP` (no `@stack_base`
 # round-trip). Each round: `canonicalize_sp_slots` unifies the per-site `@SP ± N`

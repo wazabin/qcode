@@ -483,11 +483,24 @@ pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff:
 /// to the callee's return pack, replay each output as `store(register, R)` in the
 /// continuation, and tag the call [`CallTag::RegPure`]. Order-independent: a ⊤
 /// caller can host regpure calls (its loads/stores just stay in its body).
-pub(crate) fn rewrite_call_regpure(ctx: &mut Context, call_id: InstructionId, callee: FunctionId) {
+pub(crate) fn rewrite_call_regpure(
+    ctx: &mut Context,
+    call_id: InstructionId,
+    callee: FunctionId,
+    sp: Option<VarnodeId>,
+) {
     let map = match FunctionBody::from_id(ctx, callee).effects() {
         FunctionEffects::Materialized(m) => m.clone(),
         _ => return,
     };
+    // An external (bodyless) materialized callee has no return-pack type built by
+    // `append_outputs` (pass 2 skips externals) — pass 3 owns its whole rewrite,
+    // including the poison clobber pack and the SP-relative stack-arg loads that
+    // `bind_external_args` used to emit (design ruling 7a).
+    if FunctionBody::from_id(ctx, callee).is_external() {
+        rewrite_external_call_regpure(ctx, call_id, callee, &map, sp);
+        return;
+    }
     let Some(call_block) = ctx.get_insn(call_id).parent().map(|b| b.id) else {
         return;
     };
@@ -553,12 +566,151 @@ pub(crate) fn rewrite_call_regpure(ctx: &mut Context, call_id: InstructionId, ca
     }
 }
 
+/// Pass 3 for a **bodyless external** materialized callee (design ruling 7a).
+/// Mirrors [`rewrite_call_regpure`] for bodied callees but owns the whole
+/// rewrite: register args become explicit regpure operands; the result is typed
+/// as the pack aggregate (return ∪ clobbers); the continuation replays the return
+/// register(s) from the pack and stores **poison** into every clobber register
+/// (a static alias/dataflow device — externals have no runtime semantics here).
+/// It also keeps emitting the SP-relative stack-arg loads `bind_external_args`
+/// did (implicit RAM, left in the body — the call is `RegPure`, not `Pure`).
+fn rewrite_external_call_regpure(
+    ctx: &mut Context,
+    call_id: InstructionId,
+    callee: FunctionId,
+    map: &RegisterInterfaceMap,
+    sp: Option<VarnodeId>,
+) {
+    let Some(call_block) = ctx.get_insn(call_id).parent().map(|b| b.id) else {
+        return;
+    };
+    // The return register(s) recorded on the signature — every other output is a
+    // clobber (poison at the call site).
+    let return_regs: Vec<VarnodeId> = FunctionBody::from_id(ctx, callee)
+        .signature()
+        .map(|s| s.outputs.iter().flatten().copied().collect())
+        .unwrap_or_default();
+
+    // --- register inputs: load each into a regpure argument before the call -----
+    let input_meta: Vec<(VarnodeId, usize, SpaceId)> = map
+        .inputs
+        .iter()
+        .map(|&r| {
+            let v = Varnode::from_id(&*ctx, r);
+            (r, v.size(), v.space().id)
+        })
+        .collect();
+    // Stack-arg slots (implicit RAM): emitted as standalone SP-relative loads
+    // before the call, exactly as `bind_external_args` did. Left in the body
+    // (not threaded as regpure operands, which must match `map.inputs` 1:1).
+    let stack_slots: Vec<(i64, usize)> = FunctionBody::from_id(ctx, callee)
+        .extern_interface()
+        .map(|iface| {
+            iface
+                .args
+                .iter()
+                .filter_map(|arg| match arg.slot {
+                    qcode::value::ExternSlot::Stack { offset, size } => Some((offset, size)),
+                    qcode::value::ExternSlot::Reg(..) => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let ptr_width = sp.map(|s| Varnode::from_id(&*ctx, s).size()).unwrap_or(8);
+    let default_space = ctx.shared.default_space;
+
+    let args: Vec<LocalValueId> = {
+        let mut b = (ctx).builder(call_block);
+        b.set_insert_point_before(call_id);
+        // Register args become the regpure operands (in `map.inputs` order).
+        let args: Vec<LocalValueId> = input_meta
+            .iter()
+            .map(|&(r, size, space)| {
+                b.push_load::<false>(ValueId::Varnode(r), size, space)
+                    .id()
+                    .localize(call_id.func)
+            })
+            .collect();
+        // Stack args: emit the SP-relative RAM loads (implicit RAM effect); not
+        // added to `Call.args`.
+        if let Some(sp) = sp {
+            let sp_space = Varnode::from_id(b.shr(), sp).space().id;
+            for &(offset, size) in &stack_slots {
+                let sp_val = b
+                    .push_load::<false>(ValueId::Varnode(sp), ptr_width, sp_space)
+                    .id();
+                let addr = if offset == 0 {
+                    sp_val
+                } else {
+                    let off = b.shr().get_const(offset as u64, ptr_width);
+                    b.push_add(sp_val, off).id()
+                };
+                b.push_load::<false>(addr, size, default_space);
+            }
+        }
+        args
+    };
+
+    // The pack aggregate type: one field per output register (return ∪ clobbers).
+    let field_types: Vec<TypeId> = map
+        .outputs
+        .iter()
+        .map(|&r| {
+            let size = Varnode::from_id(&*ctx, r).size();
+            ctx.shared.types.get_or_make_int(size)
+        })
+        .collect();
+    let ret_ty = ctx.shared.types.get_or_make_aggregate(field_types);
+
+    ctx.replace_instruction_mnemonic(
+        call_id,
+        Mnemonic::Call(qcode::value::insn::Call {
+            target: qcode::value::insn::Callee::Real(callee),
+            args,
+            clobbers: vec![],
+            tag: qcode::value::insn::CallTag::RegPure,
+        }),
+    );
+    Instruction::from_id_mut(ctx, call_id).set_type(ret_ty);
+
+    // --- outputs: replay the return register(s) from the pack; poison clobbers ---
+    let Some(cont) = BasicBlock::from_id(ctx, call_block)
+        .successors()
+        .next()
+        .map(|(_, b)| b)
+    else {
+        return;
+    };
+    let output_meta: Vec<(VarnodeId, usize, SpaceId, bool)> = map
+        .outputs
+        .iter()
+        .map(|&r| {
+            let v = Varnode::from_id(&*ctx, r);
+            (r, v.size(), v.space().id, return_regs.contains(&r))
+        })
+        .collect();
+    let result = ValueId::Instruction(call_id);
+    let mut b = (ctx).builder(cont);
+    b.set_insert_point_to_start();
+    for (i, &(r, size, space, is_return)) in output_meta.iter().enumerate() {
+        let value = if is_return {
+            ValueId::Instruction(b.push_extract(result, i).id)
+        } else {
+            // A clobber slot: the register holds an undefined value after the call.
+            let ty = b.shr().types.get_or_make_int(size);
+            ValueId::Poison(b.shr().values.push_poison(ty))
+        };
+        b.push_store(value, ValueId::Varnode(r), space);
+    }
+}
+
 /// Rewrite every direct `Opaque` call to a materialized function into a regpure
 /// call (pass 3). Returns the set of *caller* functions changed.
 pub(crate) fn regpure_all_sites(
     ctx: &mut Context,
     graph: &CallGraph,
     targets: &[FunctionId],
+    sp: Option<VarnodeId>,
 ) -> FxHashSet<FunctionId> {
     let mut changed = FxHashSet::default();
     for callee in targets.iter().copied() {
@@ -574,7 +726,7 @@ pub(crate) fn regpure_all_sites(
                 Mnemonic::Call(c) if c.tag == qcode::value::insn::CallTag::Opaque
             );
             if opaque {
-                rewrite_call_regpure(ctx, site, callee);
+                rewrite_call_regpure(ctx, site, callee, sp);
                 changed.insert(site.func);
             }
         }
@@ -591,7 +743,7 @@ pub fn argpromote_registers(ctx: &mut Context) -> bool {
     let sp = guess_sp(ctx);
     let mut changed = materialize_functions(ctx, &graph, &targets, sp);
     let graph = CallGraph::analyze(ctx);
-    changed.extend(regpure_all_sites(ctx, &graph, &targets));
+    changed.extend(regpure_all_sites(ctx, &graph, &targets, sp));
     !changed.is_empty()
 }
 
@@ -620,8 +772,9 @@ type InputMeta = (VarnodeId, usize, SpaceId, Option<String>, Option<TypeId>);
 pub(crate) fn rewrite_registers(ctx: &mut Context, fid: FunctionId, eff: &RegisterEffects) {
     materialize_interface(ctx, fid, eff);
     let graph = CallGraph::analyze(ctx);
+    let sp = guess_sp(ctx);
     for site in crate::calls::direct_call_sites(ctx, &graph, fid) {
-        rewrite_call_regpure(ctx, site, fid);
+        rewrite_call_regpure(ctx, site, fid, sp);
     }
 }
 
@@ -688,30 +841,36 @@ impl Pass for ArgPromoteRegpureCalls {
     fn run(
         &self,
         ctx: &mut Context,
-        _env: &PipelineEnv,
+        env: &PipelineEnv,
         targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         let graph = CallGraph::analyze(ctx);
-        Ok(
-            crate::ModulePassOutcome::functions(regpure_all_sites(ctx, &graph, targets))
-                .preserving_global::<CallGraphAnalysis>()
-                .preserving_global::<crate::AddressAnalysis>(),
-        )
+        Ok(crate::ModulePassOutcome::functions(regpure_all_sites(
+            ctx,
+            &graph,
+            targets,
+            env.sp_varnode,
+        ))
+        .preserving_global::<CallGraphAnalysis>()
+        .preserving_global::<crate::AddressAnalysis>())
     }
 
     fn run_with_analyses(
         &self,
         ctx: &mut Context,
-        _env: &PipelineEnv,
+        env: &PipelineEnv,
         targets: &[FunctionId],
         analyses: &mut AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
         let graph = analyses.global::<CallGraphAnalysis>(ctx);
-        Ok(
-            crate::ModulePassOutcome::functions(regpure_all_sites(ctx, graph, targets))
-                .preserving_global::<CallGraphAnalysis>()
-                .preserving_global::<crate::AddressAnalysis>(),
-        )
+        Ok(crate::ModulePassOutcome::functions(regpure_all_sites(
+            ctx,
+            graph,
+            targets,
+            env.sp_varnode,
+        ))
+        .preserving_global::<CallGraphAnalysis>()
+        .preserving_global::<crate::AddressAnalysis>())
     }
 }
 

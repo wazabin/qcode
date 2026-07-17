@@ -75,16 +75,27 @@ pub fn verify_pure_reg_call_args(ctx: &Context<'_>) -> Vec<PureRegCallArgsViolat
 
     for callee in ctx.function_ids() {
         let function = FunctionBody::from_id(ctx, callee);
-        if !function.is_pure_reg() {
-            continue;
-        }
-        let Some(root) = function.root().map(|b| b.id) else {
+        // A regpure site's args must match the callee's *full* register-passed
+        // interface 1:1. For a bodied callee that interface is its root params —
+        // which the later RAM channel (`argpromote`) grows with by-value memory
+        // params, so it is a superset of the register-only `Materialized` map and
+        // is the authoritative arity. For a bodyless external (no root) the
+        // `Materialized` map is the interface. Both are read from the function's
+        // published state, not from the call's origin.
+        let qcode::value::FunctionEffects::Materialized(map) = function.effects() else {
             continue;
         };
-        let param_sizes: Vec<usize> = BasicBlock::from_id(ctx, root)
-            .params()
-            .map(|param| param.size())
-            .collect();
+        let param_sizes: Vec<usize> = match function.root().map(|b| b.id) {
+            Some(root) => BasicBlock::from_id(ctx, root)
+                .params()
+                .map(|param| param.size())
+                .collect(),
+            None => map
+                .inputs
+                .iter()
+                .map(|&vn| qcode::value::Varnode::from_id(ctx, vn).size())
+                .collect(),
+        };
 
         for call_id in direct_call_sites(ctx, &graph, callee) {
             let insn = ctx.get_insn(call_id);
@@ -158,15 +169,33 @@ mod tests {
     };
 
     fn pure_callee_with_params(tc: &mut TestContext, sizes: &[usize]) -> FunctionId {
+        use qcode::value::{FunctionEffects, RegisterInterfaceMap};
         let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(0x1000, callee) };
         FunctionBody::from_id_mut(&mut tc.ctx, callee)
             .set_root(root)
             .unwrap();
-        for &size in sizes {
-            BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(size);
-        }
-        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_pure_reg(true);
+        // Map each requested size to a register varnode of that width, and record
+        // it as both a root param and a `Materialized` input (the verifier keys on
+        // the mapping, and in the real pipeline the two agree by construction).
+        let inputs: Vec<_> = sizes
+            .iter()
+            .map(|&size| {
+                BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(size);
+                match size {
+                    8 => tc.r0,
+                    4 => tc.r0_lo32,
+                    2 => tc.r0_lo16,
+                    _ => tc.r0_byte0,
+                }
+            })
+            .collect();
+        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_effects(FunctionEffects::Materialized(
+            RegisterInterfaceMap {
+                inputs,
+                outputs: vec![],
+            },
+        ));
         callee
     }
 
