@@ -264,6 +264,60 @@ mod tests {
         let _ = call_id;
     }
 
+    /// Regression: the RAM channel's caller rewrite (appending snapshot-load
+    /// args) must preserve the site's `CallTag`. Stomping a `RegPure` site back
+    /// to `Opaque` desyncs the binding convention from the already-explicit
+    /// register traffic: verifier rule 2 trips, and mem2reg / the emulator fall
+    /// back to implicit register-file binding at a site whose args are explicit.
+    #[test]
+    fn ram_promote_preserves_regpure_call_tag() {
+        use qcode::value::insn::CallTag;
+        let mut tc = qcode::testing::TestContext::new();
+        let _input = stack_input(&mut tc, 4, 8);
+
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    %v = load(ram:4, @stack_10000004);
+                    store(ram:4, @stack_10000004 <- %v);
+                    return at i64 0;
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (g, f_entry, g_entry, g_cont);
+
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
+            qcode::value::FunctionEffects::Materialized(
+                qcode::value::RegisterInterfaceMap::default(),
+            ),
+        );
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        let call_id = set_call(&mut tc, g_call, f, vec![ptr]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        let Mnemonic::Call(mut c) = tc.ctx.get_insn(call_id).mnemonic().clone() else {
+            unreachable!()
+        };
+        c.tag = CallTag::RegPure;
+        tc.ctx
+            .replace_instruction_mnemonic(call_id, Mnemonic::Call(c));
+
+        assert!(argpromote(&mut tc.ctx), "the in/out param should promote");
+
+        assert!(
+            call_at(&tc, g_call).tag.is_regpure(),
+            "the RAM caller rewrite must preserve the site's RegPure tag"
+        );
+    }
+
     #[test]
     fn skips_non_pure_reg_function() {
         // The RAM channel keys snapshot args off the `param[i] ↔ Call.args[i]`
@@ -4030,6 +4084,29 @@ mod tests {
         assert!(
             !call_at(&tc, g_call).tag.is_regpure(),
             "a prototype-less external stays Opaque"
+        );
+    }
+
+    /// Regression: a prototype-less external is ⊤ for the register channel. Its
+    /// caller must NOT get a solved/materialized summary — that summary would
+    /// omit the external's real runtime clobbers, letting the caller's *own*
+    /// callers forward caller-saved registers across the call (bug-2-external
+    /// reintroduced one level up). Declared-clobber semantics only cover the
+    /// direct caller's body.
+    #[test]
+    fn prototypeless_external_makes_caller_top() {
+        let mut tc = qcode::testing::TestContext::new();
+        let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("noproto".into())).id;
+        let (g, _g_call, _g_cont) = caller_of(&mut tc, ext);
+
+        argpromote_registers(&mut tc.ctx);
+
+        assert!(
+            matches!(
+                FunctionBody::from_id(&tc.ctx, g).effects(),
+                FunctionEffects::Top
+            ),
+            "caller of a prototype-less external must be ⊤, not summarized"
         );
     }
 
