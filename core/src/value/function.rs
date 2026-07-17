@@ -95,8 +95,9 @@ pub enum FunctionEffects {
     Top,
     /// Solved to a finite effect set but the interface is not yet materialized
     /// (no by-value params / return pack added). Call sites still bind
-    /// implicitly.
-    Solved,
+    /// implicitly, but the solved read/write register sets are precise: a call
+    /// to this function reads at most `loads` and writes at most `stores`.
+    Solved(RegisterEffectSets),
     /// Materialized: the function carries by-value register params and a return
     /// pack, and this mapping records which register each interface slot binds.
     /// Consumed by the dual binding convention.
@@ -118,9 +119,21 @@ impl FunctionEffects {
     pub fn is_solved(&self) -> bool {
         matches!(
             self,
-            FunctionEffects::Solved | FunctionEffects::Materialized(_)
+            FunctionEffects::Solved(_) | FunctionEffects::Materialized(_)
         )
     }
+}
+
+/// The solved (transitive) register effect of a function whose interface is
+/// *not* materialized: the registers a call to it may read / write, callee
+/// effects included. Sorted, deduplicated varnode lists — the persistable form
+/// of the register channel's solved lattice value.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RegisterEffectSets {
+    /// Registers a call may read (sorted).
+    pub loads: Vec<VarnodeId>,
+    /// Registers a call may write (sorted).
+    pub stores: Vec<VarnodeId>,
 }
 
 /// The ordered, machine-readable register interface of a *materialized*
@@ -136,8 +149,15 @@ impl FunctionEffects {
 pub struct RegisterInterfaceMap {
     /// Register bound by each by-value input parameter, in parameter order.
     pub inputs: Vec<VarnodeId>,
-    /// Register written back by each return-pack slot, in pack order.
+    /// Register written back by each return-pack slot, in pack order. Ordered
+    /// returns-first: slots `..returns` carry real computed values, the rest
+    /// are clobbers (undefined — poison — at a rewritten call site).
     pub outputs: Vec<VarnodeId>,
+    /// How many leading `outputs` slots are return values (the rest are
+    /// clobbers). A bodied function replays every slot as a real store, so its
+    /// `returns == outputs.len()`; a prototyped external returns only its ABI
+    /// return register(s) and clobbers the caller-saved tail.
+    pub returns: usize,
 }
 
 /// A function *body*: arenas, roster, root, reverse use-def, local names. The

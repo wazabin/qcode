@@ -86,6 +86,7 @@ mod tests {
         let iface = RegisterInterfaceMap {
             inputs: vec![r1],
             outputs: vec![r0],
+            returns: 1,
         };
         FunctionBody::from_id_mut(&mut tc.ctx, f)
             .set_effects(FunctionEffects::Materialized(iface.clone()));
@@ -3428,6 +3429,7 @@ mod tests {
             qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
                 inputs: regs.to_vec(),
                 outputs: regs.to_vec(),
+                returns: regs.len(),
             }),
         );
     }
@@ -3679,6 +3681,41 @@ mod tests {
             0,
             "regpure call is register-transparent — no register store is preserved"
         );
+    }
+
+    /// A function that solves to a finite effect but is not materialized (here:
+    /// no register writes) persists its solved load/store sets on the interface
+    /// — `FunctionEffects::Solved` carries the sets, not just a marker.
+    #[test]
+    fn solved_unmaterialized_function_persists_effect_sets() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r1 = tc.r1;
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    %v = load(register:8, {r1});
+                    return at %v;
+            fn g:
+                <g_entry>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (f_entry, g_entry, g_cont);
+        set_call(&mut tc, g_entry, f, vec![]);
+        argpromote_registers(&mut tc.ctx);
+
+        let qcode::value::FunctionEffects::Solved(sets) =
+            FunctionBody::from_id(&tc.ctx, f).effects().clone()
+        else {
+            panic!("f reads r1 and writes nothing: solved but not materialized");
+        };
+        assert_eq!(sets.loads, vec![r1], "solved read set persisted");
+        assert!(sets.stores.is_empty(), "no register writes");
+        let _ = g;
     }
 
     /// The pack replay must execute exactly when the call did: when the call
@@ -3963,6 +4000,7 @@ mod tests {
             f.set_effects(FunctionEffects::Materialized(RegisterInterfaceMap {
                 inputs: vec![r1],
                 outputs: vec![r0, r2],
+                returns: 1,
             }));
         }
         let (_g, g_call, g_cont) = caller_of(&mut tc, ext);
@@ -4035,6 +4073,7 @@ mod tests {
             f.set_effects(FunctionEffects::Materialized(RegisterInterfaceMap {
                 inputs: vec![],
                 outputs: vec![r0],
+                returns: 1,
             }));
             // One stack-passed argument at [SP+0].
             f.set_extern_interface(ExternInterface {

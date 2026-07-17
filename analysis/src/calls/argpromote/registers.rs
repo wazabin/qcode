@@ -334,8 +334,9 @@ pub(crate) fn materialize_functions(
         };
         let Ok(reg_eff) = finalize_register_effects(ctx, eff) else {
             // Solved, but no register writes / non-canonical overlap: nothing to
-            // materialize. Still a *solved* summary (the RAM gate keys on that).
-            FunctionBody::from_id_mut(ctx, fid).set_effects(FunctionEffects::Solved);
+            // materialize. Still a *solved* summary (the RAM gate keys on that);
+            // persist the solved sets so call classifiers stay precise.
+            FunctionBody::from_id_mut(ctx, fid).set_effects(FunctionEffects::Solved(eff.to_sets()));
             continue;
         };
         // The implicit (zero-arg) convention binds params from the register file
@@ -345,7 +346,7 @@ pub(crate) fn materialize_functions(
         // unbound params. Leave those solved-but-unmaterialized. (Address-taken
         // functions reached by `CallInd` *are* seeded, so they materialize.)
         if has_non_call_site(ctx, graph, fid) {
-            FunctionBody::from_id_mut(ctx, fid).set_effects(FunctionEffects::Solved);
+            FunctionBody::from_id_mut(ctx, fid).set_effects(FunctionEffects::Solved(eff.to_sets()));
             continue;
         }
         materialize_interface(ctx, fid, &reg_eff);
@@ -421,6 +422,8 @@ pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff:
         RegisterInterfaceMap {
             inputs: reg_eff.inputs.clone(),
             outputs: reg_eff.outputs.clone(),
+            // Every pack slot of a bodied function is a real computed value.
+            returns: reg_eff.outputs.len(),
         },
     ));
 }
@@ -561,12 +564,6 @@ fn rewrite_external_call_regpure(
     let Some(call_block) = ctx.get_insn(call_id).parent().map(|b| b.id) else {
         return;
     };
-    // The return register(s) recorded on the signature — every other output is a
-    // clobber (poison at the call site).
-    let return_regs: Vec<VarnodeId> = FunctionBody::from_id(ctx, callee)
-        .signature()
-        .map(|s| s.outputs.iter().flatten().copied().collect())
-        .unwrap_or_default();
 
     // --- register inputs: load each into a regpure argument before the call -----
     let input_meta: Vec<(VarnodeId, usize, SpaceId)> = map
@@ -654,12 +651,15 @@ fn rewrite_external_call_regpure(
     let Some(cont) = replay_block(ctx, call_block) else {
         return;
     };
+    // Returns-first pack ordering: slots `..map.returns` are real return
+    // values, the tail is the clobber set (poison at the call site).
     let output_meta: Vec<(VarnodeId, usize, SpaceId, bool)> = map
         .outputs
         .iter()
-        .map(|&r| {
+        .enumerate()
+        .map(|(i, &r)| {
             let v = Varnode::from_id(&*ctx, r);
-            (r, v.size(), v.space().id, return_regs.contains(&r))
+            (r, v.size(), v.space().id, i < map.returns)
         })
         .collect();
     let result = ValueId::Instruction(call_id);

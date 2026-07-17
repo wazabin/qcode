@@ -34,6 +34,19 @@ pub(crate) struct RegEffects {
     pub(crate) stores: FxHashSet<VarnodeId>,
 }
 
+impl RegEffects {
+    /// The persistable form of this solved lattice value: sorted, deduplicated
+    /// load/store lists, stored on the interface as
+    /// [`FunctionEffects::Solved`](qcode::value::FunctionEffects).
+    pub(crate) fn to_sets(&self) -> qcode::value::RegisterEffectSets {
+        let mut loads: Vec<VarnodeId> = self.loads.iter().copied().collect();
+        let mut stores: Vec<VarnodeId> = self.stores.iter().copied().collect();
+        loads.sort_unstable();
+        stores.sort_unstable();
+        qcode::value::RegisterEffectSets { loads, stores }
+    }
+}
+
 /// The register [`EffectChannel`]. `sp` is the stack-pointer varnode, needed
 /// only to model the SP reload `argpromote_external` emits for stack-passed
 /// external arguments; without it such externals are ⊤.
@@ -331,6 +344,7 @@ mod tests {
             RegisterInterfaceMap {
                 inputs: vec![],
                 outputs: vec![r0],
+                returns: 0,
             },
         ));
 

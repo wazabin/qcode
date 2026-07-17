@@ -194,6 +194,7 @@ mod tests {
             RegisterInterfaceMap {
                 inputs,
                 outputs: vec![],
+                returns: 0,
             },
         ));
         callee
