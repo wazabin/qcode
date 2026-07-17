@@ -569,11 +569,17 @@ fn scan_block_aliased<'a, 'str: 'a>(
             // own output, not the caller's pre-call value). Registers it does
             // not clobber (callee-saved) it neither reads nor writes, so their
             // existing kills pass through untouched.
+            // Guarded on the regpure tag: only a rewritten site has explicit
+            // argument loads — an Opaque site to the same callee still reads its
+            // argument registers implicitly from the register file, and on
+            // x86-64 those are caller-saved (∈ outputs), so killing them would
+            // delete the pre-call argument-setup stores.
             Mnemonic::Call(call)
-                if call.target.real().is_some_and(|target| {
-                    let interface = host.interface(target);
-                    interface.is_external && interface.effects.materialized().is_some()
-                }) =>
+                if call.tag.is_regpure()
+                    && call.target.real().is_some_and(|target| {
+                        let interface = host.interface(target);
+                        interface.is_external && interface.effects.materialized().is_some()
+                    }) =>
             {
                 let target = call.target.real().unwrap();
                 for iv in call_clobber_intervals(host, target) {
@@ -1457,8 +1463,9 @@ mod tests {
     }
 
     /// Build a one-block caller that stores `0x1` into register `r`, then calls
-    /// `callee`. Returns `(ctx, block, store_id)`.
+    /// `callee` with the given site tag. Returns `(ctx, block, store_id)`.
     fn store_then_call_fn(
+        tag: qcode::value::insn::CallTag,
         configure_callee: impl FnOnce(&mut Context, FunctionId),
     ) -> (Context<'static>, BlockId, InstructionId) {
         let mut tc = TestContext::new();
@@ -1473,29 +1480,40 @@ mod tests {
             .set_root(entry)
             .unwrap();
         let store_id;
+        let call_id;
         {
             let mut b = tc.ctx.builder_at(0x1000);
             let v = b.shr().get_const(0x1u64, 8);
             store_id = b.push_store(v, ValueId::Varnode(r), reg).id;
-            b.push_call(callee);
+            call_id = b.push_call(callee).id;
         }
+        let Mnemonic::Call(mut call) = tc.ctx.get_insn(call_id).mnemonic().clone() else {
+            unreachable!()
+        };
+        call.tag = tag;
+        tc.ctx
+            .replace_instruction_mnemonic(call_id, Mnemonic::Call(call));
         (tc.ctx, entry, store_id)
     }
 
+    fn materialize_r0_out(ctx: &mut Context, callee: FunctionId) {
+        let r0 = ctx.get_named("r0").unwrap().as_varnode().unwrap();
+        FunctionBody::from_id_mut(ctx, callee).set_effects(
+            qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
+                inputs: vec![],
+                outputs: vec![r0],
+                returns: 0,
+            }),
+        );
+    }
+
     /// A store to a register a materialized external callee clobbers, never read
-    /// before the call, is dead: the call overwrites it and reads no registers.
+    /// before the *regpure-rewritten* call, is dead: the call overwrites it and
+    /// its argument reads are explicit SSA args, not register-file reads.
     #[test]
-    fn store_before_resolved_call_to_clobbered_reg_is_dead() {
-        let (ctx, block, store_id) = store_then_call_fn(|ctx, callee| {
-            let r0 = ctx.get_named("r0").unwrap().as_varnode().unwrap();
-            FunctionBody::from_id_mut(ctx, callee).set_effects(
-                qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
-                    inputs: vec![],
-                    outputs: vec![r0],
-                    returns: 0,
-                }),
-            );
-        });
+    fn store_before_resolved_regpure_call_to_clobbered_reg_is_dead() {
+        let (ctx, block, store_id) =
+            store_then_call_fn(qcode::value::insn::CallTag::RegPure, materialize_r0_out);
         let aliases = AliasResult::simple_for_function(
             &ctx,
             BasicBlock::from_id(&ctx, block).function().unwrap().id,
@@ -1503,7 +1521,26 @@ mod tests {
         let dead = dead_load_insns(ModuleView::new(&ctx), block, Some(&aliases), &[]);
         assert!(
             dead.contains(&store_id),
-            "store to a clobbered register before a resolved call is dead"
+            "store to a clobbered register before a regpure call is dead"
+        );
+    }
+
+    /// Regression: the same store at a still-*Opaque* site must be KEPT. An
+    /// Opaque call reads its argument registers implicitly from the register
+    /// file, and on x86-64 those are caller-saved (∈ the output pack) — the
+    /// materialized-external kill arm must not fire without the regpure tag.
+    #[test]
+    fn store_before_opaque_call_to_materialized_external_is_kept() {
+        let (ctx, block, store_id) =
+            store_then_call_fn(qcode::value::insn::CallTag::Opaque, materialize_r0_out);
+        let aliases = AliasResult::simple_for_function(
+            &ctx,
+            BasicBlock::from_id(&ctx, block).function().unwrap().id,
+        );
+        let dead = dead_load_insns(ModuleView::new(&ctx), block, Some(&aliases), &[]);
+        assert!(
+            !dead.contains(&store_id),
+            "store before an Opaque site must be kept (implicit argument reads)"
         );
     }
 
@@ -1511,9 +1548,10 @@ mod tests {
     /// may read the register (e.g. an argument), so the store is live.
     #[test]
     fn store_before_unresolved_call_is_kept() {
-        let (ctx, block, store_id) = store_then_call_fn(|_ctx, _callee| {
-            // Left with the default `Unsolved` effects (not materialized).
-        });
+        let (ctx, block, store_id) =
+            store_then_call_fn(qcode::value::insn::CallTag::Opaque, |_ctx, _callee| {
+                // Left with the default `Unsolved` effects (not materialized).
+            });
         let aliases = AliasResult::simple_for_function(
             &ctx,
             BasicBlock::from_id(&ctx, block).function().unwrap().id,
