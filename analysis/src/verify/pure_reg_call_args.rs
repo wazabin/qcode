@@ -315,7 +315,8 @@ mod tests {
     fn ignores_non_pure_reg_callees() {
         let mut tc = TestContext::new();
         let callee = pure_callee_with_params(&mut tc, &[8, 4]);
-        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_reg_materialized(false);
+        FunctionBody::from_id_mut(&mut tc.ctx, callee)
+            .set_effects(qcode::value::FunctionEffects::Unsolved);
         let a0 = tc.ctx.get_const(0x11, 8).id();
         caller_calling(&mut tc, callee, vec![a0]);
 

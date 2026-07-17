@@ -486,7 +486,11 @@ mod tests {
             agg = Some(tc.ctx.type_of(ValueId::Instruction(tuple_id)));
         }
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_input_regs(inputs);
-        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_reg_materialized(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
+            qcode::value::FunctionEffects::Materialized(
+                qcode::value::RegisterInterfaceMap::default(),
+            ),
+        );
         agg.unwrap()
     }
 

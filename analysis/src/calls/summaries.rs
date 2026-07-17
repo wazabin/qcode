@@ -464,9 +464,6 @@ pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_
     f.set_input_regs(inputs);
     f.set_clobbered_regs(clobbered);
     f.set_reads_unbounded_stack(reads_unbounded);
-    if let Some(delta) = stack_delta {
-        f.set_stack_delta(delta);
-    }
 }
 
 /// Runs [`set_function_summaries`] over every non-external function.
@@ -693,7 +690,6 @@ mod tests {
         let fun = build_callee_with_delta(&mut tc, sp, 0x1000, 8);
         set_function_summaries(&mut tc.ctx, fun, sp);
         let f = FunctionBody::from_id(&tc.ctx, fun);
-        assert_eq!(f.stack_delta(), Some(8));
         assert!(
             !f.clobbered_regs().unwrap().contains(&sp),
             "the stack pointer must be excluded from clobbers when its delta is known"
@@ -719,7 +715,6 @@ mod tests {
         assert_eq!(compute_stack_delta(&tc.ctx, fun, sp), None);
         set_function_summaries(&mut tc.ctx, fun, sp);
         let f = FunctionBody::from_id(&tc.ctx, fun);
-        assert!(f.stack_delta().is_none());
         assert!(f.clobbered_regs().unwrap().contains(&sp));
     }
 

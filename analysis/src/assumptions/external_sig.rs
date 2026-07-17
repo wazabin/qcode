@@ -221,7 +221,6 @@ fn plan_args(
             },
             name: Some("return_address".into()),
             attrs: ParamAttrs::default(),
-            is_pointer: false,
         });
     }
 
@@ -237,7 +236,6 @@ fn plan_args(
     for param in &proto.params {
         let class = classify(&param.ty)?;
         let name = param.name.clone();
-        let is_pointer = matches!(param.ty, CType::Pointer { .. });
         let attrs = ParamAttrs {
             readonly: is_const_pointer(&param.ty),
             nocapture: false,
@@ -262,12 +260,7 @@ fn plan_args(
                 },
             }
         };
-        args.push(ExternArg {
-            slot,
-            name,
-            attrs,
-            is_pointer,
-        });
+        args.push(ExternArg { slot, name, attrs });
     }
     Some(args)
 }
@@ -311,7 +304,6 @@ pub fn apply_external_signature(
         return;
     };
     let plan = plan_args(proto, abi, ptr_width, stack_only);
-    let variadic = proto.variadic;
 
     // The register-channel interface mapping (argpromote v2, ruling 6a): this
     // materialized external's inputs are its argument registers and its outputs
@@ -355,7 +347,7 @@ pub fn apply_external_signature(
     // arguments are all placeable (a by-value aggregate leaves it absent).
     if let Some(args) = plan {
         f.set_input_arg_names(args.iter().map(|a| a.name.clone()).collect());
-        f.set_extern_interface(ExternInterface { args, variadic });
+        f.set_extern_interface(ExternInterface { args });
     }
 }
 

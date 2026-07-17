@@ -280,72 +280,20 @@ fn has_non_call_site(ctx: &Context, graph: &CallGraph, fid: FunctionId) -> bool 
     })
 }
 
-/// Scan `fid` for register reads (inputs) and writes (outputs). Returns `Err`
-/// when there is no register write (nothing to functionalize) or an output
-/// overlap group has no single covering register.
-///
-/// Superseded in the pass itself by the solved summaries (`reg_summary.rs` +
-/// `finalize_register_effects`, which compose callee effects); kept as the
-/// body-local scan the single-function unit tests drive `rewrite_registers`
-/// with.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Body-local register interface of a single function: the [`RegChannel`] scan
+/// finalized without callee composition. Test-only driver for the
+/// single-function `rewrite_registers` unit tests; the pass itself uses the
+/// solved summaries.
+#[cfg(test)]
 pub(crate) fn scan_register_effects(
     ctx: &Context,
     fid: FunctionId,
 ) -> Result<RegisterEffects, RegPurityReason> {
-    let mut loaded: Vec<VarnodeId> = Vec::new();
-    let mut stored: Vec<VarnodeId> = Vec::new();
-    for block in FunctionBody::from_id(ctx, fid).blocks() {
-        for insn in block.iter() {
-            match insn.mnemonic() {
-                Mnemonic::Load(l) => {
-                    if let qcode::value::LocalValueId::Varnode(vn) = l.ptr
-                        && is_register(ctx, vn)
-                        && !loaded.contains(&vn)
-                    {
-                        loaded.push(vn);
-                    }
-                }
-                Mnemonic::Store(s) => {
-                    if let qcode::value::LocalValueId::Varnode(vn) = s.ptr
-                        && is_register(ctx, vn)
-                        && !stored.contains(&vn)
-                    {
-                        stored.push(vn);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    if stored.is_empty() {
-        return Err(RegPurityReason::NoRegisterWrites);
-    }
-    let mut outputs =
-        canonicalize_to_coarsest(ctx, &stored).ok_or(RegPurityReason::NonCanonicalRegisters)?;
-
-    // The rewritten body reads not only the originally-loaded registers but also
-    // every output (the return write-set loads each one). An output written on
-    // only some paths is therefore read-before-write at a return on a no-write
-    // path; seeding it from an input param makes that read the caller's incoming
-    // value (replayed back as a no-op), keeping callee params and caller args in
-    // sync. Always-written outputs just yield a dead seed that DCE prunes.
-    let mut read_set = loaded;
-    for &o in &outputs {
-        if !read_set.contains(&o) {
-            read_set.push(o);
-        }
-    }
-    let mut inputs =
-        canonicalize_to_coarsest(ctx, &read_set).ok_or(RegPurityReason::NonCanonicalRegisters)?;
-
-    let key = |ctx: &Context, vn: &VarnodeId| {
-        let v = Varnode::from_id(ctx, *vn);
-        (v.address(), v.size())
-    };
-    inputs.sort_by_key(|vn| key(ctx, vn));
-    outputs.sort_by_key(|vn| key(ctx, vn));
-    Ok(RegisterEffects { inputs, outputs })
+    use crate::calls::argpromote::summary::EffectChannel;
+    let eff = RegChannel { sp: None }
+        .scan(ctx, fid)
+        .ok_or(RegPurityReason::NoBody)?;
+    finalize_register_effects(ctx, &eff)
 }
 
 /// Pass 2 (materialize) — `ARGPROMOTE_REGISTERS_V2.md`: solve the register

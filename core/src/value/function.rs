@@ -1376,7 +1376,9 @@ impl<'str> FunctionBody<'str> {
         let mut function = Self::make(ctx, name)?;
         function.interface_mut().kind = FunctionKind::Lambda;
         function.set_is_pure(true);
-        function.set_reg_materialized(true);
+        function.set_effects(FunctionEffects::Materialized(
+            RegisterInterfaceMap::default(),
+        ));
         Ok(function)
     }
 
@@ -1681,24 +1683,6 @@ where
             return Some(format!("stack_{:x}", vn.address() as u64));
         }
         None
-    }
-
-    /// Registers saved and restored unchanged (preserved across calls), as
-    /// inferred by analysis.
-    pub fn saved_regs(&'s self) -> Option<&'ctx [VarnodeId]> {
-        self.interface()
-            .signature
-            .as_ref()
-            .and_then(|s| s.saved.as_deref())
-    }
-
-    /// The net change this function applies to the stack pointer between entry
-    /// and return, as inferred by analysis. See [`FunctionSignature::stack_delta`].
-    pub fn stack_delta(&'s self) -> Option<i64> {
-        self.interface()
-            .signature
-            .as_ref()
-            .and_then(|s| s.stack_delta)
     }
 
     /// Whether this function performs an unresolved/dynamic stack read (or
@@ -2112,7 +2096,9 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         self.interface_mut().kind = kind;
         if kind == FunctionKind::Lambda {
             self.set_is_pure(true);
-            self.set_reg_materialized(true);
+            self.set_effects(FunctionEffects::Materialized(
+                RegisterInterfaceMap::default(),
+            ));
         }
     }
 
@@ -2197,26 +2183,6 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
             .input_names = Some(names);
     }
 
-    /// Marks this function as fully functionalized over its register channel.
-    /// Legacy shim over the unified [`FunctionEffects`] state. `true` marks the
-    /// function's register interface materialized (preserving an existing
-    /// interface mapping); `false` resets it to unsolved. Prefer
-    /// [`set_effects`](Self::set_effects) with a real mapping; this is kept for
-    /// the tests and callers that only assert "register channel functionalized".
-    pub fn set_reg_materialized(&mut self, value: bool) {
-        if value {
-            if !matches!(
-                self.interface_mut().effects,
-                FunctionEffects::Materialized(_)
-            ) {
-                self.interface_mut().effects =
-                    FunctionEffects::Materialized(RegisterInterfaceMap::default());
-            }
-        } else {
-            self.interface_mut().effects = FunctionEffects::Unsolved;
-        }
-    }
-
     /// Records this function's solved effect summary / materialized interface
     /// mapping. See [`FunctionInterface::effects`].
     pub fn set_effects(&mut self, effects: FunctionEffects) {
@@ -2233,25 +2199,12 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
             .is_pure = value;
     }
 
-    /// Records the analysis-inferred saved (preserved) register set on this function.
-    pub fn set_saved_regs(&mut self, regs: Vec<VarnodeId>) {
-        self.interface_mut().signature.get_or_insert_default().saved = Some(regs);
-    }
-
     /// Records the output (return-value) register set on this function.
     pub fn set_output_regs(&mut self, regs: Vec<VarnodeId>) {
         self.interface_mut()
             .signature
             .get_or_insert_default()
             .outputs = Some(regs);
-    }
-
-    /// Records the analysis-inferred net stack-pointer delta on this function.
-    pub fn set_stack_delta(&mut self, delta: i64) {
-        self.interface_mut()
-            .signature
-            .get_or_insert_default()
-            .stack_delta = Some(delta);
     }
 
     /// Records whether this function performs an unresolved/dynamic stack read.
