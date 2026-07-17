@@ -1106,8 +1106,8 @@ fn apply_partial(
         let Some(call_block) = ctx.get_insn(call_id).parent().map(|b| b.id) else {
             continue;
         };
-        let (target, args, clobbers) = match ctx.get_insn(call_id).mnemonic().clone() {
-            Mnemonic::Call(c) => (c.target, c.args, c.clobbers),
+        let (target, args, clobbers, tag) = match ctx.get_insn(call_id).mnemonic().clone() {
+            Mnemonic::Call(c) => (c.target, c.args, c.clobbers, c.tag),
             _ => continue,
         };
         let callee_name = FunctionBody::from_id(ctx, fid).name().to_string();
@@ -1148,7 +1148,7 @@ fn apply_partial(
                 target,
                 args: new_args,
                 clobbers,
-                tag: Default::default(),
+                tag,
             }),
         );
     }
