@@ -504,13 +504,18 @@ impl MemForward {
                 ),
                 Some(target) => {
                     let callee = host.interface(target);
-                    let regs = match callee
-                        .signature
-                        .as_ref()
-                        .and_then(|s| s.clobbered.as_deref())
-                    {
-                        Some(regs) => CallClobbers::Regs(regs.to_vec()),
-                        None => CallClobbers::AllRegisters,
+                    // The register write set from the callee's effect summary:
+                    // a materialized map's outputs, or a solved summary's store
+                    // set; ⊤ / unsolved clobbers every register.
+                    let regs = match &callee.effects {
+                        qcode::value::FunctionEffects::Materialized(map) => {
+                            CallClobbers::Regs(map.outputs.clone())
+                        }
+                        qcode::value::FunctionEffects::Solved(sets) => {
+                            CallClobbers::Regs(sets.stores.clone())
+                        }
+                        qcode::value::FunctionEffects::Top
+                        | qcode::value::FunctionEffects::Unsolved => CallClobbers::AllRegisters,
                     };
                     // An argument flowing into a `readonly` callee param is never
                     // written through, so it does not clobber the RAM cells it may
@@ -1259,8 +1264,14 @@ mod tests {
         let mut tc = TestContext::new();
         let ram = tc.ctx.shared.default_space;
         let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
-        // A resolved callee with an empty clobber set, so registers are irrelevant.
-        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_clobbered_regs(vec![]);
+        // A resolved callee with an empty register write set, so registers are
+        // irrelevant to this RAM-forwarding test.
+        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_effects(
+            qcode::value::FunctionEffects::Solved(qcode::value::RegisterEffectSets {
+                loads: vec![],
+                stores: vec![],
+            }),
+        );
         if readonly {
             FunctionBody::from_id_mut(&mut tc.ctx, callee).set_param_attrs(vec![ParamAttrs {
                 readonly: true,

@@ -50,8 +50,8 @@ fn local_effect(
     for block in FunctionBody::from_id(ctx, function_id).blocks() {
         for insn in block.iter() {
             match insn.mnemonic() {
-                // Register writes are tracked separately (`clobbered_regs`); only
-                // memory spaces matter to the forwarding prune.
+                // Register writes are tracked separately (via `FunctionEffects`);
+                // only memory spaces matter to the forwarding prune.
                 Mnemonic::Store(s) => {
                     // Function-local temporary writes never escape into the
                     // published interprocedural shared-space summary.

@@ -209,7 +209,7 @@ mod tests {
     fn promotes_single_inout_stack_param() {
         let mut tc = qcode::testing::TestContext::new();
         // Bind the stack slot at offset 4 as f's single input.
-        let input = stack_input(&mut tc, 4, 8);
+        let _input = stack_input(&mut tc, 4, 8);
 
         qcode!(
             tc.ctx,
@@ -231,7 +231,6 @@ mod tests {
         );
         let _ = g;
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -275,7 +274,7 @@ mod tests {
         // `promotes_single_inout_stack_param`, but WITHOUT `set_effects(Materialized(..))`
         // — so nothing is promoted.
         let mut tc = qcode::testing::TestContext::new();
-        let input = stack_input(&mut tc, 4, 8);
+        let _input = stack_input(&mut tc, 4, 8);
         qcode!(
             tc.ctx,
             "
@@ -295,7 +294,6 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         // NB: deliberately NOT materialized via `set_effects(Materialized(..))`.
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
@@ -503,7 +501,7 @@ mod tests {
         // replace the clean read with its entry snapshot across the unmodelled
         // aliasing store. The RAM channel must leave the function unchanged.
         let mut tc = qcode::testing::TestContext::new();
-        let input = stack_input(&mut tc, 4, 8);
+        let _input = stack_input(&mut tc, 4, 8);
         qcode!(
             tc.ctx,
             "
@@ -525,7 +523,6 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -563,7 +560,7 @@ mod tests {
     #[test]
     fn global_store_is_functionalized_and_replayed_at_caller() {
         let mut tc = qcode::testing::TestContext::new();
-        let input = stack_input(&mut tc, 4, 8);
+        let _input = stack_input(&mut tc, 4, 8);
         qcode!(
             tc.ctx,
             "
@@ -583,7 +580,6 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -646,7 +642,7 @@ mod tests {
         // gvn is what later keeps an *overlapping* read behind a load; here the
         // store is disjoint, so the read is free to forward.)
         let mut tc = qcode::testing::TestContext::new();
-        let input = stack_input(&mut tc, 4, 8);
+        let _input = stack_input(&mut tc, 4, 8);
         qcode!(
             tc.ctx,
             "
@@ -668,7 +664,6 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -695,7 +690,7 @@ mod tests {
         // `analyze_param` now skips. (Without this, the seed `store(snap, ptr)`
         // would look like a fresh write through the pointer and re-promote.)
         let mut tc = qcode::testing::TestContext::new();
-        let input = stack_input(&mut tc, 4, 8);
+        let _input = stack_input(&mut tc, 4, 8);
         qcode!(
             tc.ctx,
             "
@@ -715,7 +710,6 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -740,7 +734,7 @@ mod tests {
         // the width: a 4-byte scalar keyed by offset 0x30. Read-only, so no return
         // rewrite — only a by-value arg appears.
         let mut tc = qcode::testing::TestContext::new();
-        let input = stack_input(&mut tc, 4, 8);
+        let _input = stack_input(&mut tc, 4, 8);
 
         qcode!(
             tc.ctx,
@@ -762,7 +756,6 @@ mod tests {
         );
         let _ = g;
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -812,7 +805,7 @@ mod tests {
     fn promotes_read_through_gep_field() {
         use qcode::types::AggregateField;
         let mut tc = qcode::testing::TestContext::new();
-        let input = stack_input(&mut tc, 4, 8);
+        let _input = stack_input(&mut tc, 4, 8);
 
         qcode!(
             tc.ctx,
@@ -867,7 +860,6 @@ mod tests {
         tc.ctx
             .replace_all_uses_with(ValueId::Instruction(add_id), gep);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -963,8 +955,8 @@ mod tests {
     #[test]
     fn example_two_inout_pointers() {
         let mut tc = qcode::testing::TestContext::new();
-        let in_p = stack_input(&mut tc, 4, 8); // stack_10000004
-        let in_q = stack_input(&mut tc, 16, 8); // stack_10000010
+        let _in_p = stack_input(&mut tc, 4, 8); // stack_10000004
+        let _in_q = stack_input(&mut tc, 16, 8); // stack_10000010
         qcode!(
             tc.ctx,
             "
@@ -986,7 +978,6 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![in_p, in_q]);
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -1013,7 +1004,7 @@ mod tests {
     #[test]
     fn example_single_inout_void() {
         let mut tc = qcode::testing::TestContext::new();
-        let in_p = stack_input(&mut tc, 4, 8);
+        let _in_p = stack_input(&mut tc, 4, 8);
         qcode!(
             tc.ctx,
             "
@@ -1034,7 +1025,6 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
         FunctionBody::from_id_mut(&mut tc.ctx, foo).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -1054,7 +1044,7 @@ mod tests {
     #[test]
     fn example_inout_returns_pointer() {
         let mut tc = qcode::testing::TestContext::new();
-        let in_p = stack_input(&mut tc, 4, 8);
+        let _in_p = stack_input(&mut tc, 4, 8);
         let r0 = tc.r0; // the real-return register
         qcode!(
             tc.ctx,
@@ -1077,7 +1067,6 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
         FunctionBody::from_id_mut(&mut tc.ctx, foo).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -1107,7 +1096,7 @@ mod tests {
     #[test]
     fn example_write_through_advanced_pointer() {
         let mut tc = qcode::testing::TestContext::new();
-        let in_p = stack_input(&mut tc, 4, 8);
+        let _in_p = stack_input(&mut tc, 4, 8);
         qcode!(
             tc.ctx,
             "
@@ -1127,7 +1116,6 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
         FunctionBody::from_id_mut(&mut tc.ctx, foo).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -1147,7 +1135,7 @@ mod tests {
     #[test]
     fn example_read_only_pointer_has_no_writeset() {
         let mut tc = qcode::testing::TestContext::new();
-        let in_p = stack_input(&mut tc, 4, 8);
+        let _in_p = stack_input(&mut tc, 4, 8);
         let r0 = tc.r0;
         qcode!(
             tc.ctx,
@@ -1169,7 +1157,6 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
         FunctionBody::from_id_mut(&mut tc.ctx, foo).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -1193,7 +1180,7 @@ mod tests {
     #[test]
     fn example_pointer_arithmetic_only_has_no_writeset() {
         let mut tc = qcode::testing::TestContext::new();
-        let in_p = stack_input(&mut tc, 4, 8);
+        let _in_p = stack_input(&mut tc, 4, 8);
         let r0 = tc.r0;
         qcode!(
             tc.ctx,
@@ -1214,7 +1201,6 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
         FunctionBody::from_id_mut(&mut tc.ctx, foo).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -1240,7 +1226,7 @@ mod tests {
     #[test]
     fn example_multi_value_return() {
         let mut tc = qcode::testing::TestContext::new();
-        let in_p = stack_input(&mut tc, 4, 8);
+        let _in_p = stack_input(&mut tc, 4, 8);
         let r0 = tc.r0;
         qcode!(
             tc.ctx,
@@ -1263,7 +1249,6 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f1).set_input_regs(vec![in_p]);
         FunctionBody::from_id_mut(&mut tc.ctx, f1).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -1277,10 +1262,10 @@ mod tests {
         assert_eq!(replayed_stores(&tc, call_id), 1);
     }
 
-    /// A `pure_reg` callee — empty `input_regs`, a register write-set already on
-    /// the return — whose **stack-argument** pointer is written. The memory pass
-    /// must (1) still *trigger* (the pointer is found via the root params, not the
-    /// empty `input_regs`) and (2) *append* its `(addr, value)` pair after the
+    /// A `pure_reg` callee — a register write-set already on the return — whose
+    /// **stack-argument** pointer is written. The memory pass must (1) still
+    /// *trigger* (the pointer is found via the root params) and (2) *append* its
+    /// `(addr, value)` pair after the
     /// register field instead of clobbering it. Regression for the two fixes.
     #[test]
     fn pure_reg_stack_pointer_appends_to_register_writeset() {
@@ -1544,7 +1529,7 @@ mod tests {
     #[test]
     fn example_multi_return_write_dominates() {
         let mut tc = qcode::testing::TestContext::new();
-        let in_p = stack_input(&mut tc, 4, 8);
+        let _in_p = stack_input(&mut tc, 4, 8);
         let r0 = tc.r0;
         qcode!(
             tc.ctx,
@@ -1571,7 +1556,6 @@ mod tests {
             "
         );
         let _ = (g, r0, ret_a, ret_b);
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
         FunctionBody::from_id_mut(&mut tc.ctx, foo).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -1609,7 +1593,7 @@ mod tests {
     #[test]
     fn multi_return_path_dependent_write_is_seeded() {
         let mut tc = qcode::testing::TestContext::new();
-        let in_p = stack_input(&mut tc, 4, 8);
+        let _in_p = stack_input(&mut tc, 4, 8);
         let r0 = tc.r0;
         qcode!(
             tc.ctx,
@@ -1634,7 +1618,6 @@ mod tests {
             "
         );
         let _ = (g, r0, wr, skip);
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
         FunctionBody::from_id_mut(&mut tc.ctx, foo).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -2125,7 +2108,7 @@ mod tests {
     fn dynamic_index_loop_promotes_as_array_region() {
         let mut tc = qcode::testing::TestContext::new();
         // The buffer *pointer* is f's single stack-passed input.
-        let input = stack_input(&mut tc, 4, 8);
+        let _input = stack_input(&mut tc, 4, 8);
 
         qcode!(
             tc.ctx,
@@ -2157,7 +2140,6 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -2243,7 +2225,7 @@ mod tests {
     #[test]
     fn strided_nested_offset_loop_promotes_as_array_region() {
         let mut tc = qcode::testing::TestContext::new();
-        let input = stack_input(&mut tc, 4, 8);
+        let _input = stack_input(&mut tc, 4, 8);
 
         qcode!(
             tc.ctx,
@@ -2275,7 +2257,6 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -2328,7 +2309,7 @@ mod tests {
     #[test]
     fn single_block_self_loop_promotes_as_array_region() {
         let mut tc = qcode::testing::TestContext::new();
-        let input = stack_input(&mut tc, 4, 8);
+        let _input = stack_input(&mut tc, 4, 8);
 
         qcode!(
             tc.ctx,
@@ -2358,7 +2339,6 @@ mod tests {
         );
         let _ = (g, f_loop, f_exit);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -2392,7 +2372,7 @@ mod tests {
     #[test]
     fn region_coexists_with_disjoint_scalar_write() {
         let mut tc = qcode::testing::TestContext::new();
-        let input = stack_input(&mut tc, 4, 8);
+        let _input = stack_input(&mut tc, 4, 8);
 
         qcode!(
             tc.ctx,
@@ -2426,7 +2406,6 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -2479,7 +2458,7 @@ mod tests {
     #[test]
     fn oversized_region_does_not_orphan_into_shadow() {
         let mut tc = qcode::testing::TestContext::new();
-        let input = stack_input(&mut tc, 4, 8);
+        let _input = stack_input(&mut tc, 4, 8);
 
         qcode!(
             tc.ctx,
@@ -2502,7 +2481,6 @@ mod tests {
         );
         let _ = g;
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -2934,7 +2912,7 @@ mod tests {
                 the new recognize_total_maps matcher needs"]
     fn dynamic_index_loop_becomes_map() {
         let mut tc = qcode::testing::TestContext::new();
-        let input = stack_input(&mut tc, 4, 8);
+        let _input = stack_input(&mut tc, 4, 8);
 
         qcode!(
             tc.ctx,
@@ -2966,7 +2944,6 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -3068,7 +3045,7 @@ mod tests {
                 the wide shadow envelope first"]
     fn keep_loop_extracts_map_when_register_escapes() {
         let mut tc = qcode::testing::TestContext::new();
-        let input = stack_input(&mut tc, 4, 8);
+        let _input = stack_input(&mut tc, 4, 8);
 
         qcode!(
             tc.ctx,
@@ -3102,7 +3079,6 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit, f_entry, r);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -3203,7 +3179,7 @@ mod tests {
                 the wide shadow envelope first"]
     fn keep_loop_extracts_map_when_element_leaks_to_escaping_result() {
         let mut tc = qcode::testing::TestContext::new();
-        let input = stack_input(&mut tc, 4, 8);
+        let _input = stack_input(&mut tc, 4, 8);
 
         qcode!(
             tc.ctx,
@@ -3238,7 +3214,6 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit, f_entry, r);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
             qcode::value::FunctionEffects::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
@@ -3996,7 +3971,6 @@ mod tests {
         let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("ext".into())).id;
         {
             let mut f = FunctionBody::from_id_mut(&mut tc.ctx, ext);
-            f.set_output_regs(vec![r0]);
             f.set_effects(FunctionEffects::Materialized(RegisterInterfaceMap {
                 inputs: vec![r1],
                 outputs: vec![r0, r2],
@@ -4069,7 +4043,6 @@ mod tests {
         let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("ext".into())).id;
         {
             let mut f = FunctionBody::from_id_mut(&mut tc.ctx, ext);
-            f.set_output_regs(vec![r0]);
             f.set_effects(FunctionEffects::Materialized(RegisterInterfaceMap {
                 inputs: vec![],
                 outputs: vec![r0],

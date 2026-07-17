@@ -22,7 +22,7 @@
 //! ## What is inlinable
 //!
 //! For output field `i`, with the callee's `pure_reg` invariant that root params
-//! are positionally aligned with `input_regs` and every caller's `Call.args`:
+//! are positionally aligned with every caller's `Call.args`:
 //!
 //! * **Same value at every return.** The field's defining value must be the
 //!   exact same SSA `ValueId` in every `Return`'s write-set tuple (a path
@@ -485,11 +485,12 @@ mod tests {
             );
             agg = Some(tc.ctx.type_of(ValueId::Instruction(tuple_id)));
         }
-        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_input_regs(inputs);
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
-            qcode::value::FunctionEffects::Materialized(
-                qcode::value::RegisterInterfaceMap::default(),
-            ),
+            qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
+                inputs,
+                outputs: vec![],
+                returns: 0,
+            }),
         );
         agg.unwrap()
     }

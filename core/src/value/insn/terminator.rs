@@ -451,7 +451,15 @@ mod tests {
     fn call_display_shows_named_args_with_fallbacks() {
         let mut tc = TestContext::new();
         let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
-        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_input_regs(vec![tc.r0]);
+        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_extern_interface(
+            crate::value::ExternInterface {
+                args: vec![crate::value::ExternArg {
+                    slot: crate::value::ExternSlot::Reg(tc.r0, 8),
+                    name: Some("r0".into()),
+                    attrs: Default::default(),
+                }],
+            },
+        );
 
         let block = {
             let __f = tc.ctx.anon_function();
@@ -493,7 +501,18 @@ mod tests {
         let stack_input = Varnode::make(&mut tc.ctx, 4, 4, stack_space).id;
 
         let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
-        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_input_regs(vec![stack_input]);
+        // A stack-passed argument, named after its slot offset in the external
+        // call interface (the source of truth for a bodyless callee's arg names).
+        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_extern_interface(
+            crate::value::ExternInterface {
+                args: vec![crate::value::ExternArg {
+                    slot: crate::value::ExternSlot::Stack { offset: 4, size: 4 },
+                    name: Some("stack_4".into()),
+                    attrs: Default::default(),
+                }],
+            },
+        );
+        let _ = stack_input;
 
         let block = {
             let __f = tc.ctx.anon_function();

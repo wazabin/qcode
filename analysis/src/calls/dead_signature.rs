@@ -7,9 +7,8 @@
 //! * **dead argument** — an input the body never reads. After
 //!   `argpromote_registers` (and the mem2reg/DCE that follows it) a truly-unused
 //!   input either has no root block param left (DCE already pruned it) or a param
-//!   with zero users. Such an input is removed from `signature.inputs`, its root
-//!   param is dropped, and its positional argument is deleted at every direct
-//!   call site.
+//!   with zero users. Such an input has its root param dropped and its positional
+//!   argument deleted at every direct call site.
 //! * **dead returned field** — a `pure_reg` function returns its register writes
 //!   as an aggregate write-set; the caller projects each field with an `extract`.
 //!   A field whose `extract` is dead at *every* call site has already been DCE'd
@@ -24,8 +23,8 @@
 //! `argpromote_registers` on success) already implies the function is
 //! non-external, is not address-taken, and has only direct callers — so the
 //! closed-world rewrite reaches every caller. The functionalized return is the
-//! source of truth and `signature.outputs` (the ABI register list) is analyzed
-//! independently, so it is intentionally **not** updated by the field trim.
+//! source of truth, so the field trim rewrites only the return `Tuple` and the
+//! call-site extracts.
 //!
 //! As with `argpromote`, a caller in code we never disassembled would still bind
 //! to the old shape; that gap is accepted and unguarded.
@@ -171,10 +170,10 @@ fn dce_function(ctx: &mut Context, fid: FunctionId) {
 // ---------------------------------------------------------------------------
 
 /// Remove every input `fid` never reads. A `pure_reg` function's entry params
-/// are aligned index-for-index with `input_regs` and every caller's `Call.args`,
-/// so a param with no users is a dead argument; drop them together through the
-/// shared interface helper, which keeps all three in lockstep. Records each
-/// caller in `touched`. Returns `true` if anything changed.
+/// are aligned index-for-index with every caller's `Call.args`, so a param with
+/// no users is a dead argument; drop them together through the shared interface
+/// helper, which keeps both in lockstep. Records each caller in `touched`.
+/// Returns `true` if anything changed.
 ///
 /// This is the same operation DCE's no-pred param sweep performs, so the two stay
 /// consistent; running it here as well lets the dead-signature worklist expose
@@ -398,7 +397,7 @@ crate::register_module_pass!(DeadSignature);
 mod tests {
     use qcode::{
         types::{AggregateField, TypeId},
-        value::{BasicBlock, BlockId, Varnode, VarnodeId, insn::Call},
+        value::{BasicBlock, BlockId, VarnodeId, insn::Call},
     };
     use qcode_macro::qcode;
 
@@ -468,11 +467,12 @@ mod tests {
                 value: Some(ValueId::Instruction(tuple).localize(ret_id.func)),
             }),
         );
-        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_input_regs(inputs);
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
-            qcode::value::FunctionEffects::Materialized(
-                qcode::value::RegisterInterfaceMap::default(),
-            ),
+            qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
+                inputs,
+                outputs: vec![],
+                returns: 0,
+            }),
         );
         return_type
     }
@@ -567,9 +567,13 @@ mod tests {
         );
 
         assert_eq!(
-            FunctionBody::from_id(&tc.ctx, f).input_regs().unwrap(),
-            &[vr1],
-            "only the read input survives"
+            FunctionBody::from_id(&tc.ctx, f)
+                .root()
+                .unwrap()
+                .params()
+                .count(),
+            1,
+            "only the read input survives as a root param"
         );
         assert_eq!(
             call_args(&tc, call_id),
@@ -697,7 +701,6 @@ mod tests {
     #[test]
     fn skips_non_pure_reg_functions() {
         let mut tc = qcode::testing::TestContext::new();
-        let (vr0, vr1) = (tc.r0, tc.r1);
         qcode!(
             tc.ctx,
             "
@@ -716,8 +719,7 @@ mod tests {
             "
         );
         let _ = (g, entry);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![vr0, vr1]);
-        // Deliberately not marked pure_reg.
+        // Deliberately not marked pure_reg (no materialized effects).
         let a = tc.ctx.get_const(0x10, 8).id();
         let b = tc.ctx.get_const(0x20, 8).id();
         let call_id = set_call(&mut tc, g_call, f, vec![a, b]);
@@ -728,6 +730,5 @@ mod tests {
             "non-pure-reg functions are skipped"
         );
         assert_eq!(call_args(&tc, call_id).len(), 2, "no argument is dropped");
-        let _ = Varnode::from_id(&tc.ctx, vr1);
     }
 }

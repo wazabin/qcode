@@ -13,10 +13,10 @@
 //! * [`remove_entry_param`] — the *remove* side, used by DCE's dead-param sweep
 //!   and `dead_signature` to drop an input no body reads.
 //!
-//! `signature.inputs` (`input_regs`) is the conventional ABI register list. It is
-//! never populated for a `pure_reg` function (argpromote leaves it `None` and
-//! the params carry the interface), so [`append_entry_param`] does not touch it;
-//! [`remove_entry_param`] trims it only defensively, when it happens to be set.
+//! A `pure_reg` function's root block params carry its call interface directly;
+//! the register effect/interface mapping lives in `FunctionEffects` on the
+//! function interface. These helpers rewrite only the params and the matching
+//! `Call.args` at each caller.
 
 use qcode::value::QCodeMut;
 use std::borrow::Cow;
@@ -38,8 +38,7 @@ use qcode::{
 /// if `fid` has no root block.
 ///
 /// The add-mirror of [`remove_entry_param`]. The new param/arg go at the end,
-/// preserving every existing index. `signature.inputs` is intentionally left
-/// untouched (see the module docs).
+/// preserving every existing index (see the module docs).
 pub fn append_entry_param(
     ctx: &mut Context,
     fid: FunctionId,
@@ -145,13 +144,13 @@ pub(crate) fn append_caller_arg_at_sites(
 }
 
 /// Remove the entry param at position `index` from `fid` and keep its interface
-/// aligned: drop the root block param, the `input_regs[index]` entry, and the
-/// `Call.args[index]` argument at every direct caller, all in lockstep.
+/// aligned: drop the root block param and the `Call.args[index]` argument at
+/// every direct caller, in lockstep.
 ///
 /// This is the single ABI-consistent entry-param removal both DCE's dead-param
 /// sweep and `dead_signature` route through, so a `pure_reg` function's
-/// `param[i] ↔ input_regs[i] ↔ arg[i]` alignment holds by construction after
-/// any removal. The caller must ensure the param has no remaining users.
+/// `param[i] ↔ arg[i]` alignment holds by construction after any removal. The
+/// caller must ensure the param has no remaining users.
 pub fn remove_entry_param(ctx: &mut Context, fid: FunctionId, index: usize) {
     // Snapshot caller IDs before the first structural mutation, then drop the
     // graph. The relationship itself is unchanged by this lockstep rewrite.
@@ -205,19 +204,6 @@ pub(crate) fn remove_entry_params_at_sites(
         ctx.block_param_mut(BlockParamId::new(root.func, p)).index = i;
     }
     ctx.block_mut(root).params = params;
-
-    // Drop the matching conventional input-register entries. This only acts
-    // when `input_regs` is set (conventional functions); for
-    // `pure_reg` it is `None` and this is a no-op (see the module docs).
-    if let Some(inputs) = FunctionBody::from_id(ctx, fid).input_regs() {
-        let inputs = inputs
-            .iter()
-            .copied()
-            .enumerate()
-            .filter_map(|(index, input)| (!removed.contains(&index)).then_some(input))
-            .collect();
-        FunctionBody::from_id_mut(ctx, fid).set_input_regs(inputs);
-    }
 
     // Drop all matching positional arguments at every direct caller, replacing
     // each call instruction only once.

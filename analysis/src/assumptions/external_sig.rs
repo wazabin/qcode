@@ -7,9 +7,11 @@
 //! binary actually links against — and **materializes** everything downstream
 //! passes need, so `cabi` is consulted in exactly this one pass:
 //!
-//! * the register signature (`input_regs`, `output_regs`, `param_attrs`) under
-//!   the [`CallingConvention`] supplied by [`PipelineEnv`], plus the caller-saved
-//!   clobber set and the `externally_resolved` flag;
+//! * the register interface, materialized as
+//!   [`FunctionEffects::Materialized`](qcode::value::FunctionEffects) under the
+//!   [`CallingConvention`] supplied by [`PipelineEnv`]: its inputs are the
+//!   argument registers, its outputs the return register(s) ∪ the caller-saved
+//!   clobber set — plus the per-parameter `param_attrs`;
 //! * a persisted [`ExternInterface`] on the function's signature — the ordered
 //!   call slots (register or stack, incl. the synthesized `stdcall`/`cdecl`
 //!   `return_address` slot) and the display names — consumed later by
@@ -328,28 +330,19 @@ pub fn apply_external_signature(
     };
 
     let mut f = FunctionBody::from_id_mut(ctx, fun_id);
-    // Legacy ABI register list, kept for the external/conventional path this
-    // function serves (a C prototype); pure_reg callees use block params instead.
-    #[allow(deprecated)]
-    f.set_input_regs(inputs);
-    f.set_output_regs(outputs);
     f.set_param_attrs(param_attrs);
+    // The prototype fully describes this callee's register effect, so it is
+    // materialized directly: its inputs are the argument registers the caller
+    // passes and its outputs are the return register(s) ∪ the convention's
+    // caller-saved clobber set. This is the single source of truth for the
+    // register channel — the value passes read it (via `FunctionEffects`) and
+    // drop the conservative "reads/writes every register" fallback.
     f.set_effects(FunctionEffects::Materialized(reg_map));
-    // The prototype fully describes this callee's register effect: its inputs are
-    // the arguments the caller passes (a register reload, or — for stdcall/cdecl
-    // — a stack load supplied by `argpromote_external`), and its writes are the
-    // convention's caller-saved (volatile) registers. Marking it resolved lets
-    // the value passes drop the conservative "reads/writes every register"
-    // fallback and treat the call precisely. See
-    // [`FunctionSignature::externally_resolved`].
-    f.set_clobbered_regs(abi.caller_saved.clone());
-    f.set_externally_resolved(true);
 
     // The materialized call interface consumed by `argpromote_external`: the
     // ordered call slots and the per-slot display names. Only set when the
     // arguments are all placeable (a by-value aggregate leaves it absent).
     if let Some(args) = plan {
-        f.set_input_arg_names(args.iter().map(|a| a.name.clone()).collect());
         f.set_extern_interface(ExternInterface { args });
     }
 }
@@ -460,17 +453,16 @@ mod tests {
         let abi = toy_abi(&tc);
         let f = external(&mut tc, "memcpy");
         apply(&mut tc.ctx, f, &abi, &host_sel());
+        let func = FunctionBody::from_id(&tc.ctx, f);
+        let map = func
+            .effects()
+            .materialized()
+            .expect("prototyped external must be materialized");
         // Only two GP registers exist in the toy ABI; the third arg is stack.
-        let inputs = FunctionBody::from_id(&tc.ctx, f).input_regs().unwrap();
-        assert_eq!(inputs, [tc.r0, tc.r1]);
-        // memcpy returns void* -> the integer return register.
-        let outputs = FunctionBody::from_id(&tc.ctx, f)
-            .signature()
-            .unwrap()
-            .outputs
-            .clone()
-            .unwrap();
-        assert_eq!(outputs, vec![tc.r3]);
+        assert_eq!(map.inputs, [tc.r0, tc.r1]);
+        // memcpy returns void* -> the integer return register leads the pack.
+        assert_eq!(map.returns, 1);
+        assert_eq!(map.outputs[0], tc.r3);
     }
 
     #[test]
@@ -504,8 +496,12 @@ mod tests {
         let abi = toy_abi(&tc);
         let f = external(&mut tc, "pow");
         apply(&mut tc.ctx, f, &abi, &host_sel());
-        let inputs = FunctionBody::from_id(&tc.ctx, f).input_regs().unwrap();
-        assert_eq!(inputs, [tc.r2]);
+        let func = FunctionBody::from_id(&tc.ctx, f);
+        let map = func
+            .effects()
+            .materialized()
+            .expect("prototyped external must be materialized");
+        assert_eq!(map.inputs, [tc.r2]);
     }
 
     #[test]

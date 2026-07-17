@@ -165,9 +165,9 @@ fn remove_unused_no_pred_block_params<'a, 'str>(
     }
 
     // A `pure_reg` function's entry params are its canonical interface, aligned
-    // index-for-index with `input_regs` and every caller's `Call.args`. Removing
-    // one is an interprocedural change that must drop the param, its `input_regs`
-    // entry, and the matching argument at every caller in lockstep — that is the
+    // index-for-index with every caller's `Call.args`. Removing one is an
+    // interprocedural change that must drop the param and the matching argument at
+    // every caller in lockstep — that is the
     // job of the `dead_signature` module pass (via `remove_entry_param`), not of
     // this per-function sweep. A function pass must not reach across functions, so
     // leave pure_reg entry params for `dead_signature`; the *local* fallback below

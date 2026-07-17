@@ -79,12 +79,10 @@ pub use registers::{RegPurityGates, RegPurityReason, argpromote_registers, reg_p
 
 /// The call-argument index whose synthesized name matches `name`.
 ///
-/// Indexes over the root block's parameters, *not* `input_regs`: a `pure_reg`
-/// callee (the functions this pass augments after the register/stack channels)
-/// never has its ABI register list filled in, so `input_regs` is empty and the
-/// pointer — passed positionally, whether in a register or on the stack — would
-/// otherwise be unfindable, bailing the whole function. The root params are the
-/// real call interface and are in lockstep with `Call.args` (see
+/// Indexes over the root block's parameters — the real call interface of a
+/// `pure_reg` callee (the functions this pass augments after the register/stack
+/// channels). The pointer is passed positionally, whether in a register or on
+/// the stack, and the root params are in lockstep with `Call.args` (see
 /// [`FunctionBody::input_arg_name`]), so a param's index *is* its argument index.
 pub(crate) fn arg_index_of(ctx: &Context, fid: FunctionId, name: &str) -> Option<usize> {
     let len = FunctionBody::from_id(ctx, fid)

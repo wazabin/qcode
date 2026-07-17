@@ -429,34 +429,28 @@ fn classify_call_reg_effect<'a, 'str: 'a>(
                 // Minted / unresolved target: unknown effect.
                 return unknown_call_reg_effect(view);
             };
-            let interface = view.interface(target);
-            // Implicit (`Opaque`) call to a materialized callee: it reads exactly
-            // its input registers from the register file and writes exactly its
-            // output registers. Both are honored — a pre-call store to an input
-            // register is consumed here.
-            if let qcode::value::FunctionEffects::Materialized(map) = &interface.effects {
-                return CallRegEffect::Exact {
+            // The callee's effect summary is the single source for register
+            // reads/writes (`ARGPROMOTE_REGISTERS_V2.md`).
+            match &view.interface(target).effects {
+                // Implicit (`Opaque`) call to a materialized callee: it reads
+                // exactly its input registers from the register file and writes
+                // exactly its output registers. Both are honored — a pre-call
+                // store to an input register is consumed here.
+                qcode::value::FunctionEffects::Materialized(map) => CallRegEffect::Exact {
                     reads: map.inputs.clone(),
                     writes: map.outputs.clone(),
-                };
-            }
-            let signature = interface.signature.as_ref();
-            match signature.and_then(|s| s.clobbered.as_deref()) {
-                // Signature-based classification only: assume the recorded clobber
-                // set excludes read (argument) registers — an ABI caller-saved set
-                // never includes the argument registers, and a non-materialized
-                // callee's argument reads are already made explicit (e.g. by
-                // `argpromote_external`) before mem2reg. So the call reads no
-                // register implicitly and writes only `clobbered`.
-                Some(regs) => CallRegEffect::Exact {
-                    reads: Vec::new(),
-                    writes: regs.to_vec(),
                 },
-                // Externally-resolved with no recorded set: exact empty effect.
-                None if signature.is_some_and(|s| s.externally_resolved) => none(),
-                // Unresolved / unknown effect: reads and writes everything (unless
-                // the AssumeCallingConvention hypothesis refines this).
-                None => unknown_call_reg_effect(view),
+                // Solved but unmaterialized: the transitive load/store sets are
+                // known precisely even though call sites still bind implicitly.
+                qcode::value::FunctionEffects::Solved(sets) => CallRegEffect::Exact {
+                    reads: sets.loads.clone(),
+                    writes: sets.stores.clone(),
+                },
+                // ⊤ / not yet solved: reads and writes everything (unless the
+                // AssumeCallingConvention hypothesis refines this).
+                qcode::value::FunctionEffects::Top | qcode::value::FunctionEffects::Unsolved => {
+                    unknown_call_reg_effect(view)
+                }
             }
         }
         _ => none(),
@@ -1282,10 +1276,10 @@ impl<'str> Mem2Reg<'_, 'str> {
         // set: the only thing that would turn such a var into a root param is the
         // root-param path in `insert_block_params`, and with no live-in var promoted it
         // never fires (and is asserted away below). These inputs stay as plain loads —
-        // correct (emulation reads the real incoming value); the conventional register-ABI
-        // summary still recognizes register inputs by raw-IR liveness
-        // (`compute_input_regs`), independent of any mem2reg param. A var written before
-        // it is read (RMW / local scratch) is not live-in and still promotes normally.
+        // correct (emulation reads the real incoming value); the register interface is
+        // owned by the `argpromote` register passes via `FunctionEffects`, independent
+        // of any mem2reg param. A var written before it is read (RMW / local scratch) is
+        // not live-in and still promotes normally.
         let root_id = self.root_id();
         let root_live_in: Vec<ValueId> = vars
             .iter()
@@ -2084,6 +2078,39 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
+
+    /// Stamp each non-external function's register effect summary from its body:
+    /// the registers it directly stores to become its `Solved` store set (it
+    /// reads none implicitly). The register call classifier reads this summary via
+    /// [`FunctionEffects`], so this seeds the callee clobbers these tests rely on.
+    fn seed_call_effects(ctx: &mut Context) {
+        use qcode::value::{FunctionEffects, RegisterEffectSets, Varnode};
+        let ids: Vec<_> = ctx
+            .functions()
+            .filter(|f| !f.is_external())
+            .map(|f| f.id)
+            .collect();
+        for id in ids {
+            let mut stores: Vec<qcode::value::VarnodeId> = Vec::new();
+            for block in FunctionBody::from_id(ctx, id).iter() {
+                for insn in block.iter() {
+                    if let Mnemonic::Store(s) = insn.mnemonic()
+                        && let LocalValueId::Varnode(vn) = s.ptr
+                        && matches!(Varnode::from_id(&*ctx, vn).space().ty, SpaceType::Register)
+                        && !stores.contains(&vn)
+                    {
+                        stores.push(vn);
+                    }
+                }
+            }
+            FunctionBody::from_id_mut(ctx, id).set_effects(FunctionEffects::Solved(
+                RegisterEffectSets {
+                    loads: Vec::new(),
+                    stores,
+                },
+            ));
+        }
+    }
 
     #[test]
     fn phi_insert_pos() {
@@ -2931,12 +2958,12 @@ mod tests {
             let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
         }
-        crate::set_all_call_clobbered_regs(&mut tc.ctx);
+        seed_call_effects(&mut tc.ctx);
         assert!(
-            FunctionBody::from_id(&tc.ctx, callee)
-                .clobbered_regs()
-                .unwrap()
-                .contains(&r0),
+            matches!(
+                FunctionBody::from_id(&tc.ctx, callee).effects(),
+                qcode::value::FunctionEffects::Solved(sets) if sets.stores.contains(&r0)
+            ),
             "callee must record r0 as call-clobbered"
         );
 
@@ -3270,7 +3297,7 @@ mod tests {
             let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
         }
-        crate::set_all_call_clobbered_regs(&mut tc.ctx);
+        seed_call_effects(&mut tc.ctx);
 
         // Caller: write r0 (dead — never read before the call), call, then read r0
         // after (so r0 is a promoted var) into r1.
@@ -3327,7 +3354,7 @@ mod tests {
             let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
         }
-        crate::set_all_call_clobbered_regs(&mut tc.ctx);
+        seed_call_effects(&mut tc.ctx);
 
         let caller = FunctionBody::make(&mut tc.ctx, "caller".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, caller);
@@ -3381,7 +3408,7 @@ mod tests {
             let ret = b.shr().get_const(0u64, 8);
             b.push_return(ret);
         }
-        crate::set_all_call_clobbered_regs(&mut tc.ctx);
+        seed_call_effects(&mut tc.ctx);
 
         let caller = FunctionBody::make(&mut tc.ctx, "caller".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, caller);
@@ -3487,7 +3514,7 @@ mod tests {
             "
         );
         tc.ctx.add_cfg_edge(clobbered_path, clobbered_cont);
-        crate::set_all_call_clobbered_regs(&mut tc.ctx);
+        seed_call_effects(&mut tc.ctx);
 
         let aliases = AliasResult::simple_for_function(&tc.ctx, caller);
         mem2reg(&mut tc.ctx, caller, &aliases);
@@ -3542,7 +3569,7 @@ mod tests {
             "
         );
         tc.ctx.add_cfg_edge(clobbered_path, clobbered_cont);
-        crate::set_all_call_clobbered_regs(&mut tc.ctx);
+        seed_call_effects(&mut tc.ctx);
 
         let edge_reload_count = |ctx: &qcode::context::Context<'_>| {
             BasicBlock::from_id(ctx, clobbered_cont)
@@ -3623,7 +3650,7 @@ mod tests {
             "
         );
         tc.ctx.add_cfg_edge(clobbered_path, clobbered_cont);
-        crate::set_all_call_clobbered_regs(&mut tc.ctx);
+        seed_call_effects(&mut tc.ctx);
 
         let aliases = AliasResult::simple_for_function(&tc.ctx, caller);
         mem2reg(&mut tc.ctx, caller, &aliases);

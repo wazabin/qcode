@@ -63,13 +63,6 @@ passes = []
 
 # --- Optimization phase (derived IR) -----------------------------------------
 
-# Seed each function's call-clobbered-register set from the lifted IR before the
-# value-producing passes consult it.
-[[stage]]
-name = "seed-clobbers"
-scope = "module"
-passes = ["seed_clobbers"]
-
 # On Windows x86, type the FS_OFFSET segment-base register as PtrTo<TEB> (a global
 # varnode-type override) before any pass turns register reads into params, so the
 # promoted entry params (argpromote-registers, then mem2reg) inherit the type and

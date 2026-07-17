@@ -239,8 +239,8 @@ fn try_promote(
     // RAM channel keys snapshot args off the `param[i] ↔ Call.args[i]` lockstep
     // (see [`arg_index_of`]), and that lockstep is an invariant *only* for
     // `pure_reg` functions — the ones `argpromote_registers` established it for. A
-    // conventional (non-`pure_reg`) function uses the register ABI (`input_regs`),
-    // not positional params, and accrues root params (live-in registers promoted by
+    // conventional (non-`pure_reg`) function uses the register ABI, not positional
+    // params, and accrues root params (live-in registers promoted by
     // mem2reg, an incoming `@SP` param, …) that no caller passes positionally. Trying
     // to snapshot a deref through such a param reads a `Call.args` slot that does not
     // exist. So skip them: a conventional function is left for the legacy path, which

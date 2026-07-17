@@ -77,21 +77,6 @@ pub struct ExternInterface {
 /// All fields are `Option` — only provided fields affect analysis.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FunctionSignature {
-    /// Registers read as inputs (informational; reserved for future passes).
-    pub inputs: Option<Vec<VarnodeId>>,
-    /// Display names for positional call arguments, one per `Call.args` slot, in
-    /// order. Populated for functions whose call interface is known by name but
-    /// not by a register/param the usual naming (`input_arg_name`) can resolve —
-    /// chiefly **external** callees whose stack-passed (`stdcall`/`cdecl`)
-    /// arguments come from a C prototype, including a synthesized
-    /// `return_address` slot. A `None` entry leaves that slot unnamed.
-    #[serde(default)]
-    pub input_names: Option<Vec<Option<Box<str>>>>,
-    /// Registers written as outputs / return values. Joined to Unknown in alias analysis.
-    pub outputs: Option<Vec<VarnodeId>>,
-    /// Registers actually written by this function, as computed by analysis:
-    /// only registers the function concretely stores to.
-    pub clobbered: Option<Vec<VarnodeId>>,
     /// `true` when this function performs an unresolved/dynamic memory access, or
     /// forwards a stack-typed pointer into a callee that does. A caller that hands
     /// a pointer into its own frame to such a function cannot bound which of its
@@ -120,32 +105,11 @@ pub struct FunctionSignature {
     /// by argpromote's `mark_pure`; checked by a `verify/` rule.
     #[serde(default)]
     pub is_pure: bool,
-    /// `true` when this function's *full* register effect is captured precisely
-    /// by its call interface, so the conservative call over-approximation can be
-    /// dropped at every call site. Concretely, a resolved callee:
-    ///
-    /// * **reads no registers** beyond the explicit `Call.args` — the argument
-    ///   values are already loaded and passed by the caller, so a call is not an
-    ///   implicit use of any register (it may still read memory *through* a
-    ///   pointer argument); and
-    /// * **writes exactly** the registers in [`clobbered`](Self::clobbered) —
-    ///   never the conservative "every register" fallback used for callees with
-    ///   no known effect.
-    ///
-    /// Set for **external** callees whose C prototype is known: their arguments
-    /// come from the prototype and their clobber set is the calling convention's
-    /// caller-saved (volatile) registers. Consulted by alias analysis and
-    /// `mem2reg`'s clobber-aware liveness, which otherwise treat a callee with no
-    /// recorded clobber set as reading and writing every register.
-    ///
-    /// Named for its origin: the resolution comes from *outside* the IR (a C
-    /// prototype + calling convention), not from analyzing a body.
-    #[serde(default)]
-    pub externally_resolved: bool,
     /// Per-parameter pointer attributes ([`readonly`](ParamAttrs::readonly) /
     /// [`nocapture`](ParamAttrs::nocapture)), indexed like the positional call
     /// arguments (`Call.args`) — which for a functionalized (`pure_reg`) callee
-    /// align with its root block params, and for an external align with `inputs`.
+    /// align with its root block params, and for an external align with the
+    /// materialized register interface.
     ///
     /// `None` means "not analyzed" (fully conservative — every pointer arg
     /// escapes and is written through). A present vector may still be shorter than

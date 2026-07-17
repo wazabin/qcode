@@ -55,18 +55,18 @@ pub(crate) fn is_reg_space<'a, 'str: 'a>(
         .is_some_and(|space_id| matches!(Space::from_id(src, space_id).ty, SpaceType::Register))
 }
 
-/// The byte intervals a resolved external `target` clobbers (its recorded
-/// caller-saved register set), as kills for the backward scan. Empty for a
-/// callee with no recorded clobber set.
+/// The byte intervals a resolved external `target` clobbers (the outputs of its
+/// materialized interface map: return register(s) ∪ ABI caller-saved set), as
+/// kills for the backward scan. Empty for a callee with no materialized map.
 fn call_clobber_intervals<'a, 'str: 'a>(
     host: impl QCodeView<'a, 'str>,
     target: FunctionId,
 ) -> Vec<KilledInterval> {
     let Some(clobbered) = host
         .interface(target)
-        .signature
-        .as_ref()
-        .and_then(|signature| signature.clobbered.as_deref())
+        .effects
+        .materialized()
+        .map(|map| map.outputs.as_slice())
     else {
         return Vec::new();
     };
@@ -559,20 +559,20 @@ fn scan_block_aliased<'a, 'str: 'a>(
                     });
                 }
             }
-            // An `externally_resolved` call reads no registers and writes exactly
-            // its caller-saved clobber set (a C prototype under a known calling
-            // convention). So its clobbered registers are *killed* here — a
-            // preceding store to one of them, with no read in between, is dead —
-            // and the call satisfies any post-call read of them (that read is the
-            // call's own output, not the caller's pre-call value). Registers it
-            // does not clobber (callee-saved) it neither reads nor writes, so their
+            // A call to a *materialized external* (a C prototype under a known
+            // calling convention) reads no registers implicitly — its argument
+            // reads are explicit `load`s at the (regpure-rewritten) site — and
+            // writes exactly its interface map's outputs (return ∪ caller-saved
+            // clobbers). So those registers are *killed* here — a preceding
+            // store to one of them, with no read in between, is dead — and the
+            // call satisfies any post-call read of them (that read is the call's
+            // own output, not the caller's pre-call value). Registers it does
+            // not clobber (callee-saved) it neither reads nor writes, so their
             // existing kills pass through untouched.
             Mnemonic::Call(call)
                 if call.target.real().is_some_and(|target| {
-                    host.interface(target)
-                        .signature
-                        .as_ref()
-                        .is_some_and(|signature| signature.externally_resolved)
+                    let interface = host.interface(target);
+                    interface.is_external && interface.effects.materialized().is_some()
                 }) =>
             {
                 let target = call.target.real().unwrap();
@@ -1482,14 +1482,19 @@ mod tests {
         (tc.ctx, entry, store_id)
     }
 
-    /// A store to a register an `externally_resolved` callee clobbers, never read
+    /// A store to a register a materialized external callee clobbers, never read
     /// before the call, is dead: the call overwrites it and reads no registers.
     #[test]
     fn store_before_resolved_call_to_clobbered_reg_is_dead() {
         let (ctx, block, store_id) = store_then_call_fn(|ctx, callee| {
             let r0 = ctx.get_named("r0").unwrap().as_varnode().unwrap();
-            FunctionBody::from_id_mut(ctx, callee).set_clobbered_regs(vec![r0]);
-            FunctionBody::from_id_mut(ctx, callee).set_externally_resolved(true);
+            FunctionBody::from_id_mut(ctx, callee).set_effects(
+                qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
+                    inputs: vec![],
+                    outputs: vec![r0],
+                    returns: 0,
+                }),
+            );
         });
         let aliases = AliasResult::simple_for_function(
             &ctx,
@@ -1502,14 +1507,12 @@ mod tests {
         );
     }
 
-    /// The same store is *kept* when the callee is not `externally_resolved`: the
-    /// call may read the register (e.g. an argument), so the store is live.
+    /// The same store is *kept* when the callee's effects are unsolved: the call
+    /// may read the register (e.g. an argument), so the store is live.
     #[test]
     fn store_before_unresolved_call_is_kept() {
-        let (ctx, block, store_id) = store_then_call_fn(|ctx, callee| {
-            let r0 = ctx.get_named("r0").unwrap().as_varnode().unwrap();
-            // Clobbers r0 but is *not* marked resolved.
-            FunctionBody::from_id_mut(ctx, callee).set_clobbered_regs(vec![r0]);
+        let (ctx, block, store_id) = store_then_call_fn(|_ctx, _callee| {
+            // Left with the default `Unsolved` effects (not materialized).
         });
         let aliases = AliasResult::simple_for_function(
             &ctx,

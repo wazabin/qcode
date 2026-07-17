@@ -15,7 +15,7 @@ use crate::{
     error::{Error, ErrorTy, Result},
     value::{
         BasicBlock, BlockId, BlockRef, Instruction, InstructionId, LocalValueId, ModuleView,
-        QCodeView, Temp, TempId, TempSpace, TempSpaceId, Value, ValueId, Varnode, VarnodeId,
+        QCodeView, Temp, TempId, TempSpace, TempSpaceId, Value, ValueId, VarnodeId,
         block::EdgeData,
         block::cfg::{EdgeId, LocalBlockId},
         block_param::{BlockParam, BlockParamId, LocalParamId},
@@ -1547,17 +1547,6 @@ where
         self.inner().names.get(name).map(|id| id.qualify(self.id))
     }
 
-    /// Whether this function's full register effect is captured by its call
-    /// interface: it reads no registers (only its explicit args) and writes
-    /// exactly its [`clobbered_regs`](Self::clobbered_regs). See
-    /// [`FunctionSignature::externally_resolved`].
-    pub fn is_externally_resolved(&'s self) -> bool {
-        self.interface()
-            .signature
-            .as_ref()
-            .is_some_and(|s| s.externally_resolved)
-    }
-
     /// The inferred pointer attributes for positional argument `index`, or `None`
     /// when this function has no analyzed attributes (treat conservatively: the
     /// argument escapes and may be written through). See
@@ -1572,14 +1561,6 @@ where
             .signature
             .as_ref()
             .and_then(|s| s.param_attrs.as_deref())
-    }
-
-    /// Registers concretely written by this function, as set by analysis.
-    pub fn clobbered_regs(&'s self) -> Option<&'ctx [VarnodeId]> {
-        self.interface()
-            .signature
-            .as_ref()
-            .and_then(|s| s.clobbered.as_deref())
     }
 
     /// The non-register memory spaces this function may (transitively) write, as
@@ -1628,20 +1609,6 @@ where
         self.interface().kind
     }
 
-    /// Registers read before written (function inputs), as inferred by analysis.
-    ///
-    /// Conventional ABI input-register list. It is **`None` for `pure_reg` functions**
-    /// (argpromote never populates it); their by-value root block params are the
-    /// source of truth for the call interface, so prefer the params (e.g.
-    /// [`input_arg_name`](Self::input_arg_name)). Used only by the
-    /// conventional/external calling-convention path (`summaries`).
-    pub fn input_regs(&'s self) -> Option<&'ctx [VarnodeId]> {
-        self.interface()
-            .signature
-            .as_ref()
-            .and_then(|s| s.inputs.as_deref())
-    }
-
     /// The C-prototype-derived external call interface, if `external_sigs`
     /// planned one. Read by `argpromote_external` to rewrite call sites. See
     /// [`FunctionSignature::extern_interface`].
@@ -1653,18 +1620,16 @@ where
     }
 
     /// The display name for the call-site argument bound to input `index`: the
-    /// register name for a register input, or a synthesized `stack_<addr>` slot
-    /// name for a stack-passed input (whose varnode is a nameless stack-space
-    /// offset carrier). Mirrors mem2reg's `block_param_name_for_var` so a call
-    /// argument reads with the same name as the callee's promoted stack
-    /// parameter. `None` when there is no input at `index`.
+    /// name of the callee's root block param at `index`, or — for a bodyless
+    /// external with no root block — the C-prototype argument name recorded in
+    /// its [`extern_interface`](Self::extern_interface). `None` when there is no
+    /// input at `index` or it is unnamed.
     pub fn input_arg_name(&'s self, index: usize) -> Option<String> {
         // The root block param at `index` is the interface element a call
         // argument actually binds to, named after its register by
         // `argpromote_registers` or `stack_<addr>` by mem2reg's
         // `block_param_name_for_var`. Prefer it: it is the source of truth and is
-        // populated even for `pure_reg` functions, whose ABI register list
-        // (`input_regs`) is never filled in.
+        // populated even for `pure_reg` functions.
         if let Some(root) = self.root()
             && let Some(name) = root
                 .params()
@@ -1674,35 +1639,11 @@ where
             return Some(name);
         }
 
-        // Explicit per-argument names recorded by name-derived passes (e.g. an
-        // external callee's C-prototype parameters, plus a synthesized
-        // `return_address` slot). The source of truth for bodyless externals,
-        // which have neither a root block nor an inferred input-register list.
-        if let Some(name) = self
-            .interface()
-            .signature
-            .as_ref()
-            .and_then(|s| s.input_names.as_ref())
-            .and_then(|names| names.get(index))
-            .and_then(|n| n.as_deref())
-        {
-            return Some(name.to_owned());
-        }
-
-        // Fall back to the conventional input-register list: a register name, or a
-        // synthesized `stack_<addr>` slot name for a stack-passed input.
-        // Only reached when the param has no name (conventional functions,
-        // never `pure_reg`).
-        let input = self.input_regs()?.get(index).copied()?;
-        let vn = Varnode::from_id(self.view.shared(), input);
-        if let Some(name) = vn.name() {
-            return Some(name.to_owned());
-        }
-        let space = vn.space();
-        if space.name.as_deref() == Some("stack") {
-            return Some(format!("stack_{:x}", vn.address() as u64));
-        }
-        None
+        // Fall back to the C-prototype-derived external call interface, the
+        // source of truth for bodyless externals which have no root block.
+        self.extern_interface()
+            .and_then(|iface| iface.args.get(index))
+            .and_then(|a| a.name.as_ref().map(|n| n.to_string()))
     }
 
     /// Whether this function performs an unresolved/dynamic stack read (or
@@ -2143,14 +2084,6 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         }
     }
 
-    /// Records the analysis-computed clobbered register set on this function.
-    pub fn set_clobbered_regs(&mut self, regs: Vec<VarnodeId>) {
-        self.interface_mut()
-            .signature
-            .get_or_insert_default()
-            .clobbered = Some(regs);
-    }
-
     /// Records the analysis-computed set of non-register spaces this function may
     /// write (`None` = unknown/unbounded). See
     /// [`FunctionSignature::written_spaces`].
@@ -2161,16 +2094,6 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
             .written_spaces = spaces;
     }
 
-    /// Marks this function's register effect as fully captured by its call
-    /// interface — reads no registers, writes exactly its clobbered set. See
-    /// [`FunctionSignature::externally_resolved`].
-    pub fn set_externally_resolved(&mut self, value: bool) {
-        self.interface_mut()
-            .signature
-            .get_or_insert_default()
-            .externally_resolved = value;
-    }
-
     /// Records the C-prototype-derived external call interface on this function.
     /// See [`FunctionSignature::extern_interface`]; set by `external_sigs`,
     /// consumed by `argpromote_external`.
@@ -2179,28 +2102,6 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
             .signature
             .get_or_insert_default()
             .extern_interface = Some(iface);
-    }
-
-    /// Records the analysis-inferred input (live-in) register set on this function.
-    ///
-    /// Conventional ABI input-register list — see [`input_regs`](Self::input_regs).
-    /// Not set for `pure_reg` functions, whose param interface supersedes it.
-    pub fn set_input_regs(&mut self, regs: Vec<VarnodeId>) {
-        self.interface_mut()
-            .signature
-            .get_or_insert_default()
-            .inputs = Some(regs);
-    }
-
-    /// Records display names for this function's positional call arguments, one
-    /// per `Call.args` slot. Consulted by [`input_arg_name`](Self::input_arg_name)
-    /// for callees (chiefly externals) whose argument names come from a C
-    /// prototype rather than a register or promoted stack param.
-    pub fn set_input_arg_names(&mut self, names: Vec<Option<Box<str>>>) {
-        self.interface_mut()
-            .signature
-            .get_or_insert_default()
-            .input_names = Some(names);
     }
 
     /// Records this function's solved effect summary / materialized interface
@@ -2217,14 +2118,6 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
             .signature
             .get_or_insert_default()
             .is_pure = value;
-    }
-
-    /// Records the output (return-value) register set on this function.
-    pub fn set_output_regs(&mut self, regs: Vec<VarnodeId>) {
-        self.interface_mut()
-            .signature
-            .get_or_insert_default()
-            .outputs = Some(regs);
     }
 
     /// Records whether this function performs an unresolved/dynamic stack read.
