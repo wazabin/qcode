@@ -69,11 +69,11 @@ pub struct FunctionInterface<'str> {
     /// effect-analysis pass and read by the materialize/regpure passes, the
     /// emulator, alias analysis, and the verifier.
     ///
-    /// **Engine-internal, not serialized.** It is recomputable by re-running the
-    /// analysis pass, so it is deliberately excluded from both the textual qcode
-    /// and the `.harbinger` wire shape; a loaded snapshot restores it to
-    /// [`FunctionEffects::Unsolved`].
-    #[serde(skip)]
+    /// Serialized into the `.harbinger` wire shape so that rewritten regpure
+    /// call sites and materialized interfaces stay in sync with the snapshot.
+    /// Older snapshots that predate this field load as
+    /// [`FunctionEffects::Unsolved`] via `#[serde(default)]`.
+    #[serde(default)]
     pub effects: FunctionEffects,
 }
 
@@ -83,7 +83,7 @@ pub struct FunctionInterface<'str> {
 /// the *interface mapping* a materialized function exposes still lives on the
 /// function — the emulator's implicit call convention, alias analysis, and the
 /// verifier all consume it. This enum records how far the summary has advanced.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FunctionEffects {
     /// Not yet solved by the effect-analysis pass (the default / post-load
     /// state).
@@ -132,7 +132,7 @@ impl FunctionEffects {
 /// implicit (zero-arg) convention read this: implicitly, param `i` is seeded
 /// from `inputs[i]` at entry and pack slot `i` is stored back to `outputs[i]`
 /// on return.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RegisterInterfaceMap {
     /// Register bound by each by-value input parameter, in parameter order.
     pub inputs: Vec<VarnodeId>,

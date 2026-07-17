@@ -139,10 +139,12 @@ impl MnemonicKind for Apply {
 ///
 /// A materialized function supports two calling conventions selected per site;
 /// this tag records which one a given `Call` uses and how much of the callee's
-/// effect is already explicit at the site. **In-memory only** — not serialized
-/// to textual qcode or the `.harbinger` wire (a loaded snapshot restores
-/// [`CallTag::Opaque`], and the tag is recomputed by the argpromote passes).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+/// effect is already explicit at the site. Serialized to the `.harbinger` wire
+/// so that rewritten regpure sites persist; older snapshots that predate the
+/// field load as [`CallTag::Opaque`] via `#[serde(default)]`.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum CallTag {
     /// Implicit binding: the call reads its inputs from, and writes its outputs
     /// back to, the register file per the callee's interface mapping (or, for a
@@ -185,9 +187,9 @@ pub struct Call {
     /// reads: they are intentionally excluded from [`MnemonicKind::args`] so
     /// they do not participate in use-def bookkeeping.
     pub clobbers: Vec<LocalValueId>,
-    /// Binding-convention tag (argpromote v2). In-memory only — never
-    /// serialized (see [`CallTag`]).
-    #[serde(skip, default)]
+    /// Binding-convention tag (argpromote v2). Serialized so rewritten regpure
+    /// sites persist; older snapshots default it to `Opaque` (see [`CallTag`]).
+    #[serde(default)]
     pub tag: CallTag,
 }
 

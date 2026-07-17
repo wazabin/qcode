@@ -52,6 +52,92 @@ mod tests {
         call_id
     }
 
+    /// A function's `Materialized` register interface and a call site's
+    /// `CallTag::RegPure` survive a `Context` serde round-trip (the `.harbinger`
+    /// snapshot path). Without serialization a reloaded snapshot would reset
+    /// effects to `Unsolved` and every site to `Opaque`, desyncing the rewritten
+    /// regpure sites from their callee's interface.
+    #[test]
+    fn effects_and_call_tag_survive_serde_round_trip() {
+        use qcode::context::Context;
+        use qcode::value::insn::CallTag;
+        use qcode::value::{FunctionEffects, RegisterInterfaceMap};
+
+        let mut tc = qcode::testing::TestContext::new();
+        let (r0, r1) = (tc.r0, tc.r1);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    return at i64 0;
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = g;
+
+        let iface = RegisterInterfaceMap {
+            inputs: vec![r1],
+            outputs: vec![r0],
+        };
+        FunctionBody::from_id_mut(&mut tc.ctx, f)
+            .set_effects(FunctionEffects::Materialized(iface.clone()));
+
+        // Retag the call site RegPure.
+        let call_id = BasicBlock::from_id(&tc.ctx, g_call)
+            .iter()
+            .find(|i| matches!(i.mnemonic(), Mnemonic::Call(_)))
+            .unwrap()
+            .id;
+        tc.ctx.replace_instruction_mnemonic(
+            call_id,
+            Mnemonic::Call(Call {
+                target: qcode::value::insn::Callee::Real(f),
+                args: vec![],
+                clobbers: vec![],
+                tag: CallTag::RegPure,
+            }),
+        );
+
+        let config = bincode::config::standard();
+        let encoded = bincode::serde::encode_to_vec(&tc.ctx, config).expect("context serializes");
+        let (restored, _): (Context<'static>, usize) =
+            bincode::serde::decode_from_slice(&encoded, config).expect("context deserializes");
+
+        let f2 = FunctionBody::from_name(&restored, "f")
+            .expect("f survives")
+            .id;
+        assert_eq!(
+            FunctionBody::from_id(&restored, f2).effects(),
+            &FunctionEffects::Materialized(iface),
+            "Materialized effects must survive the snapshot round-trip"
+        );
+
+        let g2 = FunctionBody::from_name(&restored, "g")
+            .expect("g survives")
+            .id;
+        let call_tag = FunctionBody::from_id(&restored, g2)
+            .blocks()
+            .flat_map(|b| b.iter())
+            .find_map(|i| match i.mnemonic() {
+                Mnemonic::Call(c) => Some(c.tag),
+                _ => None,
+            })
+            .expect("call survives");
+        assert_eq!(
+            call_tag,
+            CallTag::RegPure,
+            "CallTag::RegPure must survive the snapshot round-trip"
+        );
+    }
+
     /// Phase 0 gate for the register channel (see `ARGPROMOTE_REGISTERS.md`): the
     /// early register run will send an **aggregate-typed call result** through
     /// mem2reg/gvn/dce for the first time (today's RAM run is post-mem2reg, so
