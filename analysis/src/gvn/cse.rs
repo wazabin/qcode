@@ -261,6 +261,43 @@ mod tests {
         assert!(!block.instruction_ids().contains(&v2));
     }
 
+    // 1b. Two distinct poisons feeding the same op are NOT congruent: GVN must
+    // keep both `zext(poison)` instructions (poison is never folded).
+    #[test]
+    fn test_distinct_poisons_not_congruent() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i64 A;
+                varnode i64 B;
+
+                <block>
+                    goto <0x1001>;
+            "
+        );
+        let _ = (A, B);
+        let i32_ty = ctx.shared.types.get_or_make_int(4);
+        let p1 = ctx.get_poison(i32_ty);
+        let p2 = ctx.get_poison(i32_ty);
+        let (z1, z2);
+        {
+            let mut b = ctx.builder(block);
+            b.set_insert_point_to_start();
+            z1 = b.push_zext(p1, 8).id().as_instruction().unwrap();
+            z2 = b.push_zext(p2, 8).id().as_instruction().unwrap();
+        }
+
+        let mut block_mut = BasicBlock::from_id_mut(&mut ctx, block);
+        gvn(&mut block_mut, None);
+
+        assert!(block_mut.instruction_ids().contains(&z1));
+        assert!(
+            block_mut.instruction_ids().contains(&z2),
+            "two distinct poisons must not be CSE'd together"
+        );
+    }
+
     // 2. Commutative normalization: a + b and b + a -> same value number
     #[test]
     fn test_commutative_normalization() {

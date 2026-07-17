@@ -604,6 +604,7 @@ impl<'str> FunctionBody<'str> {
                         .get_or_make_int(shared.values.varnodes[id].size_bytes())
                 }),
             LocalValueId::Temp(local) => shared.types.get_or_make_int(self.temps[local].size),
+            LocalValueId::Poison(id) => shared.values.poisons[id].type_id,
             LocalValueId::BasicBlock(_) | LocalValueId::Function(_) => {
                 shared.types.get_or_make_int(0)
             }
@@ -625,6 +626,7 @@ impl<'str> FunctionBody<'str> {
             LocalValueId::Instruction(local) => Some(self.insns[local].type_id),
             LocalValueId::BlockParam(local) => Some(self.params[local].type_id),
             LocalValueId::Varnode(id) => shared.values.varnode_types.get(&id).copied(),
+            LocalValueId::Poison(id) => Some(shared.values.poisons[id].type_id),
             LocalValueId::Temp(_) | LocalValueId::BasicBlock(_) | LocalValueId::Function(_) => None,
         }
     }

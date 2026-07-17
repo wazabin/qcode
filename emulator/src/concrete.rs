@@ -2280,6 +2280,9 @@ impl<'ctx> Interpreter for TempInterpreter<'_, 'ctx> {
                 .address()
                 .map(SizedValue::from_u64)
                 .ok_or(EmulatorErrorKind::EmptyFunctionRoot(f.id)),
+            // Poison has undefined bits: demanding its concrete value is a hard
+            // error (propagating it as an unread operand never reaches here).
+            ValueRef::Poison(_) => Err(EmulatorErrorKind::PoisonRead),
         }
     }
 }
@@ -2526,6 +2529,9 @@ impl<'ctx> Interpreter for Emulator<'ctx> {
                 .address()
                 .map(SizedValue::from_u64)
                 .ok_or(EmulatorErrorKind::EmptyFunctionRoot(f.id)),
+            // Poison has undefined bits: demanding its concrete value is a hard
+            // error (propagating it as an unread operand never reaches here).
+            ValueRef::Poison(_) => Err(EmulatorErrorKind::PoisonRead),
         }
     }
 }
@@ -2539,6 +2545,28 @@ mod tests {
     use qcode::value::TempSpace;
     use qcode_macro::qcode;
     use std::sync::{Arc, Mutex};
+
+    /// Reading a poison value is a hard error (`PoisonRead`); propagating it as
+    /// an unread operand never reaches `get_value`.
+    #[test]
+    fn reading_poison_is_a_hard_error() {
+        let mut ctx = Context::new();
+        let func = ctx.anon_function();
+        let block = BasicBlock::make(&mut ctx, func).with_address(0x1000).id;
+        let i32_ty = ctx.shared.types.get_or_make_int(4);
+        let poison = ctx.get_poison(i32_ty);
+        let mut emu = StandaloneEmulator::new(block);
+        let mut tmp = TempInterpreter {
+            memory: &mut emu.memory,
+            insn_values: &mut emu.insn_values,
+            block_param_values: &mut emu.block_param_values,
+            ctx: &ctx,
+        };
+        assert!(matches!(
+            tmp.get_value(poison),
+            Err(EmulatorErrorKind::PoisonRead)
+        ));
+    }
 
     #[test]
     fn minted_callee_is_not_executable() {

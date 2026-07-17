@@ -54,6 +54,11 @@ pub struct ValueRegistry<'str> {
     #[serde(default)]
     pub bytes: Interner<BytesId, Bytes>,
 
+    /// Poison-value interner (argpromote v2). Each poison is a *distinct*
+    /// interned value (never deduped), so two poisons are never congruent.
+    #[serde(default)]
+    pub poisons: Interner<crate::value::PoisonId, crate::value::Poison>,
+
     /// User-forced rendering overrides for `Bytes` blobs (e.g. from the GUI
     /// Strings pane). Absent entries render under [`BytesDisplay::Auto`].
     #[serde(default)]
@@ -141,5 +146,12 @@ impl<'str> ValueRegistry<'str> {
 
     pub fn push_varnode(&mut self, varnode: Varnode<'str>) -> VarnodeId {
         self.varnodes.push(varnode)
+    }
+
+    /// Mints a fresh typed poison value. Never deduped: each call yields a
+    /// distinct [`PoisonId`](crate::value::PoisonId) so GVN keeps every poison in
+    /// its own congruence class.
+    pub fn push_poison(&self, type_id: TypeId) -> crate::value::PoisonId {
+        self.poisons.push(crate::value::Poison { type_id })
     }
 }

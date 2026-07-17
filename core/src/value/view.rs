@@ -107,6 +107,7 @@ where
                         .get_or_make_int(shared.values.varnodes[id].size_bytes())
                 }),
             ValueId::Temp(id) => shared.types.get_or_make_int(self.temp(id).size),
+            ValueId::Poison(id) => shared.values.poisons[id].type_id,
             ValueId::BasicBlock(_) | ValueId::Function(_) => shared.types.get_or_make_int(0),
         }
     }
@@ -119,6 +120,7 @@ where
             ValueId::Instruction(id) => Some(self.instruction(id).type_id),
             ValueId::BlockParam(id) => Some(self.block_param(id).type_id),
             ValueId::Varnode(id) => shared.values.varnode_types.get(&id).copied(),
+            ValueId::Poison(id) => Some(shared.values.poisons[id].type_id),
             ValueId::Temp(_) => None,
             ValueId::BasicBlock(_) | ValueId::Function(_) => None,
         }

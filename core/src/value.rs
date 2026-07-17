@@ -102,6 +102,7 @@ pub use function::{
 pub use insn::LocalInsnId;
 pub use insn::{Instruction, InstructionId, InstructionRef};
 pub use literal::{LiteralId, LiteralRef};
+pub use poison::{Poison, PoisonId, PoisonRef};
 pub use temp::{
     LocalTempId, LocalTempSpaceId, Temp, TempId, TempRef, TempSpace, TempSpaceId, TempSpaceRef,
 };
@@ -115,6 +116,7 @@ pub mod function;
 pub mod insn;
 pub mod interner;
 pub mod literal;
+pub mod poison;
 pub mod registry;
 pub mod temp;
 pub mod util;
@@ -158,6 +160,10 @@ pub enum ValueId {
     Temp(TempId),
     /// A lifted or external [`FunctionBody`].
     Function(FunctionId),
+    /// A typed **poison** value: a placeholder with undefined bits (argpromote
+    /// v2 clobber slots). Never folded by GVN; reading it in the emulator is a
+    /// hard error. See [`poison`].
+    Poison(PoisonId),
 }
 
 impl ValueId {
@@ -171,6 +177,7 @@ impl ValueId {
             ValueId::Varnode(_) => "Varnode",
             ValueId::Temp(_) => "Temp",
             ValueId::Function(_) => "Function",
+            ValueId::Poison(_) => "Poison",
         }
     }
 
@@ -271,6 +278,18 @@ impl ValueId {
             None
         }
     }
+
+    pub fn as_poison(self) -> Option<PoisonId> {
+        if let ValueId::Poison(id) = self {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_poison(self) -> bool {
+        matches!(self, ValueId::Poison(_))
+    }
 }
 
 impl From<LiteralId> for ValueId {
@@ -321,6 +340,12 @@ impl From<FunctionId> for ValueId {
     }
 }
 
+impl From<PoisonId> for ValueId {
+    fn from(id: PoisonId) -> Self {
+        ValueId::Poison(id)
+    }
+}
+
 impl ValueId {
     /// A total-order sort key that does not require `Into<usize>` (which the
     /// composite instruction/block/param IDs deliberately lack). The tuple is
@@ -342,6 +367,7 @@ impl ValueId {
                 (6, usize::from(id.func) as u32, usize::from(id.local) as u32)
             }
             ValueId::Temp(id) => (7, usize::from(id.func) as u32, usize::from(id.local) as u32),
+            ValueId::Poison(id) => (8, 0, u32::try_from(usize::from(id)).unwrap_or(u32::MAX)),
         }
     }
 }
@@ -357,6 +383,7 @@ impl Display for ValueId {
             ValueId::BasicBlock(id) => write!(f, "BasicBlock({id})"),
             ValueId::BlockParam(id) => write!(f, "BlockParam({id})"),
             ValueId::Temp(id) => write!(f, "Temp({id})"),
+            ValueId::Poison(id) => write!(f, "Poison({})", usize::from(id)),
         }
     }
 }
@@ -395,6 +422,8 @@ pub enum LocalValueId {
     Temp(LocalTempId),
     /// A lifted or external [`FunctionBody`] (module id; same as `ValueId`).
     Function(FunctionId),
+    /// A typed poison value (module-interned; same id as `ValueId`).
+    Poison(PoisonId),
 }
 
 impl LocalValueId {
@@ -407,6 +436,7 @@ impl LocalValueId {
             LocalValueId::Bytes(id) => ValueId::Bytes(id),
             LocalValueId::Varnode(id) => ValueId::Varnode(id),
             LocalValueId::Function(id) => ValueId::Function(id),
+            LocalValueId::Poison(id) => ValueId::Poison(id),
             LocalValueId::Instruction(local) => {
                 ValueId::Instruction(InstructionId::new(func, local))
             }
@@ -429,6 +459,7 @@ impl ValueId {
             ValueId::Bytes(id) => LocalValueId::Bytes(id),
             ValueId::Varnode(id) => LocalValueId::Varnode(id),
             ValueId::Function(id) => LocalValueId::Function(id),
+            ValueId::Poison(id) => LocalValueId::Poison(id),
             ValueId::Instruction(id) => {
                 debug_assert_eq!(
                     id.func, func,
@@ -470,6 +501,7 @@ impl ValueId {
             ValueId::Bytes(id) => LocalValueId::Bytes(id),
             ValueId::Varnode(id) => LocalValueId::Varnode(id),
             ValueId::Function(id) => LocalValueId::Function(id),
+            ValueId::Poison(id) => LocalValueId::Poison(id),
             ValueId::Instruction(id) => LocalValueId::Instruction(id.local),
             ValueId::BasicBlock(id) => LocalValueId::BasicBlock(id.local),
             ValueId::BlockParam(id) => LocalValueId::BlockParam(id.local),
@@ -490,6 +522,7 @@ impl ValueId {
             ValueId::Bytes(id) => Some(LocalValueId::Bytes(id)),
             ValueId::Varnode(id) => Some(LocalValueId::Varnode(id)),
             ValueId::Function(id) => Some(LocalValueId::Function(id)),
+            ValueId::Poison(id) => Some(LocalValueId::Poison(id)),
             ValueId::Instruction(_)
             | ValueId::BasicBlock(_)
             | ValueId::BlockParam(_)
@@ -525,6 +558,7 @@ pub enum ValueRef<'str, 'ctx, R = ModuleView<'ctx, 'str>> {
     Varnode(VarnodeRef<'str, 'ctx>),
     Temp(TempRef<'str, 'ctx, R>),
     Function(FunctionRef<'str, 'ctx, R>),
+    Poison(PoisonRef<'str, 'ctx>),
 }
 
 impl<R> Debug for ValueRef<'_, '_, R> {
@@ -538,6 +572,7 @@ impl<R> Debug for ValueRef<'_, '_, R> {
             ValueRef::Varnode(_) => f.write_str("Varnode"),
             ValueRef::Temp(_) => f.write_str("Temp"),
             ValueRef::Function(_) => f.write_str("Function"),
+            ValueRef::Poison(_) => f.write_str("Poison"),
         }
     }
 }
@@ -590,6 +625,12 @@ impl<'str, 'ctx, R> From<FunctionRef<'str, 'ctx, R>> for ValueRef<'str, 'ctx, R>
     }
 }
 
+impl<'str, 'ctx, R> From<PoisonRef<'str, 'ctx>> for ValueRef<'str, 'ctx, R> {
+    fn from(poison_ref: PoisonRef<'str, 'ctx>) -> Self {
+        ValueRef::Poison(poison_ref)
+    }
+}
+
 impl<'str, 'ctx> ValueRef<'str, 'ctx> {
     pub fn new(id: ValueId, ctx: &'ctx Context<'str>) -> Self {
         ValueRef::from_view(ModuleView::new(ctx), id)
@@ -614,6 +655,7 @@ where
             ValueId::BasicBlock(id) => ValueRef::BasicBlock(BlockRef::new(view, id)),
             ValueId::BlockParam(id) => ValueRef::BlockParam(BlockParamRef::new(view, id)),
             ValueId::Function(id) => ValueRef::Function(FunctionRef::new(view, id)),
+            ValueId::Poison(id) => ValueRef::Poison(PoisonRef::from_id(view.shared(), id)),
         }
     }
 
@@ -627,6 +669,7 @@ where
             ValueRef::Varnode(r) => r,
             ValueRef::Temp(r) => r,
             ValueRef::Function(r) => r,
+            ValueRef::Poison(r) => r,
         }
     }
 
@@ -639,7 +682,8 @@ where
             | ValueRef::Bytes(_)
             | ValueRef::BasicBlock(_)
             | ValueRef::BlockParam(_)
-            | ValueRef::Function(_) => None,
+            | ValueRef::Function(_)
+            | ValueRef::Poison(_) => None,
         }
     }
 
@@ -655,7 +699,8 @@ where
             | ValueRef::Bytes(_)
             | ValueRef::BasicBlock(_)
             | ValueRef::BlockParam(_)
-            | ValueRef::Function(_) => None,
+            | ValueRef::Function(_)
+            | ValueRef::Poison(_) => None,
         }
     }
 }
@@ -677,6 +722,7 @@ where
             ValueRef::Literal(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
             ValueRef::Bytes(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
             ValueRef::Varnode(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
+            ValueRef::Poison(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
             ValueRef::Temp(r) => insn::segment::value_tokens_view(r.view, self.id()),
             ValueRef::Instruction(r) => insn::segment::value_tokens_view(r.view, self.id()),
             ValueRef::BasicBlock(r) => insn::segment::value_tokens_view(r.view, self.id()),

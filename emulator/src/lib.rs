@@ -102,6 +102,11 @@ pub enum EmulatorErrorKind {
     /// block left behind by lifting). Recoverable: bounded consumers decline to
     /// harvest rather than indexing out of bounds.
     EmptyBlock(BlockId),
+    /// A [`poison`](qcode::value::poison) value was demanded as a concrete datum.
+    /// Poison has undefined bits, so reading it is a hard error (argpromote v2);
+    /// propagating it as an unread operand is fine. Bounded consumers (e.g.
+    /// pure-call folding) treat this as a bail signal.
+    PoisonRead,
 }
 
 impl std::fmt::Display for EmulatorErrorKind {
@@ -129,6 +134,7 @@ impl std::fmt::Display for EmulatorErrorKind {
             }
             Self::UnsupportedMnemonic(op) => write!(f, "unsupported mnemonic `{op}`"),
             Self::EmptyBlock(block) => write!(f, "block {block:?} has no instructions"),
+            Self::PoisonRead => write!(f, "read of a poison value (undefined bits)"),
         }
     }
 }

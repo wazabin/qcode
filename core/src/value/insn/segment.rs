@@ -161,6 +161,11 @@ where
                 self.push(format!("i{} ", r.size() * 8), TokenKind::Type, None);
                 self.push(r.to_string(), TokenKind::Varnode, link);
             }
+            ValueId::Poison(pid) => {
+                let ty = self.view.shared().values.poisons[pid].type_id;
+                self.ty(ty);
+                self.push("poison".to_string(), TokenKind::Literal, link);
+            }
             ValueId::Temp(id) => {
                 let r = self.view.temp_ref(id);
                 self.push(format!("i{} ", r.size() * 8), TokenKind::Type, None);
@@ -789,6 +794,13 @@ where
             TokenKind::Label,
             Some(Link::Block(id)),
         )),
+        ValueId::Poison(id) => {
+            typed(
+                shared.values.poisons[id].type_id,
+                "poison".to_string(),
+                TokenKind::Literal,
+            );
+        }
     }
     out
 }
@@ -871,6 +883,15 @@ pub fn value_tokens_shared(shared: &Shared<'_>, id: ValueId) -> Vec<Token> {
                 None,
             ));
             out.push(Token::new(r.to_string(), TokenKind::Varnode, link));
+        }
+        ValueId::Poison(pid) => {
+            let ty = shared.values.poisons[pid].type_id;
+            out.push(Token::new(
+                format!("{} ", shared.types.type_name(ty)),
+                TokenKind::Type,
+                None,
+            ));
+            out.push(Token::new("poison".to_string(), TokenKind::Literal, link));
         }
         _ => panic!("value_tokens_shared: not a shared-leaf value id"),
     }

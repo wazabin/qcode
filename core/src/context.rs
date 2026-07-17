@@ -303,6 +303,7 @@ impl<'str> Shared<'str> {
             ValueId::Literal(lid) => Some(self.values.literals[lid].type_id),
             ValueId::Bytes(bid) => Some(self.values.bytes[bid].type_id),
             ValueId::Varnode(vid) => self.values.varnode_types.get(&vid).copied(),
+            ValueId::Poison(pid) => Some(self.values.poisons[pid].type_id),
             ValueId::Instruction(_)
             | ValueId::BlockParam(_)
             | ValueId::BasicBlock(_)
@@ -1637,6 +1638,13 @@ impl<'str> Context<'str> {
         LiteralRef::from_id(self, id)
     }
 
+    /// Mints a fresh typed **poison** value of the given [`TypeId`]. Never
+    /// deduped: each call yields a distinct poison so GVN keeps them in separate
+    /// congruence classes (see [`poison`](crate::value::poison)).
+    pub fn get_poison(&self, type_id: crate::types::TypeId) -> ValueId {
+        ValueId::Poison(self.shared.values.push_poison(type_id))
+    }
+
     /// Creates a typed constant literal.
     ///
     /// Unlike [`get_const`](Self::get_const) this accepts an arbitrary [`TypeId`],
@@ -1707,6 +1715,7 @@ impl<'str> Context<'str> {
                 .shared
                 .types
                 .get_or_make_int(self.bodies[id.func].temps[id.local].size),
+            ValueId::Poison(pid) => self.shared.values.poisons[pid].type_id,
             // Exhaustive on purpose: a new ValueId variant must decide its type
             // here rather than silently inheriting the zero-width fallback.
             ValueId::BasicBlock(_) | ValueId::Function(_) => self.shared.types.get_or_make_int(0),
@@ -1725,6 +1734,7 @@ impl<'str> Context<'str> {
             ValueId::Instruction(iid) => Some(self.instruction(iid).type_id),
             ValueId::BlockParam(pid) => Some(self.block_param(pid).type_id),
             ValueId::Varnode(vid) => self.shared.values.varnode_types.get(&vid).copied(),
+            ValueId::Poison(pid) => Some(self.shared.values.poisons[pid].type_id),
             ValueId::Temp(_) => None,
             ValueId::BasicBlock(_) | ValueId::Function(_) => None,
         }
