@@ -16,6 +16,7 @@ mod call_graph;
 mod carried_array;
 mod dead_signature;
 mod depipeline;
+pub(crate) mod effect_engine;
 mod interface;
 mod loop_to_map;
 mod loop_to_scan;

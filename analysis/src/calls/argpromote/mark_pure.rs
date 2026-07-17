@@ -3,8 +3,15 @@ use qcode::{
     space::LocalMemorySpaceId,
     value::{FunctionBody, FunctionId, insn::Mnemonic},
 };
+use rustc_hash::FxHashSet;
 
-use crate::{Pass, PipelineEnv};
+use crate::{
+    Pass, PipelineEnv,
+    calls::{
+        CallEdge,
+        effect_engine::{EffectChannel, solve_summaries},
+    },
+};
 
 /// Assert [`FunctionRef::is_pure`](qcode::value::FunctionRef::is_pure) on every
 /// `pure_reg` function whose body has no
@@ -20,30 +27,74 @@ pub fn mark_pure_functions(ctx: &mut Context) -> bool {
     mark_pure_functions_targeted(ctx, &targets)
 }
 
+/// The purity [`EffectChannel`]: effects are the set of (transitively) reachable
+/// direct callees; ⊤ is any body-local impurity, an external / bodyless callee,
+/// or a call site with residual clobbers. A function is pure iff its summary is
+/// solved *and* it cannot reach itself (recursion never flags — a recursive
+/// "pure" call cannot be emulated or dead-call-deleted without a termination
+/// argument, matching the pre-engine behaviour).
+///
+/// Externals are ⊤ leaves even when `Materialized` (a prototype bounds their
+/// register interface; their memory behaviour — `printf` writing stdout — is
+/// still an observable effect, so a call to one must never be deleted as a dead
+/// pure call).
+struct PureChannel;
+
+impl EffectChannel for PureChannel {
+    type Effects = FxHashSet<FunctionId>;
+
+    fn scan(&self, ctx: &Context, fid: FunctionId) -> Option<Self::Effects> {
+        body_locally_pure(ctx, fid).then(FxHashSet::default)
+    }
+
+    fn external_leaf(&self, _ctx: &Context, _fid: FunctionId) -> Option<Self::Effects> {
+        None
+    }
+
+    fn transfer(
+        &self,
+        ctx: &Context,
+        edge: &CallEdge,
+        callee_eff: &Self::Effects,
+    ) -> Option<Self::Effects> {
+        // A `Call` site with residual clobbers is not register-transparent even
+        // if its callee is pure — guard against a stale over-approximated
+        // clobber set. A synthetic edge has no site to vet: conservative ⊤.
+        let site = edge.site?;
+        if let Mnemonic::Call(c) = ctx.get_insn(site).mnemonic()
+            && !c.clobbers.is_empty()
+        {
+            return None;
+        }
+        let crate::calls::CallTarget::Function(callee) = edge.target else {
+            return None;
+        };
+        let mut eff = callee_eff.clone();
+        eff.insert(callee);
+        Some(eff)
+    }
+
+    fn join(&self, into: &mut Self::Effects, from: &Self::Effects) -> bool {
+        let before = into.len();
+        into.extend(from.iter().copied());
+        into.len() != before
+    }
+}
+
 fn mark_pure_functions_targeted(ctx: &mut Context, targets: &[FunctionId]) -> bool {
-    // Loop to a fixpoint: a pure function may call pure functions
-    // ([`mnemonic_is_pure`]), so a caller becomes provably pure only once its
-    // callees are flagged. A single pass in an unlucky (caller-before-callee)
-    // order would miss the caller; iterating until nothing new is flagged makes
-    // the result independent of `function_ids()` order (acyclic call graphs settle
-    // in depth-many rounds; recursion never flags, which is correct).
+    let graph = crate::CallGraph::analyze(ctx);
+    let summaries = solve_summaries(ctx, &graph, &PureChannel);
     let mut changed = false;
-    loop {
-        let mut round = false;
-        for fid in targets.iter().copied() {
-            let f = FunctionBody::from_id(ctx, fid);
-            if f.is_pure() || !f.is_reg_materialized() {
-                continue;
-            }
-            if body_is_pure(ctx, fid) {
-                FunctionBody::from_id_mut(ctx, fid).set_is_pure(true);
-                round = true;
-            }
+    for fid in targets.iter().copied() {
+        let f = FunctionBody::from_id(ctx, fid);
+        if f.is_pure() || !f.is_reg_materialized() || f.is_external() {
+            continue;
         }
-        if !round {
-            break;
+        let pure = matches!(summaries.get(fid), Ok(reachable) if !reachable.contains(&fid));
+        if pure {
+            FunctionBody::from_id_mut(ctx, fid).set_is_pure(true);
+            changed = true;
         }
-        changed = true;
     }
     changed
 }
@@ -64,15 +115,28 @@ fn mark_pure_functions_targeted(ctx: &mut Context, targets: &[FunctionId]) -> bo
 /// caller-visible effect, but a store to real memory is an observable side effect
 /// — allowing it would let the dead-pure-call sweep delete the call (when its
 /// return is unused) and drop that store.
+#[cfg(test)]
 pub(crate) fn body_is_pure(ctx: &Context, fid: FunctionId) -> bool {
+    let callee_pure = |target: FunctionId| FunctionBody::from_id(ctx, target).is_pure();
     FunctionBody::from_id(ctx, fid).iter().all(|block| {
         block
             .iter()
-            .all(|insn| mnemonic_is_pure(ctx, insn.mnemonic()))
+            .all(|insn| mnemonic_is_pure(insn.mnemonic(), &callee_pure))
     })
 }
 
-fn mnemonic_is_pure(ctx: &Context, m: &Mnemonic) -> bool {
+/// Body-local purity only — callee purity is the effect engine's business
+/// ([`PureChannel`]): every call-shaped mnemonic is judged solely on its
+/// site-local conditions here, with the callee treated as pure.
+fn body_locally_pure(ctx: &Context, fid: FunctionId) -> bool {
+    FunctionBody::from_id(ctx, fid).iter().all(|block| {
+        block
+            .iter()
+            .all(|insn| mnemonic_is_pure(insn.mnemonic(), &|_| true))
+    })
+}
+
+fn mnemonic_is_pure(m: &Mnemonic, callee_pure: &dyn Fn(FunctionId) -> bool) -> bool {
     let is_temp = |space| match space {
         LocalMemorySpaceId::Shared(_) => false,
         LocalMemorySpaceId::Temp(_) => true,
@@ -87,28 +151,14 @@ fn mnemonic_is_pure(ctx: &Context, m: &Mnemonic) -> bool {
         Mnemonic::CallInd(_) | Mnemonic::BranchInd(_) | Mnemonic::PCodeOp(_) => false,
         // A map is pure exactly when its per-element body is pure. The body is a
         // symbol, not an operand, so the generic varnode check below cannot see it.
-        Mnemonic::Map(m) => m
-            .body
-            .real()
-            .is_some_and(|body| FunctionBody::from_id(ctx, body).is_pure()),
+        Mnemonic::Map(m) => m.body.real().is_some_and(callee_pure),
         // A scan is pure exactly when its per-element body is pure (same as map).
-        Mnemonic::Scan(m) => m
-            .body
-            .real()
-            .is_some_and(|body| FunctionBody::from_id(ctx, body).is_pure()),
-        Mnemonic::Apply(m) => m
-            .target
-            .real()
-            .is_some_and(|target| FunctionBody::from_id(ctx, target).is_pure()),
+        Mnemonic::Scan(m) => m.body.real().is_some_and(callee_pure),
+        Mnemonic::Apply(m) => m.target.real().is_some_and(callee_pure),
         // A direct call to a pure function is a deterministic value of its args
         // and clobbers nothing — provided the call site carries no residual
         // clobbers of its own.
-        Mnemonic::Call(c) => {
-            c.clobbers.is_empty()
-                && c.target
-                    .real()
-                    .is_some_and(|target| FunctionBody::from_id(ctx, target).is_pure())
-        }
+        Mnemonic::Call(c) => c.clobbers.is_empty() && c.target.real().is_some_and(callee_pure),
         // A store is pure only when it writes the function's *private* shadow space
         // (argpromote's functionalized memory) — that produces no caller-visible
         // effect. A store to REAL memory is an observable side effect and keeps the
@@ -217,6 +267,60 @@ mod tests {
         assert!(
             body_is_pure(&tc.ctx, shadow),
             "a shadow-space store is private → pure"
+        );
+    }
+
+    /// Regression: a prototyped external is `Materialized` (reg-materialized)
+    /// and bodyless, so the pre-engine per-body scan was vacuously pure — and a
+    /// pure external with an unused result would be deleted by
+    /// `remove_dead_pure_call`, dropping its real side effects (`printf`).
+    /// Externals must never be flagged pure.
+    #[test]
+    fn materialized_external_is_never_pure() {
+        let mut tc = TestContext::new();
+        let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("printf".into())).id;
+        FunctionBody::from_id_mut(&mut tc.ctx, ext).set_effects(
+            qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
+                inputs: vec![tc.r1],
+                outputs: vec![tc.r0],
+                returns: 1,
+            }),
+        );
+        mark_pure_functions(&mut tc.ctx);
+        assert!(
+            !FunctionBody::from_id(&tc.ctx, ext).is_pure(),
+            "a materialized external keeps observable effects and must stay impure"
+        );
+    }
+
+    /// A self-recursive function whose body is otherwise pure is *not* flagged:
+    /// purity is only asserted for functions that cannot reach themselves
+    /// (no termination argument, so neither emulation nor dead-call deletion is
+    /// justified). Matches the pre-engine behaviour.
+    #[test]
+    fn recursion_never_flags_pure() {
+        use qcode_macro::qcode;
+        let mut tc = TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    call fn f();
+                <f_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (f_entry, f_cont);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
+            qcode::value::FunctionEffects::Materialized(
+                qcode::value::RegisterInterfaceMap::default(),
+            ),
+        );
+        mark_pure_functions(&mut tc.ctx);
+        assert!(
+            !FunctionBody::from_id(&tc.ctx, f).is_pure(),
+            "self-recursion must never be flagged pure"
         );
     }
 }

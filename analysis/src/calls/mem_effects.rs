@@ -16,11 +16,15 @@
 //! callee that writes only its own private scratch space — never the real `ram`
 //! the buffer lives in.
 //!
-//! A function whose effect cannot be bounded — it makes an indirect call, or
-//! calls an external function — is recorded `None` (unknown / may write any
-//! space), the conservative answer the prune already assumes.
+//! A function whose effect cannot be bounded — it makes an indirect call or
+//! tail-branch, or calls an external function — is recorded `None` (unknown /
+//! may write any space), the conservative answer the prune already assumes.
+//!
+//! The fixpoint itself is the channel-generic effect engine
+//! ([`crate::calls::effect_engine`]); this module contributes only the
+//! space-set channel and the signature write-back.
 
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     context::Context,
@@ -28,146 +32,104 @@ use qcode::{
     value::{FunctionBody, FunctionId, insn::Mnemonic},
 };
 
-/// A function's witnessed memory-write effect: either a bounded set of
-/// non-register spaces, or unbounded (an indirect/external call leaks the effect
-/// out of view).
-#[derive(Clone)]
-enum Effect {
-    Bounded(HashSet<SpaceId>),
-    Unbounded,
-}
+use super::{
+    CallEdge, CallGraph,
+    effect_engine::{EffectChannel, solve_summaries},
+};
 
-/// The *local* write effect of `function_id`: the non-register spaces its own
-/// body stores to, the resolved functions it calls, and whether it makes a call
-/// whose effect cannot be bounded (indirect, or to an external function).
-fn local_effect(
-    ctx: &Context,
-    function_id: FunctionId,
-) -> (HashSet<SpaceId>, Vec<FunctionId>, bool) {
-    let mut spaces = HashSet::default();
-    let mut callees = Vec::new();
-    let mut unbounded = false;
-    for block in FunctionBody::from_id(ctx, function_id).blocks() {
-        for insn in block.iter() {
-            match insn.mnemonic() {
-                // Register writes are tracked separately (via `FunctionEffects`);
-                // only memory spaces matter to the forwarding prune.
-                Mnemonic::Store(s) => {
-                    // Function-local temporary writes never escape into the
-                    // published interprocedural shared-space summary.
-                    if let Some(space) = s.space.shared()
-                        && !matches!(Space::from_id(ctx, space).ty, SpaceType::Register)
-                    {
-                        spaces.insert(space);
+/// The memory-write [`EffectChannel`]: effects are the set of non-register
+/// shared spaces a function may store to; ⊤ (unbounded) is any escape to code the
+/// summary cannot see. Externals are ⊤ leaves (a prototype bounds their
+/// *register* effect, not their memory accesses), and an unresolved `BranchInd`
+/// (the PLT-stub shape `goto [GOT_slot]`) is a channel-⊤ in the scan — a
+/// `BranchInd` that stayed in-function would have been resolved to a direct
+/// `Branch` by the jump-table pass, so one that survives is a genuine escape.
+/// `CallInd` is the engine's shared indirect gate (default ⊤).
+struct SpaceChannel;
+
+impl EffectChannel for SpaceChannel {
+    type Effects = HashSet<SpaceId>;
+
+    fn scan(&self, ctx: &Context, fid: FunctionId) -> Option<Self::Effects> {
+        let mut writes = HashSet::default();
+        for block in FunctionBody::from_id(ctx, fid).blocks() {
+            for insn in block.iter() {
+                match insn.mnemonic() {
+                    // Register writes are tracked separately (via
+                    // `FunctionEffects`); only memory spaces matter to the
+                    // forwarding prune. Function-local temporary writes never
+                    // escape into the published interprocedural summary.
+                    Mnemonic::Store(s) => {
+                        if let Some(space) = s.space.shared()
+                            && !matches!(Space::from_id(ctx, space).ty, SpaceType::Register)
+                        {
+                            writes.insert(space);
+                        }
                     }
+                    Mnemonic::BranchInd(_) => return None,
+                    _ => {}
                 }
-                Mnemonic::Call(call) => {
-                    let Some(target) = call.target.real() else {
-                        unbounded = true;
-                        continue;
-                    };
-                    if FunctionBody::from_id(ctx, target).is_external() {
-                        unbounded = true;
-                    } else {
-                        callees.push(target);
-                    }
-                }
-                // An unresolved indirect transfer leaves to unknown code — an
-                // indirect call, or an indirect *tail-branch* (the shape a PLT
-                // stub lifts to: `goto [GOT_slot]`). Either can write anything, so
-                // the effect is unbounded. A `BranchInd` that stayed in-function
-                // would have been resolved to a direct `Branch` by the jump-table
-                // pass; one that survives is a genuine escape.
-                Mnemonic::CallInd(_) | Mnemonic::BranchInd(_) => unbounded = true,
-                _ => {}
             }
         }
+        Some(writes)
     }
-    (spaces, callees, unbounded)
+
+    fn external_leaf(&self, _ctx: &Context, _fid: FunctionId) -> Option<Self::Effects> {
+        None
+    }
+
+    fn transfer(
+        &self,
+        _ctx: &Context,
+        _edge: &CallEdge,
+        callee: &Self::Effects,
+    ) -> Option<Self::Effects> {
+        Some(callee.clone())
+    }
+
+    fn join(&self, into: &mut Self::Effects, from: &Self::Effects) -> bool {
+        let before = into.len();
+        into.extend(from.iter().copied());
+        into.len() != before
+    }
 }
 
 /// Compute and record [`written_spaces`](qcode::value::FunctionRef::written_spaces)
-/// for every non-external function as a least fixpoint over the call graph: a
-/// function's write-set is its own stores unioned with every resolved callee's
-/// write-set, becoming unbounded as soon as any (transitive) callee is unbounded.
-///
-/// Sound and order-independent: the per-function effect only ever grows, and an
-/// unbounded effect (`None`) is the conservative value the prune already assumes,
-/// so an under-approximation is impossible.
+/// for every non-external function: the engine's least fixpoint over the call
+/// graph on the [`SpaceChannel`]. A ⊤ summary (unbounded) records `None`, the
+/// conservative value the prune already assumes, so an under-approximation is
+/// impossible.
 pub fn set_all_written_spaces(ctx: &mut Context) {
-    let ids: Vec<FunctionId> = ctx
-        .functions()
-        .filter(|f| !f.is_external())
-        .map(|f| f.id)
-        .collect();
+    let targets = ctx.function_ids();
+    set_written_spaces_targeted(ctx, &targets);
+}
 
-    // Seed each function with its local effect, remembering callees for the
-    // transitive union below.
-    let mut effect: HashMap<FunctionId, Effect> = HashMap::default();
-    let mut callees: HashMap<FunctionId, Vec<FunctionId>> = HashMap::default();
-    for &id in &ids {
-        let (spaces, cs, unbounded) = local_effect(ctx, id);
-        effect.insert(
-            id,
-            if unbounded {
-                Effect::Unbounded
-            } else {
-                Effect::Bounded(spaces)
-            },
-        );
-        callees.insert(id, cs);
-    }
+fn set_written_spaces_targeted(
+    ctx: &mut Context,
+    targets: &[FunctionId],
+) -> rustc_hash::FxHashSet<FunctionId> {
+    let graph = CallGraph::analyze(ctx);
+    let summaries = solve_summaries(ctx, &graph, &SpaceChannel);
 
-    // Propagate to a fixpoint: a callee's spaces flow into its callers; a callee
-    // going unbounded makes its callers unbounded. A call to a function not in
-    // `effect` (should not happen for resolved direct calls) is treated as
-    // unbounded, never silently dropped.
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &id in &ids {
-            if matches!(effect[&id], Effect::Unbounded) {
-                continue;
-            }
-            let mut go_unbounded = false;
-            let mut additions: HashSet<SpaceId> = HashSet::default();
-            for &c in &callees[&id] {
-                match effect.get(&c) {
-                    Some(Effect::Bounded(cs)) => additions.extend(cs.iter().copied()),
-                    _ => {
-                        go_unbounded = true;
-                        break;
-                    }
-                }
-            }
-            match effect.get_mut(&id).expect("seeded above") {
-                Effect::Unbounded => {}
-                Effect::Bounded(_) if go_unbounded => {
-                    effect.insert(id, Effect::Unbounded);
-                    changed = true;
-                }
-                Effect::Bounded(set) => {
-                    let before = set.len();
-                    set.extend(additions);
-                    if set.len() != before {
-                        changed = true;
-                    }
-                }
-            }
+    let mut changed_functions = rustc_hash::FxHashSet::default();
+    for &id in targets {
+        if FunctionBody::from_id(ctx, id).is_external() {
+            continue;
         }
-    }
-
-    for &id in &ids {
-        let summary = match &effect[&id] {
-            Effect::Unbounded => None,
-            Effect::Bounded(set) => {
+        let summary = match summaries.get(id) {
+            Err(_) => None,
+            Ok(set) => {
                 let mut v: Vec<SpaceId> = set.iter().copied().collect();
                 v.sort_by_key(|&s| usize::from(s));
                 Some(v)
             }
         };
+        if FunctionBody::from_id(ctx, id).written_spaces() != summary.as_deref() {
+            changed_functions.insert(id);
+        }
         FunctionBody::from_id_mut(ctx, id).set_written_spaces(summary);
     }
+    changed_functions
 }
 
 // ----- pass ------------------------------------------------------------------
@@ -186,14 +148,10 @@ impl Pass for SeedWrittenSpaces {
         &self,
         ctx: &mut Context,
         _env: &PipelineEnv,
+        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
-        let affected: Vec<FunctionId> = ctx
-            .functions()
-            .filter(|f| !f.is_external())
-            .map(|f| f.id)
-            .collect();
-        set_all_written_spaces(ctx);
-        Ok(crate::ModulePassOutcome::functions(affected)
+        let changed = set_written_spaces_targeted(ctx, targets);
+        Ok(crate::ModulePassOutcome::functions(changed)
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>())
     }
