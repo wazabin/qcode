@@ -3447,6 +3447,78 @@ mod tests {
         );
     }
 
+    /// The pack replay must execute exactly when the call did: when the call
+    /// falls through into a join block (a continuation with another
+    /// predecessor), pass 3 splits the fallthrough edge and replays in the
+    /// fresh block, leaving the join's other incoming path untouched.
+    #[test]
+    fn regpure_replay_splits_join_continuation() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    %v = load(register:8, {r0});
+                    %s = %v + i64 1;
+                    store(register:8, {r0} <- %s);
+                    return at i64 0;
+            fn g:
+                <g_entry>
+                    %c = load(register:8, {r0});
+                    if %c goto <g_call> else goto <g_other>;
+                <g_call>
+                    call <f>;
+                <g_other>
+                    goto <g_cont>;
+                <g_cont>
+                    %r = load(register:8, {r0});
+                    return at %r;
+            "
+        );
+        let _ = (f_entry, g_entry, g_other);
+        let eff = scan_register_effects(&tc.ctx, f).expect("f writes r0");
+        materialize_interface(&mut tc.ctx, f, &eff);
+        set_call(&mut tc, g_call, f, vec![]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        let graph = crate::CallGraph::analyze(&tc.ctx);
+        let site = crate::calls::direct_call_sites(&tc.ctx, &graph, f)[0];
+        rewrite_call_regpure(&mut tc.ctx, site, f, None);
+
+        // The join block is untouched: it still starts with its original load
+        // (no extract/store replayed onto the g_other path).
+        let cont = BasicBlock::from_id(&tc.ctx, g_cont);
+        assert!(
+            matches!(cont.iter().next().unwrap().mnemonic(), Mnemonic::Load(_)),
+            "join continuation must not receive the pack replay"
+        );
+        // The call's fallthrough edge was split: its single successor is a fresh
+        // block holding the replay (extract + register store) and branching on.
+        let (_, split) = BasicBlock::from_id(&tc.ctx, g_call)
+            .successors()
+            .next()
+            .unwrap();
+        assert_ne!(split, g_cont, "fallthrough edge must be split");
+        let split_blk = BasicBlock::from_id(&tc.ctx, split);
+        assert!(
+            split_blk
+                .iter()
+                .any(|i| matches!(i.mnemonic(), Mnemonic::Extract(_))),
+            "split block replays the pack"
+        );
+        assert_eq!(
+            split_blk.successors().map(|(_, b)| b).collect::<Vec<_>>(),
+            vec![g_cont],
+            "split block falls through to the original continuation"
+        );
+        assert_eq!(
+            BasicBlock::from_id(&tc.ctx, g_cont).predecessors().count(),
+            2,
+            "join keeps exactly its two predecessors (split block + g_other)"
+        );
+    }
+
     /// (f) End-to-end emulator differential *through* mem2reg. `g` sets up an
     /// input register with a pre-call store; the materialized callee consumes it.
     /// Running mem2reg on `g` must not change caller-visible state — for both a

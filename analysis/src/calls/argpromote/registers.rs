@@ -477,6 +477,39 @@ pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff:
     ));
 }
 
+/// The block where a regpure call's output pack is replayed: the call block's
+/// single fallthrough successor (multiple successors on a call terminator are an
+/// invariant violation). The replayed `extract`/`store`s must execute exactly
+/// when the call did, so if the continuation has other predecessors (the call
+/// falls through into a join) the fallthrough edge is split with a fresh block
+/// that branches on to the original continuation, and the replay lands there.
+fn replay_block(
+    ctx: &mut Context,
+    call_block: qcode::value::BlockId,
+) -> Option<qcode::value::BlockId> {
+    let block = BasicBlock::from_id(ctx, call_block);
+    let mut succs = block.successors();
+    let (edge, cont) = succs.next()?;
+    debug_assert!(
+        succs.next().is_none(),
+        "call terminator with multiple successor edges"
+    );
+    drop(succs);
+    if BasicBlock::from_id(ctx, cont)
+        .predecessors()
+        .nth(1)
+        .is_none()
+    {
+        return Some(cont);
+    }
+    let func = call_block.func;
+    let split = BasicBlock::make(ctx, func).id;
+    ctx.remove_cfg_edge(func, edge);
+    ctx.add_cfg_edge(call_block, split);
+    (ctx).builder(split).push_branch(cont);
+    Some(split)
+}
+
 /// Pass 3 (regpure call sites): rewrite one direct, `Opaque` call to a
 /// materialized callee into an explicit `regpure` call — materialize each input
 /// register as a `load(register, R)` argument before the call, retype the result
@@ -545,11 +578,7 @@ pub(crate) fn rewrite_call_regpure(
     Instruction::from_id_mut(ctx, call_id).set_type(ret_ty);
 
     // --- outputs: replay each pack slot as a register store in the continuation -
-    let Some(cont) = BasicBlock::from_id(ctx, call_block)
-        .successors()
-        .next()
-        .map(|(_, b)| b)
-    else {
+    let Some(cont) = replay_block(ctx, call_block) else {
         return;
     };
     let output_meta: Vec<(VarnodeId, SpaceId)> = map
@@ -674,11 +703,7 @@ fn rewrite_external_call_regpure(
     Instruction::from_id_mut(ctx, call_id).set_type(ret_ty);
 
     // --- outputs: replay the return register(s) from the pack; poison clobbers ---
-    let Some(cont) = BasicBlock::from_id(ctx, call_block)
-        .successors()
-        .next()
-        .map(|(_, b)| b)
-    else {
+    let Some(cont) = replay_block(ctx, call_block) else {
         return;
     };
     let output_meta: Vec<(VarnodeId, usize, SpaceId, bool)> = map
