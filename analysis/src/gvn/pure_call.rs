@@ -240,10 +240,11 @@ mod tests {
             }),
         );
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_signature(FunctionSignature {
-            pure_reg: true,
             is_pure: true,
             ..Default::default()
         });
+        // Materialize the register channel (what `is_pure_reg` now reads).
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
         fid
     }
 
@@ -290,6 +291,7 @@ mod tests {
                 target: qcode::value::insn::Callee::Real(foo),
                 args: vec![a_in.localize(gid), b_arg.localize(gid)],
                 clobbers: vec![],
+                tag: Default::default(),
             }),
         );
         qcode::value::Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg_ty);
@@ -407,10 +409,11 @@ mod tests {
             }),
         );
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_signature(FunctionSignature {
-            pure_reg: true,
             is_pure: true,
             ..Default::default()
         });
+        // Materialize the register channel (what `is_pure_reg` now reads).
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
         fid
     }
 
@@ -452,6 +455,7 @@ mod tests {
                 target: qcode::value::insn::Callee::Real(dec),
                 args: vec![sp_arg.localize(gid), arr_arg.localize(gid)],
                 clobbers: vec![],
+                tag: Default::default(),
             }),
         );
         qcode::value::Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg_ty);

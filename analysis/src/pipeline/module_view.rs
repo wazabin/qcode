@@ -351,9 +351,12 @@ pub fn mint_function<'str>(
     let mut interface = FunctionInterface::new(name);
     interface.kind = kind;
     if pure {
-        let sig = interface.signature.get_or_insert_default();
-        sig.is_pure = true;
-        sig.pure_reg = true;
+        interface.signature.get_or_insert_default().is_pure = true;
+        // A pure minted lambda's register channel is (vacuously) materialized —
+        // the unified effect state that `is_pure_reg` now reads.
+        interface.effects = qcode::value::FunctionEffects::Materialized(
+            qcode::value::RegisterInterfaceMap::default(),
+        );
     }
     let _ = owner;
     minted.push(Minted {
@@ -466,6 +469,7 @@ mod tests {
                     target: second,
                     args: Vec::new(),
                     clobbers: Vec::new(),
+                    tag: Default::default(),
                 }),
                 ty,
             );

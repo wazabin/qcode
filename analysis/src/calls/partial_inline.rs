@@ -444,6 +444,7 @@ mod tests {
                     .map(|arg| arg.localize(call_id.func))
                     .collect(),
                 clobbers: vec![],
+                tag: Default::default(),
             }),
         );
         call_id

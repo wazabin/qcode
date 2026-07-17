@@ -89,7 +89,9 @@ passes = ["windows_teb_seed"]
 [[stage]]
 name = "argpromote-registers"
 scope = "module"
-passes = ["argpromote_registers"]
+# Pass 2 (materialize) then pass 3 (regpure call sites), back-to-back — the
+# order-independent replacement for the v1 fused rewriter (ARGPROMOTE_REGISTERS_V2.md).
+passes = ["argpromote_materialize", "argpromote_regpure_calls"]
 
 # Resolve arguments at calls to bodyless external (imported) functions from their
 # cabi C prototype, while register/stack accesses are still explicit (like

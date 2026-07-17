@@ -136,6 +136,7 @@ pub(crate) fn append_caller_arg_at_sites(
                 target: call.target,
                 args,
                 clobbers: call.clobbers,
+                tag: call.tag,
             }),
         );
         changed = true;
@@ -239,6 +240,7 @@ pub(crate) fn remove_entry_params_at_sites(
                 target: call.target,
                 args,
                 clobbers: call.clobbers,
+                tag: call.tag,
             }),
         );
     }

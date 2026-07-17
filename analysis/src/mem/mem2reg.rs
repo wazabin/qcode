@@ -342,6 +342,99 @@ enum CallClobber {
     Regs(Vec<VarnodeId>),
 }
 
+/// What a call terminator does to *register space*, for both mem2reg liveness
+/// (which registers the call defines) and the renamer's store bookkeeping (which
+/// pre-call register stores the call *reads* — hence must be preserved — and
+/// which post-call reads it clobbers). The two used to be classified separately
+/// and could disagree; this is the single source (argpromote v2 tag/effects
+/// aware — `ARGPROMOTE_REGISTERS_V2.md`).
+///
+/// **Soundness of the read side.** A register the call *reads* holds the caller's
+/// value at the call instruction, so a pending pre-call `store(R, v)` feeding it
+/// is *consumed by the call* and must never be dead-eliminated. A register the
+/// call only *writes* (clobbers, without reading) may have its pending store
+/// dropped — but only then. For a materialized callee `inputs ∩ outputs` is the
+/// norm (`finalize_register_effects` seeds every output as an input too), so the
+/// read side is load-bearing, not a corner case.
+enum CallRegEffect {
+    /// Reads and writes *every* register var: a `CallInd` or an unresolved /
+    /// unknown-effect direct callee. Every pending register store before it is
+    /// consumed (preserved); every continuation register read is clobbered.
+    All,
+    /// Reads exactly `reads` and writes exactly `writes`.
+    Exact {
+        reads: Vec<VarnodeId>,
+        writes: Vec<VarnodeId>,
+    },
+}
+
+impl CallRegEffect {
+    /// The register-write ("clobber") view used by liveness — a written register
+    /// is a definition site for that var.
+    fn clobber(&self) -> CallClobber {
+        match self {
+            CallRegEffect::All => CallClobber::All,
+            CallRegEffect::Exact { writes, .. } => CallClobber::Regs(writes.clone()),
+        }
+    }
+}
+
+/// Classify a call terminator's register-space effect (see [`CallRegEffect`]).
+fn classify_call_reg_effect<'a, 'str: 'a>(
+    view: impl QCodeView<'a, 'str>,
+    call: &Mnemonic,
+) -> CallRegEffect {
+    let none = || CallRegEffect::Exact {
+        reads: Vec::new(),
+        writes: Vec::new(),
+    };
+    match call {
+        // An indirect call's callee is unknown: it may read and write any register.
+        Mnemonic::CallInd(_) => CallRegEffect::All,
+        Mnemonic::Call(c) => {
+            // A regpure call is register-transparent: inputs are explicit `args`
+            // and outputs are replayed as `store`s in the continuation, so the
+            // call instruction itself neither reads nor writes register space.
+            if c.tag.is_regpure() {
+                return none();
+            }
+            let Some(target) = c.target.real() else {
+                // Minted / unresolved target: unknown effect.
+                return CallRegEffect::All;
+            };
+            let interface = view.interface(target);
+            // Implicit (`Opaque`) call to a materialized callee: it reads exactly
+            // its input registers from the register file and writes exactly its
+            // output registers. Both are honored — a pre-call store to an input
+            // register is consumed here.
+            if let qcode::value::FunctionEffects::Materialized(map) = &interface.effects {
+                return CallRegEffect::Exact {
+                    reads: map.inputs.clone(),
+                    writes: map.outputs.clone(),
+                };
+            }
+            let signature = interface.signature.as_ref();
+            match signature.and_then(|s| s.clobbered.as_deref()) {
+                // Signature-based classification only: assume the recorded clobber
+                // set excludes read (argument) registers — an ABI caller-saved set
+                // never includes the argument registers, and a non-materialized
+                // callee's argument reads are already made explicit (e.g. by
+                // `argpromote_external`) before mem2reg. So the call reads no
+                // register implicitly and writes only `clobbered`.
+                Some(regs) => CallRegEffect::Exact {
+                    reads: Vec::new(),
+                    writes: regs.to_vec(),
+                },
+                // Externally-resolved with no recorded set: exact empty effect.
+                None if signature.is_some_and(|s| s.externally_resolved) => none(),
+                // Unresolved / unknown effect: reads and writes everything.
+                None => CallRegEffect::All,
+            }
+        }
+        _ => none(),
+    }
+}
+
 /// Precomputed inputs for per-variable live-in analysis, shared across every
 /// variable in one mem2reg run.
 ///
@@ -406,28 +499,15 @@ impl LiveInBlocks {
                 }
             }
 
-            match block.iter().last().map(|i| i.mnemonic().clone()) {
-                Some(Mnemonic::CallInd(_)) => call_blocks.push((block_id, CallClobber::All)),
-                Some(Mnemonic::Call(call)) => {
-                    let Some(target) = call.target.real() else {
-                        call_blocks.push((block_id, CallClobber::All));
-                        continue;
-                    };
-                    let interface = host.interface(target);
-                    let signature = interface.signature.as_ref();
-                    let clobber = match signature.and_then(|s| s.clobbered.as_deref()) {
-                        Some(regs) => CallClobber::Regs(regs.to_vec()),
-                        // A resolved callee with no recorded set clobbers nothing
-                        // (exact, empty set); an unresolved one is unknown, so
-                        // conservatively clobbers all.
-                        None if signature.is_some_and(|s| s.externally_resolved) => {
-                            CallClobber::Regs(Vec::new())
-                        }
-                        None => CallClobber::All,
-                    };
-                    call_blocks.push((block_id, clobber));
-                }
-                _ => {}
+            if let Some(mnemonic @ (Mnemonic::Call(_) | Mnemonic::CallInd(_))) =
+                block.iter().last().map(|i| i.mnemonic().clone())
+            {
+                // The register-write ("clobber") view of the call's effect drives
+                // liveness (a written register is a definition site); the shared
+                // classifier keeps this in lockstep with the renamer's store
+                // bookkeeping.
+                let clobber = classify_call_reg_effect(host, &mnemonic).clobber();
+                call_blocks.push((block_id, clobber));
             }
         }
 
@@ -1856,31 +1936,48 @@ impl<'str> Mem2Reg<'_, 'str> {
                 }
 
                 call_mnemonic @ (Mnemonic::Call(_) | Mnemonic::CallInd(_)) => {
-                    // A call clobbers its callee's registers. Shadow each promoted
-                    // register var it clobbers with a clobber marker so a read in the
-                    // continuation sees the call's output (left as a register load),
-                    // not the value the caller held before the call.
-                    let clobbered = self.call_clobbered_register_vars(&call_mnemonic, state.vars);
-                    {
-                        let frame = state.frames.last_mut().unwrap();
-                        for v in clobbered {
-                            // A pending store to a clobbered register, never read
-                            // before the call, is overwritten by the call's own
-                            // write — it is dead, exactly as a store-overwrites-store
-                            // would be (see the `Store` arm). Only the top frame is
-                            // consulted, for the same path-domination reason.
-                            if let Some(FrameEntry::Defined(ReachingValue {
+                    // Model the call's register-space effect (argpromote v2): the
+                    // registers it *reads* (whose pre-call stores it consumes and
+                    // must be preserved) and those it only *writes* (clobbers,
+                    // whose pre-call stores may be dead). A materialized callee
+                    // reads its inputs and writes its outputs; `inputs ∩ outputs`
+                    // is preserved AND clobbered.
+                    let (read_vars, write_vars) =
+                        self.call_read_written_register_vars(&call_mnemonic, state.vars);
+                    let frame = state.frames.last_mut().unwrap();
+
+                    // Reads first: a pending store to a read register feeds the
+                    // callee, so pin it live (never dead-eliminated).
+                    for v in &read_vars {
+                        if let Some(FrameEntry::Defined(ReachingValue {
+                            store_insn: Some(id),
+                            ..
+                        })) = frame.get(v)
+                        {
+                            state.preserved_stores.insert(*id);
+                        }
+                    }
+                    // Writes: the call clobbers the register (a continuation read
+                    // sees the call's output, left as a register load). A pending
+                    // store to a *write-only* register (not also read) is dead —
+                    // overwritten unread by the callee. A read+written register's
+                    // store was just preserved, so the `consumed`/`preserved`
+                    // guard below correctly keeps it.
+                    for v in &write_vars {
+                        if !read_vars.contains(v)
+                            && let Some(FrameEntry::Defined(ReachingValue {
                                 store_insn: Some(old_id),
                                 ..
-                            })) = frame.get(&v)
+                            })) = frame.get(v)
+                        {
+                            let old_id = *old_id;
+                            if !state.consumed_stores.contains(&old_id)
+                                && !state.preserved_stores.contains(&old_id)
                             {
-                                let old_id = *old_id;
-                                if !state.consumed_stores.contains(&old_id) {
-                                    state.dead_stores.insert(old_id);
-                                }
+                                state.dead_stores.insert(old_id);
                             }
-                            frame.insert(v, FrameEntry::Clobbered);
                         }
+                        frame.insert(*v, FrameEntry::Clobbered);
                     }
                     self.visit_successors(block, state);
                 }
@@ -1912,54 +2009,38 @@ impl<'str> Mem2Reg<'_, 'str> {
         }
     }
 
-    /// The promoted register vars in `vars` clobbered by call terminator `call`.
-    ///
-    /// Computed once per call block: the callee's clobber set is fetched a single
-    /// time rather than re-derived per var (as a per-var [`call_clobbers_var`]
-    /// would). A `CallInd`, or a callee with no recorded clobber set, is treated
-    /// conservatively as clobbering every promoted register var.
-    fn call_clobbered_register_vars(
+    /// The promoted register vars in `vars` that call terminator `call` *reads*
+    /// (pre-call stores must be preserved) and those it *writes* (clobbers). Uses
+    /// the shared [`classify_call_reg_effect`] classifier so this stays in lockstep
+    /// with liveness. A [`CallRegEffect::All`] call reads and writes *every*
+    /// promoted register var.
+    fn call_read_written_register_vars(
         &self,
         call: &Mnemonic,
         vars: &HashSet<ValueId>,
-    ) -> Vec<ValueId> {
-        let register_vars = || {
-            vars.iter()
+    ) -> (Vec<ValueId>, Vec<ValueId>) {
+        let register_vars: Vec<ValueId> = vars
+            .iter()
+            .copied()
+            .filter(|&v| register_varnode(self.read(), v).is_some())
+            .collect();
+        // The vars aliasing any register in `regs` (overlap decided via alias
+        // analysis, matching the liveness clobber test).
+        let vars_aliasing = |regs: &[VarnodeId]| -> Vec<ValueId> {
+            register_vars
+                .iter()
                 .copied()
-                .filter(|&v| register_varnode(self.read(), v).is_some())
+                .filter(|&v| {
+                    regs.iter()
+                        .any(|&r| self.aliases.may_alias(self.read(), ValueId::Varnode(r), v))
+                })
+                .collect()
         };
-        match call {
-            Mnemonic::CallInd(_) => register_vars().collect(),
-            Mnemonic::Call(call) => {
-                let Some(target) = call.target.real() else {
-                    return register_vars().collect();
-                };
-                let interface = self.read().interface(target);
-                let signature = interface.signature.as_ref();
-                let resolved = signature.is_some_and(|s| s.externally_resolved);
-                let clobbered = signature
-                    .and_then(|s| s.clobbered.as_deref())
-                    .map(<[VarnodeId]>::to_vec);
-                match clobbered {
-                    // A resolved callee with no recorded set clobbers nothing; an
-                    // unresolved one is unknown, so conservatively clobbers all.
-                    None => {
-                        if resolved {
-                            Vec::new()
-                        } else {
-                            register_vars().collect()
-                        }
-                    }
-                    Some(clobbered) => register_vars()
-                        .filter(|&v| {
-                            clobbered.iter().any(|&c| {
-                                self.aliases.may_alias(self.read(), ValueId::Varnode(c), v)
-                            })
-                        })
-                        .collect(),
-                }
+        match classify_call_reg_effect(self.read(), call) {
+            CallRegEffect::All => (register_vars.clone(), register_vars),
+            CallRegEffect::Exact { reads, writes } => {
+                (vars_aliasing(&reads), vars_aliasing(&writes))
             }
-            _ => Vec::new(),
         }
     }
 }

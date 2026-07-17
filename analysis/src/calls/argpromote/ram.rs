@@ -1148,6 +1148,7 @@ fn apply_partial(
                 target,
                 args: new_args,
                 clobbers,
+                tag: Default::default(),
             }),
         );
     }

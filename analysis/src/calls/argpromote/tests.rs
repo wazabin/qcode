@@ -46,6 +46,7 @@ mod tests {
                     .map(|arg| arg.localize(call_id.func))
                     .collect(),
                 clobbers: vec![],
+                tag: Default::default(),
             }),
         );
         call_id
@@ -3054,6 +3055,546 @@ mod tests {
         assert!(
             problems.is_empty(),
             "post-rewrite IR must verify: {problems:?}"
+        );
+    }
+
+    /// Regression for v1 **bug 1** (stranded input loads). The caller is defined
+    /// *before* the callee, so its `FunctionId` is lower — the ordering that made
+    /// v1 freeze the caller's interface before the callee injected its loads. The
+    /// v2 summary fixpoint composes the callee's read of `r0` into the caller's
+    /// solved inputs regardless of order, so the caller materializes with `r0` in
+    /// its interface mapping — no `load(register, r0)` is left without a param.
+    #[test]
+    fn bug1_caller_before_callee_no_stranded_input() {
+        use qcode::value::FunctionEffects;
+        let mut tc = qcode::testing::TestContext::new();
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn caller:
+                <c_entry>
+                    store(register:8, {r0} <- i64 10);
+                    goto <c_call>;
+                <c_call>
+                    call <callee>;
+                <c_cont>
+                    return at i64 0;
+            fn callee:
+                <e_entry>
+                    %v = load(register:8, {r0});
+                    %s = %v + i64 1;
+                    store(register:8, {r0} <- %s);
+                    return at i64 0;
+            "
+        );
+        let _ = (c_entry, c_call, c_cont, e_entry);
+        assert!(caller < callee, "caller must have the lower FunctionId");
+        set_call(&mut tc, c_call, callee, vec![]);
+        tc.ctx.add_cfg_edge(c_call, c_cont);
+
+        assert!(argpromote_registers(&mut tc.ctx));
+
+        // The callee's read of r0 propagated into the caller's solved interface —
+        // it is a by-value input, not a stranded load.
+        let FunctionEffects::Materialized(map) = FunctionBody::from_id(&tc.ctx, caller).effects()
+        else {
+            panic!("caller must be materialized");
+        };
+        assert!(
+            map.inputs.contains(&r0),
+            "callee's r0 read must appear in the caller's input mapping"
+        );
+    }
+
+    /// Regression for v1 **bug 2** (dropped output writes). A grandcaller calls a
+    /// caller that calls a callee which clobbers `r1`. v1 froze the grandcaller's
+    /// return pack before the clobber was known, dropping it for *its* callers.
+    /// v2 unions the clobber through both levels, so the grandcaller's return-pack
+    /// mapping contains `r1`.
+    #[test]
+    fn bug2_clobber_visible_through_two_materialized_levels() {
+        use qcode::value::FunctionEffects;
+        let mut tc = qcode::testing::TestContext::new();
+        let r1 = tc.r1;
+        qcode!(
+            tc.ctx,
+            "
+            fn grandcaller:
+                <gc_entry>
+                    goto <gc_call>;
+                <gc_call>
+                    call <caller>;
+                <gc_cont>
+                    return at i64 0;
+            fn caller:
+                <c_entry>
+                    goto <c_call>;
+                <c_call>
+                    call <callee>;
+                <c_cont>
+                    return at i64 0;
+            fn callee:
+                <e_entry>
+                    store(register:8, {r1} <- i64 99);
+                    return at i64 0;
+            "
+        );
+        let _ = (gc_entry, gc_call, gc_cont, c_entry, c_call, c_cont, e_entry);
+        set_call(&mut tc, gc_call, caller, vec![]);
+        tc.ctx.add_cfg_edge(gc_call, gc_cont);
+        set_call(&mut tc, c_call, callee, vec![]);
+        tc.ctx.add_cfg_edge(c_call, c_cont);
+
+        assert!(argpromote_registers(&mut tc.ctx));
+
+        let FunctionEffects::Materialized(map) =
+            FunctionBody::from_id(&tc.ctx, grandcaller).effects()
+        else {
+            panic!("grandcaller must be materialized");
+        };
+        assert!(
+            map.outputs.contains(&r1),
+            "the deep callee's r1 clobber must ride the grandcaller's return pack"
+        );
+    }
+
+    /// Count `store(register R, ..)` instructions in `fid`.
+    fn count_reg_stores(ctx: &Context<'_>, fid: FunctionId, reg: VarnodeId) -> usize {
+        let mut n = 0;
+        for b in FunctionBody::from_id(ctx, fid).iter() {
+            for i in b.iter() {
+                if matches!(i.mnemonic(), Mnemonic::Store(s) if s.ptr == LocalValueId::Varnode(reg))
+                {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// Count `load(register R, ..)` instructions in `fid`.
+    fn count_reg_loads(ctx: &Context<'_>, fid: FunctionId, reg: VarnodeId) -> usize {
+        let mut n = 0;
+        for b in FunctionBody::from_id(ctx, fid).iter() {
+            for i in b.iter() {
+                if matches!(i.mnemonic(), Mnemonic::Load(l) if l.ptr == LocalValueId::Varnode(reg))
+                {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// Materialize `fid` with the interface mapping `inputs`/`outputs` *without*
+    /// rewriting its body — enough for a caller's mem2reg to classify a call to it.
+    fn set_materialized(tc: &mut qcode::testing::TestContext, fid: FunctionId, regs: &[VarnodeId]) {
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
+            qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
+                inputs: regs.to_vec(),
+                outputs: regs.to_vec(),
+            }),
+        );
+    }
+
+    /// Replace the call terminating `block` with an indirect call (`CallInd`).
+    fn make_call_indirect(tc: &mut qcode::testing::TestContext, block: BlockId) {
+        let call_id = BasicBlock::from_id(&tc.ctx, block)
+            .iter()
+            .find(|i| matches!(i.mnemonic(), Mnemonic::Call(_)))
+            .unwrap()
+            .id;
+        let ptr = tc.ctx.get_const(0x1000, 8).id().localize(call_id.func);
+        tc.ctx.replace_instruction_mnemonic(
+            call_id,
+            Mnemonic::CallInd(qcode::value::insn::CallInd { ptr, args: vec![] }),
+        );
+    }
+
+    /// (a) A `CallInd` reads and writes *all* register space. A pre-call
+    /// `store(r0)` feeds the (implicit) callee and must survive mem2reg; the
+    /// post-call `load(r0)` sees the call's output and stays a register load
+    /// (not forwarded from the pre-call value). Regression for the reads-all hole.
+    #[test]
+    fn callind_preserves_pre_call_register_store_and_clobbers_read() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn g:
+                <g_entry>
+                    store(register:8, {r0} <- i64 7);
+                    goto <g_call>;
+                <g_call>
+                    call <callee>;
+                <g_cont>
+                    %r = load(register:8, {r0});
+                    return at %r;
+            fn callee:
+                <e_entry>
+                    return at i64 0;
+            "
+        );
+        let _ = (g_entry, g_call, g_cont, e_entry);
+        set_materialized(&mut tc, callee, &[r0]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        make_call_indirect(&mut tc, g_call);
+
+        let aliases = crate::AliasResult::simple_for_function(&tc.ctx, g);
+        crate::mem2reg(&mut tc.ctx, g, &aliases);
+
+        assert!(
+            count_reg_stores(&tc.ctx, g, r0) >= 1,
+            "the pre-callind store(r0) must survive (the callee reads it)"
+        );
+        assert!(
+            count_reg_loads(&tc.ctx, g, r0) >= 1,
+            "the post-callind load(r0) must remain a register load (clobbered, not forwarded)"
+        );
+    }
+
+    /// (b) A direct **Opaque** call to a materialized callee reads its inputs and
+    /// writes its outputs. `r0 ∈ inputs ∩ outputs`, so the pre-call store survives
+    /// (consumed as the input) and the post-call load stays (clobbered output).
+    #[test]
+    fn opaque_call_preserves_input_store_and_clobbers_output_read() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    %v = load(register:8, {r0});
+                    %s = %v + i64 1;
+                    store(register:8, {r0} <- %s);
+                    return at i64 0;
+            fn g:
+                <g_entry>
+                    store(register:8, {r0} <- i64 7);
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    %r = load(register:8, {r0});
+                    return at %r;
+            "
+        );
+        let _ = (f_entry, g_entry, g_call, g_cont);
+        // Pass-2-only IR: f is materialized, but the call stays Opaque (no pass 3).
+        let eff = scan_register_effects(&tc.ctx, f).expect("f writes r0");
+        materialize_interface(&mut tc.ctx, f, &eff);
+        set_call(&mut tc, g_call, f, vec![]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        let stores_before = count_reg_stores(&tc.ctx, g, r0);
+        assert_eq!(stores_before, 1, "g starts with one pre-call store to r0");
+
+        let aliases = crate::AliasResult::simple_for_function(&tc.ctx, g);
+        crate::mem2reg(&mut tc.ctx, g, &aliases);
+
+        assert!(
+            count_reg_stores(&tc.ctx, g, r0) >= 1,
+            "the pre-call store to input register r0 must survive"
+        );
+        assert!(
+            count_reg_loads(&tc.ctx, g, r0) >= 1,
+            "the post-call read of output register r0 must not be forwarded"
+        );
+    }
+
+    /// (c) `store r0,v1; opaque call reading r0; store r0,v2`. The v1 store is
+    /// consumed by the call (an input), so it must NOT be dead-marked by the
+    /// later overwrite across the call boundary — forwarding never bypasses it.
+    #[test]
+    fn store_before_opaque_call_not_killed_by_later_overwrite() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    %v = load(register:8, {r0});
+                    %s = %v + i64 1;
+                    store(register:8, {r0} <- %s);
+                    return at i64 0;
+            fn g:
+                <g_entry>
+                    store(register:8, {r0} <- i64 1);
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    store(register:8, {r0} <- i64 2);
+                    %r = load(register:8, {r0});
+                    return at %r;
+            "
+        );
+        let _ = (f_entry, g_entry, g_call, g_cont);
+        let eff = scan_register_effects(&tc.ctx, f).expect("f writes r0");
+        materialize_interface(&mut tc.ctx, f, &eff);
+        set_call(&mut tc, g_call, f, vec![]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        let aliases = crate::AliasResult::simple_for_function(&tc.ctx, g);
+        crate::mem2reg(&mut tc.ctx, g, &aliases);
+
+        // The pre-call store (in g_entry) feeds the call as an input and must
+        // survive — the call boundary blocks the post-call overwrite from
+        // dead-marking it (the post-call store forwards into the final load and is
+        // removed, which is fine; forwarding never bypasses the call).
+        let pre_call_stores = BasicBlock::from_id(&tc.ctx, g_entry)
+            .iter()
+            .filter(|i| matches!(i.mnemonic(), Mnemonic::Store(s) if s.ptr == LocalValueId::Varnode(r0)))
+            .count();
+        assert!(
+            pre_call_stores >= 1,
+            "the pre-call store must not be dead-marked by the post-call overwrite"
+        );
+    }
+
+    /// (d) A `CallInd` with a pending store to *any* register var: the store
+    /// survives (reads-all). The narrow latent pre-v2 case (a plain CallInd, no
+    /// materialized callee involved).
+    #[test]
+    fn callind_preserves_pending_register_store() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r1 = tc.r1;
+        qcode!(
+            tc.ctx,
+            "
+            fn g:
+                <g_entry>
+                    store(register:8, {r1} <- i64 42);
+                    goto <g_call>;
+                <g_call>
+                    call <callee>;
+                <g_cont>
+                    return at i64 0;
+            fn callee:
+                <e_entry>
+                    return at i64 0;
+            "
+        );
+        let _ = (g_entry, g_call, g_cont, e_entry);
+        let _ = callee;
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        make_call_indirect(&mut tc, g_call);
+
+        let aliases = crate::AliasResult::simple_for_function(&tc.ctx, g);
+        crate::mem2reg(&mut tc.ctx, g, &aliases);
+
+        assert!(
+            count_reg_stores(&tc.ctx, g, r1) >= 1,
+            "a pending register store before a reads-all CallInd must survive"
+        );
+    }
+
+    /// (e) Control for the precision path: the same caller shape with the site
+    /// **regpure**'d. A regpure call is register-transparent — its input is an
+    /// explicit `load` arg, so the pre-call store IS forwarded and removable, and
+    /// the pack replay defines the output. Confirms the fix did not over-preserve.
+    #[test]
+    fn regpure_call_still_forwards_pre_call_store() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    %v = load(register:8, {r0});
+                    %s = %v + i64 1;
+                    store(register:8, {r0} <- %s);
+                    return at i64 0;
+            fn g:
+                <g_entry>
+                    store(register:8, {r0} <- i64 7);
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    %r = load(register:8, {r0});
+                    return at %r;
+            "
+        );
+        let _ = (f_entry, g_entry, g_call, g_cont);
+        let eff = scan_register_effects(&tc.ctx, f).expect("f writes r0");
+        materialize_interface(&mut tc.ctx, f, &eff);
+        set_call(&mut tc, g_call, f, vec![]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        // Pass 3: make the one site regpure.
+        let graph = crate::CallGraph::analyze(&tc.ctx);
+        let site = crate::calls::direct_call_sites(&tc.ctx, &graph, f)[0];
+        rewrite_call_regpure(&mut tc.ctx, site, f);
+
+        let aliases = crate::AliasResult::simple_for_function(&tc.ctx, g);
+        crate::mem2reg(&mut tc.ctx, g, &aliases);
+
+        // A regpure call is register-transparent: the pre-call constant store
+        // forwards into the explicit load arg, and the pack-replay store forwards
+        // into the final load (r0 is not live-out of g), so mem2reg removes *all*
+        // register stores. The reads-all fix did NOT over-preserve the pre-call
+        // store (it would remain if the regpure call were wrongly treated as an
+        // implicit reader of r0).
+        assert_eq!(
+            count_reg_stores(&tc.ctx, g, r0),
+            0,
+            "regpure call is register-transparent — no register store is preserved"
+        );
+    }
+
+    /// (f) End-to-end emulator differential *through* mem2reg. `g` sets up an
+    /// input register with a pre-call store; the materialized callee consumes it.
+    /// Running mem2reg on `g` must not change caller-visible state — for both a
+    /// direct **Opaque** call and a `CallInd`.
+    #[test]
+    fn emulator_differential_through_mem2reg_preserves_state() {
+        use qcode_emulator::StandaloneEmulator;
+
+        fn build(indirect: bool) -> (qcode::testing::TestContext, FunctionId, VarnodeId) {
+            let mut tc = qcode::testing::TestContext::new();
+            let r0 = tc.r0;
+            qcode!(
+                tc.ctx,
+                "
+                fn f:
+                    <f_entry>
+                        %v = load(register:8, {r0});
+                        %s = %v + i64 1;
+                        store(register:8, {r0} <- %s);
+                        return at i64 4096;
+                fn g:
+                    <g_entry>
+                        store(register:8, {r0} <- i64 10);
+                        goto <g_call>;
+                    <g_call>
+                        call <f>;
+                    <g_cont>
+                        return at i64 0;
+                "
+            );
+            let _ = (f_entry, g_entry);
+            BasicBlock::from_id_mut(&mut tc.ctx, g_cont)
+                .set_address(4096)
+                .unwrap();
+            // Give f's entry an address so an indirect call can target it.
+            BasicBlock::from_id_mut(&mut tc.ctx, f_entry)
+                .set_address(0x8000)
+                .unwrap();
+            let eff = scan_register_effects(&tc.ctx, f).expect("f writes r0");
+            materialize_interface(&mut tc.ctx, f, &eff);
+            set_call(&mut tc, g_call, f, vec![]);
+            tc.ctx.add_cfg_edge(g_call, g_cont);
+            if indirect {
+                // Point the indirect call at f's entry so the emulator resolves it.
+                let f_addr = BasicBlock::from_id(&tc.ctx, f_entry).address().unwrap();
+                let call_id = BasicBlock::from_id(&tc.ctx, g_call)
+                    .iter()
+                    .find(|i| matches!(i.mnemonic(), Mnemonic::Call(_)))
+                    .unwrap()
+                    .id;
+                let ptr = tc.ctx.get_const(f_addr, 8).id().localize(call_id.func);
+                tc.ctx.replace_instruction_mnemonic(
+                    call_id,
+                    Mnemonic::CallInd(qcode::value::insn::CallInd { ptr, args: vec![] }),
+                );
+            }
+            (tc, g, r0)
+        }
+
+        for indirect in [false, true] {
+            let (mut tc, g, r0) = build(indirect);
+            let g_root = FunctionBody::from_id(&tc.ctx, g).root().unwrap().id;
+            let run = |ctx: &Context<'_>| -> u64 {
+                let mut emu = StandaloneEmulator::new(g_root);
+                emu.set_varnode(ctx, r0, 999).unwrap();
+                emu.run_function(ctx, g).unwrap();
+                emu.read_varnode(ctx, r0).unwrap()
+            };
+            let before = run(&tc.ctx);
+            let aliases = crate::AliasResult::simple_for_function(&tc.ctx, g);
+            crate::mem2reg(&mut tc.ctx, g, &aliases);
+            let after = run(&tc.ctx);
+            assert_eq!(
+                before, 11,
+                "g stores r0=10, callee adds 1 (indirect={indirect})"
+            );
+            assert_eq!(
+                after, before,
+                "mem2reg must preserve caller-visible r0 (indirect={indirect})"
+            );
+        }
+    }
+
+    /// Phase 4 differential: the *same* materialized function, called under both
+    /// binding conventions, must leave identical caller-visible register state.
+    /// We emulate the caller (1) pristine, (2) after materialize (the call is a
+    /// zero-arg **implicit** binding — exercises `seed_entry_params` + the
+    /// emulator's pack write-back), and (3) after flipping that site to a
+    /// **regpure** call (explicit args + replay). All three must agree.
+    #[test]
+    fn mixed_conventions_differential_preserves_state() {
+        use qcode_emulator::StandaloneEmulator;
+        let mut tc = qcode::testing::TestContext::new();
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    %v = load(register:8, {r0});
+                    %s = %v + i64 1;
+                    store(register:8, {r0} <- %s);
+                    return at i64 4096;
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (f_entry, g_entry);
+        BasicBlock::from_id_mut(&mut tc.ctx, g_cont)
+            .set_address(4096)
+            .unwrap();
+        set_call(&mut tc, g_call, f, vec![]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        let g_root = FunctionBody::from_id(&tc.ctx, g).root().unwrap().id;
+        let run = |ctx: &Context<'_>| -> u64 {
+            let mut emu = StandaloneEmulator::new(g_root);
+            emu.set_varnode(ctx, r0, 10).unwrap();
+            emu.run_function(ctx, g).unwrap();
+            emu.read_varnode(ctx, r0).unwrap()
+        };
+
+        let pristine = run(&tc.ctx);
+
+        // Pass 2 only: f is materialized, the call stays a zero-arg implicit bind.
+        let eff = scan_register_effects(&tc.ctx, f).expect("f writes r0");
+        materialize_interface(&mut tc.ctx, f, &eff);
+        let implicit = run(&tc.ctx);
+
+        // Pass 3: flip the one call site to an explicit regpure call.
+        let graph = crate::CallGraph::analyze(&tc.ctx);
+        let site = crate::calls::direct_call_sites(&tc.ctx, &graph, f)[0];
+        rewrite_call_regpure(&mut tc.ctx, site, f);
+        let regpure = run(&tc.ctx);
+
+        assert_eq!(pristine, 11, "r0 = 10 + 1");
+        assert_eq!(
+            implicit, pristine,
+            "implicit (zero-arg) call preserves caller-visible r0"
+        );
+        assert_eq!(
+            regpure, pristine,
+            "regpure call preserves caller-visible r0"
         );
     }
 }

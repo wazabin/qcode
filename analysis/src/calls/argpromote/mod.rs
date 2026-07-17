@@ -68,7 +68,9 @@ mod external;
 mod globals;
 mod mark_pure;
 mod ram;
+mod reg_summary;
 mod registers;
+mod summary;
 #[cfg(test)]
 mod tests;
 
@@ -119,20 +121,14 @@ pub(crate) fn address_taken_set(ctx: &Context) -> FxHashSet<FunctionId> {
 }
 
 /// Every function that is the target of at least one direct [`Mnemonic::Call`],
-/// computed for all functions in one O(instructions) pass. Mirrors
-/// [`address_taken_set`]: callers that gate every function on "has a direct
-/// caller" — the register channel's `reg_purity` / `try_promote_registers` and
-/// the loader's per-function purity query — build it once and look up, turning an
-/// O(functions × instructions) rescan into O(instructions + functions).
+/// computed from a call-graph snapshot. Mirrors [`address_taken_set`]: callers
+/// that gate every function on "has a direct caller" — the register channel and
+/// the loader's per-function purity query — build it once and look up, turning
+/// an O(functions × instructions) rescan into O(instructions + functions).
 ///
 /// Safe to reuse across a channel's mutating loop: promotion rewrites a callee's
 /// interface but never adds or removes a direct `Call.target` edge, so the set of
 /// called functions is invariant while the loop runs.
-pub(crate) fn called_function_set(ctx: &Context) -> FxHashSet<FunctionId> {
-    let graph = crate::CallGraph::analyze(ctx);
-    called_function_set_from_graph(ctx, &graph)
-}
-
 pub(crate) fn called_function_set_from_graph(
     ctx: &Context,
     graph: &crate::CallGraph,

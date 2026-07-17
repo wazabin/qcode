@@ -427,6 +427,7 @@ mod tests {
                 target: qcode::value::insn::Callee::Real(target),
                 args: args.into_iter().map(|arg| arg.localize(cid.func)).collect(),
                 clobbers: vec![],
+                tag: Default::default(),
             }),
         );
     }

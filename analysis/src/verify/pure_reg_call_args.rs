@@ -1,9 +1,17 @@
-//! Verify the `pure_reg` call-interface lockstep invariant.
+//! Verify the materialized-function call-interface invariants (argpromote v2,
+//! `ARGPROMOTE_REGISTERS_V2.md`).
 //!
-//! A `pure_reg` function is called by value: its root block params are the
-//! canonical input interface and every direct `Call.args` list must be aligned
-//! with those params index-for-index. Several call passes rely on this, and the
-//! emulator binds pure-reg entries positionally from the call's arguments.
+//! A materialized function supports two per-call binding conventions, selected
+//! by the call's [`CallTag`](qcode::value::insn::CallTag):
+//!
+//! * **`regpure`** — inputs are passed explicitly, so `Call.args` must align
+//!   with the callee's root params index-for-index (count and size); and the
+//!   callee must be materialized.
+//! * **non-regpure (`Opaque`)** — implicit binding, so the call carries **zero**
+//!   register arguments (they are bound from the register file at entry).
+//!
+//! Both are checked per direct call site so a regression crashes loudly under
+//! `QCODE_VERIFY` instead of miscompiling.
 
 use qcode::{
     context::Context,
@@ -84,19 +92,32 @@ pub fn verify_pure_reg_call_args(ctx: &Context<'_>) -> Vec<PureRegCallArgsViolat
                 unreachable!("direct_call_sites returned a non-Call instruction");
             };
 
-            let size_mismatch = if call.args.len() == param_sizes.len() {
-                first_size_mismatch(ctx, &insn.operands(), &param_sizes)
-            } else {
-                None
-            };
-
-            if call.args.len() != param_sizes.len() || size_mismatch.is_some() {
+            if call.tag.is_regpure() {
+                // Rule 1: a regpure call's args must align 1:1 with the callee's
+                // register-param mapping (count + size).
+                let size_mismatch = if call.args.len() == param_sizes.len() {
+                    first_size_mismatch(ctx, &insn.operands(), &param_sizes)
+                } else {
+                    None
+                };
+                if call.args.len() != param_sizes.len() || size_mismatch.is_some() {
+                    violations.push(PureRegCallArgsViolation {
+                        callee,
+                        call: call_id,
+                        expected_args: param_sizes.len(),
+                        actual_args: call.args.len(),
+                        size_mismatch,
+                    });
+                }
+            } else if !call.args.is_empty() {
+                // Rule 2: a non-regpure (implicit) call to a materialized callee
+                // must carry zero register arguments.
                 violations.push(PureRegCallArgsViolation {
                     callee,
                     call: call_id,
-                    expected_args: param_sizes.len(),
+                    expected_args: 0,
                     actual_args: call.args.len(),
-                    size_mismatch,
+                    size_mismatch: None,
                 });
             }
         }
@@ -154,6 +175,15 @@ mod tests {
         callee: FunctionId,
         args: Vec<ValueId>,
     ) -> InstructionId {
+        caller_calling_tagged(tc, callee, args, qcode::value::insn::CallTag::RegPure)
+    }
+
+    fn caller_calling_tagged(
+        tc: &mut TestContext,
+        callee: FunctionId,
+        args: Vec<ValueId>,
+        tag: qcode::value::insn::CallTag,
+    ) -> InstructionId {
         let caller = FunctionBody::make(&mut tc.ctx, "caller".into()).unwrap().id;
         let block = { tc.ctx.get_or_make_block(0x2000, caller) };
         FunctionBody::from_id_mut(&mut tc.ctx, caller)
@@ -173,6 +203,7 @@ mod tests {
                     .map(|arg| arg.localize(call_id.func))
                     .collect(),
                 clobbers: vec![],
+                tag,
             }),
         );
         call_id
@@ -220,6 +251,35 @@ mod tests {
                 arg_size: 4,
             })
         );
+    }
+
+    #[test]
+    fn accepts_opaque_zero_arg_call() {
+        // A non-regpure (implicit) call to a materialized callee binds from the
+        // register file, so zero args is valid.
+        let mut tc = TestContext::new();
+        let callee = pure_callee_with_params(&mut tc, &[8, 4]);
+        caller_calling_tagged(&mut tc, callee, vec![], qcode::value::insn::CallTag::Opaque);
+        assert!(verify_pure_reg_call_args(&tc.ctx).is_empty());
+    }
+
+    #[test]
+    fn reports_opaque_call_with_register_args() {
+        // Rule 2: a non-regpure call to a materialized callee must carry zero args.
+        let mut tc = TestContext::new();
+        let callee = pure_callee_with_params(&mut tc, &[8, 4]);
+        let a0 = tc.ctx.get_const(0x11, 8).id();
+        let call = caller_calling_tagged(
+            &mut tc,
+            callee,
+            vec![a0],
+            qcode::value::insn::CallTag::Opaque,
+        );
+        let violations = verify_pure_reg_call_args(&tc.ctx);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].call, call);
+        assert_eq!(violations[0].expected_args, 0);
+        assert_eq!(violations[0].actual_args, 1);
     }
 
     #[test]

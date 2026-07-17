@@ -483,6 +483,7 @@ mod minted_barrier_tests {
                 target: Callee::Minted(slot),
                 args: Vec::new(),
                 clobbers: Vec::new(),
+                tag: Default::default(),
             }),
         );
         (tc, caller, call_id, callee)
@@ -525,6 +526,7 @@ mod minted_barrier_tests {
                 target: Callee::Minted(1),
                 args: Vec::new(),
                 clobbers: Vec::new(),
+                tag: Default::default(),
             }),
         );
 
@@ -555,6 +557,7 @@ mod minted_barrier_tests {
                 target: Callee::Minted(1),
                 args: Vec::new(),
                 clobbers: Vec::new(),
+                tag: Default::default(),
             }),
             0,
         )

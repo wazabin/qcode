@@ -1398,6 +1398,7 @@ mod tests {
                     target: qcode::value::insn::Callee::Real(callee),
                     args: vec![local.localize(cid.func)],
                     clobbers: vec![],
+                    tag: Default::default(),
                 })
             };
             tc.ctx.replace_instruction_mnemonic(cid, mn);
@@ -1464,6 +1465,7 @@ mod tests {
                     target: qcode::value::insn::Callee::Real(callee),
                     args: vec![input.localize(call_result.func)], // g(input): INPUT arg, does not capture the frame
                     clobbers: vec![],
+                    tag: Default::default(),
                 }),
             );
             let host = qcode::value::BodyView::new(
