@@ -228,7 +228,10 @@ repeat_until = "no_change"
 [[stage]]
 name = "signatures"
 scope = "module"
-passes = ["summaries"]
+# `resolve_ordinals` renames ordinal-only PE imports (e.g. OLEAUT32) to their
+# real export names first, so `external_sigs` can give them prototype signatures
+# like any other named import.
+passes = ["resolve_ordinals", "external_sigs", "summaries"]
 
 # Eliminating passes, per function: drop the now-dead arg-setup stores and loads.
 # The stack pointer keeps its real `@SP`-rooted arithmetic throughout (the legacy

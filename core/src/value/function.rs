@@ -75,6 +75,11 @@ pub struct FunctionInterface<'str> {
     /// [`FunctionEffects::Unsolved`] via `#[serde(default)]`.
     #[serde(default)]
     pub effects: FunctionEffects,
+
+    /// For a PE import brought in by ordinal only, the ordinal it was imported
+    /// at. Recorded before the stub is renamed to its real export name.
+    #[serde(default)]
+    pub import_ordinal: Option<u16>,
 }
 
 /// The state of a function's register-channel effect summary (argpromote v2).
@@ -341,6 +346,7 @@ impl<'str> FunctionInterface<'str> {
             signature: None,
             kind: FunctionKind::Machine,
             effects: FunctionEffects::Unsolved,
+            import_ordinal: None,
         }
     }
 
@@ -1586,6 +1592,12 @@ where
         self.interface().is_external
     }
 
+    /// The ordinal this import was brought in at, for a PE import resolved from
+    /// an ordinal-only entry. `None` for named imports and local functions.
+    pub fn import_ordinal(&'s self) -> Option<u16> {
+        self.interface().import_ordinal
+    }
+
     /// A reference to the function interface's signature, if any.
     pub fn signature(&'s self) -> Option<&'ctx FunctionSignature> {
         self.interface().signature.as_ref()
@@ -2126,6 +2138,13 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
             self.inner().blocks.is_empty(),
             "External functions should not have blocks"
         );
+    }
+
+    /// Record the ordinal a by-ordinal PE import was brought in at. Set by the
+    /// `resolve_ordinals` pass before it renames the stub, so the by-ordinal
+    /// origin survives the rename.
+    pub fn set_import_ordinal(&mut self, ordinal: Option<u16>) {
+        self.interface_mut().import_ordinal = ordinal;
     }
 
     pub fn set_kind(&mut self, kind: FunctionKind) {

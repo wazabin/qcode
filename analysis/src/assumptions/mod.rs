@@ -3,6 +3,7 @@ mod calling_convention;
 mod external_sig;
 mod mem_protections;
 mod no_return;
+mod ordinal_imports;
 
 pub use arg_frame::{assume_args_disjoint_caller_frame, verify_args_disjoint_caller_frame};
 pub use calling_convention::assume_calling_convention;
