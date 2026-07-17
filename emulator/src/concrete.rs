@@ -30,6 +30,17 @@ fn require_real_callee(callee: Callee) -> Result<FunctionId, EmulatorErrorKind> 
     }
 }
 
+/// Whether the call instruction `call_id` carries the `regpure` binding
+/// convention (argpromote v2): its register interface is explicit at the site,
+/// so inputs are bound positionally from `Call.args` and outputs are replayed by
+/// the caller rather than by the emulator's implicit writeback.
+fn call_is_regpure(ctx: &Context<'_>, call_id: InstructionId) -> bool {
+    matches!(
+        ctx.get_insn(call_id).mnemonic(),
+        Mnemonic::Call(call) if call.tag.is_regpure()
+    )
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct EmulatedSpace(FxHashMap<u64, u8>);
 
@@ -1306,15 +1317,21 @@ impl StandaloneEmulator {
                 // entered it: an aggregate (the functional write-set) is copied
                 // field-wise; a scalar return is copied through. This is what makes
                 // a caller's `extract(call, i)` see the callee's effects.
-                if let Some(call_id) = self.call_site_stack.pop()
-                    && let Some(LocalValueId::Instruction(src_local)) = value
-                {
-                    let src = InstructionId::new(id.func, *src_local);
-                    if let Some(agg) = self.aggregate_values.get(&src).cloned() {
-                        self.aggregate_values.insert(call_id, agg);
-                    } else if let Some(scalar) = self.insn_values.get(&src).copied() {
-                        self.insn_values.insert(call_id, scalar);
+                if let Some(call_id) = self.call_site_stack.pop() {
+                    if let Some(LocalValueId::Instruction(src_local)) = value {
+                        let src = InstructionId::new(id.func, *src_local);
+                        if let Some(agg) = self.aggregate_values.get(&src).cloned() {
+                            self.aggregate_values.insert(call_id, agg);
+                        } else if let Some(scalar) = self.insn_values.get(&src).copied() {
+                            self.insn_values.insert(call_id, scalar);
+                        }
                     }
+                    // v2 implicit convention: an `Opaque` (non-regpure) call to a
+                    // *materialized* callee binds outputs by storing each return-pack
+                    // slot back to its mapped register (post-mem2reg the callee body
+                    // may no longer write those registers directly). A regpure site
+                    // replays the pack itself, so it is skipped.
+                    self.writeback_materialized_outputs(ctx, call_id, id.func);
                 }
 
                 let addr = self.get_value(ctx, ptr.qualify(id.func)).unwrap();
@@ -1511,6 +1528,31 @@ impl StandaloneEmulator {
     /// those params from the current register file, so the callee receives the
     /// caller's register state through the calling convention. Params with no
     /// matching register (e.g. promoted stack slots) are left unbound.
+    /// v2 implicit binding convention: store a materialized callee's return-pack
+    /// slots back into their mapped registers on return from an `Opaque` call
+    /// site. A `regpure` site is skipped (it replays the pack in its own body),
+    /// as is any callee that is not materialized (no mapping to write back).
+    fn writeback_materialized_outputs(
+        &mut self,
+        ctx: &Context<'_>,
+        call_id: InstructionId,
+        callee: FunctionId,
+    ) {
+        if call_is_regpure(ctx, call_id) {
+            return;
+        }
+        let outputs = match FunctionBody::from_id(ctx, callee).effects() {
+            qcode::value::FunctionEffects::Materialized(map) => map.outputs.clone(),
+            _ => return,
+        };
+        let Some(agg) = self.aggregate_values.get(&call_id).cloned() else {
+            return;
+        };
+        for (field, &reg) in agg.iter().zip(&outputs) {
+            let _ = self.set_varnode_u128(ctx, reg, field.as_bits());
+        }
+    }
+
     fn seed_entry_params(&mut self, ctx: &Context<'_>, func: FunctionId) {
         let Some(root) = FunctionBody::from_id(ctx, func).root() else {
             return;
@@ -1613,10 +1655,18 @@ impl StandaloneEmulator {
                 StepEvent::DirectCallEntered(target) => {
                     call_depth += 1;
                     self.call_stack.push(target);
-                    // A functionalized (`pure_reg`) callee takes its inputs by
-                    // value through `Call.args`; a conventional callee reads them
-                    // from the register file the calling convention set up.
-                    if FunctionBody::from_id(ctx, target).is_pure_reg() {
+                    // Dual binding convention (argpromote v2): a `regpure`-tagged
+                    // call site passes its inputs explicitly through `Call.args`
+                    // (bound positionally); an `Opaque` (implicit) call — and a
+                    // conventional callee — reads them from the register file the
+                    // calling convention set up. The legacy `pure_reg` flag is
+                    // still honored during the migration.
+                    let regpure_site = self
+                        .call_site_stack
+                        .last()
+                        .copied()
+                        .is_some_and(|call_id| call_is_regpure(ctx, call_id));
+                    if regpure_site || FunctionBody::from_id(ctx, target).is_pure_reg() {
                         if let Some(&call_id) = self.call_site_stack.last() {
                             self.bind_entry_params_from_args(ctx, call_id, target);
                         }
