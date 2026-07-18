@@ -69,6 +69,7 @@ mod mark_pure;
 mod ram;
 mod reg_summary;
 mod registers;
+mod stack_args;
 pub(crate) use crate::calls::effect_engine as summary;
 #[cfg(test)]
 mod tests;

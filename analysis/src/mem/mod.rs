@@ -4,6 +4,7 @@
 
 pub mod array_promote;
 pub mod array_reads;
+pub mod global_cells;
 pub mod mem2reg;
 pub mod mem_liveness;
 

@@ -1,6 +1,6 @@
 use qcode::{
     context::Context,
-    space::{SpaceId, SpaceType},
+    space::{Space, SpaceId, SpaceType},
     types::TypeId,
     value::{
         BasicBlock, FunctionBody, FunctionEffects, FunctionId, Instruction, LocalValueId, QCodeMut,
@@ -23,6 +23,58 @@ pub(crate) fn is_register(ctx: &Context, vn: VarnodeId) -> bool {
     matches!(Varnode::from_id(ctx, vn).space().ty, SpaceType::Register)
 }
 
+/// The `ptr` operand for a materialized access to storage cell `r`.
+///
+/// A **register** cell is addressed by the varnode itself (`load/store(register,
+/// R)`). A **global RAM** cell — a constant real-RAM address admitted to the
+/// effect channel via [`Context::get_or_make_global_varnode`] — is addressed by
+/// its constant address as a *literal value* (`load/store(ram, addr)`). The
+/// identity varnode of a global is an effect-set token only and must NEVER
+/// appear as a `ptr`: the alias oracle reads a RAM `ptr` as a dataflow value,
+/// and a varnode-as-ptr in RAM space would be meaningless to it.
+fn access_ptr(b: &mut qcode::builder::Builder, r: VarnodeId) -> ValueId {
+    let (is_reg, addr, ptr_width) = {
+        let v = Varnode::from_id(b.shr(), r);
+        let space = v.space();
+        (
+            matches!(space.ty, SpaceType::Register),
+            v.address() as u64,
+            space.addr_size,
+        )
+    };
+    if is_reg {
+        ValueId::Varnode(r)
+    } else {
+        b.shr().get_const(addr, ptr_width)
+    }
+}
+
+/// Derive the RAM-backed (`GlobalSlot`) record from the constant-RAM varnodes in
+/// a materialized interface's `inputs`/`outputs`. Globals ride in those sets as
+/// ordinary varnodes; this record is redundant (deletable once the varnode
+/// merge is proven — see GLOBALS_AS_VARNODES.md).
+fn global_slot_record(
+    ctx: &Context,
+    inputs: &[VarnodeId],
+    outputs: &[VarnodeId],
+) -> Vec<qcode::value::GlobalSlot> {
+    let mut seen = FxHashSet::default();
+    let mut out = Vec::new();
+    for &r in inputs.iter().chain(outputs) {
+        let v = Varnode::from_id(ctx, r);
+        if !matches!(v.space().ty, SpaceType::Register) {
+            let slot = (v.address() as u64, v.size());
+            if seen.insert(slot) {
+                out.push(qcode::value::GlobalSlot {
+                    addr: slot.0,
+                    size: slot.1,
+                });
+            }
+        }
+    }
+    out
+}
+
 // ===========================================================================
 // Register channel (runs early, before mem2reg — see ARGPROMOTE_REGISTERS.md)
 // ===========================================================================
@@ -42,11 +94,9 @@ pub(crate) struct RegisterEffects {
     /// (over-approximated: a written-first register yields a dead param that
     /// mem2reg/DCE prune). Sorted by `(address, size)` for a deterministic
     /// param/argument order shared with the caller rewrite.
+    /// Global cells (constant real-RAM varnodes) ride in `inputs`/`outputs`
+    /// alongside registers — no separate list (see GLOBALS_AS_VARNODES.md).
     pub(crate) inputs: Vec<VarnodeId>,
-    /// Constant real-RAM addresses the body dereferences, each lifted into a
-    /// by-value `glob_<addr>` param placed after the register inputs. Sorted
-    /// `(address, width)` pairs for a deterministic param/argument order.
-    pub(crate) globals: Vec<(u64, usize)>,
     /// Registers the body stores, canonicalized to the coarsest register per
     /// overlap group so the caller's replay is order-independent. Sorted.
     pub(crate) outputs: Vec<VarnodeId>,
@@ -383,6 +433,10 @@ pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff:
         })
         .collect();
     for (r, size, space, name, ty) in input_meta {
+        // A register cell binds from the register file by name (implicit
+        // convention); a global RAM cell has no register origin — its entry seed
+        // and every access address through `access_ptr` (the constant address).
+        let is_reg = matches!(Space::from_id(&*ctx, space).ty, SpaceType::Register);
         add_input(
             ctx,
             fid,
@@ -390,30 +444,26 @@ pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff:
             // Name the param after its register so the implicit convention binds
             // it from the register file (`seed_entry_params` keys on the name).
             name,
-            Some(ValueId::Varnode(r)),
+            is_reg.then_some(ValueId::Varnode(r)),
             ty,
             // Empty call sites: add the param + entry seed, touch no caller.
             Some(&[]),
             space,
-            move |_b| ValueId::Varnode(r),
+            move |b| access_ptr(b, r),
             // Never invoked (no call sites), but the closure type is required.
             move |ctx, call_id, block| {
                 let mut b = (ctx).builder(block);
                 b.set_insert_point_before(call_id);
-                b.push_load::<false>(ValueId::Varnode(r), size, space).id()
+                let ptr = access_ptr(&mut b, r);
+                b.push_load::<false>(ptr, size, space).id()
             },
         );
     }
 
-    // --- globals: one by-value `glob_<addr>` param per constant-address slot,
-    // placed after the register inputs; the accesses are redirected through the
-    // param and the literal is recorded as its origin for implicit binding.
-    let global_slots: Vec<qcode::value::GlobalSlot> = reg_eff
-        .globals
-        .iter()
-        .map(|&(addr, size)| qcode::value::GlobalSlot { addr, size })
-        .collect();
-    super::globals::materialize_globals(ctx, fid, &global_slots);
+    // Record the RAM-backed cells among the interface slots (globals ride in
+    // `inputs`/`outputs` as constant-RAM varnodes; this is a redundant record
+    // — see GLOBALS_AS_VARNODES.md, deletable once the merge is proven).
+    let global_slots = global_slot_record(ctx, &reg_eff.inputs, &reg_eff.outputs);
 
     // --- outputs: a flat positional return pack, one field per output register --
     let outputs = output_meta(ctx, &reg_eff.outputs);
@@ -424,9 +474,13 @@ pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff:
         Some(&[]),
         false,
         |_i, (_, _, _, name)| vec![name.clone()],
-        |b, &(r, size, space, _)| vec![b.push_load::<false>(ValueId::Varnode(r), size, space).id()],
+        |b, &(r, size, space, _)| {
+            let ptr = access_ptr(b, r);
+            vec![b.push_load::<false>(ptr, size, space).id()]
+        },
         |b, &(r, _, space, _), ext| {
-            b.push_store(ext[0], ValueId::Varnode(r), space);
+            let ptr = access_ptr(b, r);
+            b.push_store(ext[0], ptr, space);
         },
     );
 
@@ -517,25 +571,23 @@ pub(crate) fn rewrite_call_regpure(
             (r, v.size(), v.space().id)
         })
         .collect();
-    let mut args: Vec<LocalValueId> = {
+    // Each input cell becomes a positional argument: a register loaded from the
+    // register file, a global loaded from its constant RAM address (`access_ptr`
+    // — globals ride in `map.inputs` as constant-RAM varnodes, so there is no
+    // separate global argument block any more).
+    let args: Vec<LocalValueId> = {
         let mut b = (ctx).builder(call_block);
         b.set_insert_point_before(call_id);
         input_meta
             .iter()
             .map(|&(r, size, space)| {
-                b.push_load::<false>(ValueId::Varnode(r), size, space)
+                let ptr = access_ptr(&mut b, r);
+                b.push_load::<false>(ptr, size, space)
                     .id()
                     .localize(call_id.func)
             })
             .collect()
     };
-    // Global slots follow the register inputs in param order; each is passed
-    // as its address literal verbatim (literals are context-global values).
-    args.extend(map.globals.iter().map(|slot| {
-        ctx.get_const(slot.addr, slot.size)
-            .id()
-            .localize(call_id.func)
-    }));
 
     // Rewrite the call: explicit args, cleared clobbers (register-transparent),
     // tagged regpure. Retype the result to the callee's return pack.
@@ -564,7 +616,8 @@ pub(crate) fn rewrite_call_regpure(
     b.set_insert_point_to_start();
     for (i, &(r, space)) in output_meta.iter().enumerate() {
         let ext = ValueId::Instruction(b.push_extract(result, i).id);
-        b.push_store(ext, ValueId::Varnode(r), space);
+        let ptr = access_ptr(&mut b, r);
+        b.push_store(ext, ptr, space);
     }
 }
 

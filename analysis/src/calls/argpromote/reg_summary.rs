@@ -33,12 +33,6 @@ use super::{
 pub(crate) struct RegEffects {
     pub(crate) loads: FxHashSet<VarnodeId>,
     pub(crate) stores: FxHashSet<VarnodeId>,
-    /// Constant real-RAM addresses this function's *own body* dereferences
-    /// (`(address, address width)`). Unlike register effects these do NOT
-    /// compose through calls: a callee's global access stays behind the
-    /// callee's own interface (its `glob_*` param), so `transfer` drops them
-    /// and a summary carries only the function's syntactic set.
-    pub(crate) globals: FxHashSet<(u64, usize)>,
 }
 
 impl RegEffects {
@@ -69,13 +63,21 @@ impl EffectChannel for RegChannel {
         for block in FunctionBody::from_id(ctx, fid).blocks() {
             for insn in block.iter() {
                 match insn.mnemonic() {
+                    // A global (constant real-RAM address) is admitted to the
+                    // same effect sets as a register, keyed by its pre-minted
+                    // identity varnode (`(ram, addr, data-width)`). It composes
+                    // and value-threads exactly like a register — see
+                    // GLOBALS_AS_VARNODES.md. The cell width is the *access*
+                    // width (`l.size`), not the pointer literal's width.
                     Mnemonic::Load(l) => {
                         if let qcode::value::LocalValueId::Varnode(vn) = l.ptr
                             && is_register(ctx, vn)
                         {
                             eff.loads.insert(vn);
-                        } else if let Some(slot) = global_slot(ctx, fid, l.ptr, l.space) {
-                            eff.globals.insert(slot);
+                        } else if let Some((addr, _)) = global_slot(ctx, fid, l.ptr, l.space)
+                            && let Some(vn) = ctx.global_varnode(addr, l.size)
+                        {
+                            eff.loads.insert(vn);
                         }
                     }
                     Mnemonic::Store(s) => {
@@ -83,8 +85,10 @@ impl EffectChannel for RegChannel {
                             && is_register(ctx, vn)
                         {
                             eff.stores.insert(vn);
-                        } else if let Some(slot) = global_slot(ctx, fid, s.ptr, s.space) {
-                            eff.globals.insert(slot);
+                        } else if let Some((addr, _)) = global_slot(ctx, fid, s.ptr, s.space)
+                            && let Some(vn) = ctx.global_varnode(addr, s.size)
+                        {
+                            eff.stores.insert(vn);
                         }
                     }
                     _ => {}
@@ -143,22 +147,21 @@ impl EffectChannel for RegChannel {
         _edge: &CallEdge,
         callee: &RegEffects,
     ) -> Option<RegEffects> {
-        // Registers are a global namespace (identity transfer); globals are
-        // *not* interface-transparent — the callee keeps accessing them through
-        // its own `glob_*` slot — so they do not cross the call edge.
+        // Registers and globals alike are a global namespace (identity
+        // transfer): a callee's read/write of a cell is a read/write of that
+        // same cell in every caller. Global cells ride in `loads`/`stores` as
+        // constant-RAM varnodes, so they compose here for free.
         Some(RegEffects {
             loads: callee.loads.clone(),
             stores: callee.stores.clone(),
-            globals: FxHashSet::default(),
         })
     }
 
     fn join(&self, into: &mut RegEffects, from: &RegEffects) -> bool {
-        let before = (into.loads.len(), into.stores.len(), into.globals.len());
+        let before = (into.loads.len(), into.stores.len());
         into.loads.extend(from.loads.iter().copied());
         into.stores.extend(from.stores.iter().copied());
-        into.globals.extend(from.globals.iter().copied());
-        (into.loads.len(), into.stores.len(), into.globals.len()) != before
+        (into.loads.len(), into.stores.len()) != before
     }
 }
 
@@ -191,22 +194,17 @@ pub(crate) fn finalize_register_effects(
     let mut inputs =
         canonicalize_to_coarsest(ctx, &read_set).ok_or(RegPurityReason::NonCanonicalRegisters)?;
 
-    // Deterministic global-slot order shared by callee param creation and the
-    // regpure-site argument threading.
-    let mut globals: Vec<(u64, usize)> = eff.globals.iter().copied().collect();
-    globals.sort_unstable();
-
+    // Deterministic order shared by callee param creation and the regpure-site
+    // argument threading. Global cells (constant-RAM varnodes) sort in with the
+    // registers by `(address, size)`; a RAM address never collides with a
+    // register address space, so the order is stable across the two spaces.
     let key = |ctx: &Context, vn: &VarnodeId| {
         let v = Varnode::from_id(ctx, *vn);
-        (v.address(), v.size())
+        (v.space().id, v.address(), v.size())
     };
     inputs.sort_by_key(|vn| key(ctx, vn));
     outputs.sort_by_key(|vn| key(ctx, vn));
-    Ok(RegisterEffects {
-        inputs,
-        globals,
-        outputs,
-    })
+    Ok(RegisterEffects { inputs, outputs })
 }
 
 #[cfg(test)]

@@ -229,6 +229,15 @@ pub enum TypeRepr {
         owner: FunctionId,
         fields: Vec<AggregateField>,
     },
+    /// A pointer to *code* — a function/callable address, of the given byte
+    /// width. Minted by the `infer_code_pointers` pass for a value used as the
+    /// target of an indirect call. Deliberately structureless (no signature yet):
+    /// it marks "this scalar is a code address," enough to drive call-target
+    /// typing and (future) resolution/exploration. Kept last to preserve the
+    /// bincode discriminants of previously persisted variants.
+    CodePointer {
+        size: usize,
+    },
 }
 
 /// One field of an aggregate or struct type.
@@ -483,6 +492,26 @@ impl Type for StructPointer {
     }
 }
 
+/// A code (function) pointer — see [`TypeRepr::CodePointer`].
+#[derive(Clone)]
+struct CodePointerType {
+    size: usize,
+}
+
+impl Type for CodePointerType {
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    fn clone_box(&self) -> Box<dyn Type> {
+        Box::new(self.clone())
+    }
+
+    fn repr(&self) -> TypeRepr {
+        TypeRepr::CodePointer { size: self.size }
+    }
+}
+
 /// A fixed-length homogeneous array — see [`TypeRepr::Array`]. `size` is cached
 /// as `count * sizeof(elem)`; the array is opaque (no `fields()`) so it presents
 /// to structural passes exactly as a width-`size` integer would.
@@ -603,6 +632,8 @@ struct TypeManagerInner {
     struct_by_name: HashMap<String, TypeId>,
     /// Fast lookup: (size, pointee) → StructPointer TypeId.
     struct_pointer: HashMap<(usize, TypeId), TypeId>,
+    /// Fast lookup: size → CodePointer TypeId.
+    code_pointer: HashMap<usize, TypeId>,
     /// Fast lookup: (elem, count) → Array TypeId.
     array_by_elem_count: HashMap<(TypeId, usize), TypeId>,
     /// Fast lookup: (elem, bound) → List TypeId (`bound` `None` = unbounded).
@@ -629,6 +660,7 @@ impl TypeManagerInner {
             struct_pointer: HashMap::default(),
             array_by_elem_count: HashMap::default(),
             list_by_elem_bound: HashMap::default(),
+            code_pointer: HashMap::default(),
         }
     }
 
@@ -646,6 +678,18 @@ impl TypeManagerInner {
         }
         let id = self.register(Box::new(IntType { size }));
         self.int_by_size.insert(size, id);
+        id
+    }
+
+    /// Returns the [`TypeId`] for a [`CodePointer`](TypeRepr::CodePointer) of the
+    /// given byte width, creating it if it does not yet exist. Keyed by size
+    /// alone (like `Int`), so a pass may mint it directly.
+    pub fn get_or_make_code_pointer(&mut self, size: usize) -> TypeId {
+        if let Some(&id) = self.code_pointer.get(&size) {
+            return id;
+        }
+        let id = self.register(Box::new(CodePointerType { size }));
+        self.code_pointer.insert(size, id);
         id
     }
 
@@ -1137,6 +1181,12 @@ impl TypeManager {
         }
         self.mint(|inner| inner.get_or_make_struct_pointer(size, pointee))
     }
+    pub fn get_or_make_code_pointer(&self, size: usize) -> TypeId {
+        if let Some(&id) = self.read().code_pointer.get(&size) {
+            return id;
+        }
+        self.mint(|inner| inner.get_or_make_code_pointer(size))
+    }
     /// Access an already-published struct-pointer type without creating state.
     pub fn get_struct_pointer(&self, size: usize, pointee: TypeId) -> Option<TypeId> {
         self.read().struct_pointer.get(&(size, pointee)).copied()
@@ -1276,6 +1326,7 @@ impl TypeManager {
                 Some(bound) => format!("[{};<={}]", self.type_name(elem), bound),
                 None => format!("[{};*]", self.type_name(elem)),
             },
+            TypeRepr::CodePointer { size } => format!("code{}*", size * 8),
             _ => format!("i{}", self.size_of(id) * 8),
         }
     }
@@ -1402,6 +1453,9 @@ impl<'de> serde::Deserialize<'de> for TypeManager {
                         manager.get_or_make_unbounded_list(elem);
                     }
                 },
+                TypeRepr::CodePointer { size } => {
+                    manager.get_or_make_code_pointer(size);
+                }
             }
         }
         Ok(manager)

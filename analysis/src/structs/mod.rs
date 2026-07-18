@@ -6,6 +6,7 @@
 //! - [`win32`] — Windows-specific seeding (type the `FS_OFFSET` register as
 //!   `PtrTo<TEB>` from the `teb.h` layout) that gives the typing pass a root.
 
+pub mod code_pointers;
 pub mod typing;
 pub mod win32;
 

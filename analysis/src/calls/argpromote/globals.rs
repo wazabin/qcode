@@ -98,14 +98,10 @@ fn mint_global_param(
     Some(param)
 }
 
-/// Materialization-time entry: mint every solved global slot of `fid` without
-/// touching any call site (the interface is being materialized; every caller
-/// still binds implicitly).
-pub(super) fn materialize_globals(ctx: &mut Context, fid: FunctionId, globals: &[GlobalSlot]) {
-    for &slot in globals {
-        mint_global_param(ctx, fid, slot, &[]);
-    }
-}
+// NOTE: the former `materialize_globals` (address-parameter path) is superseded
+// by value-threading through the register effect channel (GLOBALS_AS_VARNODES.md).
+// `grow_globals` below is retained for the late-discovery path pending the same
+// migration.
 
 /// Grow an already-materialized function's interface with globals surfaced
 /// after materialization (a later constprop round folding an address to a
