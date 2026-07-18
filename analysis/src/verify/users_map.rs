@@ -21,11 +21,15 @@ use qcode::{
 };
 
 pub fn verify_users_map(ctx: &Context) -> Vec<String> {
+    verify_users_map_scoped(ctx, super::Scope::All)
+}
+
+pub(crate) fn verify_users_map_scoped(ctx: &Context, scope: super::Scope<'_>) -> Vec<String> {
     // Expected users, from a single scan of every live instruction's operands,
     // keyed by owning function so each function's map is checked in isolation.
     let mut expected: FxHashMap<FunctionId, FxHashMap<ValueId, Vec<InstructionId>>> =
         FxHashMap::default();
-    for insn in ctx.instructions() {
+    for insn in scope.instructions(ctx) {
         for arg in insn.operands() {
             expected
                 .entry(insn.id.func)
@@ -39,6 +43,9 @@ pub fn verify_users_map(ctx: &Context) -> Vec<String> {
     let mut out = Vec::new();
     let empty = FxHashMap::default();
     for func in ctx.functions() {
+        if !scope.contains(func.id) {
+            continue;
+        }
         let exp_map = expected.get(&func.id).unwrap_or(&empty);
         let mut recorded_keys: FxHashSet<ValueId> = FxHashSet::default();
 

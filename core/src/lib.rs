@@ -114,7 +114,7 @@ pub mod space;
 pub mod types;
 pub mod value;
 
-pub use arena_integrity::verify_body_arena_integrity;
+pub use arena_integrity::{verify_body_arena_integrity, verify_body_arena_integrity_scoped};
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

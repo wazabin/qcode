@@ -31,9 +31,22 @@ fn missing_type_temp_space(
 /// corruption. Callers should not run higher-level traversals until it returns
 /// an empty vector.
 pub fn verify_body_arena_integrity(ctx: &Context<'_>) -> Vec<String> {
+    verify_body_arena_integrity_scoped(ctx, None)
+}
+
+/// [`verify_body_arena_integrity`], restricted to the functions in `scope`
+/// (`None` means every function). Arena invariants are strictly per-body, so a
+/// caller that knows which functions changed can skip the rest.
+pub fn verify_body_arena_integrity_scoped(
+    ctx: &Context<'_>,
+    scope: Option<&FxHashSet<crate::value::FunctionId>>,
+) -> Vec<String> {
     let mut out = Vec::new();
 
     for body in ctx.bodies.iter() {
+        if scope.is_some_and(|set| !set.contains(&body.id)) {
+            continue;
+        }
         let fid = body.id;
         let live_blocks: FxHashSet<_> = body.blocks.iter().map(|block| block.id).collect();
         let live_insns: FxHashSet<_> = body.insns.iter().map(|insn| insn.id).collect();

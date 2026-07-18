@@ -98,8 +98,15 @@ fn impurity(ctx: &Context, m: &Mnemonic) -> Option<&'static str> {
 /// Every `is_pure` function whose body still has a side effect, one violation per
 /// offending instruction.
 pub fn verify_pure_functions(ctx: &Context<'_>) -> Vec<PureFunctionViolation> {
+    verify_pure_functions_scoped(ctx, super::Scope::All)
+}
+
+pub(crate) fn verify_pure_functions_scoped(
+    ctx: &Context<'_>,
+    scope: super::Scope<'_>,
+) -> Vec<PureFunctionViolation> {
     let mut violations = Vec::new();
-    for fid in ctx.function_ids() {
+    for fid in scope.function_ids(ctx) {
         if !FunctionBody::from_id(ctx, fid).is_pure() {
             continue;
         }

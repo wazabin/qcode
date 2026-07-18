@@ -37,6 +37,15 @@ mod tests {
             .find(|i| matches!(i.mnemonic(), Mnemonic::Call(_)))
             .unwrap()
             .id;
+        // Positional args model an explicit lockstep (regpure) site — the only
+        // site shape the RAM channel promotes past; zero args model an implicit
+        // (`Opaque`) site. Tests needing the other pairing retag afterwards
+        // with `set_call_tag`.
+        let tag = if args.is_empty() {
+            qcode::value::insn::CallTag::Opaque
+        } else {
+            qcode::value::insn::CallTag::RegPure
+        };
         tc.ctx.replace_instruction_mnemonic(
             call_id,
             Mnemonic::Call(Call {
@@ -46,10 +55,22 @@ mod tests {
                     .map(|arg| arg.localize(call_id.func))
                     .collect(),
                 clobbers: vec![],
-                tag: Default::default(),
+                tag,
             }),
         );
         call_id
+    }
+
+    fn set_call_tag(
+        tc: &mut qcode::testing::TestContext,
+        call_id: InstructionId,
+        tag: qcode::value::insn::CallTag,
+    ) {
+        let Mnemonic::Call(call) = tc.ctx.get_insn(call_id).mnemonic().clone() else {
+            panic!("not a call");
+        };
+        tc.ctx
+            .replace_instruction_mnemonic(call_id, Mnemonic::Call(Call { tag, ..call }));
     }
 
     /// A function's `Materialized` register interface and a call site's
@@ -84,6 +105,7 @@ mod tests {
         let _ = g;
 
         let iface = RegisterInterfaceMap {
+            globals: vec![],
             inputs: vec![r1],
             outputs: vec![r0],
             returns: 1,
@@ -417,9 +439,10 @@ mod tests {
     }
 
     /// A constant real-ram address used as a load/store base is lifted to a
-    /// `glob_<addr>` parameter: the access is rewritten to dereference the param,
-    /// no constant-address access remains, and every direct caller passes the
-    /// address literal as the new argument.
+    /// `glob_<addr>` interface slot: the access is rewritten to dereference the
+    /// param, no constant-address access remains, the slot is recorded in the
+    /// interface map, and a **regpure** direct caller passes the address literal
+    /// as the new argument.
     #[test]
     fn lifts_constant_global_address_to_param() {
         let mut tc = qcode::testing::TestContext::new();
@@ -447,13 +470,16 @@ mod tests {
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
+        // The site is regpure (f's materialized interface is empty, so zero args
+        // is lockstep-valid); growth must append the literal here.
         let call_id = set_call(&mut tc, g_call, f, vec![]);
+        set_call_tag(&mut tc, call_id, qcode::value::insn::CallTag::RegPure);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
-        let address_taken = super::super::address_taken_set(&tc.ctx);
+        let graph = crate::CallGraph::analyze(&tc.ctx);
         assert!(
-            super::super::globals::globalize_constants(&mut tc.ctx, &address_taken, f),
-            "constant global address must be lifted to a param"
+            super::super::globals::grow_globals(&mut tc.ctx, &graph, f),
+            "constant global address must be lifted to an interface slot"
         );
 
         // f gains a `glob_454df8` param.
@@ -491,12 +517,86 @@ mod tests {
             matches!(call.args[0], LocalValueId::Literal(_)),
             "caller passes the address literal"
         );
+
+        // The slot is recorded in the interface map, after the register inputs.
+        let map = FunctionBody::from_id(&tc.ctx, f)
+            .effects()
+            .materialized()
+            .unwrap()
+            .clone();
+        assert_eq!(map.globals.len(), 1, "growth records one interface slot");
+        assert_eq!(map.globals[0].addr, 0x454df8);
     }
 
-    /// An address-taken function must not be globalized: an indirect caller this
-    /// pass cannot rewrite would be left without the new argument.
+    /// The 2026-07-17 verifier regression: a non-regpure (`Opaque`,
+    /// implicit-binding) direct site must stay **zero-arg** when the callee's
+    /// interface grows a global slot — the param binds from its literal origin,
+    /// not from a positional argument. (The old direct-site surgery appended the
+    /// literal at every caller, tripping `pure_reg_call_args` rule 2.)
     #[test]
-    fn skips_address_taken_function_for_globals() {
+    fn opaque_site_stays_zero_arg_when_globals_grow() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    %p = load(ram:4, 0x454df8);
+                    return at i64 0;
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = g;
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
+            qcode::value::FunctionEffects::Materialized(
+                qcode::value::RegisterInterfaceMap::default(),
+            ),
+        );
+        let call_id = set_call(&mut tc, g_call, f, vec![]);
+        set_call_tag(&mut tc, call_id, qcode::value::insn::CallTag::Opaque);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        let graph = crate::CallGraph::analyze(&tc.ctx);
+        assert!(
+            super::super::globals::grow_globals(&mut tc.ctx, &graph, f),
+            "the global is still lifted (the callee side is site-independent)"
+        );
+
+        // The callee gained the param + slot...
+        let pnames: Vec<String> = FunctionBody::from_id(&tc.ctx, f)
+            .root()
+            .unwrap()
+            .params()
+            .filter_map(|p| p.name().map(str::to_string))
+            .collect();
+        assert!(pnames.iter().any(|n| n == "glob_454df8"));
+
+        // ...but the Opaque site keeps its implicit zero-arg binding.
+        let Mnemonic::Call(call) = tc.ctx.get_insn(call_id).mnemonic().clone() else {
+            panic!("g_call is a call");
+        };
+        assert!(
+            call.args.is_empty(),
+            "an implicit-binding site must not receive positional args"
+        );
+        assert!(
+            crate::verify::verify_pure_reg_call_args(&tc.ctx).is_empty(),
+            "the grown interface passes the call-interface verifier"
+        );
+    }
+
+    /// Old address-taken shape, kept as a smoke test: growth is now *sound* for
+    /// an address-taken function (indirect sites bind implicitly from the
+    /// param's literal origin), so the global is lifted rather than skipped.
+    #[test]
+    fn lifts_globals_of_address_taken_function() {
         let mut tc = qcode::testing::TestContext::new();
         qcode!(
             tc.ctx,
@@ -531,9 +631,17 @@ mod tests {
             address_taken.contains(&f),
             "test setup: f must be address-taken"
         );
+        let graph = crate::CallGraph::analyze(&tc.ctx);
         assert!(
-            !super::super::globals::globalize_constants(&mut tc.ctx, &address_taken, f),
-            "address-taken function must be left untouched"
+            super::super::globals::grow_globals(&mut tc.ctx, &graph, f),
+            "address-taken no longer gates global lifting"
+        );
+        assert!(
+            FunctionBody::from_id(&tc.ctx, f)
+                .root()
+                .unwrap()
+                .params()
+                .any(|p| p.name() == Some("glob_454df8")),
         );
     }
 
@@ -686,6 +794,83 @@ mod tests {
             )
         });
         assert!(has_replay, "caller replays the returned global write-set");
+    }
+
+    /// The shadow space is a body-local aliasing device and must never escape a
+    /// function's interface: no value returned in the write-set may carry a
+    /// temp-space-qualified *type*. Regression for the leak where the exported
+    /// `write_addr` field shared its instruction with the shadow read that
+    /// stamped it with shadow provenance — which then dangled when a caller
+    /// (`partial_inline`) cloned the field into its own arena.
+    #[test]
+    fn writeset_address_does_not_leak_shadow_space() {
+        let mut tc = qcode::testing::TestContext::new();
+        let _input = stack_input(&mut tc, 4, 8);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    %a = @stack_10000004 + i64 0x30;
+                    store(ram:4, %a <- i32 7);
+                    return at i64 0;
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = g;
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
+            qcode::value::FunctionEffects::Materialized(
+                qcode::value::RegisterInterfaceMap::default(),
+            ),
+        );
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, g_call, f, vec![ptr]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(argpromote(&mut tc.ctx), "the offset store must promote");
+
+        // No instruction in `f` whose value flows into the returned write-set may
+        // carry a temp-space type. Scan every instruction: any temp-space-typed
+        // result is the shadow leaking, since the only body-local space here is
+        // argpromote's shadow.
+        use qcode::space::MemorySpaceId;
+        for block in FunctionBody::from_id(&tc.ctx, f).iter() {
+            for insn in block.iter() {
+                // Redirected shadow loads/stores legitimately *operate* in the
+                // shadow (their mnemonic space), but their *result type* must not
+                // be temp-qualified unless it is such a load's own address — which
+                // stays internal. The exported tuple fields are what matter, so
+                // assert on the Return's tuple operands specifically.
+                if let Mnemonic::Return(qcode::value::insn::Return { value: Some(v), .. }) =
+                    insn.mnemonic()
+                    && let LocalValueId::Instruction(t) = v
+                {
+                    let tuple = InstructionId::new(f, *t);
+                    if let Mnemonic::Tuple(tp) = tc.ctx.get_insn(tuple).mnemonic().clone() {
+                        for field in tp.fields {
+                            let ty = tc
+                                .ctx
+                                .stored_type_of(field.qualify(f))
+                                .unwrap_or_else(|| tc.ctx.type_of(field.qualify(f)));
+                            assert!(
+                                !matches!(
+                                    tc.ctx.shared.types.space_of(ty),
+                                    Some(MemorySpaceId::Temp(_))
+                                ),
+                                "return-pack field {field:?} leaks a shadow temp space through the interface"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -3456,6 +3641,7 @@ mod tests {
     fn set_materialized(tc: &mut qcode::testing::TestContext, fid: FunctionId, regs: &[VarnodeId]) {
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
             qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
+                globals: vec![],
                 inputs: regs.to_vec(),
                 outputs: regs.to_vec(),
                 returns: regs.len(),
@@ -4026,6 +4212,7 @@ mod tests {
         {
             let mut f = FunctionBody::from_id_mut(&mut tc.ctx, ext);
             f.set_effects(FunctionEffects::Materialized(RegisterInterfaceMap {
+                globals: vec![],
                 inputs: vec![r1],
                 outputs: vec![r0, r2],
                 returns: 1,
@@ -4121,6 +4308,7 @@ mod tests {
         {
             let mut f = FunctionBody::from_id_mut(&mut tc.ctx, ext);
             f.set_effects(FunctionEffects::Materialized(RegisterInterfaceMap {
+                globals: vec![],
                 inputs: vec![],
                 outputs: vec![r0],
                 returns: 1,

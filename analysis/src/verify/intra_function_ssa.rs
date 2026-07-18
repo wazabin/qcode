@@ -33,12 +33,26 @@ use qcode::{context::Context, value::BasicBlock};
 /// invariant on the edge and storage axes (the operand and block-target axes are
 /// discharged by the `LocalValueId`/`LocalBlockId` storage types).
 pub fn verify_intra_function_ssa(ctx: &Context) -> Vec<String> {
+    verify_intra_function_ssa_scoped(ctx, super::Scope::All)
+}
+
+pub(crate) fn verify_intra_function_ssa_scoped(
+    ctx: &Context,
+    scope: super::Scope<'_>,
+) -> Vec<String> {
     let mut out = Vec::new();
     // Axes 1 (data operands) and 2 (CFG block targets) are discharged by the
     // `LocalValueId`/`LocalBlockId` storage types: an instruction's operands and a
     // terminator's targets are body-local indices in `insn.func`'s own arena and
     // cannot reference another function's value or block.
-    for block in ctx.blocks() {
+    for fid in scope.function_ids(ctx) {
+        verify_function(ctx, fid, &mut out);
+    }
+    out
+}
+
+fn verify_function(ctx: &Context, fid: qcode::value::FunctionId, out: &mut Vec<String>) {
+    for block in qcode::value::FunctionBody::from_id(ctx, fid).iter() {
         // Axis 4: self-storage (arena == owner).
         if let Some(parent) = block.parent().map(|f| f.id)
             && parent != block.id.func
@@ -61,7 +75,6 @@ pub fn verify_intra_function_ssa(ctx: &Context) -> Vec<String> {
             }
         }
     }
-    out
 }
 
 #[cfg(test)]

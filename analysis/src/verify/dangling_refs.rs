@@ -9,8 +9,15 @@ use qcode::{context::Context, value::ValueId};
 /// (`Context::instructions` yields live instructions only; we flag any of their
 /// *operands* that point at an absent stable-arena ID.)
 pub fn verify_no_dangling_refs(ctx: &Context) -> Vec<String> {
+    verify_no_dangling_refs_scoped(ctx, super::Scope::All)
+}
+
+pub(crate) fn verify_no_dangling_refs_scoped(
+    ctx: &Context,
+    scope: super::Scope<'_>,
+) -> Vec<String> {
     let mut out = Vec::new();
-    for insn in ctx.instructions() {
+    for insn in scope.instructions(ctx) {
         for arg in insn.operands() {
             let removed = match arg {
                 ValueId::Instruction(id) => !ctx.contains_instruction(id),

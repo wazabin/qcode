@@ -322,6 +322,7 @@ pub fn apply_external_signature(
         }
     }
     let reg_map = RegisterInterfaceMap {
+        globals: vec![],
         inputs: inputs.clone(),
         // Returns-first ordering: the ABI return register(s) lead, the
         // caller-saved clobber tail follows (poison at a rewritten site).

@@ -1569,23 +1569,42 @@ impl StandaloneEmulator {
             return;
         };
         let root_id = root.id;
-        let params: Vec<(BlockParamId, Option<VarnodeId>, usize)> =
-            BasicBlock::from_id(ctx, root_id)
-                .params()
-                .map(|param| {
-                    let src = param
-                        .name()
-                        .and_then(|name| ctx.get_named(name))
-                        .and_then(|value| match value {
-                            ValueId::Varnode(id) => Some(id),
-                            _ => None,
-                        });
-                    (param.id, src, param.size())
-                })
-                .collect();
+        enum Seed {
+            Reg(VarnodeId),
+            /// A lifted global slot: the param's origin is its address literal,
+            /// so implicit binding is the literal value itself (see
+            /// `argpromote::globals` — an `Opaque` site passes no argument).
+            Lit(u64),
+        }
+        let params: Vec<(BlockParamId, Option<Seed>, usize)> = BasicBlock::from_id(ctx, root_id)
+            .params()
+            .map(|param| {
+                let src = param
+                    .name()
+                    .and_then(|name| ctx.get_named(name))
+                    .and_then(|value| match value {
+                        ValueId::Varnode(id) => Some(Seed::Reg(id)),
+                        _ => None,
+                    })
+                    .or_else(|| match param.origin() {
+                        Some(ValueId::Literal(_)) => {
+                            let ValueRef::Literal(lit) = ValueRef::new(param.origin()?, ctx) else {
+                                return None;
+                            };
+                            Some(Seed::Lit(lit.value()))
+                        }
+                        _ => None,
+                    });
+                (param.id, src, param.size())
+            })
+            .collect();
         for (param_id, src, size) in params {
-            let Some(varnode_id) = src else { continue };
-            if let Some(value) = self.read_varnode(ctx, varnode_id) {
+            let value = match src {
+                Some(Seed::Reg(varnode_id)) => self.read_varnode(ctx, varnode_id),
+                Some(Seed::Lit(value)) => Some(value),
+                None => None,
+            };
+            if let Some(value) = value {
                 self.block_param_values
                     .insert(param_id, SizedValue::new(value, size));
             }

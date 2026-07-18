@@ -1500,6 +1500,7 @@ mod tests {
         let r0 = ctx.get_named("r0").unwrap().as_varnode().unwrap();
         FunctionBody::from_id_mut(ctx, callee).set_effects(
             qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
+                globals: vec![],
                 inputs: vec![],
                 outputs: vec![r0],
                 returns: 0,

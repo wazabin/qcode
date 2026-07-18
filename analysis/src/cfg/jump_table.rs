@@ -63,13 +63,6 @@ struct Edit {
     value: u64,
 }
 
-struct MakeBranch {
-    /// The block ending in the indirect branch.
-    from: BlockId,
-    /// Resolved target address.
-    target: u64,
-}
-
 struct MakeCBranch {
     /// The block ending in the indirect branch.
     from: BlockId,
@@ -202,7 +195,6 @@ impl HandleJumpTables {
 
         // Read-only scan: collect every resolvable edge, then mutate.
         let mut edits: Vec<Edit> = Vec::new();
-        let mut single_branches: Vec<MakeBranch> = Vec::new();
         let mut branches: Vec<MakeCBranch> = Vec::new();
 
         let block_ids = function.blocks().map(|b| b.id).collect::<Vec<_>>();
@@ -212,13 +204,15 @@ impl HandleJumpTables {
 
             if let Some(mut block_edits) = resolve_block(block, binary) {
                 match block_edits.len() {
-                    1 => {
-                        let e = block_edits.pop().unwrap();
-                        single_branches.push(MakeBranch {
-                            from: e.from,
-                            target: e.target,
-                        });
-                    }
+                    // A single resolved case does NOT collapse the indirect branch
+                    // into a direct `Branch`: the index may simply be bounded to one
+                    // value *this* fixpoint round, with the rest of the table
+                    // resolvable only once more of the function is lifted. Rewriting
+                    // to a `Branch` now would delete the `BranchInd` and permanently
+                    // strand those later cases (and the code they reach). Keep the
+                    // indirect terminator and wire the one edge, exactly like the
+                    // many-case path; a genuinely single-target table stabilizes at
+                    // one edge across rounds without losing discovery.
                     2 => {
                         let e1 = block_edits.pop().unwrap();
                         let e2 = block_edits.pop().unwrap();
@@ -245,7 +239,7 @@ impl HandleJumpTables {
             }
         }
 
-        if edits.is_empty() && single_branches.is_empty() && branches.is_empty() {
+        if edits.is_empty() && branches.is_empty() {
             return Ok(false);
         }
 
@@ -268,7 +262,7 @@ impl HandleJumpTables {
             by_from.entry(e.from).or_default().push(e);
         }
         for (from, edits) in by_from {
-            let from_addr = BasicBlock::from_id(ctx, from).address();
+            let from_addr = dispatch_source_addr(ctx, from);
             for edit in &edits {
                 discover(ctx, fn_entry, from_addr, edit.target);
             }
@@ -312,33 +306,6 @@ impl HandleJumpTables {
             }
         }
 
-        // A single resolved target: the indirect branch is really an
-        // unconditional jump. Replace `BranchInd` with a direct `Branch`.
-        for MakeBranch { from, target } in single_branches {
-            let from_addr = BasicBlock::from_id(ctx, from).address();
-            discover(ctx, fn_entry, from_addr, target);
-            let Some(resolved) = classify_existing_target(ctx, addresses, target, fun_id) else {
-                continue;
-            };
-            clear_successors(ctx, from);
-            {
-                let mut block = BasicBlock::from_id_mut(ctx, from);
-                block.pop_insn();
-            }
-            {
-                let mut builder = ctx.builder(from);
-                match resolved {
-                    LocalTarget::Local(target_block) => {
-                        builder.push_branch(target_block);
-                    }
-                    LocalTarget::Foreign(g) => {
-                        builder.push_tail_call(g);
-                    }
-                }
-            }
-            changed = true;
-        }
-
         for MakeCBranch {
             from,
             index,
@@ -347,7 +314,7 @@ impl HandleJumpTables {
             false_target,
         } in branches
         {
-            let from_addr = BasicBlock::from_id(ctx, from).address();
+            let from_addr = dispatch_source_addr(ctx, from);
             discover(ctx, fn_entry, from_addr, true_target);
             discover(ctx, fn_entry, from_addr, false_target);
             let (Some(true_target_resolved), Some(false_target_resolved)) = (
@@ -447,6 +414,32 @@ fn clear_successors(ctx: &mut Context, from: BlockId) {
     for edge in edges {
         ctx.remove_cfg_edge(from.func, edge);
     }
+}
+
+/// Machine address that re-identifies, in the clean IR, the dispatch block a
+/// resolved jump table lives in.
+///
+/// This pass runs on the *optimized* IR, where straight-line merging can fold
+/// the clean-IR dispatch block into an earlier block — after, say, a call was
+/// elided, leaving a block whose clean-IR counterpart still ends in that call.
+/// `from`'s *start* address then belongs to that earlier clean-IR block, so
+/// wiring the resolved edges against it would attach jump-table continuations to
+/// a call block (malformed — see `verify::call_edges`) and, worse, divert the
+/// discovery/split cascade those edges drive.
+///
+/// The `BranchInd` instruction keeps its own machine address across those
+/// merges, and that address is always a clean-IR block leader (it equals the
+/// block start when nothing merged, and otherwise reappears as an absorbed
+/// block's start). Recording it lets the clean lifter resolve the true dispatch
+/// block. Fall back to the block start only if the terminator carries no
+/// address.
+fn dispatch_source_addr(ctx: &Context, from: BlockId) -> Option<u64> {
+    let block = BasicBlock::from_id(ctx, from);
+    block
+        .iter()
+        .last()
+        .and_then(|insn| insn.address())
+        .or_else(|| block.address())
 }
 
 /// Record a resolved `target` for later disassembly, keyed by the owning

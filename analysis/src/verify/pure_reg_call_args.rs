@@ -13,6 +13,8 @@
 //! Both are checked per direct call site so a regression crashes loudly under
 //! `QCODE_VERIFY` instead of miscompiling.
 
+use rustc_hash::{FxHashMap, FxHashSet};
+
 use qcode::{
     context::Context,
     value::{
@@ -20,8 +22,6 @@ use qcode::{
         insn::InstructionId,
     },
 };
-
-use crate::{CallGraph, calls::direct_call_sites};
 
 /// A direct call to a `pure_reg` function does not match the callee's root params.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,71 +70,143 @@ impl PureRegCallArgsViolation {
 
 /// Return every direct-call interface violation for `pure_reg` functions.
 pub fn verify_pure_reg_call_args(ctx: &Context<'_>) -> Vec<PureRegCallArgsViolation> {
+    verify_pure_reg_call_args_scoped(ctx, super::Scope::All)
+}
+
+/// [`verify_pure_reg_call_args`], restricted to `scope`. The rule is driven
+/// from call sites (no call-graph build): every direct call in an in-scope
+/// caller is checked, plus — because rewriting an in-scope *callee's* interface
+/// can invalidate call sites in unchanged callers — every direct call anywhere
+/// targeting an in-scope materialized callee.
+pub(crate) fn verify_pure_reg_call_args_scoped(
+    ctx: &Context<'_>,
+    scope: super::Scope<'_>,
+) -> Vec<PureRegCallArgsViolation> {
     let mut violations = Vec::new();
-    let graph = CallGraph::analyze(ctx);
+    // Per-callee interface, computed lazily: `None` = not materialized (exempt).
+    let mut interfaces: FxHashMap<FunctionId, Option<Vec<usize>>> = FxHashMap::default();
 
-    for callee in ctx.function_ids() {
-        let function = FunctionBody::from_id(ctx, callee);
-        // A regpure site's args must match the callee's *full* register-passed
-        // interface 1:1. For a bodied callee that interface is its root params —
-        // which the later RAM channel (`argpromote`) grows with by-value memory
-        // params, so it is a superset of the register-only `Materialized` map and
-        // is the authoritative arity. For a bodyless external (no root) the
-        // `Materialized` map is the interface. Both are read from the function's
-        // published state, not from the call's origin.
-        let qcode::value::FunctionEffects::Materialized(map) = function.effects() else {
-            continue;
-        };
-        let param_sizes: Vec<usize> = match function.root().map(|b| b.id) {
-            Some(root) => BasicBlock::from_id(ctx, root)
-                .params()
-                .map(|param| param.size())
-                .collect(),
-            None => map
-                .inputs
-                .iter()
-                .map(|&vn| qcode::value::Varnode::from_id(ctx, vn).size())
-                .collect(),
-        };
+    // Caller side: every direct call issued by an in-scope function.
+    for insn in scope.instructions(ctx) {
+        check_call_site(ctx, &insn, &mut interfaces, &mut violations);
+    }
 
-        for call_id in direct_call_sites(ctx, &graph, callee) {
-            let insn = ctx.get_insn(call_id);
-            let qcode::value::insn::Mnemonic::Call(call) = insn.mnemonic() else {
-                unreachable!("direct_call_sites returned a non-Call instruction");
-            };
-
-            if call.tag.is_regpure() {
-                // Rule 1: a regpure call's args must align 1:1 with the callee's
-                // register-param mapping (count + size).
-                let size_mismatch = if call.args.len() == param_sizes.len() {
-                    first_size_mismatch(ctx, &insn.operands(), &param_sizes)
-                } else {
-                    None
-                };
-                if call.args.len() != param_sizes.len() || size_mismatch.is_some() {
-                    violations.push(PureRegCallArgsViolation {
-                        callee,
-                        call: call_id,
-                        expected_args: param_sizes.len(),
-                        actual_args: call.args.len(),
-                        size_mismatch,
-                    });
+    // Callee side (scoped runs only; the pass above already covered the whole
+    // module under `Scope::All`): if some in-scope function is materialized,
+    // its callers' sites must still line up, so sweep the out-of-scope callers
+    // for calls into the scope. Skipped entirely when no in-scope function is
+    // materialized — the rule is vacuous for other callees.
+    if let super::Scope::Functions(set) = scope {
+        let materialized: FxHashSet<FunctionId> = scope
+            .function_ids(ctx)
+            .into_iter()
+            .filter(|&fid| {
+                matches!(
+                    FunctionBody::from_id(ctx, fid).effects(),
+                    qcode::value::FunctionEffects::Materialized(_)
+                )
+            })
+            .collect();
+        if !materialized.is_empty() {
+            for insn in ctx.instructions() {
+                if set.contains(&insn.id.func) {
+                    continue; // already checked in the caller-side pass
                 }
-            } else if !call.args.is_empty() {
-                // Rule 2: a non-regpure (implicit) call to a materialized callee
-                // must carry zero register arguments.
-                violations.push(PureRegCallArgsViolation {
-                    callee,
-                    call: call_id,
-                    expected_args: 0,
-                    actual_args: call.args.len(),
-                    size_mismatch: None,
-                });
+                let qcode::value::insn::Mnemonic::Call(call) = insn.mnemonic() else {
+                    continue;
+                };
+                if call
+                    .target
+                    .real()
+                    .is_some_and(|callee| materialized.contains(&callee))
+                {
+                    check_call_site(ctx, &insn, &mut interfaces, &mut violations);
+                }
             }
         }
     }
 
     violations
+}
+
+/// If `insn` is a direct call to a materialized callee, check its binding
+/// convention against the callee's published interface.
+fn check_call_site(
+    ctx: &Context<'_>,
+    insn: &qcode::value::InstructionRef<'_, '_>,
+    interfaces: &mut FxHashMap<FunctionId, Option<Vec<usize>>>,
+    violations: &mut Vec<PureRegCallArgsViolation>,
+) {
+    let qcode::value::insn::Mnemonic::Call(call) = insn.mnemonic() else {
+        return;
+    };
+    let Some(callee) = call.target.real() else {
+        return;
+    };
+    let Some(param_sizes) = interfaces
+        .entry(callee)
+        .or_insert_with(|| interface_param_sizes(ctx, callee))
+        .as_ref()
+    else {
+        return;
+    };
+
+    if call.tag.is_regpure() {
+        // Rule 1: a regpure call's args must align 1:1 with the callee's
+        // register-param mapping (count + size).
+        let size_mismatch = if call.args.len() == param_sizes.len() {
+            first_size_mismatch(ctx, &insn.operands(), param_sizes)
+        } else {
+            None
+        };
+        if call.args.len() != param_sizes.len() || size_mismatch.is_some() {
+            violations.push(PureRegCallArgsViolation {
+                callee,
+                call: insn.id,
+                expected_args: param_sizes.len(),
+                actual_args: call.args.len(),
+                size_mismatch,
+            });
+        }
+    } else if !call.args.is_empty() {
+        // Rule 2: a non-regpure (implicit) call to a materialized callee
+        // must carry zero register arguments.
+        violations.push(PureRegCallArgsViolation {
+            callee,
+            call: insn.id,
+            expected_args: 0,
+            actual_args: call.args.len(),
+            size_mismatch: None,
+        });
+    }
+}
+
+/// The register-passed interface arity/sizes of `callee`, or `None` when it is
+/// not materialized (the rule does not apply).
+///
+/// A regpure site's args must match the callee's *full* register-passed
+/// interface 1:1. For a bodied callee that interface is its root params —
+/// which the later RAM channel (`argpromote`) grows with by-value memory
+/// params, so it is a superset of the register-only `Materialized` map and
+/// is the authoritative arity. For a bodyless external (no root) the
+/// `Materialized` map is the interface. Both are read from the function's
+/// published state, not from the call's origin.
+fn interface_param_sizes(ctx: &Context<'_>, callee: FunctionId) -> Option<Vec<usize>> {
+    let function = FunctionBody::from_id(ctx, callee);
+    let qcode::value::FunctionEffects::Materialized(map) = function.effects() else {
+        return None;
+    };
+    Some(match function.root().map(|b| b.id) {
+        Some(root) => BasicBlock::from_id(ctx, root)
+            .params()
+            .map(|param| param.size())
+            .collect(),
+        None => map
+            .inputs
+            .iter()
+            .map(|&vn| qcode::value::Varnode::from_id(ctx, vn).size())
+            .collect(),
+    })
 }
 
 fn first_size_mismatch(
@@ -192,6 +264,7 @@ mod tests {
             .collect();
         FunctionBody::from_id_mut(&mut tc.ctx, callee).set_effects(FunctionEffects::Materialized(
             RegisterInterfaceMap {
+                globals: vec![],
                 inputs,
                 outputs: vec![],
                 returns: 0,
@@ -310,6 +383,37 @@ mod tests {
         assert_eq!(violations[0].call, call);
         assert_eq!(violations[0].expected_args, 0);
         assert_eq!(violations[0].actual_args, 1);
+    }
+
+    #[test]
+    fn scoped_to_callee_still_reports_unchanged_callers_sites() {
+        // The callee-side sweep: with only the (materialized) callee in scope,
+        // a mismatched call site in an out-of-scope caller is still reported —
+        // an interface rewrite invalidates callers that did not change.
+        let mut tc = TestContext::new();
+        let callee = pure_callee_with_params(&mut tc, &[8, 4]);
+        let a0 = tc.ctx.get_const(0x11, 8).id();
+        let call = caller_calling(&mut tc, callee, vec![a0]);
+
+        let scope: rustc_hash::FxHashSet<_> = [callee].into_iter().collect();
+        let violations =
+            verify_pure_reg_call_args_scoped(&tc.ctx, crate::verify::Scope::Functions(&scope));
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].call, call);
+    }
+
+    #[test]
+    fn scoped_to_caller_reports_its_own_sites() {
+        let mut tc = TestContext::new();
+        let callee = pure_callee_with_params(&mut tc, &[8, 4]);
+        let a0 = tc.ctx.get_const(0x11, 8).id();
+        let call = caller_calling(&mut tc, callee, vec![a0]);
+
+        let scope: rustc_hash::FxHashSet<_> = [call.func].into_iter().collect();
+        let violations =
+            verify_pure_reg_call_args_scoped(&tc.ctx, crate::verify::Scope::Functions(&scope));
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].call, call);
     }
 
     #[test]

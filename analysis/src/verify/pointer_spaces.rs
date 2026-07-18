@@ -15,9 +15,15 @@ use qcode::{
 /// the runtime assertion in `alias::simple`, surfaced here so `verify_after` pins it
 /// to the pass that produced it rather than to whichever pass next runs alias.
 pub fn verify_pointer_spaces(ctx: &Context) -> Vec<String> {
+    verify_pointer_spaces_scoped(ctx, super::Scope::All)
+}
+
+pub(crate) fn verify_pointer_spaces_scoped(ctx: &Context, scope: super::Scope<'_>) -> Vec<String> {
+    // A pointer value is function-local (operands are body-local), so scoping
+    // the scan per function cannot miss a cross-function space conflict.
     let mut seen: HashMap<ValueId, MemorySpaceId> = HashMap::new();
     let mut out = Vec::new();
-    for insn in ctx.instructions() {
+    for insn in scope.instructions(ctx) {
         let (ptr, space) = match insn.mnemonic() {
             Mnemonic::Load(l) => (l.ptr.qualify(insn.id.func), l.space),
             Mnemonic::Store(s) => (s.ptr.qualify(insn.id.func), s.space),

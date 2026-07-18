@@ -117,10 +117,12 @@ fn argpromote_changed_functions_with_sp(
         if callers.iter().any(|id| !target_set.contains(id)) {
             continue;
         }
-        // Lift constant-address (global) accesses into params first, so the freshly
-        // param-relative derefs are visible to `try_promote`'s footprint scan in the
-        // same visit.
-        if super::globals::globalize_constants(ctx, &address_taken, fid) {
+        // Lift late-discovered constant-address (global) accesses into interface
+        // slots first (constprop may only now have folded the address), so the
+        // freshly param-relative derefs are visible to `try_promote`'s footprint
+        // scan in the same visit. Interface-honest growth: regpure sites get the
+        // literal argument, implicit sites bind from the param's literal origin.
+        if super::globals::grow_globals(ctx, graph, fid) {
             changed.insert(fid);
             changed.extend(callers.iter().copied());
         }
@@ -259,6 +261,29 @@ fn try_promote(
     // caller on the old by-reference ABI. (Callers in undiscovered code are an
     // accepted, unguardable gap — see the module docs.)
     if address_taken.contains(&fid) {
+        return false;
+    }
+
+    // Snapshot arguments are real data loaded at the caller — unlike a register
+    // input or a global's address literal they have no implicit binding, so a
+    // non-regpure (`Opaque`) direct site cannot be given one. Promoting past
+    // such a site would either desync the `param[i] ↔ arg[i]` lockstep or trip
+    // the `[lockstep]` asserts in `apply`; bail instead.
+    if crate::calls::direct_call_sites(ctx, graph, fid)
+        .into_iter()
+        .any(|site| {
+            !matches!(
+                ctx.get_insn(site).mnemonic(),
+                Mnemonic::Call(c) if c.tag.is_regpure()
+            )
+        })
+    {
+        qcode::pass_log!(
+            debug,
+            "argpromote {}: bail — a direct call site is not regpure (implicit binding \
+             cannot carry snapshot args)",
+            FunctionBody::from_id(ctx, fid).name(),
+        );
         return false;
     }
 
@@ -961,9 +986,21 @@ fn apply(
             ]
         },
         |b, &(base, base_size, offset, size)| {
-            let addr = seed_addr(b, base, base_size, offset);
-            let v = b.push_load::<false>(addr, size, shadow).id();
-            vec![addr, v]
+            // Read the written value out of the shadow. `push_load` stamps its
+            // pointer instruction with the load space's provenance
+            // (`set_insn_space_local`), so this address becomes shadow-qualified —
+            // correct, and kept internal to the body.
+            let shadow_addr = seed_addr(b, base, base_size, offset);
+            let v = b.push_load::<false>(shadow_addr, size, shadow).id();
+            // The *exported* write address is a real-RAM pointer (replayed as
+            // `store(ram)` at the caller). Build it as its own instruction so it
+            // keeps `base`'s real provenance instead of inheriting the shadow
+            // space from the load above — otherwise the body-local shadow space
+            // leaks through the return interface and dangles when a caller
+            // clones the field (e.g. `partial_inline`). At `offset == 0` this is
+            // the bare `base` param, already real-typed.
+            let ram_addr = seed_addr(b, base, base_size, offset);
+            vec![ram_addr, v]
         },
         |b, _, ext| {
             b.push_store(ext[1], ext[0], ram);

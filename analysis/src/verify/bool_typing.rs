@@ -48,6 +48,10 @@ fn describe_value(ctx: &Context, value: ValueId) -> String {
 
 /// Run the `bool`-typing checks over every instruction.
 pub fn verify_bool_typing(ctx: &Context) -> Vec<String> {
+    verify_bool_typing_scoped(ctx, super::Scope::All)
+}
+
+pub(crate) fn verify_bool_typing_scoped(ctx: &Context, scope: super::Scope<'_>) -> Vec<String> {
     let mut out = Vec::new();
 
     let check_domain = |v: ValueId, out: &mut Vec<String>| {
@@ -58,7 +62,7 @@ pub fn verify_bool_typing(ctx: &Context) -> Vec<String> {
         }
     };
 
-    for insn in ctx.instructions() {
+    for insn in scope.instructions(ctx) {
         let func = insn.id.func;
         match insn.mnemonic() {
             Mnemonic::Binop(b) => {

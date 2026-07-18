@@ -20,6 +20,7 @@ use rustc_hash::FxHashSet;
 use crate::calls::CallEdge;
 
 use super::{
+    globals::global_slot,
     registers::{RegPurityReason, RegisterEffects, canonicalize_to_coarsest, is_register},
     summary::EffectChannel,
 };
@@ -32,6 +33,12 @@ use super::{
 pub(crate) struct RegEffects {
     pub(crate) loads: FxHashSet<VarnodeId>,
     pub(crate) stores: FxHashSet<VarnodeId>,
+    /// Constant real-RAM addresses this function's *own body* dereferences
+    /// (`(address, address width)`). Unlike register effects these do NOT
+    /// compose through calls: a callee's global access stays behind the
+    /// callee's own interface (its `glob_*` param), so `transfer` drops them
+    /// and a summary carries only the function's syntactic set.
+    pub(crate) globals: FxHashSet<(u64, usize)>,
 }
 
 impl RegEffects {
@@ -67,6 +74,8 @@ impl EffectChannel for RegChannel {
                             && is_register(ctx, vn)
                         {
                             eff.loads.insert(vn);
+                        } else if let Some(slot) = global_slot(ctx, fid, l.ptr, l.space) {
+                            eff.globals.insert(slot);
                         }
                     }
                     Mnemonic::Store(s) => {
@@ -74,6 +83,8 @@ impl EffectChannel for RegChannel {
                             && is_register(ctx, vn)
                         {
                             eff.stores.insert(vn);
+                        } else if let Some(slot) = global_slot(ctx, fid, s.ptr, s.space) {
+                            eff.globals.insert(slot);
                         }
                     }
                     _ => {}
@@ -132,14 +143,22 @@ impl EffectChannel for RegChannel {
         _edge: &CallEdge,
         callee: &RegEffects,
     ) -> Option<RegEffects> {
-        Some(callee.clone())
+        // Registers are a global namespace (identity transfer); globals are
+        // *not* interface-transparent — the callee keeps accessing them through
+        // its own `glob_*` slot — so they do not cross the call edge.
+        Some(RegEffects {
+            loads: callee.loads.clone(),
+            stores: callee.stores.clone(),
+            globals: FxHashSet::default(),
+        })
     }
 
     fn join(&self, into: &mut RegEffects, from: &RegEffects) -> bool {
-        let before = (into.loads.len(), into.stores.len());
+        let before = (into.loads.len(), into.stores.len(), into.globals.len());
         into.loads.extend(from.loads.iter().copied());
         into.stores.extend(from.stores.iter().copied());
-        (into.loads.len(), into.stores.len()) != before
+        into.globals.extend(from.globals.iter().copied());
+        (into.loads.len(), into.stores.len(), into.globals.len()) != before
     }
 }
 
@@ -172,13 +191,22 @@ pub(crate) fn finalize_register_effects(
     let mut inputs =
         canonicalize_to_coarsest(ctx, &read_set).ok_or(RegPurityReason::NonCanonicalRegisters)?;
 
+    // Deterministic global-slot order shared by callee param creation and the
+    // regpure-site argument threading.
+    let mut globals: Vec<(u64, usize)> = eff.globals.iter().copied().collect();
+    globals.sort_unstable();
+
     let key = |ctx: &Context, vn: &VarnodeId| {
         let v = Varnode::from_id(ctx, *vn);
         (v.address(), v.size())
     };
     inputs.sort_by_key(|vn| key(ctx, vn));
     outputs.sort_by_key(|vn| key(ctx, vn));
-    Ok(RegisterEffects { inputs, outputs })
+    Ok(RegisterEffects {
+        inputs,
+        globals,
+        outputs,
+    })
 }
 
 #[cfg(test)]
@@ -348,6 +376,7 @@ mod tests {
         let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("ext".into())).id;
         FunctionBody::from_id_mut(&mut tc.ctx, ext).set_effects(FunctionEffects::Materialized(
             RegisterInterfaceMap {
+                globals: vec![],
                 inputs: vec![],
                 outputs: vec![r0],
                 returns: 0,

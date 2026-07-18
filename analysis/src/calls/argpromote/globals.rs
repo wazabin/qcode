@@ -1,34 +1,46 @@
-//! Lift fixed-address (global) memory accesses to parameters.
+//! Constant-address (global) memory accesses as interface slots.
 //!
-//! A `pure_reg` function that loads or stores at a *constant* real-ram address —
+//! A function that loads or stores at a *constant* real-ram address —
 //! `load(ram:4, 0x454df8)` — reaches into absolute memory that no parameter
-//! describes. That keeps it impure and opaque to the param-relative RAM channel,
-//! which only models derefs of a promoted parameter (`param ± const`).
+//! describes, keeping it opaque to the param-relative RAM channel (which only
+//! models derefs of a promoted parameter, `param ± const`).
 //!
-//! This step lifts each such constant address into a new by-value parameter
-//! (`glob_<addr>`), rewrites the access to dereference the parameter, and threads
-//! the *same address literal* as an argument at every direct caller. Because the
-//! caller passes the literal unchanged, the parameter equals the constant at entry
-//! and the rewrite is value-preserving. The access is now param-relative —
-//! `load(ram:4, @glob_454df8)` — so the rest of argpromote (snapshotting, region
-//! detection, shadow promotion) handles the memory behind it; this step only
-//! functionalizes the *address*.
+//! Globals are part of the *effect system* (Jack's ruling, 2026-07-17): the
+//! register channel's scan records each constant address as a
+//! [`GlobalSlot`](qcode::value::GlobalSlot) effect, `materialize_interface`
+//! mints one `glob_<addr>` by-value param per slot (recorded in
+//! [`RegisterInterfaceMap::globals`](qcode::value::RegisterInterfaceMap)) and
+//! this module rewrites the accesses to dereference the param. Call sites are
+//! never touched directly:
+//!
+//! * a **regpure** site passes the address literal verbatim as a positional
+//!   argument (threaded by `rewrite_call_regpure`, like a register input);
+//! * an **implicit** (`Opaque`) site passes nothing — the binder seeds the
+//!   param from the address literal recorded as its `origin`.
+//!
+//! Because the param equals the literal under either convention, the rewrite is
+//! value-preserving, and the freshly param-relative deref is visible to the RAM
+//! channel's footprint scan.
+//!
+//! [`grow_globals`] handles *late* discovery: a later round (constprop folding
+//! an address to a constant) can surface a new global in an
+//! already-materialized function. The interface then grows by appending — the
+//! new param goes at the end of the root params, the literal is appended at
+//! every **regpure** site (lockstep), and implicit sites stay zero-arg.
 
 use qcode::value::QCodeMut;
-use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     context::Context,
     space::{LocalMemorySpaceId, Space, SpaceType},
     value::{
-        FunctionBody, FunctionId, Value, ValueId, ValueRef,
+        BasicBlock, FunctionBody, FunctionEffects, FunctionId, GlobalSlot, LocalValueId, Value,
+        ValueId, ValueRef,
         insn::{Load, Mnemonic, Store},
     },
 };
 
-use rustc_hash::FxHashSet;
-
-use super::append_entry_param;
+use crate::calls::interface::append_entry_param_at_sites;
 
 /// A writable global lives in real RAM. ROM/register/temporary addresses are left
 /// alone: temporary is argpromote's own shadow, registers are varnodes (never a
@@ -39,68 +51,154 @@ fn is_real_ram(ctx: &Context, space: LocalMemorySpaceId) -> bool {
         .is_some_and(|space| matches!(Space::from_id(ctx, space).ty, SpaceType::Ram))
 }
 
-/// Lift every constant real-ram load/store address in `fid` into a parameter,
-/// threading the address literal to each direct caller. Returns whether the
-/// function changed.
-pub(super) fn globalize_constants(
-    ctx: &mut Context,
-    address_taken: &FxHashSet<FunctionId>,
+/// Classify one load/store pointer as a global slot: a literal address into
+/// real RAM. Returns the `(address, address width)` pair the effect channel
+/// records.
+pub(super) fn global_slot(
+    ctx: &Context,
     fid: FunctionId,
-) -> bool {
+    ptr: LocalValueId,
+    space: LocalMemorySpaceId,
+) -> Option<(u64, usize)> {
+    let ptr = ptr.qualify(fid);
+    if !matches!(ptr, ValueId::Literal(_)) || !is_real_ram(ctx, space) {
+        return None;
+    }
+    let ValueRef::Literal(lit) = ValueRef::new(ptr, ctx) else {
+        return None;
+    };
+    Some((lit.value(), lit.size()))
+}
+
+/// Mint the by-value param for one global slot on `fid` and redirect the
+/// slot's accesses through it. `call_sites` receive the address literal as an
+/// appended positional argument — the caller passes the **regpure** sites only
+/// (materialization passes none; implicit sites bind the param from its
+/// literal origin). Returns the new param, or `None` if `fid` has no root.
+fn mint_global_param(
+    ctx: &mut Context,
+    fid: FunctionId,
+    slot: GlobalSlot,
+    call_sites: &[qcode::value::insn::InstructionId],
+) -> Option<ValueId> {
+    let addr = ctx.get_const(slot.addr, slot.size).id();
+    let param = append_entry_param_at_sites(
+        ctx,
+        fid,
+        slot.size,
+        Some(format!("glob_{:x}", slot.addr)),
+        // The literal origin is the single source for implicit binding, and
+        // lets alias analysis treat the param as a static/global pointer,
+        // disjoint from the live stack frame.
+        Some(addr),
+        call_sites,
+        move |_, _, _| addr,
+    )?;
+    rewrite_accesses(ctx, fid, addr, param);
+    Some(param)
+}
+
+/// Materialization-time entry: mint every solved global slot of `fid` without
+/// touching any call site (the interface is being materialized; every caller
+/// still binds implicitly).
+pub(super) fn materialize_globals(ctx: &mut Context, fid: FunctionId, globals: &[GlobalSlot]) {
+    for &slot in globals {
+        mint_global_param(ctx, fid, slot, &[]);
+    }
+}
+
+/// Grow an already-materialized function's interface with globals surfaced
+/// after materialization (a later constprop round folding an address to a
+/// constant). Appends one slot per *new* constant address: the param at the end
+/// of the root params, the literal argument at every regpure direct site, and
+/// the slot in the interface map. Implicit sites stay zero-arg. Idempotent: a
+/// rewritten access is param-relative, so re-scanning finds nothing, and an
+/// address already in the map only has its (new) accesses redirected to the
+/// existing param. Returns whether anything changed.
+pub(super) fn grow_globals(ctx: &mut Context, graph: &crate::CallGraph, fid: FunctionId) -> bool {
     let f = FunctionBody::from_id(ctx, fid);
     if f.is_external() || !f.is_reg_materialized() {
         return false;
     }
-    // Adding a param appends an argument at every direct caller's `Call.args`. An
-    // address-taken function may also be reached by an indirect call this pass
-    // cannot find and rewrite, which would desync the `param[i] ↔ arg[i]` lockstep.
-    // Same closed-world gate as `try_promote`.
-    if address_taken.contains(&fid) {
+    let Some(root) = f.root().map(|b| b.id) else {
         return false;
-    }
+    };
 
-    // Distinct constant addresses used as a real-ram load/store base. Keyed by the
-    // literal `ValueId` — literals are interned, so one id per (address, width).
-    let mut globals: Vec<ValueId> = Vec::new();
-    let mut seen: HashSet<ValueId> = HashSet::default();
+    // Distinct constant real-ram addresses in the current body, in first-seen
+    // order (deterministic: block/instruction order).
+    let mut found: Vec<(u64, usize)> = Vec::new();
     for block in FunctionBody::from_id(ctx, fid).iter() {
         for insn in block.iter() {
             let (space, ptr) = match insn.mnemonic() {
-                Mnemonic::Load(l) => (l.space, l.ptr.qualify(insn.id.func)),
-                Mnemonic::Store(s) => (s.space, s.ptr.qualify(insn.id.func)),
+                Mnemonic::Load(l) => (l.space, l.ptr),
+                Mnemonic::Store(s) => (s.space, s.ptr),
                 _ => continue,
             };
-            if matches!(ptr, ValueId::Literal(_)) && is_real_ram(ctx, space) && seen.insert(ptr) {
-                globals.push(ptr);
+            if let Some(slot) = global_slot(ctx, fid, ptr, space)
+                && !found.contains(&slot)
+            {
+                found.push(slot);
             }
         }
     }
-    if globals.is_empty() {
+    if found.is_empty() {
         return false;
     }
 
-    for addr in globals {
-        // The literal's width is the address width — the size of the new pointer
-        // param. Read it (and the value, for the name) before the `&mut` borrow.
-        let ValueRef::Literal(lit) = ValueRef::new(addr, ctx) else {
-            continue;
-        };
-        let size = lit.size();
-        let name = format!("glob_{:x}", lit.value());
+    let mapped: Vec<GlobalSlot> = FunctionBody::from_id(ctx, fid)
+        .effects()
+        .materialized()
+        .map(|m| m.globals.clone())
+        .unwrap_or_default();
 
-        // The caller passes the address literal verbatim: literals are context-
-        // global, so `addr` is a valid `ValueId` in any function's body. Record the
-        // address literal as the param's `origin` so alias analysis recognizes this
-        // param as a static/global pointer, disjoint from the live stack frame.
-        let Some(param) =
-            append_entry_param(ctx, fid, size, Some(name), Some(addr), move |_, _, _| addr)
-        else {
-            continue;
-        };
+    // Only regpure sites carry positional arguments; implicit (`Opaque`) and
+    // indirect sites bind the new param from its literal origin, so they are
+    // correct untouched — the very desync the old direct-site surgery had.
+    let regpure_sites: Vec<_> = crate::calls::direct_call_sites(ctx, graph, fid)
+        .into_iter()
+        .filter(|&site| {
+            matches!(
+                ctx.get_insn(site).mnemonic(),
+                Mnemonic::Call(c) if c.tag.is_regpure()
+            )
+        })
+        .collect();
 
-        rewrite_accesses(ctx, fid, addr, param);
+    let mut changed = false;
+    for (addr, size) in found {
+        let slot = GlobalSlot { addr, size };
+        if mapped.contains(&slot) {
+            // Already an interface slot: redirect the new accesses to the
+            // existing param instead of minting a duplicate.
+            let lit = ctx.get_const(addr, size).id();
+            if let Some(param) = param_with_origin(ctx, root, lit) {
+                rewrite_accesses(ctx, fid, lit, param);
+                changed = true;
+            }
+            continue;
+        }
+        if mint_global_param(ctx, fid, slot, &regpure_sites).is_none() {
+            continue;
+        }
+        // Record the appended slot in the interface map, keeping map order in
+        // lockstep with param append order.
+        if let FunctionEffects::Materialized(mut map) =
+            FunctionBody::from_id(ctx, fid).effects().clone()
+        {
+            map.globals.push(slot);
+            FunctionBody::from_id_mut(ctx, fid).set_effects(FunctionEffects::Materialized(map));
+        }
+        changed = true;
     }
-    true
+    changed
+}
+
+/// The root param whose origin is the literal `lit`, if any.
+fn param_with_origin(ctx: &Context, root: qcode::value::BlockId, lit: ValueId) -> Option<ValueId> {
+    BasicBlock::from_id(ctx, root)
+        .params()
+        .find(|p| p.origin() == Some(lit))
+        .map(|p| p.id())
 }
 
 /// Redirect every real-ram load/store at `addr` in `fid` to dereference `param`.

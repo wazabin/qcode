@@ -43,6 +43,10 @@ pub(crate) struct RegisterEffects {
     /// mem2reg/DCE prune). Sorted by `(address, size)` for a deterministic
     /// param/argument order shared with the caller rewrite.
     pub(crate) inputs: Vec<VarnodeId>,
+    /// Constant real-RAM addresses the body dereferences, each lifted into a
+    /// by-value `glob_<addr>` param placed after the register inputs. Sorted
+    /// `(address, width)` pairs for a deterministic param/argument order.
+    pub(crate) globals: Vec<(u64, usize)>,
     /// Registers the body stores, canonicalized to the coarsest register per
     /// overlap group so the caller's replay is order-independent. Sorted.
     pub(crate) outputs: Vec<VarnodeId>,
@@ -401,6 +405,16 @@ pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff:
         );
     }
 
+    // --- globals: one by-value `glob_<addr>` param per constant-address slot,
+    // placed after the register inputs; the accesses are redirected through the
+    // param and the literal is recorded as its origin for implicit binding.
+    let global_slots: Vec<qcode::value::GlobalSlot> = reg_eff
+        .globals
+        .iter()
+        .map(|&(addr, size)| qcode::value::GlobalSlot { addr, size })
+        .collect();
+    super::globals::materialize_globals(ctx, fid, &global_slots);
+
     // --- outputs: a flat positional return pack, one field per output register --
     let outputs = output_meta(ctx, &reg_eff.outputs);
     append_outputs(
@@ -420,6 +434,7 @@ pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff:
     // outputs[i]. `add_input`/`append_outputs` iterate in these same orders.
     FunctionBody::from_id_mut(ctx, fid).set_effects(FunctionEffects::Materialized(
         RegisterInterfaceMap {
+            globals: global_slots,
             inputs: reg_eff.inputs.clone(),
             outputs: reg_eff.outputs.clone(),
             // Every pack slot of a bodied function is a real computed value.
@@ -502,7 +517,7 @@ pub(crate) fn rewrite_call_regpure(
             (r, v.size(), v.space().id)
         })
         .collect();
-    let args: Vec<LocalValueId> = {
+    let mut args: Vec<LocalValueId> = {
         let mut b = (ctx).builder(call_block);
         b.set_insert_point_before(call_id);
         input_meta
@@ -514,6 +529,13 @@ pub(crate) fn rewrite_call_regpure(
             })
             .collect()
     };
+    // Global slots follow the register inputs in param order; each is passed
+    // as its address literal verbatim (literals are context-global values).
+    args.extend(map.globals.iter().map(|slot| {
+        ctx.get_const(slot.addr, slot.size)
+            .id()
+            .localize(call_id.func)
+    }));
 
     // Rewrite the call: explicit args, cleared clobbers (register-transparent),
     // tagged regpure. Retype the result to the callee's return pack.

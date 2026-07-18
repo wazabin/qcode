@@ -6,6 +6,16 @@ pub fn verify_body_arena_integrity(ctx: &Context<'_>) -> Vec<String> {
     qcode::verify_body_arena_integrity(ctx)
 }
 
+pub(crate) fn verify_body_arena_integrity_scoped(
+    ctx: &Context<'_>,
+    scope: super::Scope<'_>,
+) -> Vec<String> {
+    match scope {
+        super::Scope::All => qcode::verify_body_arena_integrity(ctx),
+        super::Scope::Functions(set) => qcode::verify_body_arena_integrity_scoped(ctx, Some(set)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use qcode::{

@@ -847,8 +847,17 @@ fn run_module_stage(
                 if pass_changed { "changed" } else { "no change" },
             );
             // Between-pass invariant check (opt-in via `QCODE_VERIFY`): pin a broken
-            // invariant to the pass that produced it.
-            crate::verify::verify_after(ctx, p.name());
+            // invariant to the pass that produced it, scoped to what it changed
+            // (an unchanged function verified clean after the previous pass).
+            crate::verify::verify_after(
+                ctx,
+                p.name(),
+                if outcome.module_changed {
+                    crate::verify::Scope::All
+                } else {
+                    crate::verify::Scope::Functions(&outcome.changed_functions)
+                },
+            );
             if watching && pass_changed {
                 let fp = module_fingerprint(ctx);
                 if tracer.observe(&tracer_label, iters + 1, p.name(), fp) {
@@ -1469,11 +1478,18 @@ fn run_function_worklist(
                 let patched = resolve_minted_callees(ctx, &stage.name, fun_id, &installed)?;
                 replay_rename(ctx, &stage.name, fun_id, outcome.rename)?;
                 // Minted functions are new work for downstream `only_dirty` stages.
+                let verify_scope: HashSet<FunctionId> =
+                    installed.iter().copied().chain([fun_id]).collect();
                 dirty.extend(installed);
                 // Opt-in `QCODE_VERIFY` check once the split borrow has ended — the body
                 // is reachable through `ctx` again — pinning any invariant break to this
-                // stage. A no-op unless `QCODE_VERIFY` is set.
-                crate::verify::verify_after(ctx, &stage.name);
+                // stage, scoped to the one function it ran on (plus its mints).
+                // A no-op unless `QCODE_VERIFY` is set.
+                crate::verify::verify_after(
+                    ctx,
+                    &stage.name,
+                    crate::verify::Scope::Functions(&verify_scope),
+                );
                 if outcome.changed || patched {
                     analyses.invalidate_globals(&outcome.preserved_analyses);
                     dirty.insert(fun_id);
@@ -1855,10 +1871,16 @@ fn run_stage_parallel(
         let installed = install_minted(ctx, &stage.name, outcome.minted)?;
         let patched = resolve_minted_callees(ctx, &stage.name, fun_id, &installed)?;
         replay_rename(ctx, &stage.name, fun_id, outcome.rename)?;
+        let verify_scope: HashSet<FunctionId> = installed.iter().copied().chain([fun_id]).collect();
         dirty.extend(installed);
-        // Opt-in `QCODE_VERIFY` check once the split borrow has ended. A no-op
+        // Opt-in `QCODE_VERIFY` check once the split borrow has ended, scoped to
+        // the one function this outcome belongs to (plus its mints). A no-op
         // unless enabled.
-        crate::verify::verify_after(ctx, &stage.name);
+        crate::verify::verify_after(
+            ctx,
+            &stage.name,
+            crate::verify::Scope::Functions(&verify_scope),
+        );
         if outcome.changed || patched {
             analyses.invalidate_globals(&outcome.preserved_analyses);
             dirty.insert(fun_id);

@@ -1,29 +1,38 @@
 //! Verify that calls have at most one caller-side continuation edge.
 
-use qcode::{context::Context, value::insn::Mnemonic};
+use qcode::{
+    context::Context,
+    value::{FunctionBody, insn::Mnemonic},
+};
 
 /// A returning direct or indirect call has one caller-side CFG successor: the
 /// block where execution resumes. A known-noreturn call may have no successor,
 /// but multiple outgoing edges (including duplicate parallel edges) are always
 /// malformed.
 pub fn verify_call_edges(ctx: &Context) -> Vec<String> {
-    let mut out = Vec::new();
-    for block in ctx.blocks() {
-        let Some(last) = block.iter().last() else {
-            continue;
-        };
-        if !matches!(last.mnemonic(), Mnemonic::Call(_) | Mnemonic::CallInd(_)) {
-            continue;
-        }
+    verify_call_edges_scoped(ctx, super::Scope::All)
+}
 
-        let successors: Vec<_> = block.successors().collect();
-        if successors.len() > 1 {
-            out.push(format!(
-                "fn {:?} call block {:?} has {} continuation edges {successors:?}; calls may have at most one continuation edge",
-                block.id.func,
-                block.id,
-                successors.len(),
-            ));
+pub(crate) fn verify_call_edges_scoped(ctx: &Context, scope: super::Scope<'_>) -> Vec<String> {
+    let mut out = Vec::new();
+    for fid in scope.function_ids(ctx) {
+        for block in FunctionBody::from_id(ctx, fid).iter() {
+            let Some(last) = block.iter().last() else {
+                continue;
+            };
+            if !matches!(last.mnemonic(), Mnemonic::Call(_) | Mnemonic::CallInd(_)) {
+                continue;
+            }
+
+            let successors: Vec<_> = block.successors().collect();
+            if successors.len() > 1 {
+                out.push(format!(
+                    "fn {:?} call block {:?} has {} continuation edges {successors:?}; calls may have at most one continuation edge",
+                    block.id.func,
+                    block.id,
+                    successors.len(),
+                ));
+            }
         }
     }
     out
