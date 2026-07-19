@@ -74,6 +74,13 @@ struct MakeCBranch {
     false_target: u64,
 }
 
+struct MakeBranch {
+    /// The block ending in the indirect branch.
+    from: BlockId,
+    /// The single resolved target address.
+    target: u64,
+}
+
 impl Pass for HandleJumpTables {
     const NAME: &'static str = "handle_jump_tables";
 
@@ -196,6 +203,7 @@ impl HandleJumpTables {
         // Read-only scan: collect every resolvable edge, then mutate.
         let mut edits: Vec<Edit> = Vec::new();
         let mut branches: Vec<MakeCBranch> = Vec::new();
+        let mut single_branches: Vec<MakeBranch> = Vec::new();
 
         let block_ids = function.blocks().map(|b| b.id).collect::<Vec<_>>();
 
@@ -204,15 +212,19 @@ impl HandleJumpTables {
 
             if let Some(mut block_edits) = resolve_block(block, binary) {
                 match block_edits.len() {
-                    // A single resolved case does NOT collapse the indirect branch
-                    // into a direct `Branch`: the index may simply be bounded to one
-                    // value *this* fixpoint round, with the rest of the table
-                    // resolvable only once more of the function is lifted. Rewriting
-                    // to a `Branch` now would delete the `BranchInd` and permanently
-                    // strand those later cases (and the code they reach). Keep the
-                    // indirect terminator and wire the one edge, exactly like the
-                    // many-case path; a genuinely single-target table stabilizes at
-                    // one edge across rounds without losing discovery.
+                    // A single fully-resolved case is a genuine unconditional jump:
+                    // `resolve_block` resolves the *entire* bounded index range (or
+                    // bails on the whole table), so `len == 1` means the index is
+                    // provably a single value — collapse the `BranchInd` to a direct
+                    // `Branch` (or a `TailCall` for a foreign target). This mirrors
+                    // the two-case arm below, which likewise collapses the terminator.
+                    1 => {
+                        let e = block_edits.pop().unwrap();
+                        single_branches.push(MakeBranch {
+                            from: e.from,
+                            target: e.target,
+                        });
+                    }
                     2 => {
                         let e1 = block_edits.pop().unwrap();
                         let e2 = block_edits.pop().unwrap();
@@ -239,7 +251,7 @@ impl HandleJumpTables {
             }
         }
 
-        if edits.is_empty() && branches.is_empty() {
+        if edits.is_empty() && branches.is_empty() && single_branches.is_empty() {
             return Ok(false);
         }
 
@@ -304,6 +316,34 @@ impl HandleJumpTables {
                     ctx.add_cfg_edge(from, tb);
                 }
             }
+        }
+
+        // A single resolved target: the indirect branch is really an unconditional
+        // jump. Replace `BranchInd` with a direct `Branch` (local target) or a
+        // `TailCall` (foreign target — strict IR locality forbids a foreign edge).
+        for MakeBranch { from, target } in single_branches {
+            let from_addr = dispatch_source_addr(ctx, from);
+            discover(ctx, fn_entry, from_addr, target);
+            let Some(resolved) = classify_existing_target(ctx, addresses, target, fun_id) else {
+                continue;
+            };
+            clear_successors(ctx, from);
+            {
+                let mut block = BasicBlock::from_id_mut(ctx, from);
+                block.pop_insn();
+            }
+            {
+                let mut builder = ctx.builder(from);
+                match resolved {
+                    LocalTarget::Local(target_block) => {
+                        builder.push_branch(target_block);
+                    }
+                    LocalTarget::Foreign(g) => {
+                        builder.push_tail_call(g);
+                    }
+                }
+            }
+            changed = true;
         }
 
         for MakeCBranch {
@@ -473,6 +513,22 @@ fn resolve_block(mut block: BlockMutRef, binary: &dyn binfmt::BinaryFormat) -> O
         "considering block {:x} with indirect branch",
         block.address().unwrap_or_default(),
     );
+
+    // Indirect jump straight through a literal code address: `goto [const]`.
+    // A prior pass (gvn/const-fold) proved the computed target and folded the
+    // pointer to a constant, but left the terminator indirect. There is no table
+    // or index — a literal cannot gain more cases — so it is an unconditional
+    // jump to that one address whenever it lands in executable memory.
+    if let Some(target) = numeric_const(block.ctx(), ptr) {
+        return binary.is_executable(target).then(|| {
+            vec![Edit {
+                from: block.id,
+                target,
+                index: ptr,
+                value: 0,
+            }]
+        });
+    }
 
     // Indirect jump through a single fixed pointer slot: `goto [load(const)]`.
     // Not a table (there is no index), but the slot is immutable data, so it
@@ -948,6 +1004,62 @@ mod tests {
             size: 8,
         };
         assert_eq!(ctx.truth(prop).map(|t| t.value), Some(true));
+    }
+
+    /// A `goto [const]`: the branch pointer is already a literal code address
+    /// (an earlier const-fold proved the computed target but left the terminator
+    /// indirect). With no table or slot to grow, it collapses straight to a direct
+    /// `Branch` to that one address.
+    #[test]
+    fn collapses_literal_pointer_to_branch() {
+        let mut ctx = Context::new();
+        let mut image = image();
+
+        qcode!(
+            ctx,
+            "
+            fn fun:
+            <entry>
+                goto [0x1100];
+            "
+        );
+
+        add_code(&mut image, 0x1000, 0x1000);
+        add_local_targets(&mut ctx, fun, &[0x1100]);
+
+        let changed = HandleJumpTables::resolve_function(&mut ctx, &image, fun).unwrap();
+        assert!(changed);
+
+        assert_eq!(successor_count(&ctx, entry), 1);
+        assert!(
+            matches!(terminator(&ctx, entry), Mnemonic::Branch(_)),
+            "expected an unconditional Branch, got {:?}",
+            terminator(&ctx, entry),
+        );
+        assert!(AddressIndex::analyze(&ctx).get(0x1100).is_some());
+    }
+
+    /// A `goto [const]` whose literal target is not executable memory is left as
+    /// an indirect branch — analysis never fabricates an edge to non-code.
+    #[test]
+    fn leaves_non_executable_literal_pointer_indirect() {
+        let mut ctx = Context::new();
+        let mut image = image();
+
+        qcode!(
+            ctx,
+            "
+            fn fun:
+            <entry>
+                goto [0x9999];
+            "
+        );
+
+        add_code(&mut image, 0x1000, 0x1000);
+
+        let changed = HandleJumpTables::resolve_function(&mut ctx, &image, fun).unwrap();
+        assert!(!changed);
+        assert!(matches!(terminator(&ctx, entry), Mnemonic::BranchInd(_)));
     }
 
     /// A relative table: each 4-byte slot holds a signed offset added back to a
