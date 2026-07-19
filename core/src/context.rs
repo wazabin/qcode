@@ -965,6 +965,10 @@ impl<'str> Context<'str> {
                     let qualified = arg.qualify(old.func);
                     if let Some(&new_val) = value_map.get(&qualified) {
                         pairs.push((arg, new_val.localize(new.func)));
+                    } else if let Some(new_lit) =
+                        remap_symbolic_block_literal(&self.shared.values.literals, arg, &block_map)
+                    {
+                        pairs.push((arg, new_lit));
                     } else {
                         // An operand not in the map must resolve to `target` itself
                         // (an unmoved own block) or to a shared value — never into a
@@ -2178,6 +2182,43 @@ fn remap_rehomed_memory_space(
 /// locality ⇒ a terminator's target shares its arena); this qualifies with
 /// `old_func`, looks the full [`BlockId`] up in `block_map`, and re-localizes the
 /// mapped clone against its new arena `new_func`.
+/// Re-point a relocated block's symbolic block literal at the block's clone.
+///
+/// [`SymbolicRef::Block`] carries an *absolute* [`BlockId`], so it is the one
+/// construct in the IR that can name a block in another function — every other
+/// operand and terminator target is a bare body-local id qualified by its
+/// reader's own arena, making a cross-function reference unrepresentable. A
+/// re-home therefore has to rewrite these by hand: phase 5 deletes the originals,
+/// so a literal left naming the pre-move block dangles into a deleted arena slot.
+///
+/// Returns `None` (leave the operand alone) unless `arg` is a symbolic block
+/// literal whose target actually moved. Symbolic literals are not intern-cached
+/// (see [`LiteralInterner::push_literal`]), so minting a replacement cannot alias
+/// another user of the original.
+///
+/// [`LiteralInterner::push_literal`]: crate::value::interner::LiteralInterner::push_literal
+fn remap_symbolic_block_literal(
+    literals: &crate::value::interner::LiteralInterner,
+    arg: crate::value::LocalValueId,
+    block_map: &HashMap<BlockId, BlockId>,
+) -> Option<crate::value::LocalValueId> {
+    use crate::value::literal::SymbolicRef;
+
+    let crate::value::LocalValueId::Literal(lid) = arg else {
+        return None;
+    };
+    let literal = literals[lid].clone();
+    let Some(SymbolicRef::Block(old_block)) = literal.symbolic else {
+        return None;
+    };
+    let &new_block = block_map.get(&old_block)?;
+    let new_lit = literals.push_literal(crate::value::literal::Literal {
+        symbolic: Some(SymbolicRef::Block(new_block)),
+        ..literal
+    });
+    Some(crate::value::LocalValueId::Literal(new_lit))
+}
+
 fn remap_block_targets(
     mnemonic: &mut Mnemonic,
     old_func: FunctionId,
@@ -3609,6 +3650,68 @@ mod tests {
             let new_tail = block_at_addr(&ctx, g, 0x2000);
             let new_param = BasicBlock::from_id(&ctx, new_tail).params().next().unwrap();
             assert_eq!(new_param.origin(), Some(ValueId::BlockParam(new_param.id)));
+        }
+
+        /// A relocated block carrying a `&<block>` literal that names another
+        /// relocated block must have that literal re-pointed at the clone.
+        ///
+        /// `SymbolicRef::Block` holds an *absolute* `BlockId` — the one construct
+        /// that can name a block in another function — so unlike operands and
+        /// branch targets it is not fixed up by re-localization. Left alone it
+        /// would dangle into the source arena slot that phase 5 deletes.
+        #[test]
+        fn split_rehomes_symbolic_block_literals() {
+            use crate::value::literal::SymbolicRef;
+
+            let mut ctx = Context::new();
+            let f = FunctionBody::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+            let entry = block_at(&mut ctx, f, 0x1000);
+            let tail = block_at(&mut ctx, f, 0x2000);
+            let landing = block_at(&mut ctx, f, 0x2008);
+
+            // A code-pointer constant in `tail` that symbolically names `landing`.
+            // Both blocks move together when `tail` is split off into `g`.
+            let lit = ctx.get_const(0x2008, 8).id();
+            let ValueId::Literal(lit_id) = lit else {
+                panic!("expected a literal");
+            };
+            ctx.shared.values.literals[lit_id].symbolic = Some(SymbolicRef::Block(landing));
+
+            branch_at(&mut ctx, entry, tail, 0x1000);
+            // `goto [&<landing>]` — the literal reaches the IR as an operand.
+            let ind = ctx.builder(tail).push_branchind(lit).id;
+            Instruction::from_id_mut(&mut ctx, ind).set_address(0x2000);
+            ctx.add_cfg_edge(tail, landing);
+            return_at(&mut ctx, landing, 0x2008);
+            FunctionBody::from_id_mut(&mut ctx, f)
+                .set_root(entry)
+                .unwrap();
+
+            let g = ctx.split_function_at(tail);
+
+            let new_landing = block_at_addr(&ctx, g, 0x2008);
+            let new_tail = block_at_addr(&ctx, g, 0x2000);
+            let Mnemonic::BranchInd(b) = BasicBlock::from_id(&ctx, new_tail)
+                .instructions()
+                .last()
+                .unwrap()
+                .mnemonic()
+                .clone()
+            else {
+                panic!("tail must still end in an indirect branch");
+            };
+            let crate::value::LocalValueId::Literal(new_lit) = b.ptr else {
+                panic!("indirect branch operand must still be a literal");
+            };
+            assert_eq!(
+                ctx.shared.values.literals[new_lit].symbolic,
+                Some(SymbolicRef::Block(new_landing)),
+                "the relocated literal must name the clone, not the deleted original",
+            );
+            assert_eq!(
+                ctx.shared.values.literals[new_lit].value, 0x2008,
+                "re-pointing the symbol must not disturb the numeric value",
+            );
         }
 
         /// A conditional arm into the split block is routed through a fresh
