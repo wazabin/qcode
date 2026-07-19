@@ -19,6 +19,7 @@ mod bool_typing;
 mod call_edges;
 mod dangling_refs;
 mod intra_function_ssa;
+mod materialized_interface;
 mod pointer_spaces;
 mod pure_function;
 mod pure_reg_call_args;
@@ -30,6 +31,7 @@ pub use bool_typing::verify_bool_typing;
 pub use call_edges::verify_call_edges;
 pub use dangling_refs::verify_no_dangling_refs;
 pub use intra_function_ssa::verify_intra_function_ssa;
+pub use materialized_interface::verify_materialized_interfaces;
 pub use pointer_spaces::verify_pointer_spaces;
 pub use pure_function::{PureFunctionViolation, verify_pure_functions};
 pub use pure_reg_call_args::{PureRegCallArgsViolation, verify_pure_reg_call_args};
@@ -121,6 +123,7 @@ pub fn verify_scoped(ctx: &Context<'_>, scope: Scope<'_>) -> Vec<String> {
     diagnostics.extend(users_map::verify_users_map_scoped(ctx, scope));
     diagnostics.extend(pointer_spaces::verify_pointer_spaces_scoped(ctx, scope));
     diagnostics.extend(bool_typing::verify_bool_typing_scoped(ctx, scope));
+    diagnostics.extend(materialized_interface::verify_materialized_interfaces_scoped(ctx, scope));
     diagnostics.extend(
         pure_reg_call_args::verify_pure_reg_call_args_scoped(ctx, scope)
             .into_iter()
