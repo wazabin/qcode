@@ -559,10 +559,17 @@ fn resolve_block(mut block: BlockMutRef, binary: &dyn binfmt::BinaryFormat) -> O
         range.min,
     );
 
-    if !range.is_bounded(index_size)
-        || range.fills_containing_width()
-        || range.count() > MAX_TABLE_ENTRIES
-    {
+    // A full-sub-word range like `[0, 255]` (a zero-extended byte index with no
+    // dominating `idx < N` guard) carries no bound beyond the value's own width.
+    // We still attempt it: control-flow-flattening obfuscators dispatch through
+    // exactly this shape (`jmp table[zext(al) * 4]`) over a genuinely full 256-way
+    // table, and resolving it is the only way to reach the flattened handlers.
+    // The safety net is the per-slot check below — every entry must map to
+    // executable memory or the whole table is rejected — so a byte index over a
+    // table that is *not* really 256-wide bails on the first non-code slot rather
+    // than materializing bogus edges. Only a genuinely unbounded index (Top for
+    // its own declared width) or an over-large table is refused up front.
+    if !range.is_bounded(index_size) || range.count() > MAX_TABLE_ENTRIES {
         log::debug!(target: "jump_table", "skipping unbounded or huge table: range {range:?}");
         return None;
     }
