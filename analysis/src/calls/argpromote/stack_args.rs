@@ -81,6 +81,9 @@ impl Pass for PromoteStackArgs {
             if f.is_external() || !f.is_reg_materialized() {
                 continue;
             }
+            if has_implicit_direct_site(ctx, &graph, fid) {
+                continue;
+            }
             if promote_one(ctx, fid, sp_reg) {
                 changed.insert(fid);
                 // `append_entry_param` also rewrites every direct caller (new
@@ -98,6 +101,43 @@ impl Pass for PromoteStackArgs {
             preserved_analyses: crate::PreservedAnalyses::none(),
         })
     }
+}
+
+/// Whether any direct call site of `fid` binds implicitly (a non-regpure,
+/// `Opaque` tag).
+///
+/// The same gate the RAM channel applies (see `ram.rs`, "snapshot arguments"),
+/// and for the same reason: the value this pass threads is a `load(ram, @SP + k)`
+/// evaluated *at the caller*. Unlike a register input or a global's address
+/// literal it is real loaded data with no implicit counterpart, so an `Opaque`
+/// site — which by the dual binding convention must carry **zero** args and seed
+/// its params at entry — cannot be given one.
+///
+/// Appending an argument there anyway is precisely what
+/// [`verify::pure_reg_call_args`] rule 2 forbids, and it is how this pass came to
+/// be blamed for interface breakage in otherwise healthy callees: the callee kept
+/// a perfectly consistent interface (root params ⊇ `map.inputs`) while its
+/// implicit call site silently acquired an argument.
+///
+/// [`verify::pure_reg_call_args`]: crate::verify::verify_pure_reg_call_args
+fn has_implicit_direct_site(ctx: &Context, graph: &crate::CallGraph, fid: FunctionId) -> bool {
+    let implicit = crate::calls::direct_call_sites(ctx, graph, fid)
+        .into_iter()
+        .any(|site| {
+            !matches!(
+                ctx.get_insn(site).mnemonic(),
+                Mnemonic::Call(c) if c.tag.is_regpure()
+            )
+        });
+    if implicit {
+        qcode::pass_log!(
+            debug,
+            "promote_stack_args {}: bail — a direct call site binds implicitly \
+             (it cannot carry a caller-evaluated stack load)",
+            FunctionBody::from_id(ctx, fid).name(),
+        );
+    }
+    implicit
 }
 
 fn promote_one(ctx: &mut Context, fid: FunctionId, sp_reg: VarnodeId) -> bool {
