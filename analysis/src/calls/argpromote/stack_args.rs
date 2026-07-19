@@ -75,7 +75,6 @@ impl Pass for PromoteStackArgs {
 
         // Only functions whose call interface is positional (`pure_reg`) — the
         // ones whose direct callers pass `@SP` as an argument we can key on.
-        let _ = &graph;
         let mut changed = rustc_hash::FxHashSet::default();
         for &fid in targets {
             let f = FunctionBody::from_id(ctx, fid);
@@ -84,6 +83,11 @@ impl Pass for PromoteStackArgs {
             }
             if promote_one(ctx, fid, sp_reg) {
                 changed.insert(fid);
+                // `append_entry_param` also rewrites every direct caller (new
+                // binding load + extra `Call` arg), so those callers are dirtied
+                // too — downstream `only_dirty` stages must revisit them, and the
+                // between-pass verifier must include them in scope.
+                changed.extend(graph.callers(fid));
             }
         }
 
@@ -108,7 +112,8 @@ fn promote_one(ctx: &mut Context, fid: FunctionId, sp_reg: VarnodeId) -> bool {
 
     // Distinct incoming caller-frame read slots `(offset > 0, size)` → the loads
     // that read them. Offset 0 is the return-address slot, not an argument.
-    let mut slots: HashMap<(i64, usize), Vec<qcode::value::insn::InstructionId>> = HashMap::default();
+    let mut slots: HashMap<(i64, usize), Vec<qcode::value::insn::InstructionId>> =
+        HashMap::default();
     for block in FunctionBody::from_id(ctx, fid).blocks() {
         for insn in block.iter() {
             let Mnemonic::Load(l) = insn.mnemonic() else {
@@ -156,14 +161,22 @@ fn promote_one(ctx: &mut Context, fid: FunctionId, sp_reg: VarnodeId) -> bool {
             Some(format!("stack_{off:x}")),
             None,
             move |ctx, call_id, block| {
-                let Mnemonic::Call(c) = ctx.get_insn(call_id).mnemonic().clone() else {
-                    // Non-`Call` direct site (tail-call/apply): no positional
-                    // args to key on. Fall back to a poison so lockstep holds;
-                    // such sites are excluded elsewhere in practice.
+                let mnemonic = ctx.get_insn(call_id).mnemonic().clone();
+                // Fall back to a poison (keeping `param[i] ↔ arg[i]` lockstep) at any
+                // direct site we cannot key on the callee's `@SP` argument: a non-`Call`
+                // site (tail-call/apply, no positional args), or a `Call` whose arg list
+                // is shorter than `sp_index` — a caller not (yet) presenting the callee's
+                // full positional `pure_reg` interface. Such sites are excluded elsewhere
+                // in practice; the poison just avoids an out-of-bounds panic here.
+                let sp_arg = match &mnemonic {
+                    Mnemonic::Call(c) => c.args.get(sp_index).copied(),
+                    _ => None,
+                };
+                let Some(sp_arg) = sp_arg else {
                     let ty = ctx.shared.types.get_or_make_int(size);
                     return ValueId::Poison(ctx.shared.values.push_poison(ty));
                 };
-                let sp_val = c.args[sp_index].qualify(call_id.func);
+                let sp_val = sp_arg.qualify(call_id.func);
                 let mut b = (ctx).builder(block);
                 b.set_insert_point_before(call_id);
                 let addr = if off == 0 {

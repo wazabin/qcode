@@ -1778,49 +1778,58 @@ fn run_stage_parallel(
                     let mut local_cache = cache.extract(&funcs);
                     let tx = tx.clone();
                     let stage_name = stage_name.clone();
-                    let handle = scope.spawn(move || -> Result<WorkerOutput, String> {
-                        let mut local_elapsed: HashMap<
-                            &'static str,
-                            (std::time::Duration, usize, usize),
-                        > = HashMap::default();
-                        for e in chunk.iter_mut() {
-                            let index = e.index;
-                            let name = e.name.clone();
-                            let stage_name = stage_name.clone();
-                            let tx = &tx;
-                            let outcome = run_one_function(
-                                passes,
-                                e.body,
-                                view,
-                                &mut local_cache,
-                                &mut e.analyses,
-                                &mut local_elapsed,
-                                stage_label,
-                                &name,
-                                repeat_until,
-                                |pass| {
-                                    // Send failure only means the master stopped
-                                    // pumping (it never does before join); ignore it.
-                                    let _ = tx.send(PipelineProgress::FunctionPass {
-                                        round,
-                                        stage: stage_name.clone(),
-                                        function: name.clone(),
-                                        index: index + 1,
-                                        total,
-                                        pass,
-                                    });
-                                },
-                            )?;
-                            e.outcome = outcome;
-                        }
-                        // Drain this thread's `stat!` counters before it exits — the
-                        // thread-local table is otherwise lost — for re-absorption.
-                        Ok(WorkerOutput {
-                            cache: local_cache,
-                            elapsed: local_elapsed,
-                            stats: qcode::pass_scope::drain_stats(),
+                    // Some analysis passes (notably mem2reg's `decide_values_start_from`
+                    // renamer) recurse along the CFG DFS, so their native-stack depth
+                    // scales with the function's longest block chain. Obfuscated inputs
+                    // produce functions deep enough to overflow the default ~2MB worker
+                    // stack, so give each worker a generous stack.
+                    let handle = std::thread::Builder::new()
+                        .name("qcode-pass-worker".into())
+                        .stack_size(256 * 1024 * 1024)
+                        .spawn_scoped(scope, move || -> Result<WorkerOutput, String> {
+                            let mut local_elapsed: HashMap<
+                                &'static str,
+                                (std::time::Duration, usize, usize),
+                            > = HashMap::default();
+                            for e in chunk.iter_mut() {
+                                let index = e.index;
+                                let name = e.name.clone();
+                                let stage_name = stage_name.clone();
+                                let tx = &tx;
+                                let outcome = run_one_function(
+                                    passes,
+                                    e.body,
+                                    view,
+                                    &mut local_cache,
+                                    &mut e.analyses,
+                                    &mut local_elapsed,
+                                    stage_label,
+                                    &name,
+                                    repeat_until,
+                                    |pass| {
+                                        // Send failure only means the master stopped
+                                        // pumping (it never does before join); ignore it.
+                                        let _ = tx.send(PipelineProgress::FunctionPass {
+                                            round,
+                                            stage: stage_name.clone(),
+                                            function: name.clone(),
+                                            index: index + 1,
+                                            total,
+                                            pass,
+                                        });
+                                    },
+                                )?;
+                                e.outcome = outcome;
+                            }
+                            // Drain this thread's `stat!` counters before it exits — the
+                            // thread-local table is otherwise lost — for re-absorption.
+                            Ok(WorkerOutput {
+                                cache: local_cache,
+                                elapsed: local_elapsed,
+                                stats: qcode::pass_scope::drain_stats(),
+                            })
                         })
-                    });
+                        .expect("failed to spawn qcode pass worker thread");
                     handles.push(handle);
                 }
                 // The master holds no sender: once every worker's sender drops the
