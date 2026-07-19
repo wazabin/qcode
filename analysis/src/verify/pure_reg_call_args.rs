@@ -23,11 +23,35 @@ use qcode::{
     },
 };
 
-/// A direct call to a `pure_reg` function does not match the callee's root params.
+/// Which of the two rules a call site broke. They fail for unrelated reasons and
+/// must not share a diagnostic: rule 1 is a statement *about the callee's
+/// interface*, rule 2 is a statement about the *call site's binding convention*
+/// and never consults the interface at all.
+///
+/// They were reported with one message once, and rule 2's `expected_args` (a
+/// constant zero) rendered as "callee root has 0 params". That sent three
+/// separate investigations after root params on callees that in fact had a
+/// healthy interface — one observed case read "0 params" for a callee with 16.
+/// Keep the two phrasings apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PureRegCallArgsRule {
+    /// Rule 1: a regpure site's args must align 1:1 with the callee's interface.
+    RegpureArity,
+    /// Rule 2: an implicitly-bound (`Opaque`) site must carry zero args — the
+    /// callee seeds those params at entry instead. Says nothing about arity.
+    ImplicitMustBeZeroArgs,
+}
+
+/// A direct call whose arguments disagree with the callee's `pure_reg` calling
+/// convention — see [`PureRegCallArgsRule`] for which way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PureRegCallArgsViolation {
     pub callee: FunctionId,
     pub call: InstructionId,
+    pub rule: PureRegCallArgsRule,
+    /// Rule 1 only: the callee's interface arity. Always zero for rule 2, where
+    /// it is the convention's fixed requirement and *not* a property of the
+    /// callee — do not render it as one.
     pub expected_args: usize,
     pub actual_args: usize,
     pub size_mismatch: Option<ArgSizeMismatch>,
@@ -48,10 +72,23 @@ impl PureRegCallArgsViolation {
             .address()
             .map(|addr| format!(" at {addr:#x}"))
             .unwrap_or_default();
-        let mut msg = format!(
-            "pure_reg call interface mismatch: call{call_addr} to `{callee}` has {} args, callee root has {} params",
-            self.actual_args, self.expected_args
-        );
+        // Rule 2 carries no interface arity — describe the binding convention it
+        // broke, and say which pass-side mistake produces it, rather than
+        // reporting a params count it never looked at.
+        let mut msg = match self.rule {
+            PureRegCallArgsRule::ImplicitMustBeZeroArgs => format!(
+                "implicit call binding violation: call{call_addr} to `{callee}` is not tagged \
+                 regpure, so it binds implicitly and must carry no arguments, but it carries \
+                 {}. A pass appended a positional argument at an implicitly-bound site; the \
+                 callee's own interface is not implicated.",
+                self.actual_args,
+            ),
+            PureRegCallArgsRule::RegpureArity => format!(
+                "regpure call interface mismatch: call{call_addr} to `{callee}` passes {} args \
+                 but the callee's interface declares {} params",
+                self.actual_args, self.expected_args,
+            ),
+        };
         if let Some(size) = &self.size_mismatch {
             msg.push_str(&format!(
                 "; arg {} is {} bytes but param is {} bytes",
@@ -163,6 +200,7 @@ fn check_call_site(
             violations.push(PureRegCallArgsViolation {
                 callee,
                 call: insn.id,
+                rule: PureRegCallArgsRule::RegpureArity,
                 expected_args: param_sizes.len(),
                 actual_args: call.args.len(),
                 size_mismatch,
@@ -174,6 +212,7 @@ fn check_call_site(
         violations.push(PureRegCallArgsViolation {
             callee,
             call: insn.id,
+            rule: PureRegCallArgsRule::ImplicitMustBeZeroArgs,
             expected_args: 0,
             actual_args: call.args.len(),
             size_mismatch: None,
@@ -381,8 +420,60 @@ mod tests {
         let violations = verify_pure_reg_call_args(&tc.ctx);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].call, call);
+        assert_eq!(
+            violations[0].rule,
+            PureRegCallArgsRule::ImplicitMustBeZeroArgs
+        );
         assert_eq!(violations[0].expected_args, 0);
         assert_eq!(violations[0].actual_args, 1);
+    }
+
+    /// Rule 2's diagnostic must not describe the callee's params. Its
+    /// `expected_args` is a fixed zero required by the binding convention, not
+    /// anything read off the callee — and this callee demonstrably has two params.
+    ///
+    /// Regression guard: the two rules once shared a format string, so rule 2
+    /// rendered as "callee root has 0 params" and repeatedly sent debugging after
+    /// phantom missing params on callees whose interface was fine.
+    #[test]
+    fn implicit_binding_diagnostic_does_not_claim_the_callee_lost_params() {
+        let mut tc = TestContext::new();
+        let callee = pure_callee_with_params(&mut tc, &[8, 4]);
+        let a0 = tc.ctx.get_const(0x11, 8).id();
+        caller_calling_tagged(
+            &mut tc,
+            callee,
+            vec![a0],
+            qcode::value::insn::CallTag::Opaque,
+        );
+
+        let violations = verify_pure_reg_call_args(&tc.ctx);
+        let msg = violations[0].diagnostic(&tc.ctx);
+        assert!(
+            !msg.contains("0 params"),
+            "rule 2 must not report a params count it never consulted: {msg}",
+        );
+        assert!(
+            msg.contains("must carry no arguments"),
+            "rule 2 should describe the binding convention it broke: {msg}",
+        );
+    }
+
+    /// Rule 1 keeps reporting arity, since for it the count is real.
+    #[test]
+    fn regpure_arity_diagnostic_still_reports_the_interface_count() {
+        let mut tc = TestContext::new();
+        let callee = pure_callee_with_params(&mut tc, &[8, 4]);
+        let a0 = tc.ctx.get_const(0x11, 8).id();
+        caller_calling(&mut tc, callee, vec![a0]);
+
+        let violations = verify_pure_reg_call_args(&tc.ctx);
+        assert_eq!(violations[0].rule, PureRegCallArgsRule::RegpureArity);
+        let msg = violations[0].diagnostic(&tc.ctx);
+        assert!(
+            msg.contains("passes 1 args") && msg.contains("declares 2 params"),
+            "rule 1 must still report both counts: {msg}",
+        );
     }
 
     #[test]

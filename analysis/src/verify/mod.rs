@@ -34,7 +34,9 @@ pub use intra_function_ssa::verify_intra_function_ssa;
 pub use materialized_interface::verify_materialized_interfaces;
 pub use pointer_spaces::verify_pointer_spaces;
 pub use pure_function::{PureFunctionViolation, verify_pure_functions};
-pub use pure_reg_call_args::{PureRegCallArgsViolation, verify_pure_reg_call_args};
+pub use pure_reg_call_args::{
+    PureRegCallArgsRule, PureRegCallArgsViolation, verify_pure_reg_call_args,
+};
 pub use users_map::verify_users_map;
 
 use std::sync::OnceLock;
