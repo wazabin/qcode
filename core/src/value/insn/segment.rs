@@ -128,6 +128,12 @@ where
     /// for functions/blocks.
     fn value(&mut self, id: ValueId) {
         let link = Some(Link::Value(id));
+        // Note: instruction / block-param operands are never foreign. They are
+        // stored as bare body-local ids and qualified with their reader's own
+        // `func`, so a cross-function data operand is unrepresentable — no guard
+        // is needed (or wanted: one would mask a mis-qualification). Only the
+        // *absolute* ids below (blocks, and symbolic block literals) can name
+        // another function.
         match id {
             ValueId::Instruction(iid) => {
                 let r = self.view.insn_ref(iid);
@@ -182,11 +188,15 @@ where
             ValueId::BasicBlock(bid) => {
                 // A block used as a value renders via the block's own `Display`
                 // (never `ValueRef`'s, which routes back here — that would recurse).
-                self.push(
-                    self.view.block_ref(bid).to_string(),
-                    TokenKind::Label,
-                    Some(Link::Block(bid)),
-                );
+                // A block in another function (a transient during discovery) is
+                // unreadable through a function-scoped view, so render its id
+                // instead of resolving the foreign body's block text.
+                let text = if self.view.owner().is_some_and(|o| o != bid.func) {
+                    format!("<{bid}>")
+                } else {
+                    self.view.block_ref(bid).to_string()
+                };
+                self.push(text, TokenKind::Label, Some(Link::Block(bid)));
             }
         }
     }
@@ -683,7 +693,24 @@ fn call_arg_name<'ctx, 'str: 'ctx>(
     target: FunctionId,
     index: usize,
 ) -> String {
-    match view.function_ref(target).input_arg_name(index) {
+    // The authoritative name is the callee's root block param, which lives in the
+    // callee's *body*. A function-scoped view (a `BodyView`, as used by the
+    // pass-fixpoint fingerprint) may not read another function's body at all, so
+    // for a foreign callee fall back to the interface-only name — the C-prototype
+    // argument name, if any, else the positional form. Purely cosmetic: only the
+    // rendered argument label changes, never the operand itself.
+    let foreign = view.owner().is_some_and(|owner| owner != target);
+    let name = if foreign {
+        view.interface(target)
+            .signature
+            .as_ref()
+            .and_then(|s| s.extern_interface.as_ref())
+            .and_then(|iface| iface.args.get(index))
+            .and_then(|a| a.name.as_ref().map(|n| n.to_string()))
+    } else {
+        view.function_ref(target).input_arg_name(index)
+    };
+    match name {
         Some(name) => format!("@{name}="),
         None => format!("@arg{index}="),
     }
@@ -834,6 +861,14 @@ fn literal_atom_view<'ctx, 'str: 'ctx>(view: impl QCodeView<'ctx, 'str>, id: Lit
     let shared = view.shared();
     let literal = &shared.values.literals[id];
     match &literal.symbolic {
+        // A symbolic block-ref into *another* function (a transient during
+        // discovery/jump-table recovery) cannot be name-resolved through a
+        // function-scoped `BodyView` — reading the foreign body trips the locality
+        // guard — so fall back to the numeric form. A whole-module view (`owner()
+        // == None`) resolves the name normally.
+        Some(SymbolicRef::Block(id)) if view.owner().is_some_and(|o| o != id.func) => {
+            format!("&<0x{:x}>", literal.value)
+        }
         Some(SymbolicRef::Block(id)) => view.block_ref(*id).name().map_or_else(
             || format!("&<0x{:x}>", literal.value),
             |name| format!("&<{name}>"),

@@ -33,6 +33,15 @@ where
     fn interface(self, id: FunctionId) -> &'ctx FunctionInterface<'str>;
     fn function(self, id: FunctionId) -> &'ctx FunctionBody<'str>;
 
+    /// The single function this view is scoped to, if any. A whole-module view
+    /// returns `None` (it may read every function); a function-pass [`BodyView`]
+    /// returns its owner, so callers can avoid a cross-function read that the
+    /// locality guard would panic on (e.g. rendering a foreign `SymbolicRef::Block`
+    /// falls back to the numeric form instead of resolving its name).
+    fn owner(self) -> Option<FunctionId> {
+        None
+    }
+
     fn instruction(self, id: InstructionId) -> &'ctx Instruction<'str> {
         &self.function(id.func).insns[id.local]
     }
@@ -254,6 +263,10 @@ impl<'ctx, 'str: 'ctx> QCodeView<'ctx, 'str> for BodyView<'ctx, 'str> {
             self.interfaces[id].name,
         );
         self.body
+    }
+
+    fn owner(self) -> Option<FunctionId> {
+        Some(self.body.id())
     }
 }
 
