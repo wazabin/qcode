@@ -351,6 +351,62 @@ fn apply_unroll_plan<'a, 'str>(
         replace_terminator_with_branch(body, cx, last_new_block, plan.exit, exit_args);
     }
 
+    // Not just params — a header *instruction* can be read directly outside the
+    // loop too. The header dominates the exit, so its trailing condition/flag
+    // computations (e.g. the SF/ZF/PF a caller reads after a counted loop) are
+    // valid live-outs. Unrolling copies only the body path, never the header, so
+    // deleting the header would dangle those uses. Reproduce the header's own
+    // instructions once on the exit-bound edge — evaluated with the values that
+    // reach the exit (the final carried values, or the preheader args for a
+    // zero-trip loop) — and redirect every external use to that final copy. The
+    // block flowing to the exit is the last unrolled latch, or the preheader when
+    // nothing was unrolled; the copies go just before its terminating branch.
+    let exit_pred = previous_new_block.unwrap_or(plan.preheader);
+    let final_carried = if previous_new_block.is_some() {
+        &carried
+    } else {
+        &plan.preheader_args
+    };
+    let mut header_out_map = header_value_map(cx.body_view(body), plan.lp.header, final_carried);
+    let header_insns = cx
+        .body_view(body)
+        .block_ref(plan.lp.header)
+        .instruction_ids()
+        .to_vec();
+    if let Some((_, header_body)) = header_insns.split_last() {
+        for &old_insn in header_body {
+            let (type_id, mnemonic) = {
+                let old_ref = cx.body_view(body).insn_ref(old_insn);
+                (
+                    old_ref.type_id(),
+                    remap_mnemonic(old_ref.mnemonic(), &header_out_map),
+                )
+            };
+            let new_insn = body.push_mnemonic_with_type(mnemonic, type_id);
+            // Insert before `exit_pred`'s terminating branch (its last instruction).
+            let insert_at = cx
+                .body_view(body)
+                .block_ref(exit_pred)
+                .instruction_ids()
+                .len()
+                .saturating_sub(1);
+            {
+                // TODO(5b-ii): `BaseRef::insert_insn_at_index` is not mirrored on
+                // `FunctionBody`; go through a temporary host.
+                let mut host = cx.host(body);
+                BaseRef::new(host.reborrow(), exit_pred).insert_insn_at_index(insert_at, new_insn);
+            }
+            header_out_map.insert(
+                ValueId::Instruction(old_insn),
+                ValueId::Instruction(new_insn),
+            );
+        }
+        for &old_insn in header_body {
+            let final_value = header_out_map[&ValueId::Instruction(old_insn)];
+            body.replace_all_uses_with(ValueId::Instruction(old_insn), final_value);
+        }
+    }
+
     // A header param may be read *directly* outside the loop: the header dominates
     // the exit, so a live-out can use the param without an exit-block param (e.g. a
     // returned register write-set referencing the loop counter — `fn_449740`'s
@@ -1342,6 +1398,41 @@ mod tests {
                 goto <header @i=%i_next>;
             <exit>
                 %p = (@i);
+                return at @i;
+            "
+        );
+
+        assert!(run_function_pass::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
+        assert_no_dangling(&ctx, test);
+        let _ = run_function_pass::<crate::cfg::SimplifyCfg>(&mut ctx, test);
+        assert_no_dangling(&ctx, test);
+    }
+
+    /// Reproduction: a header *instruction* (not just a param) used **directly**
+    /// in the exit block. The header dominates the exit, so its trailing
+    /// condition/flag computations are valid live-outs — this is the shape of the
+    /// CPU flags a caller reads after a counted byte-transform loop (`fn_449660`).
+    /// Unrolling copies only the body, never the header, and then deletes the
+    /// header, so it must reproduce the header instruction on the exit edge and
+    /// rewrite the live-out use to that final copy, or it dangles.
+    #[test]
+    fn direct_live_out_use_of_header_instruction_is_rewritten() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn test:
+            <entry>
+                goto <header @i=0x0>;
+            <header @i:i64>
+                %flag = @i < 0x2;
+                %cond = @i < 0x3;
+                if %cond goto <body> else goto <exit>;
+            <body>
+                %i_next = @i + 0x1;
+                goto <header @i=%i_next>;
+            <exit>
+                %used = (%flag);
                 return at @i;
             "
         );
