@@ -1167,41 +1167,105 @@ impl FixpointCache {
 /// module stage modified it. Rendering the IR captures operand rewrites,
 /// insertions/removals, retypes, and CFG edits; block order is address-sorted
 /// (deterministic) so an unchanged function fingerprints identically across a
-/// stage. The render is streamed straight into the hasher — no intermediate
-/// `String` of the whole body is ever built, so the cost is the formatting
-/// walk alone.
+/// stage. Arena ids embedded in the render are normalized away first, so a body
+/// that churns its temporaries without changing structure fingerprints
+/// identically (see [`fingerprint_display`]).
 pub(super) fn function_fingerprint(ctx: &Context, fun_id: FunctionId) -> u64 {
     fingerprint_display(FunctionRef::from_id(ctx, fun_id))
 }
 
-/// Hash a renderable value (a `FunctionRef` over *any* host) by streaming its
-/// `Display` output straight into the hasher — no intermediate `String`. Used to
-/// fingerprint a function whether it is live in the module ([`function_fingerprint`])
-/// or checked out of it (the per-function fixpoint tracer, which renders the body
-/// through its `BodyMut` host).
+/// Hash a renderable value (a `FunctionRef` over *any* host), normalizing the
+/// arena ids that the render embeds so the result is *alpha-equivalent*: two
+/// structurally identical bodies fingerprint the same even if every temporary was
+/// deleted and re-created in between.
+///
+/// This normalization is the whole point. An unnamed value renders as
+/// `%tmp{local_id:x}` (and an unnamed block param as `@param{local_id:x}`), so the
+/// rendered text carries raw arena indices. Those indices are monotonic and never
+/// reused, so a pass that rewrites an instruction shifts them permanently: a
+/// fixpoint oscillating between two structurally identical states produced a
+/// *different* fingerprint every single iteration, and [`FixpointTracer`] — which
+/// only trips on a repeated fingerprint — could never fire. Measured on `test21`:
+/// `mem2reg` and `gvn` traded 252 moves on one function with 252 distinct
+/// fingerprints and zero detected cycles, spinning to the iteration cap and
+/// leaving the body unsimplified.
+///
+/// Each distinct id-bearing atom is therefore replaced by its first-appearance
+/// ordinal before hashing, which preserves structure (two atoms are the same iff
+/// they were the same before) while discarding absolute ids. Named values are left
+/// alone: their names are already churn-stable and carry real meaning.
+///
+/// Used to fingerprint a function whether it is live in the module
+/// ([`function_fingerprint`]) or checked out of it (the per-function fixpoint
+/// tracer, which renders the body through its `BodyMut` host). Unlike the previous
+/// streaming implementation this materializes the render, which is affordable
+/// because fingerprinting only runs once a stage is already being traced for
+/// non-convergence (`iters >= FIXPOINT_WATCH_ITERS`), never on the common path.
 pub(super) fn fingerprint_display(d: impl std::fmt::Display) -> u64 {
-    use std::fmt::Write as _;
     use std::hash::Hasher;
 
-    struct HashWriter(std::collections::hash_map::DefaultHasher);
-    impl std::fmt::Write for HashWriter {
-        fn write_str(&mut self, s: &str) -> std::fmt::Result {
-            self.0.write(s.as_bytes());
-            Ok(())
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_id_normalized(&mut hasher, &d.to_string());
+    hasher.finish()
+}
+
+/// Atom prefixes whose rendered suffix is a raw body-local arena index
+/// (`instruction_atom` / `block_param_atom` in `qcode::value::insn::segment`).
+const ID_BEARING_ATOMS: [&str; 2] = ["%tmp", "@param"];
+
+/// Feed `rendered` to `hasher`, replacing each distinct id-bearing atom with its
+/// first-appearance ordinal. See [`fingerprint_display`].
+fn hash_id_normalized(hasher: &mut impl std::hash::Hasher, rendered: &str) {
+    let mut ordinals: HashMap<&str, u32> = HashMap::default();
+    let mut rest = rendered;
+
+    while let Some((at, prefix)) = ID_BEARING_ATOMS
+        .iter()
+        .filter_map(|p| rest.find(p).map(|i| (i, *p)))
+        .min_by_key(|&(i, _)| i)
+    {
+        let after = &rest[at + prefix.len()..];
+        let digits = after
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(after.len());
+
+        // Only a hex run that ends the identifier is an arena index. A bare prefix,
+        // or one running into further identifier characters, belongs to a *named*
+        // value that merely starts with these letters (`%tmpfoo`) — pass it through
+        // rather than risk conflating two distinct names into one ordinal, which
+        // would fabricate a cycle that is not there.
+        let ends_identifier = after[digits..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+        if digits == 0 || !ends_identifier {
+            hasher.write(&rest.as_bytes()[..at + prefix.len()]);
+            rest = after;
+            continue;
         }
+
+        hasher.write(&rest.as_bytes()[..at]);
+        let next = ordinals.len() as u32;
+        let ordinal = *ordinals
+            .entry(&rest[at..at + prefix.len() + digits])
+            .or_insert(next);
+        hasher.write(prefix.as_bytes());
+        hasher.write(&ordinal.to_le_bytes());
+        rest = &after[digits..];
     }
 
-    let mut writer = HashWriter(std::collections::hash_map::DefaultHasher::new());
-    write!(writer, "{d}").expect("writing into a hasher cannot fail");
-    writer.0.finish()
+    hasher.write(rest.as_bytes());
 }
 
 /// Whole-program structural fingerprint: the address-sorted list of per-function
 /// [`function_fingerprint`]s. Stable across a stage that changes nothing, and — like
-/// its per-function basis — id-churn tolerant (it hashes rendered IR, not instruction
-/// ids), so a module stage that oscillates back to a prior whole-program state
-/// fingerprints identically. Used only while a stage is being traced for
-/// non-convergence, so the O(program) render cost is off the common path.
+/// its per-function basis — id-churn tolerant, so a module stage that oscillates
+/// back to a prior whole-program state fingerprints identically. That tolerance
+/// comes from the id normalization in [`fingerprint_display`]: the rendered IR
+/// *does* embed arena indices (`%tmp1f3`), so hashing it verbatim is not
+/// churn-tolerant, which is what previously blinded the cycle detector. Used only
+/// while a stage is being traced for non-convergence, so the O(program) render cost
+/// is off the common path.
 fn module_fingerprint(ctx: &Context) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut per_fn: Vec<(Option<u64>, u64)> = ctx
@@ -1896,6 +1960,84 @@ fn run_stage_parallel(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::fingerprint_display;
+
+    /// The property the cycle detector depends on: renumbering temporaries without
+    /// changing structure must not change the fingerprint. Before normalization
+    /// these two hashed differently, so an oscillating fixpoint produced a fresh
+    /// fingerprint every iteration and no cycle was ever detected.
+    #[test]
+    fn renumbered_temporaries_fingerprint_identically() {
+        let before = "%tmp1 = i32 %tmp2 + i32 0x4;\nreturn %tmp1;";
+        let after = "%tmpa0 = i32 %tmpa1 + i32 0x4;\nreturn %tmpa0;";
+        assert_eq!(
+            fingerprint_display(before),
+            fingerprint_display(after),
+            "structurally identical bodies must fingerprint identically",
+        );
+    }
+
+    /// Normalization must not flatten real differences into a false match — that
+    /// would report a cycle that is not there and stop a converging fixpoint early.
+    #[test]
+    fn structural_differences_still_change_the_fingerprint() {
+        let a = "%tmp1 = i32 %tmp2 + i32 0x4;";
+        // Same ids, different operator.
+        let b = "%tmp1 = i32 %tmp2 * i32 0x4;";
+        // Same shape, but the two operands are now the *same* value — a real
+        // structural difference that ordinals must preserve.
+        let c = "%tmp1 = i32 %tmp1 + i32 0x4;";
+        assert_ne!(fingerprint_display(a), fingerprint_display(b));
+        assert_ne!(fingerprint_display(a), fingerprint_display(c));
+    }
+
+    /// Distinct atom kinds must not collide: `%tmp0` and `@param0` both normalize
+    /// to ordinal 0, and only the retained prefix keeps them apart.
+    #[test]
+    fn instruction_and_param_atoms_do_not_collide() {
+        assert_ne!(
+            fingerprint_display("return %tmp0;"),
+            fingerprint_display("return @param0;"),
+        );
+    }
+
+    /// A *named* value that merely begins with an atom prefix is not an arena
+    /// index and must pass through untouched, or two unrelated names would collapse
+    /// into one ordinal and fabricate a cycle.
+    #[test]
+    fn named_values_resembling_atoms_are_not_normalized() {
+        assert_ne!(
+            fingerprint_display("return %tmpfoo;"),
+            fingerprint_display("return %tmpbar;"),
+        );
+        // `%tmpab` is a name (letters continue past the hex run `ab`), not `%tmp` +
+        // index `ab`; it must not be conflated with a genuine `%tmpab` index... but
+        // it also must not crash or mis-slice on the boundary.
+        assert_ne!(
+            fingerprint_display("return %tmpabz;"),
+            fingerprint_display("return %tmpaby;"),
+        );
+    }
+
+    /// Ordinals are assigned by first appearance, which in real IR is pinned by
+    /// the defining instructions. Swapping which *defined* value an operand reads
+    /// is therefore a genuine difference, not a renaming.
+    ///
+    /// (Operands alone are not enough to show this: `%tmpA + %tmpB` and
+    /// `%tmpB + %tmpA` with no definitions in sight really are alpha-equivalent,
+    /// and hashing them equal is correct.)
+    #[test]
+    fn swapping_which_defined_value_is_read_is_significant() {
+        let defs = "%tmp2 = load(ram:4, 0x10);\n%tmp3 = load(ram:4, 0x20);\n";
+        assert_ne!(
+            fingerprint_display(format!("{defs}%tmp1 = %tmp2 + %tmp3;")),
+            fingerprint_display(format!("{defs}%tmp1 = %tmp3 + %tmp2;")),
+        );
+    }
 }
 
 #[cfg(test)]
