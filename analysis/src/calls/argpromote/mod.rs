@@ -222,7 +222,7 @@ pub(crate) fn append_outputs<S>(
     append: bool,
     field_names: impl Fn(usize, &S) -> Vec<String>,
     at_return: impl Fn(&mut Builder, &S) -> Vec<ValueId>,
-    replay: impl Fn(&mut Builder, &S, &[ValueId]),
+    replay: impl Fn(&mut Builder, &S, &[ValueId], &[ValueId]),
 ) {
     if slots.is_empty() {
         return;
@@ -336,6 +336,14 @@ pub(crate) fn append_outputs<S>(
             continue;
         };
         let result = ValueId::Instruction(call_id);
+        // The call's positional arguments, for replays that recompute an
+        // address caller-side (`arg + offset`) instead of consuming the
+        // extracted one — an affine address the caller's own footprint scan
+        // can capture, where an `extract` is opaque.
+        let call_args: Vec<ValueId> = match ctx.get_insn(call_id).mnemonic() {
+            Mnemonic::Call(c) => c.args.iter().map(|a| a.qualify(call_id.func)).collect(),
+            _ => Vec::new(),
+        };
         let mut b = (ctx).builder(cont);
         b.set_insert_point_to_start();
         let mut idx = base_len;
@@ -343,7 +351,7 @@ pub(crate) fn append_outputs<S>(
             let extracted: Vec<ValueId> = (0..arity)
                 .map(|k| ValueId::Instruction(b.push_extract(result, idx + k).id))
                 .collect();
-            replay(&mut b, s, &extracted);
+            replay(&mut b, s, &extracted, &call_args);
             idx += arity;
         }
     }

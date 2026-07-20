@@ -478,7 +478,7 @@ pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff:
             let ptr = access_ptr(b, r);
             vec![b.push_load::<false>(ptr, size, space).id()]
         },
-        |b, &(r, _, space, _), ext| {
+        |b, &(r, _, space, _), ext, _args| {
             let ptr = access_ptr(b, r);
             b.push_store(ext[0], ptr, space);
         },

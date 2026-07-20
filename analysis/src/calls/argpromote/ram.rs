@@ -139,6 +139,13 @@ fn argpromote_changed_functions_with_sp(
     // freshly promoted callee unblocks its callers on the pipeline's next
     // round, after cleanup drops its shadow accesses, exactly as before.)
     let ram_summaries = super::ram_summary::solve(ctx, graph, sp_reg);
+    // Functions whose complete footprint the shadow path absorbed *this sweep*.
+    // Their bodies are already access-free in shared spaces, and their call-site
+    // rewrites have landed the footprint as ordinary accesses in each caller's
+    // body — which the caller's own scan captures when its (later) visit comes.
+    // Next run the summary itself sees the shadow-only body as invisible; this
+    // set only bridges the in-sweep window.
+    let mut absorbed: FxHashSet<FunctionId> = FxHashSet::default();
     // Callee-before-caller order kept for the apply side: a promoted callee's
     // call-site rewrites land before its caller is visited. One visit per
     // function (no fixpoint), so an already-promoted body is never re-promoted.
@@ -160,9 +167,29 @@ fn argpromote_changed_functions_with_sp(
             changed.insert(fid);
             changed.extend(callers.iter().copied());
         }
-        if try_promote(ctx, fid, sp_reg, &address_taken, graph, &ram_summaries) {
-            changed.insert(fid);
-            changed.extend(callers);
+        match try_promote(
+            ctx,
+            fid,
+            sp_reg,
+            &address_taken,
+            graph,
+            &ram_summaries,
+            &absorbed,
+        ) {
+            Promotion::No => {}
+            Promotion::Partial => {
+                changed.insert(fid);
+                changed.extend(callers);
+            }
+            Promotion::Shadow => {
+                // The full shadow path absorbed this function's entire real-ram
+                // footprint: its remaining accesses live in its private shadow,
+                // so calls to it are inert for every caller visited later in
+                // this same sweep (see [`function_makes_blocking_call`]).
+                absorbed.insert(fid);
+                changed.insert(fid);
+                changed.extend(callers);
+            }
         }
     }
     changed
@@ -266,10 +293,11 @@ fn try_promote(
     address_taken: &FxHashSet<FunctionId>,
     graph: &crate::CallGraph,
     ram_summaries: &super::summary::EffectSummaries<super::ram_summary::RamChannel>,
-) -> bool {
+    absorbed: &FxHashSet<FunctionId>,
+) -> Promotion {
     let f = FunctionBody::from_id(ctx, fid);
     if f.is_external() {
-        return false;
+        return Promotion::No;
     }
 
     // Only functionalize functions whose call interface this pass owns. The whole
@@ -284,11 +312,11 @@ fn try_promote(
     // is correct (the body is unchanged). `argpromote_registers` runs earlier and
     // makes every functionalizable function `pure_reg`, so this loses no real work.
     if !f.is_reg_materialized() {
-        return false;
+        return Promotion::No;
     }
 
     let Some(root) = f.root().map(|b| b.id) else {
-        return false;
+        return Promotion::No;
     };
 
     // Closed-world / direct-only gate: if the function's address is taken it may
@@ -296,7 +324,7 @@ fn try_promote(
     // caller on the old by-reference ABI. (Callers in undiscovered code are an
     // accepted, unguardable gap — see the module docs.)
     if address_taken.contains(&fid) {
-        return false;
+        return Promotion::No;
     }
 
     // Snapshot arguments are real data loaded at the caller — unlike a register
@@ -319,7 +347,7 @@ fn try_promote(
              cannot carry snapshot args)",
             FunctionBody::from_id(ctx, fid).name(),
         );
-        return false;
+        return Promotion::No;
     }
 
     // A call composes with our shadow promotion only if it is fully inert toward
@@ -328,8 +356,8 @@ fn try_promote(
     // dereference a promoted pointer we hand it, or alias our shadow). Any
     // other call — indirect, clobbering, or memory-reaching — would have to bubble
     // its effects through ours, which stage 2's rebasing transfer will do; bail.
-    if function_makes_blocking_call(ctx, fid, ram_summaries) {
-        return false;
+    if function_makes_blocking_call(ctx, fid, ram_summaries, absorbed) {
+        return Promotion::No;
     }
 
     // Every return block carries its own copy of the write-set (the register
@@ -345,7 +373,7 @@ fn try_promote(
         })
         .collect();
     if returns.is_empty() {
-        return false;
+        return Promotion::No;
     }
 
     // Classify every named root parameter. Dereferenced pointers are promoted and
@@ -444,7 +472,7 @@ fn try_promote(
                 "argpromote {}: bail — partial promotion with stores may forward across aliases",
                 FunctionBody::from_id(ctx, fid).name(),
             );
-            return false;
+            return Promotion::No;
         }
         qcode::pass_log!(
             debug,
@@ -452,7 +480,11 @@ fn try_promote(
             FunctionBody::from_id(ctx, fid).name(),
         );
         let call_sites = crate::calls::direct_call_sites(ctx, graph, fid);
-        return apply_partial(ctx, fid, &promoted, &call_sites);
+        return if apply_partial(ctx, fid, &promoted, &call_sites) {
+            Promotion::Partial
+        } else {
+            Promotion::No
+        };
     }
     qcode::pass_log!(
         debug,
@@ -470,11 +502,15 @@ fn try_promote(
         .iter()
         .all(|p| p.reads.is_empty() && p.write_targets.is_empty() && p.region.is_none())
     {
-        return false;
+        return Promotion::No;
     }
 
     let call_sites = crate::calls::direct_call_sites(ctx, graph, fid);
-    apply(ctx, fid, promoted, sp_reg, &call_sites)
+    if apply(ctx, fid, promoted, sp_reg, &call_sites) {
+        Promotion::Shadow
+    } else {
+        Promotion::No
+    }
 }
 
 /// Whether every real-memory (default-space) load/store in `fid` is captured by
@@ -621,6 +657,17 @@ fn regions_disjoint(
     })
 }
 
+/// What one [`try_promote`] visit did to a function.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Promotion {
+    /// Nothing changed.
+    No,
+    /// Inputs-only partial promotion; real-ram loads remain in the body.
+    Partial,
+    /// Full shadow promotion: the entire real-ram footprint was absorbed.
+    Shadow,
+}
+
 /// `true` if `function_id` makes any call this promotion cannot compose with.
 /// A body walk (not an edge walk) so an *unresolved* direct call — which never
 /// makes a [`CallGraph`] edge — still blocks. The callee verdict comes from the
@@ -632,6 +679,7 @@ fn function_makes_blocking_call(
     ctx: &Context,
     function_id: FunctionId,
     ram_summaries: &super::summary::EffectSummaries<super::ram_summary::RamChannel>,
+    absorbed: &FxHashSet<FunctionId>,
 ) -> bool {
     FunctionBody::from_id(ctx, function_id).blocks().any(|b| {
         b.iter().any(|i| match i.mnemonic() {
@@ -643,7 +691,13 @@ fn function_makes_blocking_call(
             Mnemonic::Call(c) => {
                 !c.clobbers.is_empty()
                     || !c.target.real().is_some_and(|target| {
+                        // Inert: no caller-observable footprint per the solved
+                        // summary, or the shadow path absorbed the footprint
+                        // earlier in this sweep — the call-site rewrite has
+                        // already landed it as this function's own accesses,
+                        // which the scan below captures.
                         super::ram_summary::is_memory_free(ram_summaries, target)
+                            || absorbed.contains(&target)
                     })
             }
             _ => false,
@@ -819,11 +873,14 @@ fn apply(
     // `(base_param, base_size, offset, size)`.
     let own_frame = OwnFrame::new(ctx, fid, sp_reg);
     let numbering = precompute_forms(qcode::value::ModuleView::new(&*ctx), fid);
-    // `(base_param, base_size, signed offset, size)`. A negative offset (`base - k`,
-    // e.g. an own-frame slot when there is no stack-pointer to recognise it) is
-    // encoded two's-complement into the address const, so `base + offset` wraps to
-    // `base - k`.
-    let mut write_slots: Vec<(ValueId, usize, i64, usize)> = Vec::new();
+    // `(base_param, base_size, signed offset, size, base arg index)`. A negative
+    // offset (`base - k`, e.g. an own-frame slot when there is no stack-pointer to
+    // recognise it) is encoded two's-complement into the address const, so
+    // `base + offset` wraps to `base - k`. The arg index (when the base is a
+    // promoted param) lets the caller-side replay *recompute* the write address
+    // as `arg + offset` — affine in the caller, so the caller's own footprint
+    // scan captures the replayed store; the extracted pack address is opaque.
+    let mut write_slots: Vec<(ValueId, usize, i64, usize, Option<usize>)> = Vec::new();
     for p in &promoted {
         for &(addr, size) in &p.write_targets {
             if own_frame.is_local(ctx, addr) {
@@ -832,15 +889,13 @@ fn apply(
             let (base, offset) = numbering
                 .base_offset(qcode::value::ModuleView::new(&*ctx), addr)
                 .unwrap_or((addr, 0));
-            let base_size = promoted
-                .iter()
-                .find(|q| q.param == base)
-                .map_or(p.base_size, |q| q.base_size);
+            let based = promoted.iter().find(|q| q.param == base);
+            let base_size = based.map_or(p.base_size, |q| q.base_size);
             if !write_slots
                 .iter()
-                .any(|&(b, _, o, _)| b == base && o == offset)
+                .any(|&(b, _, o, _, _)| b == base && o == offset)
             {
-                write_slots.push((base, base_size, offset, size));
+                write_slots.push((base, base_size, offset, size, based.map(|q| q.arg_idx)));
             }
         }
     }
@@ -851,7 +906,13 @@ fn apply(
     // as the scalar slots.
     for p in &promoted {
         if let Some(r) = p.region.filter(|r| r.has_write) {
-            write_slots.push((p.param, p.base_size, r.base_off as i64, r.byte_len()));
+            write_slots.push((
+                p.param,
+                p.base_size,
+                r.base_off as i64,
+                r.byte_len(),
+                Some(p.arg_idx),
+            ));
         }
     }
 
@@ -916,7 +977,7 @@ fn apply(
             });
         }
     }
-    for &(base, base_size, offset, size) in &write_slots {
+    for &(base, base_size, offset, size, _) in &write_slots {
         if snaps.iter().any(|s| s.base == base && s.offset == offset) {
             continue;
         }
@@ -1017,7 +1078,7 @@ fn apply(
                 format!("write{}_value", i + 1),
             ]
         },
-        |b, &(base, base_size, offset, size)| {
+        |b, &(base, base_size, offset, size, _)| {
             // Read the written value out of the shadow. `push_load` stamps its
             // pointer instruction with the load space's provenance
             // (`set_insn_space_local`), so this address becomes shadow-qualified —
@@ -1034,8 +1095,17 @@ fn apply(
             let ram_addr = seed_addr(b, base, base_size, offset);
             vec![ram_addr, v]
         },
-        |b, _, ext| {
-            b.push_store(ext[1], ext[0], ram);
+        |b, &(_, base_size, offset, _, arg_idx), ext, args| {
+            // Recompute the address from the caller's own argument when the
+            // base is a promoted param present at this (lockstep) site — an
+            // affine `arg + offset` the caller's footprint scan can capture,
+            // which is what lets a caller promote past this call in the same
+            // sweep (see the absorbed-set gate). Fall back to the extracted
+            // pack address otherwise.
+            let addr = arg_idx
+                .and_then(|i| args.get(i).copied())
+                .map_or(ext[0], |base| seed_addr(b, base, base_size, offset));
+            b.push_store(ext[1], addr, ram);
         },
     );
 

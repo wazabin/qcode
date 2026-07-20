@@ -1745,6 +1745,73 @@ mod tests {
         );
     }
 
+    /// Stage 2b composition: a callee with a *real* footprint (it stores
+    /// through its pointer param) no longer blocks its caller for a whole
+    /// pipeline round. In one sweep, callee-first: `gee` shadow-promotes,
+    /// its call-site rewrite lands the footprint as ordinary accesses in
+    /// `eff` (the snapshot feed load before the call, the write-set replay
+    /// store after), and `eff`'s own visit — gated on `gee` being absorbed —
+    /// captures those and promotes too, surfacing the write in its own
+    /// write-set.
+    #[test]
+    fn absorbed_callee_composes_into_caller_same_sweep() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn gee:
+                <gee_entry @p:i64>
+                    store(ram:8, @p <- i64 7);
+                    return at i64 0;
+
+            fn eff:
+                <eff_entry @p:i64>
+                    goto <eff_call>;
+                <eff_call>
+                    call <gee>;
+                <eff_cont>
+                    return at i64 0;
+
+            fn top:
+                <top_entry>
+                    goto <top_call>;
+                <top_call>
+                    call <eff>;
+                <top_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (gee_entry, eff_entry, top_entry, top);
+        for fid in [gee, eff] {
+            FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
+                qcode::value::FunctionEffects::Materialized(
+                    qcode::value::RegisterInterfaceMap::default(),
+                ),
+            );
+        }
+        let eff_p = {
+            let f = FunctionBody::from_id(&tc.ctx, eff);
+            f.root().unwrap().params().next().unwrap().id()
+        };
+        set_call(&mut tc, eff_call, gee, vec![eff_p]);
+        tc.ctx.add_cfg_edge(eff_call, eff_cont);
+        let p_arg = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, top_call, eff, vec![p_arg]);
+        tc.ctx.add_cfg_edge(top_call, top_cont);
+
+        assert!(argpromote_with_sp(&mut tc.ctx, None));
+        assert_eq!(
+            register_writeset_len(&tc, gee),
+            Some(2),
+            "gee's store surfaces in its own write-set"
+        );
+        assert_eq!(
+            register_writeset_len(&tc, eff),
+            Some(2),
+            "eff must promote in the same sweep, absorbing gee's replayed write"
+        );
+    }
+
     /// Regression: when the register channel has **already typed** the call result
     /// to its (smaller) register-only write-set, appending the memory pairs *grows*
     /// that aggregate. The caller retype must use the resizing setter — a plain
