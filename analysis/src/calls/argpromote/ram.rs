@@ -55,6 +55,17 @@ impl OwnFrame {
         })
     }
 
+    /// The affine numbering backing this frame view, shared with callers that
+    /// need `base_offset` decomposition over the same function.
+    pub(super) fn numbering(&self) -> &Numbering {
+        &self.numbering
+    }
+
+    /// The incoming `@SP` param this frame is rooted at, if recognised.
+    pub(super) fn sp_param(&self) -> Option<ValueId> {
+        self.sp_param
+    }
+
     /// The stable slot key of an own-frame local: `addr`'s constant offset from
     /// the incoming `@SP`, if `addr` is a plain `@SP - k` local. `None` for
     /// non-locals *and* for realigned-base locals (`@SP & -mask` has no stable
@@ -72,7 +83,7 @@ impl OwnFrame {
 
     /// Whether `addr` is any `@SP`-rooted frame slot — an own-frame local or a
     /// caller-frame slot (`@SP + k`, `k ≥ 0`).
-    fn is_frame_slot(&self, ctx: &Context, addr: ValueId) -> bool {
+    pub(super) fn is_frame_slot(&self, ctx: &Context, addr: ValueId) -> bool {
         self.sp_param.is_some_and(|sp| {
             matches!(
                 frame_class(

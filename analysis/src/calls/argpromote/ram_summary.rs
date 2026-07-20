@@ -1,107 +1,372 @@
 //! RAM instantiation of the [`EffectChannel`](super::summary::EffectChannel)
-//! fixpoint — stages 1–2a of moving the RAM argpromote channel onto the effect
+//! fixpoint — stage 2b of moving the RAM argpromote channel onto the effect
 //! engine (see `argpromote-ram-effects-migration`).
 //!
-//! The effect element is still the *unit* lattice: a function's summary is
-//! either "no **outward** memory effects" (`Ok(RamEffects)`) or ⊤. Stage 1
-//! solved the legacy blocking-call gate's fact ("touches no memory at all")
-//! order-independently and closed over the call graph; stage 2a refines the
-//! scan to what the gate actually needs — effects a *caller* could observe.
-//! Two access classes are outward-invisible and no longer poison a summary:
+//! A function's summary is its **outward memory footprint**: the set of scalar
+//! fields ([`RamField`]) and bounded dynamic regions ([`RamRegion`]) it may
+//! read or write, each hung off a [`RamBase`] a caller can rebase —
+//! a positional pointer argument (`Param`), an absolute address (`Global`),
+//! or (minted only by [`transfer`](EffectChannel::transfer)) a slot in the
+//! summary owner's own frame (`Frame`). ⊤ is any footprint the lattice cannot
+//! express: an unclassifiable access, a non-positional interface, a budget
+//! overflow, or a call edge whose argument cannot be rebased.
+//!
+//! Outward-**invisible** accesses never enter a summary:
 //!
 //! - **Function-private spaces** (`space.shared()` is `None`): a promoted
-//!   callee's shadow is a body-local [`TempSpace`](qcode::value::TempSpace)
-//!   seeded from its own by-value snapshot params, so it can neither observe
-//!   nor alias anything the caller names. This unblocks a caller in the same
-//!   pipeline round its callee was promoted, instead of waiting for gvn/dce to
-//!   erase the callee's redirected shadow accesses.
-//! - **Own-frame locals** (classified [`FrameClass::Local`](crate::stack::frame::FrameClass)
-//!   against the callee's own incoming `@SP`): a fresh frame strictly below the
-//!   caller's stack pointer is disjoint from every address the caller can pass
-//!   or promote, by the same stack discipline frame-freshness already relies
-//!   on, and it is dead at return.
+//!   callee's shadow is a body-local `TempSpace` seeded from its own by-value
+//!   snapshot params — it can neither observe nor alias anything the caller
+//!   names.
+//! - **Own-frame locals**, *written*, or read back after this function's own
+//!   same-block same-slot write. An **unlicensed** read of an own-frame slot
+//!   observes whatever dead frame last occupied those bytes (the classic
+//!   uninitialized-local idiom) — that refutes the freshness hypothesis and
+//!   is ⊤, see `uninit_frame_read_refutes_freshness`.
 //!
-//! Everything else — shared-ram accesses (param-relative derefs included),
-//! caller-frame slots, register traffic, other shared spaces — stays ⊤.
-//! Stage 2b grows `RamEffects` into param-relative read/write region sets with
-//! a rebasing `transfer`, so those become expressible instead of ⊤.
+//! The `transfer` rebases a callee's `Param(i)` entries through the actual
+//! argument at each call site: through a caller pointer param (composing),
+//! a literal address (→ `Global`), or a caller own-frame local (→ `Frame`,
+//! **writes only** — the callee's write lands in the caller's frame and dies
+//! with it, so it is dropped again one level further up; a callee *read*
+//! through a frame argument would need store-licensing knowledge the transfer
+//! does not have, so it stays ⊤). Loaded-pointer arguments under existing
+//! disjointness assumptions are TODO — ⊤ for now.
+//!
+//! The blocking-call gate still admits only outward-invisible callees
+//! (`Frame`-only or empty summaries); letting a caller compose a callee's
+//! real `Param`/`Global` footprint into its own interface is the
+//! materialization step that follows.
 
 use qcode::{
     context::Context,
-    value::{FunctionBody, FunctionId, VarnodeId, insn::Mnemonic},
+    value::{
+        FunctionBody, FunctionId, ModuleView, ValueId, ValueRef, VarnodeId,
+        insn::{InstructionId, Mnemonic},
+    },
 };
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::cell::RefCell;
 
 use crate::CallGraph;
 use crate::calls::CallEdge;
+use crate::sequence::{AddressRelation, MemoryAccess, collect_regions_for_base, relate_address};
 
+use super::globals::global_slot;
 use super::ram::OwnFrame;
 use super::summary::{EffectChannel, EffectSummaries, solve_summaries};
 
-/// Stage-2a effect element: carries no information beyond "not ⊤". A function
-/// with an `Ok(RamEffects)` summary has no caller-observable memory effect —
-/// transitively, through every resolved call, tail-call, and array-op body.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct RamEffects;
+/// Total entries (fields + regions) a summary may hold before it saturates.
+/// Joins at call edges grow sets; saturation is the finite-height guarantee —
+/// a saturated summary is treated as ⊤ by every consumer.
+pub(crate) const MAX_EFFECT_ENTRIES: usize = 64;
 
-/// The RAM [`EffectChannel`] (outward-effect-free or ⊤). `sp` is the
-/// stack-pointer varnode used to recognise own-frame locals; without it the
-/// own-frame carve-out is inert and such accesses are ⊤.
+/// What an effect entry's offsets are relative to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum RamBase {
+    /// The pointer passed at this positional argument index of the summary
+    /// owner's `pure_reg` interface (`param[i] ↔ Call.args[i]` lockstep).
+    Param(u32),
+    /// A slot in the summary owner's **own frame**: a constant offset (`< 0`)
+    /// from its incoming `@SP`. Minted only by `transfer` (a callee effect
+    /// rebased through an own-frame-local argument), always a *write*, and
+    /// dropped again when transferred one level further up — the frame dies at
+    /// return, so the effect is contained.
+    Frame(i64),
+    /// An absolute (literal) address in real ram.
+    Global(u64),
+}
+
+/// One scalar effect: `size` bytes at `base + offset`, read or written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RamField {
+    pub base: RamBase,
+    pub offset: i64,
+    pub size: usize,
+    pub write: bool,
+}
+
+/// One bounded dynamic-index effect: the half-open byte span
+/// `[base + lo, base + hi)`, read (and written iff `write`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RamRegion {
+    pub base: RamBase,
+    pub lo: i64,
+    pub hi: i64,
+    pub write: bool,
+}
+
+/// A function's solved outward footprint (see the module docs).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RamEffects {
+    pub fields: FxHashSet<RamField>,
+    pub regions: FxHashSet<RamRegion>,
+    /// Entry budget exceeded: the sets are no longer exhaustive. Monotone
+    /// (never cleared by joins) and treated as ⊤ by every consumer.
+    pub saturated: bool,
+}
+
+impl RamEffects {
+    fn len(&self) -> usize {
+        self.fields.len() + self.regions.len()
+    }
+
+    /// Whether nothing in this footprint is observable by any caller: empty,
+    /// or `Frame`-contained (writes into the owner's own frame, dead at
+    /// return). This is the blocking-call gate's admission predicate until
+    /// materialization learns to compose real footprints.
+    pub(crate) fn outward_invisible(&self) -> bool {
+        !self.saturated
+            && self
+                .fields
+                .iter()
+                .all(|f| matches!(f.base, RamBase::Frame(_)))
+            && self
+                .regions
+                .iter()
+                .all(|r| matches!(r.base, RamBase::Frame(_)))
+    }
+}
+
+/// Per-caller classification state the transfer reuses across that caller's
+/// call edges: the positional param index map (lockstep interfaces only) and
+/// the frame/affine view.
+struct CallerInfo {
+    materialized: bool,
+    params: FxHashMap<ValueId, u32>,
+    frame: OwnFrame,
+}
+
+/// The RAM [`EffectChannel`]. `sp` is the stack-pointer varnode used to
+/// recognise own-frame locals; without it the own-frame carve-outs are inert.
 pub(crate) struct RamChannel {
     pub(crate) sp: Option<VarnodeId>,
+    /// Lazily built per-caller state; the solve is single-threaded.
+    callers: RefCell<FxHashMap<FunctionId, CallerInfo>>,
+}
+
+impl RamChannel {
+    pub(crate) fn new(sp: Option<VarnodeId>) -> Self {
+        Self {
+            sp,
+            callers: RefCell::new(FxHashMap::default()),
+        }
+    }
+
+    /// Classify one call argument as a rebase target: the caller-side base the
+    /// callee's `Param` entries land on, plus a constant offset shift.
+    fn classify_arg(
+        &self,
+        ctx: &Context,
+        caller: FunctionId,
+        arg: ValueId,
+    ) -> Option<(RamBase, i64)> {
+        if let ValueRef::Literal(lit) = ValueRef::new(arg, ctx) {
+            return Some((RamBase::Global(lit.value()), 0));
+        }
+        let mut callers = self.callers.borrow_mut();
+        let info = callers.entry(caller).or_insert_with(|| {
+            let f = FunctionBody::from_id(ctx, caller);
+            let params = f
+                .root()
+                .map(|b| {
+                    b.params()
+                        .enumerate()
+                        .map(|(i, p)| (p.id(), i as u32))
+                        .collect()
+                })
+                .unwrap_or_default();
+            CallerInfo {
+                materialized: f.is_reg_materialized(),
+                params,
+                frame: OwnFrame::new(ctx, caller, self.sp),
+            }
+        });
+        // A caller own-frame local: the callee's effect lands in the caller's
+        // frame. Checked *before* the positional map — the `@SP` param is
+        // itself a root param, so an `@SP - k` local would otherwise rebase to
+        // `Param(sp_index)` and lose its containment. (Write-only admission is
+        // enforced at the entry rebase.)
+        if let Some(t) = info.frame.local_offset(ctx, arg) {
+            return Some((RamBase::Frame(t), 0));
+        }
+        let (base, off) = info
+            .frame
+            .numbering()
+            .base_offset(ModuleView::new(ctx), arg)
+            .unwrap_or((arg, 0));
+        // Any other `@SP`-rooted argument (the return-address slot, an
+        // incoming stack arg, a realigned base): not containable, not
+        // composable — ⊤.
+        if Some(base) == info.frame.sp_param() {
+            return None;
+        }
+        // A caller pointer param + const: composes positionally — but only if
+        // the caller's own interface is lockstep, else the index is meaningless.
+        if info.materialized
+            && let Some(&j) = info.params.get(&base)
+        {
+            return Some((RamBase::Param(j), off));
+        }
+        // TODO(stage 2b): loaded-pointer arguments admitted by existing
+        // disjointness assumptions (LoadedPointerDisjointFromSlot /
+        // assume_arg_frame). ⊤ until the assumption plumbing lands.
+        None
+    }
 }
 
 impl EffectChannel for RamChannel {
     type Effects = RamEffects;
 
     fn scan(&self, ctx: &Context, fid: FunctionId) -> Option<RamEffects> {
+        // ---- outward-access filter (2a + freshness licensing) --------------
         // Built on the first shared-space access only: most memory-free
         // candidates have none, and the affine numbering behind the frame
         // classifier is the expensive part.
         let mut own_frame: Option<OwnFrame> = None;
+        // Shared-space accesses that are caller-observable, to be claimed by
+        // the footprint extraction below. `(access, raw ptr, space)` keeps the
+        // unqualified pointer for `global_slot`.
+        let mut outward: Vec<MemoryAccess> = Vec::new();
+        let mut raw: Vec<(qcode::value::LocalValueId, qcode::space::LocalMemorySpaceId)> =
+            Vec::new();
+        let mut register_touch = false;
         for block in FunctionBody::from_id(ctx, fid).blocks() {
-            // Own-frame slots this block has stored to, in program order. A
-            // load of an own-frame local is private only *after* the function
-            // itself wrote that slot; a read of the slot's pre-call contents
-            // observes whatever dead frame last occupied those bytes (the
-            // classic uninitialized-local idiom reading a prior callee's
-            // frame), which refutes the freshness hypothesis for this
-            // function — ⊤. Per-block, exact `(offset, size)` licensing: a
-            // cross-block or overlapping-width reload stays ⊤, conservative.
-            let mut stored: rustc_hash::FxHashSet<(i64, usize)> = Default::default();
+            // Own-frame slots this block has stored to, in program order (see
+            // the freshness licensing rationale in the module docs).
+            let mut stored: FxHashSet<(i64, usize)> = FxHashSet::default();
             for insn in block.iter() {
-                let (space, ptr, size, is_store) = match insn.mnemonic() {
+                let (space, lptr, size, is_store) = match insn.mnemonic() {
                     Mnemonic::Load(l) => (l.space, l.ptr, l.size, false),
                     Mnemonic::Store(s) => (s.space, s.ptr, s.size, true),
                     _ => continue,
                 };
                 // Function-private (shadow/temp) space: outward-invisible.
-                if space.shared().is_none() {
+                let Some(shared) = space.shared() else {
+                    continue;
+                };
+                // Register traffic is the register channel's business; a
+                // function still moving registers through loads/stores is not
+                // functionalized and its footprint is not expressible here.
+                if matches!(
+                    qcode::space::Space::from_id(ctx, shared).ty,
+                    qcode::space::SpaceType::Register
+                ) {
+                    register_touch = true;
                     continue;
                 }
-                // Register accesses, caller-frame slots, and every other
-                // shared-space access are caller-observable — ⊤. Own-frame
-                // locals are invisible when written, and when read back after
-                // a write; a read of frame pre-state is ⊤ (see above).
+                let ptr = lptr.qualify(insn.id.func);
                 let frame = own_frame.get_or_insert_with(|| OwnFrame::new(ctx, fid, self.sp));
-                let ptr = ptr.qualify(insn.id.func);
-                if !frame.is_local(ctx, ptr) {
+                if frame.is_local(ctx, ptr) {
+                    if is_store {
+                        if let Some(off) = frame.local_offset(ctx, ptr) {
+                            stored.insert((off, size));
+                        }
+                        continue;
+                    }
+                    if frame
+                        .local_offset(ctx, ptr)
+                        .is_some_and(|off| stored.contains(&(off, size)))
+                    {
+                        continue; // licensed reload of an own write
+                    }
+                    // Unlicensed own-frame read: observes the previous dead
+                    // frame — the freshness hypothesis is refuted.
                     return None;
                 }
-                if is_store {
-                    if let Some(off) = frame.local_offset(ctx, ptr) {
-                        stored.insert((off, size));
-                    }
-                } else {
-                    let licensed = frame
-                        .local_offset(ctx, ptr)
-                        .is_some_and(|off| stored.contains(&(off, size)));
-                    if !licensed {
-                        return None;
-                    }
+                if frame.is_frame_slot(ctx, ptr) {
+                    // A caller-frame slot (`@SP + k`, `k ≥ 0`): the return
+                    // address / incoming stack arguments. promote_stack_args
+                    // territory; not expressible here yet.
+                    return None;
                 }
+                outward.push(MemoryAccess {
+                    id: insn.id,
+                    block: block.id,
+                    is_store,
+                    ptr,
+                    size,
+                });
+                raw.push((lptr, space));
             }
         }
-        Some(RamEffects)
+        if register_touch {
+            return None;
+        }
+        if outward.is_empty() {
+            return Some(RamEffects::default());
+        }
+
+        // ---- footprint extraction ------------------------------------------
+        // Effects hang off positional argument indices, which are meaningful
+        // only for a lockstep (`pure_reg`) interface.
+        let f = FunctionBody::from_id(ctx, fid);
+        if !f.is_reg_materialized() {
+            return None;
+        }
+        let numbering = own_frame
+            .get_or_insert_with(|| OwnFrame::new(ctx, fid, self.sp))
+            .numbering();
+        let params: Vec<(ValueId, u32)> = f
+            .root()?
+            .params()
+            .enumerate()
+            .map(|(i, p)| (p.id(), i as u32))
+            .collect();
+
+        let mut eff = RamEffects::default();
+        let mut claimed: FxHashSet<InstructionId> = FxHashSet::default();
+        for &(param, idx) in &params {
+            for access in &outward {
+                if let AddressRelation::Const(off) =
+                    relate_address(ctx, numbering, param, access.ptr, access.block)
+                {
+                    eff.fields.insert(RamField {
+                        base: RamBase::Param(idx),
+                        offset: off,
+                        size: access.size,
+                        write: access.is_store,
+                    });
+                    claimed.insert(access.id);
+                }
+            }
+            let region_set = collect_regions_for_base(ctx, numbering, param, &outward);
+            for ru in &region_set.regions {
+                let lo = i64::try_from(ru.region.base_off).ok()?;
+                let hi = lo.checked_add(i64::try_from(ru.region.byte_len()).ok()?)?;
+                eff.regions.insert(RamRegion {
+                    base: RamBase::Param(idx),
+                    lo,
+                    hi,
+                    write: ru.region.has_write,
+                });
+                claimed.extend(ru.accesses.iter().copied());
+            }
+            // `rejected_accesses` stay unclaimed; the completeness check below
+            // sends the function to ⊤ if nothing else claims them.
+        }
+        for (access, &(lptr, space)) in outward.iter().zip(&raw) {
+            if claimed.contains(&access.id) {
+                continue;
+            }
+            if let Some((addr, _)) = global_slot(ctx, fid, lptr, space) {
+                eff.fields.insert(RamField {
+                    base: RamBase::Global(addr),
+                    offset: 0,
+                    size: access.size,
+                    write: access.is_store,
+                });
+                claimed.insert(access.id);
+            }
+        }
+        // Completeness: a single unclaimed outward access means the footprint
+        // is not fully expressed — the summary must be ⊤, not a subset.
+        if outward.iter().any(|a| !claimed.contains(&a.id)) {
+            return None;
+        }
+        if eff.len() > MAX_EFFECT_ENTRIES {
+            return None;
+        }
+        Some(eff)
     }
 
     fn external_leaf(&self, _ctx: &Context, _fid: FunctionId) -> Option<RamEffects> {
@@ -110,49 +375,178 @@ impl EffectChannel for RamChannel {
         // in practice every external call site carries ABI clobbers, which the
         // caller-side clobber check rejects on its own. Stage 3 (persisted
         // memory effects) revisits this with the materialized interface.
-        Some(RamEffects)
+        Some(RamEffects::default())
     }
 
-    fn transfer(
-        &self,
-        _ctx: &Context,
-        _edge: &CallEdge,
-        _callee: &RamEffects,
-    ) -> Option<RamEffects> {
-        // No outward effects compose through any call edge unchanged; ⊤
-        // callees never reach transfer (the engine poisons the caller first).
-        Some(RamEffects)
+    fn transfer(&self, ctx: &Context, edge: &CallEdge, callee: &RamEffects) -> Option<RamEffects> {
+        if callee.saturated {
+            return None;
+        }
+        // Only a real positional `Call` site can rebase `Param` entries. Any
+        // other direct-like edge (tail call, `Apply`/`Map`/`Scan`, synthetic)
+        // composes only an invisible footprint.
+        let call_args = edge
+            .site
+            .and_then(|site| match ctx.get_insn(site).mnemonic() {
+                Mnemonic::Call(c) => Some(c.args.clone()),
+                _ => None,
+            });
+        let Some(args) = call_args else {
+            return callee.outward_invisible().then(RamEffects::default);
+        };
+        let caller = edge.caller;
+        let mut out = RamEffects::default();
+        // Rebase one entry's base; `write`-ness gates the own-frame landing.
+        let rebase = |base: RamBase, write: bool| -> Option<Option<(RamBase, i64)>> {
+            Some(match base {
+                // Contained in the callee's own frame — invisible here.
+                RamBase::Frame(_) => None,
+                RamBase::Global(a) => Some((RamBase::Global(a), 0)),
+                RamBase::Param(i) => {
+                    let arg = args.get(i as usize)?.qualify(caller);
+                    let (new_base, shift) = self.classify_arg(ctx, caller, arg)?;
+                    if matches!(new_base, RamBase::Frame(_)) && !write {
+                        // A callee *read* through a frame argument needs
+                        // store-licensing knowledge (freshness) — ⊤.
+                        return None;
+                    }
+                    Some((new_base, shift))
+                }
+            })
+        };
+        for f in &callee.fields {
+            match rebase(f.base, f.write)? {
+                None => {}
+                Some((base, shift)) => {
+                    let offset = f.offset.checked_add(shift)?;
+                    // A frame landing must stay strictly below the caller's
+                    // entry SP — crossing into the return-address slot or the
+                    // caller's caller frame is not containable.
+                    if let RamBase::Frame(t) = base
+                        && t.checked_add(offset)?
+                            .checked_add(i64::try_from(f.size).ok()?)?
+                            > 0
+                    {
+                        return None;
+                    }
+                    out.fields.insert(RamField { base, offset, ..*f });
+                }
+            }
+        }
+        for r in &callee.regions {
+            match rebase(r.base, r.write)? {
+                None => {}
+                Some((base, shift)) => {
+                    let lo = r.lo.checked_add(shift)?;
+                    let hi = r.hi.checked_add(shift)?;
+                    if let RamBase::Frame(t) = base
+                        && t.checked_add(hi)? > 0
+                    {
+                        return None;
+                    }
+                    out.regions.insert(RamRegion { base, lo, hi, ..*r });
+                }
+            }
+        }
+        if out.len() > MAX_EFFECT_ENTRIES {
+            return None;
+        }
+        Some(out)
     }
 
-    fn join(&self, _into: &mut RamEffects, _from: &RamEffects) -> bool {
-        false // the unit lattice never grows
+    fn join(&self, into: &mut RamEffects, from: &RamEffects) -> bool {
+        let before = (into.len(), into.saturated);
+        into.fields.extend(from.fields.iter().copied());
+        into.regions.extend(from.regions.iter().copied());
+        into.saturated |= from.saturated || into.len() > MAX_EFFECT_ENTRIES;
+        (into.len(), into.saturated) != before
     }
 }
 
-/// Solve the outward-effect-free summary for every function in `ctx`.
+/// Solve the outward-footprint summary for every function in `ctx`.
 pub(crate) fn solve(
     ctx: &Context,
     graph: &CallGraph,
     sp: Option<VarnodeId>,
 ) -> EffectSummaries<RamChannel> {
-    solve_summaries(ctx, graph, &RamChannel { sp })
+    solve_summaries(ctx, graph, &RamChannel::new(sp))
 }
 
 /// Whether `fid`'s solved summary says it has no caller-observable memory
-/// effect. `false` for ⊤ and for call targets outside the solved snapshot.
+/// effect. `false` for ⊤, saturation, any real footprint, and call targets
+/// outside the solved snapshot.
 pub(crate) fn is_memory_free(summaries: &EffectSummaries<RamChannel>, fid: FunctionId) -> bool {
-    summaries.try_get(fid).is_some_and(|s| s.is_ok())
+    summaries
+        .try_get(fid)
+        .is_some_and(|s| s.as_ref().is_ok_and(|e| e.outward_invisible()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qcode::value::QCodeMut;
+    use qcode::value::insn::{Call, CallTag, Callee};
     use qcode_macro::qcode;
+
+    /// Find the (single) call in `block`, give it positional `args` and the
+    /// regpure tag, and resolve it to `target`.
+    fn regpure_call(
+        tc: &mut qcode::testing::TestContext,
+        block: qcode::value::BlockId,
+        target: FunctionId,
+        args: Vec<ValueId>,
+    ) -> InstructionId {
+        let call_id = qcode::value::BasicBlock::from_id(&tc.ctx, block)
+            .iter()
+            .find(|i| matches!(i.mnemonic(), Mnemonic::Call(_)))
+            .unwrap()
+            .id;
+        tc.ctx.replace_instruction_mnemonic(
+            call_id,
+            Mnemonic::Call(Call {
+                target: Callee::Real(target),
+                args: args
+                    .into_iter()
+                    .map(|arg| arg.localize(call_id.func))
+                    .collect(),
+                clobbers: vec![],
+                tag: CallTag::RegPure,
+            }),
+        );
+        call_id
+    }
+
+    fn materialize(tc: &mut qcode::testing::TestContext, fid: FunctionId) {
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
+            qcode::value::FunctionEffects::Materialized(
+                qcode::value::RegisterInterfaceMap::default(),
+            ),
+        );
+    }
+
+    fn set_sp_origin(tc: &mut qcode::testing::TestContext, fid: FunctionId, sp: VarnodeId) {
+        let pid = {
+            let f = FunctionBody::from_id(&tc.ctx, fid);
+            let p = f
+                .root()
+                .unwrap()
+                .params()
+                .find(|p| p.name() == Some("RSP"))
+                .unwrap();
+            match p.id() {
+                ValueId::BlockParam(pid) => pid,
+                _ => unreachable!(),
+            }
+        };
+        tc.ctx
+            .block_param_mut(pid)
+            .set_origin_id(ValueId::Varnode(sp).localize(pid.func));
+    }
 
     /// The transitive hole the legacy body-rescan gate had: `mid` is memory-free
     /// in its own body but calls a loading `leaf`, so its summary must be ⊤ —
     /// a caller handing `mid` a promoted pointer is not safe. (A register
-    /// access is also a caller-observable effect: still ⊤ after stage 2a.)
+    /// access is a caller-observable effect: still ⊤ under the region lattice.)
     #[test]
     fn memory_free_is_transitive() {
         let mut tc = qcode::testing::TestContext::new();
@@ -182,6 +576,44 @@ mod tests {
         assert!(is_memory_free(&s, pure));
     }
 
+    /// Accesses in a function-private (shadow/temp) space are outward-invisible.
+    #[test]
+    fn private_space_access_is_outward_invisible() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn shadowed:
+                <entry @p:i64>
+                    return at i64 0;
+            "
+        );
+        let _ = entry;
+        let shadow = tc.ctx.bodies[shadowed].push_temp_space(qcode::value::TempSpace::new(
+            Some("test_shadow"),
+            1,
+            8,
+        ));
+        let shadow = qcode::space::LocalMemorySpaceId::Temp(shadow.local);
+        let root = FunctionBody::from_id(&tc.ctx, shadowed).root().unwrap().id;
+        let p = qcode::value::BasicBlock::from_id(&tc.ctx, root)
+            .params()
+            .next()
+            .unwrap()
+            .id();
+        let mut b = (&mut tc.ctx).builder(root);
+        b.set_insert_point_to_start();
+        let a = b.shr().get_const(0x10, 8);
+        b.push_store(p, a, shadow);
+
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, None);
+        assert!(
+            is_memory_free(&s, shadowed),
+            "a private-space store must not poison the summary"
+        );
+    }
+
     /// The uninitialized-local idiom that falsifies own-frame freshness:
     ///
     /// ```c
@@ -192,18 +624,15 @@ mod tests {
     ///
     /// Frame accounting: both are called from the same `main` call sites, so
     /// their entry `@RSP` values are equal (each `call` pushes the return
-    /// address at the caller's `SP - 8`, giving both callees the same entry
-    /// SP; the return address itself sits at offset `0`). Each function's
-    /// prologue then writes the saved-`RBP` slot at `-0x8`; the `str` local
-    /// lives below the prologue at `-0x10`. `hello`'s prologue write at
-    /// `-0x8` is its *own* store (licensed, private), but its read of the
-    /// untouched `-0x10` observes the slot `init`'s dead frame left behind —
-    /// on the machine, `hello` prints "Hello World!". A read of an own-frame
-    /// slot *before* the function has written it therefore observes caller-
-    /// visible state (a dead frame is still memory), refuting the freshness
-    /// hypothesis: `hello` must be ⊤, and `main` — transitively — with it.
-    /// `init` (write-only frame traffic) and a spill/reload (read *after*
-    /// own write) stay outward-invisible.
+    /// address at the caller's `SP - 8`; the return address itself sits at
+    /// offset `0`). Each prologue writes the saved-`RBP` slot at `-0x8`; the
+    /// `str` local lives below the prologue at `-0x10`. `hello`'s prologue
+    /// write at `-0x8` is its *own* store (licensed, private), but its read
+    /// of the untouched `-0x10` observes the slot `init`'s dead frame left
+    /// behind — on the machine, `hello` prints "Hello World!". Such a read
+    /// refutes the freshness hypothesis: `hello` must be ⊤, and the
+    /// composing caller with it. `init` (write-only frame traffic) and a
+    /// spill/reload (read *after* own write) stay outward-invisible.
     #[test]
     fn uninit_frame_read_refutes_freshness() {
         let mut tc = qcode::testing::TestContext::new();
@@ -252,22 +681,7 @@ mod tests {
             entry_3,
         );
         for fid in [init, hello, spill] {
-            let pid = {
-                let f = qcode::value::FunctionBody::from_id(&tc.ctx, fid);
-                let p = f
-                    .root()
-                    .unwrap()
-                    .params()
-                    .find(|p| p.name() == Some("RSP"))
-                    .unwrap();
-                match p.id() {
-                    qcode::value::ValueId::BlockParam(pid) => pid,
-                    _ => unreachable!(),
-                }
-            };
-            tc.ctx
-                .block_param_mut(pid)
-                .set_origin_id(qcode::value::ValueId::Varnode(sp).localize(pid.func));
+            set_sp_origin(&mut tc, fid, sp);
         }
 
         let graph = CallGraph::analyze(&tc.ctx);
@@ -291,49 +705,200 @@ mod tests {
         );
     }
 
-    /// Stage 2a: accesses in a function-private (shadow/temp) space are
-    /// outward-invisible — a freshly promoted callee whose loads were
-    /// redirected into its shadow no longer blocks its callers.
+    /// Stage 2b scan: a lockstep callee's param-relative derefs become
+    /// `Param`-based fields — a real (non-⊤) footprint, still blocking.
     #[test]
-    fn private_space_access_is_outward_invisible() {
+    fn scan_extracts_param_fields() {
         let mut tc = qcode::testing::TestContext::new();
         qcode!(
             tc.ctx,
             "
-            fn shadowed:
-                <entry @p:i64>
+            fn callee:
+                <c_entry @p:i64 @q:i64>
+                    store(ram:4, @p <- i32 9);
+                    %a = @q + i64 0x8;
+                    %v = load(ram:4, %a);
+                    return at %v;
+            "
+        );
+        let _ = c_entry;
+        materialize(&mut tc, callee);
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, None);
+        let eff = s.get(callee).as_ref().expect("footprint is expressible");
+        let mut fields: Vec<RamField> = eff.fields.iter().copied().collect();
+        fields.sort_by_key(|f| (f.base, f.offset));
+        assert_eq!(
+            fields,
+            vec![
+                RamField {
+                    base: RamBase::Param(0),
+                    offset: 0,
+                    size: 4,
+                    write: true
+                },
+                RamField {
+                    base: RamBase::Param(1),
+                    offset: 8,
+                    size: 4,
+                    write: false
+                },
+            ]
+        );
+        assert!(!is_memory_free(&s, callee), "a real footprint still blocks");
+    }
+
+    /// Stage 2b transfer: `Param` entries rebase through the actual call
+    /// arguments — a caller pointer param + const composes positionally, a
+    /// literal address lands on `Global`.
+    #[test]
+    fn transfer_rebases_param_and_literal_args() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn callee:
+                <c_entry @p:i64 @q:i64>
+                    store(ram:4, @p <- i32 9);
+                    %a = @q + i64 0x8;
+                    %v = load(ram:4, %a);
+                    return at %v;
+
+            fn caller:
+                <k_entry @r:i64>
+                    %arg = @r + i64 0x10;
+                    goto <k_call>;
+                <k_call>
+                    call <callee>;
+                <k_cont>
                     return at i64 0;
             "
         );
-        let _ = entry;
-        // Redirect-style access: store the param into a body-local temp space.
-        let word = 1;
-        let addr_size = 8;
-        let shadow = tc.ctx.bodies[shadowed].push_temp_space(qcode::value::TempSpace::new(
-            Some("test_shadow"),
-            word,
-            addr_size,
-        ));
-        let shadow = qcode::space::LocalMemorySpaceId::Temp(shadow.local);
-        let root = qcode::value::FunctionBody::from_id(&tc.ctx, shadowed)
-            .root()
-            .unwrap()
-            .id;
-        let p = qcode::value::BasicBlock::from_id(&tc.ctx, root)
-            .params()
-            .next()
-            .unwrap()
-            .id();
-        let mut b = (&mut tc.ctx).builder(root);
-        b.set_insert_point_to_start();
-        let a = b.shr().get_const(0x10, addr_size);
-        b.push_store(p, a, shadow);
+        let _ = (c_entry, k_entry);
+        materialize(&mut tc, callee);
+        materialize(&mut tc, caller);
+        let lit = tc.ctx.get_const(0x4000, 8).id();
+        let arg = {
+            let block = qcode::value::BasicBlock::from_id(&tc.ctx, k_entry);
+            block
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id
+        };
+        regpure_call(
+            &mut tc,
+            k_call,
+            callee,
+            vec![ValueId::Instruction(arg), lit],
+        );
+        tc.ctx.add_cfg_edge(k_call, k_cont);
 
         let graph = CallGraph::analyze(&tc.ctx);
         let s = solve(&tc.ctx, &graph, None);
+        let eff = s.get(caller).as_ref().expect("rebase must succeed");
+        let mut fields: Vec<RamField> = eff.fields.iter().copied().collect();
+        fields.sort_by_key(|f| (f.base, f.offset));
+        assert_eq!(
+            fields,
+            vec![
+                RamField {
+                    base: RamBase::Param(0),
+                    offset: 0x10,
+                    size: 4,
+                    write: true
+                },
+                RamField {
+                    base: RamBase::Global(0x4000),
+                    offset: 8,
+                    size: 4,
+                    write: false
+                },
+            ]
+        );
+        assert!(!is_memory_free(&s, caller));
+    }
+
+    /// Stage 2b frame containment: a callee *write* through a pointer to the
+    /// caller's own-frame local lands on `Frame` — contained, outward-
+    /// invisible, and dropped one level further up. A callee *read* through
+    /// the same shape would need freshness licensing: ⊤.
+    #[test]
+    fn frame_landing_contains_writes_rejects_reads() {
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        qcode!(
+            tc.ctx,
+            "
+            fn sink:
+                <s_entry @p:i64>
+                    store(ram:8, @p <- i64 1);
+                    return at i64 0;
+
+            fn source:
+                <o_entry @p:i64>
+                    %v = load(ram:8, @p);
+                    return at %v;
+
+            fn wcaller:
+                <w_entry @RSP:i64>
+                    %loc = @RSP - i64 0x20;
+                    goto <w_call>;
+                <w_call>
+                    call <sink>;
+                <w_cont>
+                    return at i64 0;
+
+            fn rcaller:
+                <r_entry @RSP:i64>
+                    %loc = @RSP - i64 0x20;
+                    goto <r_call>;
+                <r_call>
+                    call <source>;
+                <r_cont>
+                    return at i64 0;
+
+            fn top:
+                <t_entry>
+                    call fn wcaller();
+                <t_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (s_entry, o_entry, w_entry, r_entry, t_entry, t_cont);
+        for fid in [sink, source, wcaller, rcaller] {
+            materialize(&mut tc, fid);
+        }
+        for fid in [wcaller, rcaller] {
+            set_sp_origin(&mut tc, fid, sp);
+        }
+        for (entry, call, cont, callee) in [
+            (w_entry, w_call, w_cont, sink),
+            (r_entry, r_call, r_cont, source),
+        ] {
+            let loc = qcode::value::BasicBlock::from_id(&tc.ctx, entry)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id;
+            regpure_call(&mut tc, call, callee, vec![ValueId::Instruction(loc)]);
+            tc.ctx.add_cfg_edge(call, cont);
+        }
+
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, Some(sp));
+        assert!(!is_memory_free(&s, sink), "sink's own footprint is real");
         assert!(
-            is_memory_free(&s, shadowed),
-            "a private-space store must not poison the summary"
+            is_memory_free(&s, wcaller),
+            "the write into wcaller's own frame is contained — outward-invisible"
+        );
+        assert!(
+            is_memory_free(&s, top),
+            "the Frame entry must be dropped when transferred further up"
+        );
+        assert!(
+            !is_memory_free(&s, rcaller),
+            "a callee read through a frame pointer needs freshness licensing — ⊤"
         );
     }
 }
