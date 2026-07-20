@@ -1192,13 +1192,14 @@ impl<'str> Context<'str> {
                     if tid == block || !tail_set.contains(&tid) {
                         continue;
                     }
-                    // Skip a landing whose own reach re-enters `block`: it shares an
-                    // SCC with the entry, so it is not a separable function and
-                    // cannot be carved off without relocating the entry itself.
-                    let reaches_entry = self.split_tail(addresses, tid, g).contains(&block);
-                    if reaches_entry {
-                        continue;
-                    }
+                    // A landing whose reach re-enters `block` (it shares an SCC with
+                    // the entry) is still promoted: the recursive split's own tail
+                    // walk stops at `g`'s registered entry (G was minted above, so
+                    // `addr` is registered), so the entry is never relocated — the
+                    // SCC simply becomes mutually tail-calling functions. Skipping
+                    // it instead would leave any *retained* predecessor's branch
+                    // naming the landing's old local index after the storage move —
+                    // a dangling terminator dereferenced as a dead block later.
                     promote = Some(tid);
                     break 'scan;
                 }
@@ -1859,6 +1860,32 @@ impl<'str> Context<'str> {
     /// richer type. Pass a type whose size matches the varnode's width.
     pub fn set_varnode_type(&mut self, varnode: VarnodeId, type_id: crate::types::TypeId) {
         self.shared.values.varnode_types.insert(varnode, type_id);
+    }
+
+    /// Get (or mint once) the stable *global-cell* varnode for a constant
+    /// real-RAM address of the given width. The register effect channel uses it
+    /// as the identity of a global in its `loads`/`stores` sets, exactly as a
+    /// register varnode identifies a register cell.
+    ///
+    /// This varnode is an **effect-set identity token only**: it is never
+    /// emitted as a real `load`/`store` `ptr`. Materialization maps it back to
+    /// an address-literal access (`load/store(ram, addr)`), because a RAM `ptr`
+    /// must remain a dataflow value the alias oracle can reason about.
+    pub fn get_or_make_global_varnode(&mut self, addr: u64, size: usize) -> VarnodeId {
+        if let Some(&id) = self.shared.values.global_cells.get(&(addr, size)) {
+            return id;
+        }
+        let ram = self.shared.default_space;
+        let id = Varnode::make(self, addr as i64, size, ram).id;
+        self.shared.values.global_cells.insert((addr, size), id);
+        id
+    }
+
+    /// The previously-minted global-cell varnode for `(addr, size)`, if any.
+    /// Immutable companion to [`get_or_make_global_varnode`](Self::get_or_make_global_varnode),
+    /// for read-only effect scanning after the cells have been pre-minted.
+    pub fn global_varnode(&self, addr: u64, size: usize) -> Option<VarnodeId> {
+        self.shared.values.global_cells.get(&(addr, size)).copied()
     }
 
     /// Return all instructions that use `value` as an operand.
