@@ -1195,10 +1195,7 @@ impl<'str> Context<'str> {
                     // Skip a landing whose own reach re-enters `block`: it shares an
                     // SCC with the entry, so it is not a separable function and
                     // cannot be carved off without relocating the entry itself.
-                    let reaches_entry = self
-                        .split_tail(addresses, tid, g)
-                        .iter()
-                        .any(|&r| r == block);
+                    let reaches_entry = self.split_tail(addresses, tid, g).contains(&block);
                     if reaches_entry {
                         continue;
                     }
