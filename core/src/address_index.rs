@@ -62,6 +62,21 @@ impl AddressIndex {
         *self = Self::analyze(ctx);
     }
 
+    /// Re-point `addr` from a relocated block `old` to its clone `new`, in place.
+    ///
+    /// The incremental analogue of a [`refresh`](Self::refresh) after a block
+    /// rehome: the caller already knows exactly which address moved and where, so
+    /// there is no need to re-scan the whole module. A no-op unless `addr` is
+    /// currently indexed to `old` — this preserves [`analyze`](Self::analyze)'s
+    /// function-over-block precedence (a function entry that deliberately shadows
+    /// its root block, or another block that already owns the address, is left
+    /// untouched).
+    pub fn rehome_block(&mut self, addr: u64, old: BlockId, new: BlockId) {
+        if self.targets.get(&addr) == Some(&AddressTarget::Block(old)) {
+            self.targets.insert(addr, AddressTarget::Block(new));
+        }
+    }
+
     /// Registers one address-bearing entity during module construction.
     ///
     /// A function and one of its own blocks may intentionally share an entry

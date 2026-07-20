@@ -1009,13 +1009,21 @@ impl<'str> Context<'str> {
             self.add_cfg_edge(new_from, new_to);
         }
 
-        // Phase 4: move each block's machine address onto its clone.
+        // Phase 4: move each block's machine address onto its clone, and re-point
+        // the address index at the clone in place. We know exactly which addresses
+        // moved and where, so this replaces a full `addresses.refresh(self)`
+        // (O(all blocks + all functions)) with an O(moved blocks) update — the
+        // per-split cost that otherwise made lifting quadratic in the grown IR.
         for &old in olds {
             let Some(addr) = self.block(old).address else {
                 continue;
             };
             let new = block_map[&old];
             let extra = self.block(old).extra_addresses.clone();
+            addresses.rehome_block(addr, old, new);
+            for &e in &extra {
+                addresses.rehome_block(e, old, new);
+            }
             self.block_mut(new).extra_addresses = extra;
             self.block_mut(new).address = Some(addr);
         }
@@ -1029,7 +1037,6 @@ impl<'str> Context<'str> {
         // Phase 6: rebuild `target`'s reverse-use map from its live instructions,
         // since phase 2 rewrote operands in place.
         self.rebuild_users(target);
-        addresses.refresh(self);
         block_map
     }
 
@@ -1139,6 +1146,73 @@ impl<'str> Context<'str> {
             Some(existing) => existing,
             None => FunctionBody::make_at_addr_indexed(self, addresses, addr, None).id,
         };
+
+        // Promote mid-tail landings to their own functions before carving the tail.
+        // A *retained* block (one outside the tail) that branches into the middle of
+        // the tail is, per strict-locality (ruling 2), a function boundary: that
+        // target is a distinct entry. If we left it in this tail the storage move
+        // below would relocate it out of the retained predecessor's arena while its
+        // `Branch` still named the old local index — a dangling terminator that a
+        // later pass dereferences as a dead block. Splitting at the landing first
+        // registers it as an entry, so the recursive split rewrites every
+        // predecessor branch (retained and in-tail) into a `TailCall`, and the tail
+        // walk below then stops at it cleanly. Iterated to a fixpoint because each
+        // promotion can expose another; it terminates because every promotion
+        // registers a new entry and so strictly shrinks future tails.
+        loop {
+            let tail_set: HashSet<BlockId> =
+                self.split_tail(addresses, block, g).into_iter().collect();
+            let mut promote: Option<BlockId> = None;
+            'scan: for b in self.block_ids() {
+                if tail_set.contains(&b) {
+                    // An in-tail predecessor moves with the tail — no boundary.
+                    continue;
+                }
+                let Some(mnemonic) = BasicBlock::from_id(self, b)
+                    .instructions()
+                    .last()
+                    .map(|t| t.mnemonic().clone())
+                else {
+                    continue;
+                };
+                let targets = match &mnemonic {
+                    Mnemonic::Branch(Branch { target, .. }) => vec![*target],
+                    Mnemonic::CBranch(CBranch {
+                        success_block,
+                        failure_block,
+                        ..
+                    }) => vec![*success_block, *failure_block],
+                    _ => vec![],
+                };
+                for t in targets {
+                    let tid = BlockId::new(b.func, t);
+                    // `block` itself is already handled by the terminator-rewrite
+                    // below (its retained callers become `TailCall(g)`); only
+                    // *mid*-tail landings need a fresh split.
+                    if tid == block || !tail_set.contains(&tid) {
+                        continue;
+                    }
+                    // Skip a landing whose own reach re-enters `block`: it shares an
+                    // SCC with the entry, so it is not a separable function and
+                    // cannot be carved off without relocating the entry itself.
+                    let reaches_entry = self
+                        .split_tail(addresses, tid, g)
+                        .iter()
+                        .any(|&r| r == block);
+                    if reaches_entry {
+                        continue;
+                    }
+                    promote = Some(tid);
+                    break 'scan;
+                }
+            }
+            match promote {
+                Some(tid) => {
+                    self.split_function_at_indexed(addresses, tid);
+                }
+                None => break,
+            }
+        }
 
         // The tail is computed on the pre-split CFG (cross-function edges intact) so
         // the reach walk is exact — matching the settle's `claimed_from`.
