@@ -1174,6 +1174,50 @@ pub(super) fn function_fingerprint(ctx: &Context, fun_id: FunctionId) -> u64 {
     fingerprint_display(FunctionRef::from_id(ctx, fun_id))
 }
 
+/// Cheap structural fingerprint of a function's clean IR, for the discovery loop's
+/// per-round `restrict` set (which functions changed since last round).
+///
+/// Hashes the arena content directly — block ids, addresses, params, and each
+/// instruction's id/opcode/operands/type/address, plus edges — instead of
+/// rendering the whole body to a `String` and scanning it like
+/// [`function_fingerprint`]. That render is the dominant per-round cost on large
+/// binaries (it runs for every function every round).
+///
+/// It deliberately does **not** normalize arena ids. Normalization exists so a
+/// body that churns its temporaries (mem2reg/gvn) fingerprints stably for cycle
+/// detection — but between discovery rounds `clean` is only *grown* by the lifting
+/// phase, never optimized, so an untouched function keeps byte-identical ids and
+/// hashes the same, while any lifted or split function changes ids (or content)
+/// and hashes differently. Raw ids are therefore both sufficient and cheaper here.
+pub(super) fn cheap_function_fingerprint(ctx: &Context, fun_id: FunctionId) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let body = FunctionBody::from_id(ctx, fun_id);
+    for block_id in body.block_ids() {
+        block_id.hash(&mut h);
+        let block = qcode::value::BasicBlock::from_id(ctx, block_id);
+        block.address().hash(&mut h);
+        for param in block.params() {
+            param.id().hash(&mut h);
+            param.type_id().hash(&mut h);
+        }
+        for insn in block.instructions() {
+            insn.id().hash(&mut h);
+            insn.mnemonic().opcode().hash(&mut h);
+            for arg in insn.mnemonic().args() {
+                arg.hash(&mut h);
+            }
+            insn.type_id().hash(&mut h);
+            insn.address().hash(&mut h);
+        }
+        for (_, succ) in block.successors() {
+            succ.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
 /// Hash a renderable value (a `FunctionRef` over *any* host), normalizing the
 /// arena ids that the render embeds so the result is *alpha-equivalent*: two
 /// structurally identical bodies fingerprint the same even if every temporary was

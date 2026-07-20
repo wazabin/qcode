@@ -432,7 +432,7 @@ fn lift_and_discover_until_quiet(
         let bodies: HashMap<FunctionId, u64> = clean
             .functions()
             .filter(|f| !f.is_external())
-            .map(|f| (f.id, config::function_fingerprint(clean, f.id)))
+            .map(|f| (f.id, config::cheap_function_fingerprint(clean, f.id)))
             .collect();
         let restrict: HashSet<FunctionId> = bodies
             .iter()
