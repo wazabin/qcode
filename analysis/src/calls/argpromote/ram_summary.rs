@@ -190,14 +190,20 @@ mod tests {
     /// int main(void)   { init(); hello(); return 0; }
     /// ```
     ///
-    /// `init` and `hello` run at the same stack depth, so `hello`'s
-    /// uninitialized `str` reads the slot `init`'s dead frame left behind —
+    /// Frame accounting: both are called from the same `main` call sites, so
+    /// their entry `@RSP` values are equal (each `call` pushes the return
+    /// address at the caller's `SP - 8`, giving both callees the same entry
+    /// SP; the return address itself sits at offset `0`). Each function's
+    /// prologue then writes the saved-`RBP` slot at `-0x8`; the `str` local
+    /// lives below the prologue at `-0x10`. `hello`'s prologue write at
+    /// `-0x8` is its *own* store (licensed, private), but its read of the
+    /// untouched `-0x10` observes the slot `init`'s dead frame left behind —
     /// on the machine, `hello` prints "Hello World!". A read of an own-frame
     /// slot *before* the function has written it therefore observes caller-
     /// visible state (a dead frame is still memory), refuting the freshness
-    /// hypothesis: `hello` must be ⊤, and `main` must keep both calls
-    /// blocking. `init` (write-only frame traffic) and a spill/reload
-    /// (read *after* own write) stay outward-invisible.
+    /// hypothesis: `hello` must be ⊤, and `main` — transitively — with it.
+    /// `init` (write-only frame traffic) and a spill/reload (read *after*
+    /// own write) stay outward-invisible.
     #[test]
     fn uninit_frame_read_refutes_freshness() {
         let mut tc = qcode::testing::TestContext::new();
@@ -207,13 +213,17 @@ mod tests {
             "
             fn init:
                 <init_entry @RSP:i64>
-                    %slot = @RSP - i64 0x8;
+                    %rbp_slot = @RSP - i64 0x8;
+                    store(ram:8, %rbp_slot <- i64 0x0);
+                    %slot = @RSP - i64 0x10;
                     store(ram:8, %slot <- i64 0x4010);
                     return at i64 0;
 
             fn hello:
                 <hello_entry @RSP:i64>
-                    %slot = @RSP - i64 0x8;
+                    %rbp_slot = @RSP - i64 0x8;
+                    store(ram:8, %rbp_slot <- i64 0x0);
+                    %slot = @RSP - i64 0x10;
                     %str = load(ram:8, %slot);
                     return at %str;
 
@@ -223,9 +233,24 @@ mod tests {
                     store(ram:8, %slot <- @v);
                     %r = load(ram:8, %slot);
                     return at %r;
+
+            fn entry:
+                <entry_1>
+                    call fn init();
+                <entry_2>
+                    call fn hello();
+                <entry_3>
+                    return at i64 0;
             "
         );
-        let _ = (init_entry, hello_entry, spill_entry);
+        let _ = (
+            init_entry,
+            hello_entry,
+            spill_entry,
+            entry_1,
+            entry_2,
+            entry_3,
+        );
         for fid in [init, hello, spill] {
             let pid = {
                 let f = qcode::value::FunctionBody::from_id(&tc.ctx, fid);
@@ -259,6 +284,10 @@ mod tests {
             !is_memory_free(&s, hello),
             "reading an own-frame slot before writing it observes the previous \
              dead frame — the freshness hypothesis is refuted, hello is ⊤"
+        );
+        assert!(
+            !is_memory_free(&s, entry),
+            "hello's refuted freshness must poison the composing caller too"
         );
     }
 
