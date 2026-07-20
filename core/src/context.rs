@@ -1214,8 +1214,8 @@ impl<'str> Context<'str> {
 
         // The tail is computed on the pre-split CFG (cross-function edges intact) so
         // the reach walk is exact — matching the settle's `claimed_from`.
-        let tail = self.split_tail(addresses, block, g);
-        let tail_set: HashSet<BlockId> = tail.iter().copied().collect();
+        let mut tail = self.split_tail(addresses, block, g);
+        let mut tail_set: HashSet<BlockId> = tail.iter().copied().collect();
 
         // Every function that currently owns a tail block loses those blocks; record
         // them so their `instruction_addrs` can be rebuilt afterwards.
@@ -1312,6 +1312,18 @@ impl<'str> Context<'str> {
             (self).builder(tramp).push_tail_call(callee);
             self.add_cfg_edge(owner_block, tramp);
 
+            // A trampoline is a fresh block of `owner`'s arena. When its
+            // predecessor is a *tail* block (about to relocate into `g`), the
+            // trampoline must relocate with it: otherwise the storage move below
+            // rewrites the predecessor's arm to a tramp that stays behind in the
+            // old arena — a dangling terminator target dereferenced later. Join
+            // it to the moved set (its `TailCall` names a function, not a block,
+            // so it carries no intra-tail reference to remap).
+            if tail_set.contains(&owner_block) {
+                tail.push(tramp);
+                tail_set.insert(tramp);
+            }
+
             let Mnemonic::CBranch(mut cb) = self.instruction(insn).mnemonic().clone() else {
                 continue;
             };
@@ -1332,13 +1344,24 @@ impl<'str> Context<'str> {
         // reach walk already stopped at these boundaries, so removing them cannot
         // change ownership — it only closes each function's graph over its own
         // blocks (a precondition of the storage relocation below).
+        // Owner of a block during the move: `g` for any block in the (now
+        // trampoline-augmented) moved set, else its storing arena. Inlined rather
+        // than reusing the `effective_owner` closure so `tail_set` is free to have
+        // grown trampolines above (the closure borrows it immutably).
+        let moved_owner = |candidate: BlockId| {
+            if tail_set.contains(&candidate) {
+                g
+            } else {
+                candidate.func
+            }
+        };
         let mut stale: HashSet<(FunctionId, EdgeId)> = HashSet::default();
         for &b in &tail {
             for edge in self.block(b).edges.iter().copied() {
                 let &EdgeData { from, to } = self.edge(b.func, edge);
                 let from = BlockId::new(b.func, from);
                 let to = BlockId::new(b.func, to);
-                let cross = effective_owner(self, from) != effective_owner(self, to);
+                let cross = moved_owner(from) != moved_owner(to);
                 let touches_tail = tail_set.contains(&from) || tail_set.contains(&to);
                 if cross && touches_tail {
                     stale.insert((b.func, edge));
