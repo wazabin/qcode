@@ -88,7 +88,19 @@ pub fn cabi_abi_target(os: TargetOs, bits: u8) -> cabi::AbiTarget {
 /// Maximum checkpoint+replay rounds the overrides-aware driver attempts before
 /// giving up with [`PipelineError::NoConvergence`].
 const MAX_OVERRIDE_ROUNDS: usize = 5;
+/// Fallback analyze/lift round cap, used only when the driver has no wall-clock
+/// deadline ([`PipelineServices::deadline`], e.g. on wasm). With a deadline the
+/// rounds are unbounded in count and bounded in time instead.
 const MAX_ANALYZE_LIFT_ROUNDS: usize = 100;
+
+/// True when the driver's budget is exhausted: past the wall-clock deadline, or
+/// past the fallback round cap when no deadline is set.
+fn out_of_budget(deadline: Option<std::time::Instant>, round: usize) -> bool {
+    match deadline {
+        Some(d) => std::time::Instant::now() >= d,
+        None => round >= MAX_ANALYZE_LIFT_ROUNDS,
+    }
+}
 
 /// Failure modes of [`analyze_with_overrides_with_progress`].
 #[derive(Debug, Clone)]
@@ -343,8 +355,9 @@ pub fn analyze_with_progress<'s>(
     // The persistent clean IR. Only the lifting passes mutate it; it grows
     // monotonically across discovery rounds.
     let mut clean = baseline.clone();
+    let deadline = services.deadline;
     let mut discovery_round = 0usize;
-    for _ in 0..MAX_ANALYZE_LIFT_ROUNDS {
+    loop {
         let converged = lift_and_discover_until_quiet(
             &mut clean,
             cfg,
@@ -358,8 +371,20 @@ pub fn analyze_with_progress<'s>(
         let mut analyzed =
             run_analysis_fixpoint(&clean, cfg, pipeline, &binary, overrides, &mut progress)?;
         // Stop on a clean fixpoint, or bail out best-effort if lifting could not
-        // converge (round cap / error) — never panic on input-dependent paths.
+        // converge (budget / error) — never panic on input-dependent paths.
         if !converged || analyzed.has_no_discoveries() {
+            progress(PipelineProgress::Finished);
+            return Ok(analyzed);
+        }
+
+        // Budget check *after* the analysis so the returned context is always an
+        // analyzed view of the most-grown IR; no further optimization round runs.
+        if out_of_budget(deadline, discovery_round) {
+            log::warn!(
+                target: "pipeline",
+                "analyze/lift budget exhausted after {discovery_round} rounds; returning best-effort analysis of the most-grown IR ({} pending discoveries)",
+                analyzed.discoveries().count(),
+            );
             progress(PipelineProgress::Finished);
             return Ok(analyzed);
         }
@@ -368,15 +393,6 @@ pub fn analyze_with_progress<'s>(
             clean.discover(discovery);
         }
     }
-
-    log::warn!(
-        target: "pipeline",
-        "analyze/lift did not converge after {MAX_ANALYZE_LIFT_ROUNDS} rounds; returning best-effort analysis of the most-grown IR ({} pending discoveries)",
-        clean.discoveries().count(),
-    );
-    let analyzed = run_analysis_fixpoint(&clean, cfg, pipeline, &binary, overrides, &mut progress)?;
-    progress(PipelineProgress::Finished);
-    Ok(analyzed)
 }
 
 /// Grow the clean IR until address discovery is quiet for this analysis round.
@@ -399,10 +415,11 @@ fn lift_and_discover_until_quiet(
     // thousands of functions to find a few addresses into one that touches only those.
     let mut prev_bodies: HashMap<FunctionId, u64> = HashMap::default();
     loop {
-        if *discovery_round >= MAX_ANALYZE_LIFT_ROUNDS {
+        if out_of_budget(services.deadline, *discovery_round) {
             log::warn!(
                 target: "pipeline",
-                "lift/discover hit the {MAX_ANALYZE_LIFT_ROUNDS}-round cap; stopping best-effort with {} pending discoveries",
+                "lift/discover budget exhausted after {} rounds; stopping best-effort with {} pending discoveries",
+                *discovery_round,
                 clean.discoveries().count(),
             );
             return false;

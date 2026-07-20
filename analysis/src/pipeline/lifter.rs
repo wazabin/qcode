@@ -12,17 +12,32 @@ use qcode::{
 
 pub struct PipelineServices<'a> {
     pub lifter: Option<&'a mut dyn Lifter>,
+    /// Wall-clock deadline for the analyze/lift driver. Once it passes, no new
+    /// discovery or optimization round starts: the driver returns the analysis
+    /// of the most-grown IR best-effort (pending discoveries stay queued).
+    /// `None` falls back to the fixed round cap (wasm has no monotonic clock).
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl<'a> PipelineServices<'a> {
     pub fn none() -> Self {
-        Self { lifter: None }
+        Self {
+            lifter: None,
+            deadline: None,
+        }
     }
 
     pub fn with_lifter(lifter: &'a mut dyn Lifter) -> Self {
         Self {
             lifter: Some(lifter),
+            deadline: None,
         }
+    }
+
+    /// Set the wall-clock deadline (see [`PipelineServices::deadline`]).
+    pub fn with_deadline(mut self, deadline: Option<std::time::Instant>) -> Self {
+        self.deadline = deadline;
+        self
     }
 }
 
