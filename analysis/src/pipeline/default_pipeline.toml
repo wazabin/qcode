@@ -428,6 +428,16 @@ scope = "function"
 passes = ["gvn", "dead_store", "dce"]
 repeat_until = "no_change"
 
+# Re-run CRT-main discovery on fully normalized IR. This is required for i386
+# PIE startup, where `_start` computes the stack-passed main pointer through a
+# get-PC thunk and it becomes a literal only after late register/stack
+# forwarding. The outer analyze/lift loop feeds the stable-address discovery
+# back to the clean lifter on the next round.
+[[stage]]
+name = "discover-crt-main-normalized"
+scope = "module"
+passes = ["discover_libc_main"]
+
 # Second struct-typing pass: the early one (above) runs right after the first
 # `gvn`, before late forwarding has assembled offsets built from overlapping
 # partial stores into single constants. Now that `final-canonicalize` has folded

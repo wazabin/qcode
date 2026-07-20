@@ -630,6 +630,20 @@ pub(super) fn materialize<'str>(
 type AffineDecomposition = (usize, u64, Vec<(ValueId, u64)>);
 
 impl Numbering {
+    /// Return a value proven to be a constant by its affine normal form.
+    ///
+    /// This complements direct literal inspection for analysis passes that run
+    /// after constants have been carried through arithmetic SSA values but
+    /// before those values are materialized back into literal operands.
+    pub(crate) fn constant_value(&self, v: ValueId) -> Option<u64> {
+        match self.forms.get(&v)? {
+            NormalForm::Affine {
+                constant, terms, ..
+            } if terms.is_empty() => Some(*constant),
+            _ => None,
+        }
+    }
+
     /// Record the arithmetic view of `id` so consumers can compose it.
     pub(super) fn record_form(&mut self, id: ValueId, form: NormalForm) {
         self.forms.insert(id, form);
