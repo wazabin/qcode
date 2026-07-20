@@ -1673,6 +1673,78 @@ mod tests {
         );
     }
 
+    /// Stage 2a of the RAM effects migration: a callee whose only memory access
+    /// is in its own function-private (shadow) space has no caller-observable
+    /// effect, so a caller that keeps a call to it can still shadow-promote its
+    /// own pointer params. The legacy gate blocked on *any* callee load/store —
+    /// a freshly promoted callee (accesses redirected into shadow, not yet
+    /// DCE'd) kept its callers unpromotable for a whole extra pipeline round.
+    #[test]
+    fn private_space_callee_does_not_block_caller_promotion() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn h:
+                <h_entry>
+                    return at i64 0;
+
+            fn f:
+                <f_entry @p:i64>
+                    store(ram:4, @p <- i32 9);
+                    goto <f_call>;
+                <f_call>
+                    call <h>;
+                <f_cont>
+                    return at i64 0;
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (h_entry, f_entry, g_entry, g);
+
+        // Give `h` a shadow-style access: a store into a body-local temp space.
+        let shadow = tc.ctx.bodies[h].push_temp_space(qcode::value::TempSpace::new(
+            Some("test_shadow"),
+            1,
+            8,
+        ));
+        let shadow = qcode::space::LocalMemorySpaceId::Temp(shadow.local);
+        let h_root = FunctionBody::from_id(&tc.ctx, h).root().unwrap().id;
+        let mut b = (&mut tc.ctx).builder(h_root);
+        b.set_insert_point_to_start();
+        let addr = b.shr().get_const(0x10, 8);
+        let val = b.shr().get_const(0x1, 4);
+        b.push_store(val, addr, shadow);
+
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
+            qcode::value::FunctionEffects::Materialized(
+                qcode::value::RegisterInterfaceMap::default(),
+            ),
+        );
+        set_call(&mut tc, f_call, h, vec![]);
+        tc.ctx.add_cfg_edge(f_call, f_cont);
+        let p_arg = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, g_call, f, vec![p_arg]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(
+            argpromote_with_sp(&mut tc.ctx, None),
+            "the private-space callee must not block f's promotion"
+        );
+        assert_eq!(
+            register_writeset_len(&tc, f),
+            Some(2),
+            "f's caller-pointer write must surface in the returned write-set"
+        );
+    }
+
     /// Regression: when the register channel has **already typed** the call result
     /// to its (smaller) register-only write-set, appending the memory pairs *grows*
     /// that aggregate. The caller retype must use the resizing setter — a plain

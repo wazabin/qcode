@@ -27,13 +27,13 @@ use super::arg_index_of;
 /// Recognises this function's own stack-frame locals (`@SP`-rooted slots below the
 /// entry stack pointer). Inert when there is no stack-pointer register or no
 /// incoming `@SP` param, in which case [`OwnFrame::is_local`] is always `false`.
-struct OwnFrame {
+pub(super) struct OwnFrame {
     sp_param: Option<ValueId>,
     numbering: Numbering,
 }
 
 impl OwnFrame {
-    fn new(ctx: &Context, fid: FunctionId, sp_reg: Option<VarnodeId>) -> Self {
+    pub(super) fn new(ctx: &Context, fid: FunctionId, sp_reg: Option<VarnodeId>) -> Self {
         let sp_param =
             sp_reg.and_then(|r| incoming_sp_param(qcode::value::ModuleView::new(ctx), fid, r));
         Self {
@@ -44,7 +44,7 @@ impl OwnFrame {
 
     /// Whether `addr` points into this function's own frame (classified
     /// [`FrameClass::Local`]).
-    fn is_local(&self, ctx: &Context, addr: ValueId) -> bool {
+    pub(super) fn is_local(&self, ctx: &Context, addr: ValueId) -> bool {
         self.sp_param.is_some_and(|sp| {
             frame_class(
                 qcode::value::ModuleView::new(ctx),
@@ -112,7 +112,7 @@ fn argpromote_changed_functions_with_sp(
     // memory-free within this run, so the pre-solved answer stays valid; a
     // freshly promoted callee unblocks its callers on the pipeline's next
     // round, after cleanup drops its shadow accesses, exactly as before.)
-    let ram_summaries = super::ram_summary::solve(ctx, graph);
+    let ram_summaries = super::ram_summary::solve(ctx, graph, sp_reg);
     // Callee-before-caller order kept for the apply side: a promoted callee's
     // call-site rewrites land before its caller is visited. One visit per
     // function (no fixpoint), so an already-promoted body is never re-promoted.
