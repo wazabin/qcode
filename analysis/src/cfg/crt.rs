@@ -402,6 +402,7 @@ mod tests {
             abi: CallingConvention::default(),
             os: qcode::context::TargetOs::Unknown,
             bitness: 32,
+            assume_calling_convention: false,
         };
         let env = PipelineEnv::from_parts(cfg, tc.r3);
 
