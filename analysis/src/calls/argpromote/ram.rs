@@ -55,6 +55,21 @@ impl OwnFrame {
         })
     }
 
+    /// The stable slot key of an own-frame local: `addr`'s constant offset from
+    /// the incoming `@SP`, if `addr` is a plain `@SP - k` local. `None` for
+    /// non-locals *and* for realigned-base locals (`@SP & -mask` has no stable
+    /// `@SP`-relative offset, so such a slot can never license a read).
+    pub(super) fn local_offset(&self, ctx: &Context, addr: ValueId) -> Option<i64> {
+        let sp = self.sp_param?;
+        let off = crate::stack::frame::frame_offset(
+            qcode::value::ModuleView::new(ctx),
+            &self.numbering,
+            sp,
+            addr,
+        )?;
+        (off < 0).then_some(off)
+    }
+
     /// Whether `addr` is any `@SP`-rooted frame slot — an own-frame local or a
     /// caller-frame slot (`@SP + k`, `k ≥ 0`).
     fn is_frame_slot(&self, ctx: &Context, addr: ValueId) -> bool {

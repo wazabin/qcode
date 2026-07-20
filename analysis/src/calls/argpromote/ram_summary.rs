@@ -59,22 +59,45 @@ impl EffectChannel for RamChannel {
         // classifier is the expensive part.
         let mut own_frame: Option<OwnFrame> = None;
         for block in FunctionBody::from_id(ctx, fid).blocks() {
+            // Own-frame slots this block has stored to, in program order. A
+            // load of an own-frame local is private only *after* the function
+            // itself wrote that slot; a read of the slot's pre-call contents
+            // observes whatever dead frame last occupied those bytes (the
+            // classic uninitialized-local idiom reading a prior callee's
+            // frame), which refutes the freshness hypothesis for this
+            // function — ⊤. Per-block, exact `(offset, size)` licensing: a
+            // cross-block or overlapping-width reload stays ⊤, conservative.
+            let mut stored: rustc_hash::FxHashSet<(i64, usize)> = Default::default();
             for insn in block.iter() {
-                let (space, ptr) = match insn.mnemonic() {
-                    Mnemonic::Load(l) => (l.space, l.ptr),
-                    Mnemonic::Store(s) => (s.space, s.ptr),
+                let (space, ptr, size, is_store) = match insn.mnemonic() {
+                    Mnemonic::Load(l) => (l.space, l.ptr, l.size, false),
+                    Mnemonic::Store(s) => (s.space, s.ptr, s.size, true),
                     _ => continue,
                 };
                 // Function-private (shadow/temp) space: outward-invisible.
                 if space.shared().is_none() {
                     continue;
                 }
-                // Own-frame local in a shared ram space: outward-invisible.
                 // Register accesses, caller-frame slots, and every other
-                // shared-space access are caller-observable — ⊤.
+                // shared-space access are caller-observable — ⊤. Own-frame
+                // locals are invisible when written, and when read back after
+                // a write; a read of frame pre-state is ⊤ (see above).
                 let frame = own_frame.get_or_insert_with(|| OwnFrame::new(ctx, fid, self.sp));
-                if !frame.is_local(ctx, ptr.qualify(insn.id.func)) {
+                let ptr = ptr.qualify(insn.id.func);
+                if !frame.is_local(ctx, ptr) {
                     return None;
+                }
+                if is_store {
+                    if let Some(off) = frame.local_offset(ctx, ptr) {
+                        stored.insert((off, size));
+                    }
+                } else {
+                    let licensed = frame
+                        .local_offset(ctx, ptr)
+                        .is_some_and(|off| stored.contains(&(off, size)));
+                    if !licensed {
+                        return None;
+                    }
                 }
             }
         }
@@ -157,6 +180,86 @@ mod tests {
         assert!(!is_memory_free(&s, leaf));
         assert!(!is_memory_free(&s, mid));
         assert!(is_memory_free(&s, pure));
+    }
+
+    /// The uninitialized-local idiom that falsifies own-frame freshness:
+    ///
+    /// ```c
+    /// void init(void)  { char *str = "Hello World!\n"; return; }
+    /// void hello(void) { char *str; printf(str); return; }
+    /// int main(void)   { init(); hello(); return 0; }
+    /// ```
+    ///
+    /// `init` and `hello` run at the same stack depth, so `hello`'s
+    /// uninitialized `str` reads the slot `init`'s dead frame left behind —
+    /// on the machine, `hello` prints "Hello World!". A read of an own-frame
+    /// slot *before* the function has written it therefore observes caller-
+    /// visible state (a dead frame is still memory), refuting the freshness
+    /// hypothesis: `hello` must be ⊤, and `main` must keep both calls
+    /// blocking. `init` (write-only frame traffic) and a spill/reload
+    /// (read *after* own write) stay outward-invisible.
+    #[test]
+    fn uninit_frame_read_refutes_freshness() {
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        qcode!(
+            tc.ctx,
+            "
+            fn init:
+                <init_entry @RSP:i64>
+                    %slot = @RSP - i64 0x8;
+                    store(ram:8, %slot <- i64 0x4010);
+                    return at i64 0;
+
+            fn hello:
+                <hello_entry @RSP:i64>
+                    %slot = @RSP - i64 0x8;
+                    %str = load(ram:8, %slot);
+                    return at %str;
+
+            fn spill:
+                <spill_entry @RSP:i64 @v:i64>
+                    %slot = @RSP - i64 0x8;
+                    store(ram:8, %slot <- @v);
+                    %r = load(ram:8, %slot);
+                    return at %r;
+            "
+        );
+        let _ = (init_entry, hello_entry, spill_entry);
+        for fid in [init, hello, spill] {
+            let pid = {
+                let f = qcode::value::FunctionBody::from_id(&tc.ctx, fid);
+                let p = f
+                    .root()
+                    .unwrap()
+                    .params()
+                    .find(|p| p.name() == Some("RSP"))
+                    .unwrap();
+                match p.id() {
+                    qcode::value::ValueId::BlockParam(pid) => pid,
+                    _ => unreachable!(),
+                }
+            };
+            tc.ctx
+                .block_param_mut(pid)
+                .set_origin_id(qcode::value::ValueId::Varnode(sp).localize(pid.func));
+        }
+
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, Some(sp));
+        assert!(
+            is_memory_free(&s, init),
+            "a write-only own frame is dead on exit — outward-invisible"
+        );
+        assert!(
+            is_memory_free(&s, spill),
+            "a spill/reload (read after own write) is private frame traffic"
+        );
+        assert!(
+            !is_memory_free(&s, hello),
+            "reading an own-frame slot before writing it observes the previous \
+             dead frame — the freshness hypothesis is refuted, hello is ⊤"
+        );
     }
 
     /// Stage 2a: accesses in a function-private (shadow/temp) space are
