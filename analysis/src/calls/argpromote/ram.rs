@@ -104,9 +104,17 @@ fn argpromote_changed_functions_with_sp(
     // stays valid across the loop: promotion threads only data values, never adding
     // a `ValueId::Function` operand. See [`super::address_taken_set`].
     let address_taken = super::address_taken_set(ctx);
-    // Callee-before-caller order: a function may keep a call to a memory-free
-    // callee (see [`function_makes_blocking_call`]), and that callee must already
-    // be promoted — its own loads gone — for the caller to qualify. One visit per
+    // A caller may keep a call only to a transitively memory-free callee (see
+    // [`function_makes_blocking_call`]). That fact is solved on the effect
+    // engine *before* any mutation, so the gate is independent of the visit
+    // order below. (The sweep's own mutations — global slot growth, access
+    // redirection into shadow — never make a memory-touching function
+    // memory-free within this run, so the pre-solved answer stays valid; a
+    // freshly promoted callee unblocks its callers on the pipeline's next
+    // round, after cleanup drops its shadow accesses, exactly as before.)
+    let ram_summaries = super::ram_summary::solve(ctx, graph);
+    // Callee-before-caller order kept for the apply side: a promoted callee's
+    // call-site rewrites land before its caller is visited. One visit per
     // function (no fixpoint), so an already-promoted body is never re-promoted.
     let order = callee_first_order(ctx, graph);
     for fid in order {
@@ -126,7 +134,7 @@ fn argpromote_changed_functions_with_sp(
             changed.insert(fid);
             changed.extend(callers.iter().copied());
         }
-        if try_promote(ctx, fid, sp_reg, &address_taken, graph) {
+        if try_promote(ctx, fid, sp_reg, &address_taken, graph, &ram_summaries) {
             changed.insert(fid);
             changed.extend(callers);
         }
@@ -231,6 +239,7 @@ fn try_promote(
     sp_reg: Option<VarnodeId>,
     address_taken: &FxHashSet<FunctionId>,
     graph: &crate::CallGraph,
+    ram_summaries: &super::summary::EffectSummaries<super::ram_summary::RamChannel>,
 ) -> bool {
     let f = FunctionBody::from_id(ctx, fid);
     if f.is_external() {
@@ -289,11 +298,11 @@ fn try_promote(
 
     // A call composes with our shadow promotion only if it is fully inert toward
     // memory: a *direct* call, with no clobbers (writes nothing the caller sees),
-    // to a callee that reads no memory (so it cannot dereference any promoted
-    // pointer we hand it, and there is no read/write alias with our shadow). Any
-    // other call — indirect, clobbering, or memory-reading — would have to bubble
-    // its effects through ours, which is out of scope; bail.
-    if function_makes_blocking_call(ctx, fid) {
+    // to a callee that is *transitively* memory-free (so nothing it reaches can
+    // dereference a promoted pointer we hand it, or alias our shadow). Any
+    // other call — indirect, clobbering, or memory-reaching — would have to bubble
+    // its effects through ours, which stage 2's rebasing transfer will do; bail.
+    if function_makes_blocking_call(ctx, fid, ram_summaries) {
         return false;
     }
 
@@ -586,36 +595,33 @@ fn regions_disjoint(
     })
 }
 
-/// `true` if `function_id` makes any call (direct or indirect).
-fn function_makes_blocking_call(ctx: &Context, function_id: FunctionId) -> bool {
+/// `true` if `function_id` makes any call this promotion cannot compose with.
+/// A body walk (not an edge walk) so an *unresolved* direct call — which never
+/// makes a [`CallGraph`] edge — still blocks. The callee verdict comes from the
+/// pre-solved [`super::ram_summary`] fixpoint: a memory-free callee cannot
+/// dereference a pointer passed to it — for reading *or writing* — anywhere in
+/// its call tree, so handing it a promoted pointer is safe (nothing it reaches
+/// can observe our shadow, alias it, or mutate a promoted address behind it).
+fn function_makes_blocking_call(
+    ctx: &Context,
+    function_id: FunctionId,
+    ram_summaries: &super::summary::EffectSummaries<super::ram_summary::RamChannel>,
+) -> bool {
     FunctionBody::from_id(ctx, function_id).blocks().any(|b| {
         b.iter().any(|i| match i.mnemonic() {
             // Indirect transfers: target unknown, cannot vet.
             Mnemonic::CallInd(_) => true,
-            // A direct call is inert iff it clobbers nothing and the callee
-            // touches no memory; otherwise its effects would have to bubble
-            // through ours.
+            // A direct call is inert iff it clobbers nothing and the callee is
+            // transitively memory-free; otherwise its effects would have to
+            // bubble through ours.
             Mnemonic::Call(c) => {
                 !c.clobbers.is_empty()
-                    || c.target
-                        .real()
-                        .is_none_or(|target| function_accesses_memory(ctx, target))
+                    || !c.target.real().is_some_and(|target| {
+                        super::ram_summary::is_memory_free(ram_summaries, target)
+                    })
             }
             _ => false,
         })
-    })
-}
-
-/// `true` if `function_id`'s body contains any memory access (**load or store**).
-/// A memory-free callee cannot dereference a pointer passed to it — for reading
-/// *or writing* — so handing it a promoted pointer is safe (it can neither observe
-/// our shadow, alias it, nor mutate a promoted address behind it). A store *is* a
-/// dereference, so checking loads alone would let a store-only callee silently
-/// write a promoted address our shadow no longer maintains.
-fn function_accesses_memory(ctx: &Context, function_id: FunctionId) -> bool {
-    FunctionBody::from_id(ctx, function_id).blocks().any(|b| {
-        b.iter()
-            .any(|i| matches!(i.mnemonic(), Mnemonic::Load(_) | Mnemonic::Store(_)))
     })
 }
 

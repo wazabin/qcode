@@ -67,6 +67,7 @@ use super::{append_entry_param, interface::append_entry_param_at_sites};
 mod globals;
 mod mark_pure;
 mod ram;
+mod ram_summary;
 mod reg_summary;
 mod registers;
 mod stack_args;

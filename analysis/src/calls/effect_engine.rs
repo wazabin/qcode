@@ -106,6 +106,13 @@ impl<C: EffectChannel> EffectSummaries<C> {
     pub(crate) fn get(&self, fid: FunctionId) -> &Summary<C::Effects> {
         &self.map[&fid]
     }
+
+    /// The solved summary for `fid`, or `None` for a function outside the
+    /// snapshot the summaries were solved on (e.g. a call target discovered
+    /// by a mutation after the solve).
+    pub(crate) fn try_get(&self, fid: FunctionId) -> Option<&Summary<C::Effects>> {
+        self.map.get(&fid)
+    }
 }
 
 /// Solve the channel's effect summaries for the whole program to a fixpoint.
