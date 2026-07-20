@@ -43,6 +43,12 @@ use crate::{Pass, PipelineEnv, value_range::value_range};
 /// turning into millions of bogus edges.
 const MAX_TABLE_ENTRIES: u64 = 4096;
 
+/// Minimum length of a recovered run for a full-sub-word index (see
+/// `resolve_block`). A real dispatch table over an unbounded byte index has many
+/// entries; requiring at least a short run keeps a lone coincidental code-pointer
+/// in adjacent data from being mistaken for a one- or two-case table.
+const MIN_RECOVERED_RUN: usize = 2;
+
 pub struct HandleJumpTables;
 
 impl Default for HandleJumpTables {
@@ -559,17 +565,19 @@ fn resolve_block(mut block: BlockMutRef, binary: &dyn binfmt::BinaryFormat) -> O
         range.min,
     );
 
-    // A full-sub-word range like `[0, 255]` (a zero-extended byte index with no
-    // dominating `idx < N` guard) carries no bound beyond the value's own width.
-    // We still attempt it: control-flow-flattening obfuscators dispatch through
-    // exactly this shape (`jmp table[zext(al) * 4]`) over a genuinely full 256-way
-    // table, and resolving it is the only way to reach the flattened handlers.
-    // The safety net is the per-slot check below — every entry must map to
-    // executable memory or the whole table is rejected — so a byte index over a
-    // table that is *not* really 256-wide bails on the first non-code slot rather
-    // than materializing bogus edges. Only a genuinely unbounded index (Top for
-    // its own declared width) or an over-large table is refused up front.
-    if !range.is_bounded(index_size) || range.count() > MAX_TABLE_ENTRIES {
+    // Whether the index range is merely the value's own sub-word width — e.g.
+    // `[0, 255]` for a zero-extended byte with no dominating `idx < N` guard. Such
+    // a range is not a real table-size bound (value-range just couldn't do better
+    // than the type), so the true length is recovered below by scanning the
+    // leading run of valid slots rather than trusting `range.max`.
+    let full_width = range.fills_containing_width();
+
+    // A genuinely unbounded index (Top for its own declared width) or an
+    // over-large range carries no usable bound and is refused up front. A
+    // full-sub-word range is kept: control-flow-flattening obfuscators dispatch
+    // through exactly that shape (`jmp table[zext(al) * 4]`), and its real size is
+    // recovered by the run scan.
+    if (!full_width && !range.is_bounded(index_size)) || range.count() > MAX_TABLE_ENTRIES {
         log::debug!(target: "jump_table", "skipping unbounded or huge table: range {range:?}");
         return None;
     }
@@ -579,41 +587,53 @@ fn resolve_block(mut block: BlockMutRef, binary: &dyn binfmt::BinaryFormat) -> O
         ValueRef::from_id(ctx, table.index),
     );
 
-    // Materialize one edge per index value. Bail on the whole table if any slot
-    // is unmapped or points outside executable memory — a partial resolution
-    // would leave a misleading CFG.
+    // Materialize one edge per index value. For a precise (guard-derived) range an
+    // invalid slot is a real hole that invalidates the whole table. For a
+    // full-sub-word range the leading run of valid slots *is* the recovered table:
+    // stop at the first invalid slot, which marks its end (see the header TODO).
     let mut resolved: Vec<Edit> = Vec::new();
     for index in range.min..=range.max {
         let entry_addr = table.base.wrapping_add(index.wrapping_mul(table.scale));
 
-        // A table in writable memory is not trustworthy data (see
-        // `resolve_constant_load`); bail on the whole table rather than resolve
-        // against bytes the runtime may rewrite.
-        if binary.is_known_writable(entry_addr) {
-            log::debug!(target: "jump_table", "skipping table: entry {entry_addr:x} is writable");
-            return None;
-        }
+        // Read-only validity of this slot: a writable slot (the runtime may
+        // rewrite it — see `resolve_constant_load`), an unmapped slot, or one
+        // whose target is not executable is not a real table entry. Determined
+        // before installing any immutability assumption, so a run-recovery break
+        // never pins immutability on the terminator slot.
+        let entry_target = if binary.is_known_writable(entry_addr) {
+            None
+        } else {
+            binary
+                .read_uint(entry_addr, table.slot_width)
+                .map(|raw| match table.relative_base {
+                    Some(base) => base.wrapping_add(sign_extend(raw, table.slot_width)),
+                    None => raw,
+                })
+                .filter(|&target| binary.is_executable(target))
+        };
 
+        let Some(target) = entry_target else {
+            if full_width && resolved.len() >= MIN_RECOVERED_RUN {
+                log::debug!(
+                    target: "jump_table",
+                    "recovered {}-entry table (run ended at slot {index} @ {entry_addr:x})",
+                    resolved.len(),
+                );
+                break;
+            }
+            log::debug!(target: "jump_table", "skipping table: slot {entry_addr:x} invalid");
+            return None;
+        };
+
+        // Commit the slot: pin its bytes immutable so the resolution is replay-safe.
         if !block.ctx_mut().assume_true(Proposition::ImmutableMemory {
             addr: entry_addr,
             size: table.slot_width as u8,
         }) {
+            if full_width && resolved.len() >= MIN_RECOVERED_RUN {
+                break;
+            }
             log::debug!(target: "jump_table", "skipping table: entry {entry_addr:x} not immutable");
-            return None;
-        }
-
-        let Some(raw) = binary.read_uint(entry_addr, table.slot_width) else {
-            log::debug!(target: "jump_table", "skipping table: slot {entry_addr:x} unmapped");
-            return None;
-        };
-
-        let target = match table.relative_base {
-            Some(base) => base.wrapping_add(sign_extend(raw, table.slot_width)),
-            None => raw,
-        };
-
-        if !binary.is_executable(target) {
-            log::debug!(target: "jump_table", "skipping table: target {target:x} not executable");
             return None;
         }
 

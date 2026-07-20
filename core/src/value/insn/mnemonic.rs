@@ -2,7 +2,7 @@ use crate::value::{
     LocalValueId,
     function::FunctionId,
     insn::{
-        Apply, Assert, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract,
+        Apply, Assert, BadInsn, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract,
         FloatToFloat, FloatToInt, Gep, IntToFloat, IntrinsicApp, IsFloatNaN, Load, LzCount, Map,
         PCodeOp, PopCount, Range, Return, ReturnValue, SBorrow, SCarry, Scan, Sext, Store,
         TailCall, Tuple, Unary, Zext,
@@ -49,7 +49,7 @@ pub trait MnemonicKind {
 /// | Variants | Category |
 /// |---|---|
 /// | [`Load`], [`Store`] | Memory access |
-/// | [`Branch`], [`CBranch`], [`BranchInd`], [`Call`], [`CallInd`], [`Return`], [`ReturnValue`] | Control flow (terminators) |
+/// | [`Branch`], [`CBranch`], [`BranchInd`], [`Call`], [`CallInd`], [`Return`], [`ReturnValue`], [`BadInsn`] | Control flow (terminators) |
 /// | [`Unop`](Mnemonic::Unop) | Unary integer/float/bool operations |
 /// | [`Binop`](Mnemonic::Binop) | Binary integer/float/bool operations |
 /// | [`Zext`], [`Sext`], [`Range`], [`IntToFloat`], [`FloatToInt`], [`FloatToFloat`] | Type casts and bit extraction |
@@ -83,6 +83,9 @@ pub enum Mnemonic {
     Return(Return),
     /// Value return from a lambda function.
     ReturnValue(ReturnValue),
+    /// Bytes that do not decode to a valid instruction. A terminator with no
+    /// successors (see [`BadInsn`]).
+    BadInsn(BadInsn),
     /// A unary integer, float, or boolean operation.
     Unop(Unary),
     /// A binary integer, float, or boolean operation.
@@ -178,6 +181,7 @@ impl Mnemonic {
             Mnemonic::CallInd(m) => m,
             Mnemonic::Return(m) => m,
             Mnemonic::ReturnValue(m) => m,
+            Mnemonic::BadInsn(m) => m,
             Mnemonic::Range(m) => m,
             Mnemonic::Unop(m) => m,
             Mnemonic::Binop(m) => m,
@@ -342,6 +346,8 @@ impl Mnemonic {
                     m.value = new;
                 }
             }
+            // No operands to rewrite.
+            Mnemonic::BadInsn(_) => {}
             Mnemonic::Unop(m) => {
                 if m.src == old {
                     m.src = new;

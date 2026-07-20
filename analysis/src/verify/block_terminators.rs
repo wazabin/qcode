@@ -15,15 +15,22 @@ pub(crate) fn verify_block_terminators_scoped(
 ) -> Vec<String> {
     let mut out = Vec::new();
     for fid in scope.function_ids(ctx) {
-        for block in FunctionBody::from_id(ctx, fid).iter() {
+        let function = FunctionBody::from_id(ctx, fid);
+        let fname = function.name().to_owned();
+        for block in function.iter() {
+            // Name and address the block, not just its arena id: a bare
+            // `BlockId(153:2610)` says nothing about *which* block, and locating it
+            // otherwise means re-running the lift under a debugger.
+            let label = block.name().map(str::to_owned).unwrap_or_default();
+            let at = block
+                .address()
+                .map(|a| format!(" at {a:#x}"))
+                .unwrap_or_default();
+            let where_ = format!("fn `{fname}` block `{label}`{at} ({:?})", block.id);
             match block.iter().last() {
-                None => out.push(format!(
-                    "fn {fid:?} block {:?} is empty (no terminator)",
-                    block.id
-                )),
+                None => out.push(format!("{where_} is empty (no terminator)")),
                 Some(last) if !last.mnemonic().is_terminator() => out.push(format!(
-                    "fn {fid:?} block {:?} does not end in a terminator (last op: `{}`)",
-                    block.id,
+                    "{where_} does not end in a terminator (last op: `{}`)",
                     last.mnemonic().opcode()
                 )),
                 Some(_) => {}

@@ -313,6 +313,11 @@ pub enum Statement {
         value: TypedAtom,
         span: SourceSpan,
     },
+    /// Bytes that did not decode to a valid instruction; a terminator with no
+    /// successors and no operands.
+    BadInsn {
+        span: SourceSpan,
+    },
     Assert {
         condition: TypedAtom,
         span: SourceSpan,

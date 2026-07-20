@@ -304,6 +304,39 @@ impl MnemonicKind for ReturnValue {
     }
 }
 
+/// Control flow reached bytes that do not decode to a valid instruction.
+///
+/// A terminator with **no successors** — the analogue of LLVM's `unreachable`.
+/// It records an honest "we could not lift this" in the IR, so a failed decode
+/// neither aborts the lift nor leaves a block empty and terminator-less for a
+/// later pass to trip over. Dead-code elimination may prune a block ending here
+/// once nothing reaches it.
+///
+/// Scope is deliberately narrow: **invalid bytes only**. A block that is merely
+/// unlifted — a fall-through placeholder whose address a later discovery round
+/// may still fill — is a different situation and must not be stamped with this,
+/// or a healthy function would be poisoned mid-fixpoint.
+///
+/// Carries no payload: it is a marker, not a diagnostic. The reason a decode
+/// failed belongs in the lifter's log and stats, where it can be counted, rather
+/// than embedded in every rendered body.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct BadInsn;
+
+impl MnemonicKind for BadInsn {
+    fn opcode(&self) -> &'static str {
+        "badinsn"
+    }
+
+    fn is_terminator(&self) -> bool {
+        true
+    }
+
+    fn args(&self) -> Args {
+        smallvec![]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::value::QCodeMut;

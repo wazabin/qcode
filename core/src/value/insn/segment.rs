@@ -439,6 +439,12 @@ fn mnemonic_segments<'ctx, 'str: 'ctx>(
             }
             seg.punct(";");
         }
+        // No operands: the marker alone. Kept short so a run of unlifted padding
+        // stays readable.
+        Mnemonic::BadInsn(_) => {
+            seg.kw("badinsn");
+            seg.punct(";");
+        }
         Mnemonic::Return(r) => match r.value {
             Some(value) => {
                 seg.kw("return ");

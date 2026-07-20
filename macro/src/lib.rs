@@ -249,6 +249,8 @@ fn collect_statement(stmt: &Statement, names: &mut Names, local_temps: bool) {
             }
         }
         Statement::ReturnValue { value, .. } => collect_atom(value, names),
+        // Operand-less marker: no names to collect.
+        Statement::BadInsn { .. } => {}
         Statement::Assert { condition, .. } => collect_atom(condition, names),
         Statement::Commented { inner, .. } => collect_statement(inner, names, local_temps),
     }

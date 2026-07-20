@@ -21,7 +21,7 @@ label           =  { "<" ~ (ident | integer) ~ ">" }
 label_decl      =  { "<" ~ (ident ~ block_param_decl* | integer) ~ ">" }
 block_param_decl = { block_param_name ~ (":" ~ ty)? }
 label_stmt      =  { SOI ~ label ~ EOI }
-terminator      =  { return_stmt | branchind_stmt | callind_stmt | cbranch_stmt | branch_stmt | tailcall_stmt | call_stmt }
+terminator      =  { badinsn_stmt | return_stmt | branchind_stmt | callind_stmt | cbranch_stmt | branch_stmt | tailcall_stmt | call_stmt }
 terminator_stmt =  { SOI ~ terminator ~ EOI }
 branch_stmt     =  { "goto" ~ branch_label }
 branch_label    =  { "<" ~ (ident | integer) ~ branch_arg* ~ ">" }
@@ -45,6 +45,9 @@ call_arg        =  { block_param_name ~ "=" ~ typed_atom }
 tailcall_stmt   =  { "tailcall" ~ "fn" ~ callee ~ "(" ~ (typed_atom ~ ("," ~ typed_atom)*)? ~ ")" }
 callind_stmt    =  { "call" ~ "[" ~ typed_atom ~ "]" ~ callind_args? ~ edge_hint? }
 callind_args    =  { "(" ~ (typed_atom ~ ("," ~ typed_atom)*)? ~ ")" }
+// Bytes that did not decode to a valid instruction: a terminator with no
+// successors. Operand-less, so the keyword alone.
+badinsn_stmt    =  { "badinsn" }
 return_stmt     =  { return_at_stmt | return_value_at_stmt | return_value_stmt }
 return_at_stmt  =  { "return" ~ "at" ~ typed_atom }
 return_value_at_stmt = { "return" ~ typed_atom ~ "at" ~ typed_atom }

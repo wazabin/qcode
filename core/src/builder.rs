@@ -2367,6 +2367,20 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         self.insn_ref(local)
     }
 
+    /// Terminate the current block with [`BadInsn`]: bytes that did not decode to
+    /// a valid instruction. No successors, no operands.
+    pub fn push_bad_insn(&mut self) -> InstructionRef<'str, '_, BodyView<'_, 'str>> {
+        let local = self.push_bad_insn_local();
+        self.insn_ref(local)
+    }
+
+    /// Body-local sibling of [`push_bad_insn`](Self::push_bad_insn).
+    pub fn push_bad_insn_local(&mut self) -> LocalInsnId {
+        let id = self.store_insn(Mnemonic::BadInsn(crate::value::insn::BadInsn), 0);
+        self.is_terminated = true;
+        id
+    }
+
     /// Body-local sibling of [`push_return_value`](Self::push_return_value).
     pub fn push_return_value_local(&mut self, value: LocalValueId) -> LocalInsnId {
         let id = self.store_insn(Mnemonic::ReturnValue(ReturnValue { value }), 0);

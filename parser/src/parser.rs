@@ -552,6 +552,8 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
             })
         }
 
+        Rule::badinsn_stmt => Ok(Statement::BadInsn { span }),
+
         Rule::return_stmt => {
             let mut inner = specific.into_inner();
             let ret = inner

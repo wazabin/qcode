@@ -744,6 +744,10 @@ impl Lowerer<'_, '_, '_> {
                 self.b.push_return_value(v);
             }
 
+            Statement::BadInsn { .. } => {
+                self.b.push_bad_insn();
+            }
+
             Statement::Assert { condition, .. } => {
                 let c = self.atom(condition, None)?;
                 self.b.push_assert(c);
