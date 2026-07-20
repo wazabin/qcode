@@ -42,7 +42,7 @@ use qcode::{
     },
 };
 
-use crate::calls::interface::append_entry_param;
+use crate::calls::interface::append_entry_param_at_sites;
 use crate::gvn::affine::precompute_forms;
 use crate::stack::frame::{frame_offset, incoming_sp_param};
 use crate::{Pass, PipelineEnv};
@@ -81,10 +81,19 @@ impl Pass for PromoteStackArgs {
             if f.is_external() || !f.is_reg_materialized() {
                 continue;
             }
-            if has_implicit_direct_site(ctx, &graph, fid) {
+            // One direct-site query per function, from the single pass-level
+            // graph: the sites gate below and every per-slot interface append
+            // reuse it. The snapshot stays valid across this pass's mutations —
+            // argument appends rewrite existing `Call` instructions in place and
+            // the deleted slot loads are not call sites, so no call instruction
+            // is created, destroyed, or re-keyed. (Rebuilding the graph inside
+            // `append_entry_param` per promoted slot was quadratic in module
+            // size and dominated the pass on real binaries.)
+            let sites = crate::calls::direct_call_sites(ctx, &graph, fid);
+            if has_implicit_direct_site(ctx, &sites) {
                 continue;
             }
-            if promote_one(ctx, fid, sp_reg) {
+            if promote_one(ctx, fid, sp_reg, &sites) {
                 changed.insert(fid);
                 // `append_entry_param` also rewrites every direct caller (new
                 // binding load + extra `Call` arg), so those callers are dirtied
@@ -120,27 +129,29 @@ impl Pass for PromoteStackArgs {
 /// implicit call site silently acquired an argument.
 ///
 /// [`verify::pure_reg_call_args`]: crate::verify::verify_pure_reg_call_args
-fn has_implicit_direct_site(ctx: &Context, graph: &crate::CallGraph, fid: FunctionId) -> bool {
-    let implicit = crate::calls::direct_call_sites(ctx, graph, fid)
-        .into_iter()
-        .any(|site| {
-            !matches!(
-                ctx.get_insn(site).mnemonic(),
-                Mnemonic::Call(c) if c.tag.is_regpure()
-            )
-        });
+fn has_implicit_direct_site(ctx: &Context, sites: &[InstructionId]) -> bool {
+    let implicit = sites.iter().any(|&site| {
+        !matches!(
+            ctx.get_insn(site).mnemonic(),
+            Mnemonic::Call(c) if c.tag.is_regpure()
+        )
+    });
     if implicit {
         qcode::pass_log!(
             debug,
-            "promote_stack_args {}: bail — a direct call site binds implicitly \
+            "promote_stack_args: bail — a direct call site binds implicitly \
              (it cannot carry a caller-evaluated stack load)",
-            FunctionBody::from_id(ctx, fid).name(),
         );
     }
     implicit
 }
 
-fn promote_one(ctx: &mut Context, fid: FunctionId, sp_reg: VarnodeId) -> bool {
+fn promote_one(
+    ctx: &mut Context,
+    fid: FunctionId,
+    sp_reg: VarnodeId,
+    sites: &[InstructionId],
+) -> bool {
     let Some(sp_param) = incoming_sp_param(ModuleView::new(ctx), fid, sp_reg) else {
         return false;
     };
@@ -194,12 +205,13 @@ fn promote_one(ctx: &mut Context, fid: FunctionId, sp_reg: VarnodeId) -> bool {
     for ((off, size), loads) in ordered {
         // Add the by-value param and, at every direct caller, bind it to
         // `load(ram, @SP-argument + off)` — the exact slot the callee reads.
-        let Some(param) = append_entry_param(
+        let Some(param) = append_entry_param_at_sites(
             ctx,
             fid,
             size,
             Some(format!("stack_{off:x}")),
             None,
+            sites,
             move |ctx, call_id, block| {
                 let mnemonic = ctx.get_insn(call_id).mnemonic().clone();
                 // Fall back to a poison (keeping `param[i] ↔ arg[i]` lockstep) at any
