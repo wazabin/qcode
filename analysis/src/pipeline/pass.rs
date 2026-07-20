@@ -32,9 +32,9 @@ use std::sync::OnceLock;
 use qcode::{
     context::Context,
     space::Space,
-    value::{FunctionBody, FunctionId, RegisterId, Renameable, VarnodeId},
+    value::{FunctionBody, FunctionId, FunctionRef, RegisterId, Renameable, VarnodeId},
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
     AnalysisManager, ArchConfig, CallingConvention, ContextSplit, ContextView,
@@ -402,8 +402,42 @@ pub(super) fn install_minted<'str>(
             ));
         }
     }
+    // Identical-code folding: a minted body that is structurally identical to an
+    // existing pure function is interchangeable with it (both are deterministic
+    // functions of their by-value params), so reuse that function instead of
+    // appending a duplicate. Without this every outlined `*_map_body` becomes its
+    // own registry function — many near-identical copies when the same loop shape
+    // recurs (functions are never removed, so they persist in the output). The
+    // `structural_key` buckets candidates; `structurally_eq` verifies before any
+    // fold, so a hash collision can never merge two different functions.
+    let mut pure_index: FxHashMap<u64, Vec<FunctionId>> = FxHashMap::default();
+    for fid in ctx.function_ids() {
+        if FunctionRef::from_id(ctx, fid).is_pure() {
+            let key = ctx.function(fid).structural_key();
+            pure_index.entry(key).or_default().push(fid);
+        }
+    }
+
     let mut installed = Vec::with_capacity(minted.len());
     for minted in minted {
+        let pure = minted
+            .interface
+            .signature
+            .as_ref()
+            .is_some_and(|s| s.is_pure);
+        let key = pure.then(|| minted.body.structural_key());
+        if let Some(key) = key
+            && let Some(&existing) = pure_index.get(&key).and_then(|cands| {
+                cands
+                    .iter()
+                    .find(|&&c| ctx.function(c).structurally_eq(&minted.body))
+            })
+        {
+            // Fold onto the existing identical function; its slot resolves there.
+            installed.push(existing);
+            continue;
+        }
+
         let id = FunctionId::from(ctx.bodies.len());
         let (_, mut interface, body) = minted.into_installed_parts(id);
         let name = std::mem::take(&mut interface.name);
@@ -413,6 +447,11 @@ pub(super) fn install_minted<'str>(
         debug_assert_eq!(appended, id, "function registry append returned wrong id");
         ctx.update_name(unique, id.into(), None)
             .map_err(|e| format!("{pass}: minted-function name registration failed: {e}"))?;
+        // Index the newly installed function so a later identical mint in this same
+        // batch folds onto it too.
+        if let Some(key) = key {
+            pure_index.entry(key).or_default().push(id);
+        }
         installed.push(id);
     }
     Ok(installed)
@@ -1114,6 +1153,59 @@ mod tests {
             outcome
                 .preserved_analyses()
                 .preserves_local_analysis::<crate::AliasAnalysis>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod icf_dedup_tests {
+    use qcode::context::Context;
+    use qcode_macro::qcode;
+
+    /// Two structurally-identical function bodies share a `structural_key` and are
+    /// `structurally_eq`; a body differing only in a literal does not. This is the
+    /// merge key `install_minted` folds duplicate outlined bodies on.
+    #[test]
+    fn structural_key_and_eq_distinguish_identical_from_different_bodies() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f1:
+            <entry @a:i32>
+                %x = @a + 0x1;
+                return at i32 0x0;
+            fn f2:
+            <entry @a:i32>
+                %x = @a + 0x1;
+                return at i32 0x0;
+            fn g:
+            <entry @a:i32>
+                %x = @a + 0x2;
+                return at i32 0x0;
+            "
+        );
+        let f1b = ctx.function(f1);
+        let f2b = ctx.function(f2);
+        let gb = ctx.function(g);
+
+        assert_eq!(
+            f1b.structural_key(),
+            f2b.structural_key(),
+            "identical bodies must share a structural key"
+        );
+        assert!(
+            f1b.structurally_eq(f2b),
+            "identical bodies must verify equal"
+        );
+        assert_ne!(
+            f1b.structural_key(),
+            gb.structural_key(),
+            "a differing literal must change the key"
+        );
+        assert!(
+            !f1b.structurally_eq(gb),
+            "a differing literal must not verify equal"
         );
     }
 }

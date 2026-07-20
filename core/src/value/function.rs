@@ -609,6 +609,64 @@ impl<'str> FunctionBody<'str> {
         &mut self.params[id.local]
     }
 
+    /// A name-agnostic structural hash of this body: for each block in roster
+    /// (semantic) order, its parameters' types and each instruction's mnemonic and
+    /// result type. Ignores every name (function, block, value) and accesses the
+    /// arenas directly, so it is valid on a *detached* body (no installed id) too.
+    ///
+    /// Two independently-built but identical bodies hash equal. Combined with
+    /// [`structurally_eq`](Self::structurally_eq) to guard collisions, this is a
+    /// sound merge key for pure functions (identical-code folding at install).
+    pub fn structural_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for &bl in &self.roster {
+            let block = &self.blocks[bl];
+            block.params.len().hash(&mut h);
+            for &p in &block.params {
+                self.params[p].type_id.hash(&mut h);
+            }
+            block.instructions.len().hash(&mut h);
+            for &i in &block.instructions {
+                let insn = &self.insns[i];
+                insn.mnemonic().hash(&mut h);
+                insn.type_id.hash(&mut h);
+            }
+        }
+        h.finish()
+    }
+
+    /// Whether `self` and `other` have identical structure — block/param/instruction
+    /// counts, parameter and result types, and mnemonics (operands included) in
+    /// roster order — ignoring all names. For pure functions this is exact
+    /// interchangeability, so it verifies a [`structural_key`](Self::structural_key)
+    /// match before two bodies are folded. Direct arena access: valid on detached
+    /// bodies.
+    pub fn structurally_eq(&self, other: &FunctionBody<'str>) -> bool {
+        if self.roster.len() != other.roster.len() {
+            return false;
+        }
+        for (&sbl, &obl) in self.roster.iter().zip(&other.roster) {
+            let (sb, ob) = (&self.blocks[sbl], &other.blocks[obl]);
+            if sb.params.len() != ob.params.len() || sb.instructions.len() != ob.instructions.len()
+            {
+                return false;
+            }
+            for (&sp, &op) in sb.params.iter().zip(&ob.params) {
+                if self.params[sp].type_id != other.params[op].type_id {
+                    return false;
+                }
+            }
+            for (&si, &oi) in sb.instructions.iter().zip(&ob.instructions) {
+                let (sin, oin) = (&self.insns[si], &other.insns[oi]);
+                if sin.type_id != oin.type_id || sin.mnemonic() != oin.mnemonic() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Whether `id` currently names a live block-parameter payload in this body.
     pub fn contains_block_param(&self, id: BlockParamId) -> bool {
         id.func == self.id() && self.params.contains(id.local)
