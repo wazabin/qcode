@@ -223,6 +223,16 @@ pub fn verify_body_arena_integrity_scoped(
                         arg.qualify(fid)
                     ));
                 }
+                // A pure instruction that names its own result as an operand is a
+                // self-referential (unsatisfiable) value: an SSA-invariant
+                // violation that makes recursive value-walkers loop. Catch the
+                // direct case here — it is the concrete shape a bad forward mints
+                // (`%x = %y + %x`).
+                if arg == LocalValueId::Instruction(local) {
+                    out.push(format!(
+                        "instruction {insn_id:?} references itself as an operand"
+                    ));
+                }
             }
 
             let mnemonic_space = match insn_entry.mnemonic() {
@@ -418,6 +428,28 @@ mod tests {
     fn valid_body_is_clean() {
         let ctx = fixture();
         assert_eq!(verify_body_arena_integrity(&ctx), Vec::<String>::new());
+    }
+
+    #[test]
+    fn reports_self_referential_instruction() {
+        let mut ctx = fixture();
+        let f = ctx.function_ids()[0];
+        let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
+        // `%y = @x + 1` — rewrite its `@x` operand to `%y` itself.
+        let y = BasicBlock::from_id(&ctx, entry).instruction_ids()[0];
+        let x = ctx
+            .instruction(y)
+            .mnemonic()
+            .args()
+            .into_iter()
+            .next()
+            .unwrap();
+        ctx.bodies[f]
+            .insn_mut(y)
+            .mnemonic_mut()
+            .replace_value(x, LocalValueId::Instruction(y.local));
+
+        assert_has(&ctx, "references itself as an operand");
     }
 
     #[test]

@@ -49,7 +49,7 @@
 //! unguarded gap as `argpromote` / `dead_signature`.
 
 use qcode::value::QCodeMut;
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{
     context::Context,
@@ -306,12 +306,15 @@ fn try_partial_inline(ctx: &mut Context, fid: FunctionId, call_sites: &[Instruct
             // Every `extract` of this field at this call site (usually one).
             for extract_id in extracts_by_index.remove(&inl.index).unwrap_or_default() {
                 let clone = clone_expr(ctx, extract_id, inl.value, &inl.order, &inputs, &args);
-                // A degenerate recompute can resolve straight back to the extract
-                // itself (empty clone order whose root value is the projection).
-                // Replacing it with itself would delete a still-referenced value
-                // (`replace_all_uses_with` is a no-op on `old == new`, but the
-                // deletion is not) — and report spurious change. Skip it.
-                if clone == ValueId::Instruction(extract_id) {
+                // The recompute can resolve back to (a value transitively
+                // referencing) the extract itself — e.g. the projected field just
+                // passes through a loop-carried argument that derives from this
+                // very projection. Replacing the extract with such a `clone` would
+                // rewrite an operand inside `clone` to `clone`, minting a
+                // self-referential pure value (an unsatisfiable cycle) that later
+                // recursive value-walkers loop on. A circular recompute is not a
+                // simplification: leave the extract in place.
+                if clone_references(ctx, clone, extract_id) {
                     continue;
                 }
                 ctx.replace_instruction(extract_id, clone);
@@ -320,6 +323,29 @@ fn try_partial_inline(ctx: &mut Context, fid: FunctionId, call_sites: &[Instruct
         }
     }
     changed
+}
+
+/// Whether `root` transitively references instruction `target` through its
+/// operand chain. Used to reject a partial-inline recompute that would close a
+/// cycle by replacing `target` with a value that depends on it. Bounded by a
+/// visited set (the operand graph is a DAG in sound IR; the visited set also
+/// terminates on any pre-existing cycle).
+fn clone_references(ctx: &Context, root: ValueId, target: InstructionId) -> bool {
+    let mut stack = vec![root];
+    let mut seen: HashSet<InstructionId> = HashSet::default();
+    while let Some(v) = stack.pop() {
+        let ValueId::Instruction(iid) = v else {
+            continue;
+        };
+        if iid == target {
+            return true;
+        }
+        if !seen.insert(iid) {
+            continue;
+        }
+        stack.extend(ctx.get_insn(iid).operands().iter().copied());
+    }
+    false
 }
 
 /// Clone `value`'s expression (post-ordered nodes in `order`) into the block of
@@ -425,11 +451,43 @@ crate::register_module_pass!(PartialInline);
 mod tests {
     use qcode::{
         types::TypeId,
-        value::{BasicBlock, BlockId, Instruction, VarnodeId, insn::Call},
+        value::{BasicBlock, BlockId, FunctionBody, Instruction, VarnodeId, insn::Call},
     };
     use qcode_macro::qcode;
 
     use super::*;
+
+    /// `clone_references` must detect a transitive operand-chain reference — the
+    /// guard that stops partial-inline from replacing an extract with a recompute
+    /// that depends on that very extract (which would mint a self-referential
+    /// value).
+    #[test]
+    fn clone_references_detects_transitive_dependency() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <entry @a:i64>
+                %b = @a + 1;
+                %c = %b + 2;
+                %d = @a + 3;
+                return %c;
+            "
+        );
+        let root = FunctionBody::from_id(&ctx, f).root().unwrap().id;
+        let ids = BasicBlock::from_id(&ctx, root).instruction_ids();
+        let (b, c, d) = (ids[0], ids[1], ids[2]);
+
+        // c = b + 2 depends on b (directly), and on itself trivially.
+        assert!(clone_references(&ctx, ValueId::Instruction(c), b));
+        assert!(clone_references(&ctx, ValueId::Instruction(c), c));
+        // d = a + 3 is independent of b and c.
+        assert!(!clone_references(&ctx, ValueId::Instruction(d), b));
+        assert!(!clone_references(&ctx, ValueId::Instruction(d), c));
+        // A leaf value references nothing.
+        assert!(!clone_references(&ctx, ValueId::Instruction(b), c));
+    }
 
     /// Give `block`'s call instruction the target `target` and `args`.
     fn set_call(
