@@ -8,7 +8,9 @@ use std::{
 };
 
 mod signature;
-pub use signature::{ExternArg, ExternInterface, ExternSlot, FunctionSignature, ParamAttrs};
+pub use signature::{
+    ArgMemKind, ExternArg, ExternArgmem, ExternInterface, ExternSlot, FunctionSignature, ParamAttrs,
+};
 
 use crate::{
     context::Context,
@@ -1679,6 +1681,16 @@ where
             .and_then(|s| s.extern_interface.as_ref())
     }
 
+    /// The C-prototype-derived argmem summary for a prototyped external, or `None`
+    /// when this function is not a prototyped external. See
+    /// [`FunctionSignature::argmem`].
+    pub fn argmem(&'s self) -> Option<&'ctx crate::value::ExternArgmem> {
+        self.interface()
+            .signature
+            .as_ref()
+            .and_then(|s| s.argmem.as_ref())
+    }
+
     /// The display name for the call-site argument bound to input `index`: the
     /// name of the callee's root block param at `index`, or — for a bodyless
     /// external with no root block — the C-prototype argument name recorded in
@@ -2170,6 +2182,16 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
             .signature
             .get_or_insert_default()
             .extern_interface = Some(iface);
+    }
+
+    /// Records the C-prototype-derived argmem summary on this external. See
+    /// [`FunctionSignature::argmem`]; set by `external_sigs`, read by the RAM
+    /// effect channel's `external_leaf`.
+    pub fn set_argmem(&mut self, argmem: crate::value::ExternArgmem) {
+        self.interface_mut()
+            .signature
+            .get_or_insert_default()
+            .argmem = Some(argmem);
     }
 
     /// Records this function's solved effect summary / materialized interface

@@ -30,8 +30,8 @@ use cabi::{CFunctionProto, CType, Config, Selection};
 use qcode::{
     context::Context,
     value::{
-        ExternArg, ExternInterface, ExternSlot, FunctionBody, FunctionEffects, FunctionId,
-        ParamAttrs, RegisterInterfaceMap, VarnodeId,
+        ArgMemKind, ExternArg, ExternArgmem, ExternInterface, ExternSlot, FunctionBody,
+        FunctionEffects, FunctionId, ParamAttrs, RegisterInterfaceMap, VarnodeId,
     },
 };
 
@@ -131,7 +131,12 @@ fn gp64(gp: &crate::pipeline::GpReg) -> Option<VarnodeId> {
 fn map_prototype(
     proto: &CFunctionProto,
     abi: &CallingConvention,
-) -> Option<(Vec<VarnodeId>, Vec<VarnodeId>, Vec<ParamAttrs>)> {
+) -> Option<(
+    Vec<VarnodeId>,
+    Vec<VarnodeId>,
+    Vec<ParamAttrs>,
+    Vec<ArgMemKind>,
+)> {
     // An aggregate return uses a hidden pointer argument (memory class), which
     // would shift every argument. Rather than mis-map, skip the function.
     if matches!(proto.return_type, CType::Other | CType::Struct { .. }) {
@@ -145,6 +150,10 @@ fn map_prototype(
     // `nocapture` (C `const` says nothing about capture — `strchr`/`tsearch`
     // retain their pointer). Non-pointer arguments carry no attribute.
     let mut attrs: Vec<ParamAttrs> = Vec::with_capacity(proto.params.len());
+    // Per-input argmem kinds, kept in lockstep with `inputs` (and so with the
+    // materialized register interface / `Param(i)` positions the RAM channel
+    // rebases). Read by `ram_summary::external_leaf`.
+    let mut argmem: Vec<ArgMemKind> = Vec::with_capacity(proto.params.len());
     let mut next_int = 0usize;
     let mut next_sse = 0usize;
     for param in &proto.params {
@@ -162,6 +171,7 @@ fn map_prototype(
                     readonly: is_const_pointer(&param.ty),
                     nocapture: false,
                 });
+                argmem.push(argmem_kind(&param.ty));
             }
             Class::Sse => {
                 let Some(&vn) = abi.sse_args.get(next_sse) else {
@@ -170,6 +180,8 @@ fn map_prototype(
                 next_sse += 1;
                 inputs.push(vn);
                 attrs.push(ParamAttrs::default());
+                // A float in an SSE register is never a pointer.
+                argmem.push(ArgMemKind::NonPtr);
             }
         }
     }
@@ -180,7 +192,7 @@ fn map_prototype(
         None => Vec::new(), // void: no return register
     };
 
-    Some((inputs, outputs, attrs))
+    Some((inputs, outputs, attrs, argmem))
 }
 
 /// Plan the ordered call slots for `proto` under the calling convention selected
@@ -279,6 +291,36 @@ fn is_const_pointer(ty: &CType) -> bool {
     )
 }
 
+/// The RAM argmem kind of one parameter type: how (if at all) an external can
+/// reach memory *we* model through it. Feeds the RAM effect channel's
+/// `external_leaf`.
+///
+/// A function/callback pointer (`int (*)(...)`) lowers to a pointer to
+/// [`CType::Other`] (function types are not modelled), and a pointer to a
+/// pointer (`char **`) admits a *transitive* write that escapes the shallow
+/// whole-object model. Both are classified [`ArgMemKind::Opaque`] — a
+/// conservative over-approximation of "unbounded through this pointer" that sends
+/// the whole external footprint to ⊤. Pointers to a scalar/void/named-aggregate
+/// pointee are flat data pointers (`libc`'s own aggregate state lives outside the
+/// lifted image), so they carry a bounded whole-object effect.
+fn argmem_kind(ty: &CType) -> ArgMemKind {
+    match ty {
+        CType::Pointer {
+            pointee,
+            const_pointee,
+        } => {
+            if matches!(**pointee, CType::Other | CType::Pointer { .. }) {
+                ArgMemKind::Opaque
+            } else if *const_pointee {
+                ArgMemKind::ConstPtr
+            } else {
+                ArgMemKind::MutPtr
+            }
+        }
+        _ => ArgMemKind::NonPtr,
+    }
+}
+
 /// Assign a signature and call interface to `fun_id` if it is a known external
 /// function present in `sel`.
 pub fn apply_external_signature(
@@ -302,7 +344,7 @@ pub fn apply_external_signature(
     let Some(proto) = sel.lookup(name) else {
         return;
     };
-    let Some((inputs, outputs, param_attrs)) = map_prototype(proto, abi) else {
+    let Some((inputs, outputs, param_attrs, argmem_kinds)) = map_prototype(proto, abi) else {
         return;
     };
     let plan = plan_args(proto, abi, ptr_width, stack_only);
@@ -332,6 +374,12 @@ pub fn apply_external_signature(
 
     let mut f = FunctionBody::from_id_mut(ctx, fun_id);
     f.set_param_attrs(param_attrs);
+    // The prototype-derived argmem summary consumed by the RAM effect channel:
+    // per-input pointer kinds (lockstep with `inputs`) plus the variadic flag.
+    f.set_argmem(ExternArgmem {
+        params: argmem_kinds,
+        variadic: proto.variadic,
+    });
     // The prototype fully describes this callee's register effect, so it is
     // materialized directly: its inputs are the argument registers the caller
     // passes and its outputs are the return register(s) ∪ the convention's
@@ -601,6 +649,73 @@ mod tests {
             FunctionBody::from_id(&restored, f2).extern_interface(),
             Some(&before),
             "ExternInterface must survive the snapshot round-trip"
+        );
+    }
+
+    /// The prototype-derived argmem summary is stamped in lockstep with the
+    /// register inputs: memcpy(void *dst, const void *src, size_t) → a mutable
+    /// pointer, a const pointer, then a non-pointer scalar.
+    #[test]
+    fn argmem_classifies_memcpy_pointers() {
+        use qcode::value::ArgMemKind;
+        let mut tc = TestContext::new();
+        let abi = toy_abi(&tc);
+        let f = external(&mut tc, "memcpy");
+        apply(&mut tc.ctx, f, &abi, &host_sel());
+        let func = FunctionBody::from_id(&tc.ctx, f);
+        let argmem = func.argmem().expect("prototyped external has argmem");
+        assert!(!argmem.variadic, "memcpy is not variadic");
+        // Only two GP registers in the toy ABI, so only the first two params are
+        // register-passed (lockstep with `inputs`).
+        assert_eq!(
+            argmem.params,
+            vec![ArgMemKind::MutPtr, ArgMemKind::ConstPtr],
+            "dst is a mutable pointer, src is a const pointer"
+        );
+    }
+
+    /// A variadic prototype (printf) carries the `variadic` flag through.
+    #[test]
+    fn argmem_marks_variadic_prototype() {
+        let mut tc = TestContext::new();
+        let abi = toy_abi(&tc);
+        let f = external(&mut tc, "printf");
+        apply(&mut tc.ctx, f, &abi, &host_sel());
+        let func = FunctionBody::from_id(&tc.ctx, f);
+        let argmem = func.argmem().expect("prototyped external has argmem");
+        assert!(argmem.variadic, "printf is variadic");
+    }
+
+    /// `argmem_kind` maps each shape: scalar → NonPtr, mutable/const data
+    /// pointers → Mut/ConstPtr, and a function-pointer or pointer-to-pointer →
+    /// Opaque (⊤ trigger).
+    #[test]
+    fn argmem_kind_classifies_pointer_shapes() {
+        use qcode::value::ArgMemKind;
+        let ptr_to = |pointee: CType, c: bool| CType::Pointer {
+            pointee: Box::new(pointee),
+            const_pointee: c,
+        };
+        assert_eq!(argmem_kind(&int()), ArgMemKind::NonPtr);
+        assert_eq!(argmem_kind(&ptr_to(CType::Void, false)), ArgMemKind::MutPtr);
+        assert_eq!(
+            argmem_kind(&ptr_to(CType::Void, true)),
+            ArgMemKind::ConstPtr
+        );
+        assert_eq!(
+            argmem_kind(&ptr_to(CType::Struct { name: None }, false)),
+            ArgMemKind::MutPtr,
+            "a flat named-aggregate pointer is a bounded whole-object pointer"
+        );
+        assert_eq!(
+            argmem_kind(&ptr_to(CType::Other, false)),
+            ArgMemKind::Opaque,
+            "a function/callback pointer (pointee Other) is opaque"
+        );
+        assert_eq!(
+            argmem_kind(&ptr_to(ptr_to(CType::Void, false), false)),
+            ArgMemKind::Opaque,
+            "a pointer-to-pointer admits a transitive write — opaque"
         );
     }
 

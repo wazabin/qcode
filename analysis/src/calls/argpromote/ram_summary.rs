@@ -3,8 +3,10 @@
 //! engine (see `argpromote-ram-effects-migration`).
 //!
 //! A function's summary is its **outward memory footprint**: the set of scalar
-//! fields ([`RamField`]) and bounded dynamic regions ([`RamRegion`]) it may
-//! read or write, each hung off a [`RamBase`] a caller can rebase —
+//! fields ([`RamField`]), bounded dynamic regions ([`RamRegion`]), and
+//! extent-unknown whole objects ([`RamObject`], minted only for prototyped
+//! externals) it may read or write, each hung off a [`RamBase`] a caller can
+//! rebase —
 //! a positional pointer argument (`Param`), an absolute address (`Global`),
 //! or (minted only by [`transfer`](EffectChannel::transfer)) a slot in the
 //! summary owner's own frame (`Frame`). ⊤ is any footprint the lattice cannot
@@ -40,7 +42,7 @@
 use qcode::{
     context::Context,
     value::{
-        FunctionBody, FunctionId, ModuleView, ValueId, ValueRef, VarnodeId,
+        ArgMemKind, FunctionBody, FunctionId, ModuleView, ValueId, ValueRef, VarnodeId,
         insn::{InstructionId, Mnemonic},
     },
 };
@@ -465,19 +467,81 @@ impl EffectChannel for RamChannel {
         })
     }
 
-    fn external_leaf(&self, _ctx: &Context, _fid: FunctionId) -> Option<RamEffects> {
-        // A bodyless external is fully-⊤ on both components: a prototype bounds
-        // an external's *register* effect, not its memory. The clobber pack that
-        // used to make it safe to treat as footprint-inert is not a load-bearing
-        // invariant — `rewrite_external_call_regpure` rewrites external calls
-        // into RegPure calls with `clobbers: vec![]`, so a shadow-promoted
-        // caller could otherwise pass the blocking gate while the external (e.g.
-        // memset) writes real ram through a promoted pointer. Both components
-        // are unbounded until prototype-declared argmem footprints exist
-        // (future direction).
+    fn external_leaf(&self, ctx: &Context, fid: FunctionId) -> Option<RamEffects> {
+        // An external can only touch memory *we* model through the pointers *we*
+        // pass it — its own libc-internal state lives outside the lifted image.
+        // So a prototyped external gets a real **argmem** footprint: one
+        // whole-object effect per pointer parameter (write+read for a mutable
+        // pointer, read-only for a `const` one), hung off the `Param(i)` that
+        // pointer arrived on. `transfer` then rebases those objects through each
+        // caller's actual argument (composing a caller pointer param, landing a
+        // literal on `Global`, containing an own-frame-local write on `Frame`).
+        //
+        // Confinement is an ASSUMPTION: a whole-object write is taken to stay
+        // within the addressed object (e.g. `memset`'s length in bounds), which
+        // is what lets a frame-landing write be contained without extent
+        // arithmetic. See `ExternalArgmemConfinement` in the module docs.
+        let Some(argmem) = FunctionBody::from_id(ctx, fid).argmem() else {
+            // No usable prototype: unbounded on both components (the pre-argmem
+            // behavior). A caller shadow-promoted over such an external must not
+            // pass the blocking gate — the external may write real ram through a
+            // promoted pointer.
+            return Some(RamEffects {
+                precise: None,
+                written: None,
+            });
+        };
+        // ⊤ carve-outs: a variadic external (`printf`'s `%n` / unknowable pointer
+        // args) or any function-pointer/callback param (`qsort` re-enters our
+        // code) — or a pointer the shallow model cannot bound (`char **`) —
+        // defeats the argmem model entirely.
+        if argmem.variadic
+            || argmem
+                .params
+                .iter()
+                .any(|k| matches!(k, ArgMemKind::Opaque))
+        {
+            return Some(RamEffects {
+                precise: None,
+                written: None,
+            });
+        }
+        let mut objects: FxHashSet<RamObject> = FxHashSet::default();
+        let mut any_mut_ptr = false;
+        for (i, kind) in argmem.params.iter().enumerate() {
+            match kind {
+                ArgMemKind::NonPtr => {}
+                ArgMemKind::MutPtr => {
+                    objects.insert(RamObject {
+                        base: RamBase::Param(i as u32),
+                        write: true,
+                    });
+                    any_mut_ptr = true;
+                }
+                ArgMemKind::ConstPtr => {
+                    objects.insert(RamObject {
+                        base: RamBase::Param(i as u32),
+                        write: false,
+                    });
+                }
+                // Filtered out above.
+                ArgMemKind::Opaque => unreachable!(),
+            }
+        }
+        // Pointers passed to externals target the default ram space (TLS/FS is
+        // out of scope, per the existing conventions). A read-only footprint
+        // writes nothing.
+        let written = if any_mut_ptr {
+            Some([ctx.shared.default_space].into_iter().collect())
+        } else {
+            Some(std::collections::BTreeSet::new())
+        };
         Some(RamEffects {
-            precise: None,
-            written: None,
+            precise: Some(Footprint {
+                objects,
+                ..Footprint::default()
+            }),
+            written,
         })
     }
 
@@ -724,6 +788,26 @@ mod tests {
         tc.ctx
             .block_param_mut(pid)
             .set_origin_id(ValueId::Varnode(sp).localize(pid.func));
+    }
+
+    /// Make a bodyless external named `name` at `addr` and stamp it with the
+    /// given prototype-derived argmem summary (as `external_sigs` would).
+    fn external_argmem(
+        tc: &mut qcode::testing::TestContext,
+        addr: u64,
+        name: &str,
+        params: Vec<ArgMemKind>,
+        variadic: bool,
+    ) -> FunctionId {
+        let f = qcode::value::FunctionBody::make_external(
+            &mut tc.ctx,
+            addr,
+            Some(name.to_string().into()),
+        )
+        .id;
+        FunctionBody::from_id_mut(&mut tc.ctx, f)
+            .set_argmem(qcode::value::ExternArgmem { params, variadic });
+        f
     }
 
     /// The transitive hole the legacy body-rescan gate had: `mid` is memory-free
@@ -1432,6 +1516,211 @@ mod tests {
             !real.invisible(),
             "a Param-based object write is caller-observable"
         );
+    }
+
+    /// STAGE 2: a `memset`-like external (mutable ptr, int, int) gets a single
+    /// `Param(0)` whole-object write, and a caller whose only effect is calling it
+    /// through an own-frame local composes to memory-free — the `memset(&local)`
+    /// fold, the whole payoff.
+    #[test]
+    fn memset_argmem_frame_local_call_is_memory_free() {
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        let memset = external_argmem(
+            &mut tc,
+            0x9000,
+            "memset",
+            vec![ArgMemKind::MutPtr, ArgMemKind::NonPtr, ArgMemKind::NonPtr],
+            false,
+        );
+        qcode!(
+            tc.ctx,
+            "
+            fn caller:
+                <k_entry @RSP:i64>
+                    %loc = @RSP - i64 0x20;
+                    goto <k_call>;
+                <k_call>
+                    call fn caller();
+                <k_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (k_entry, k_cont);
+        materialize(&mut tc, caller);
+        set_sp_origin(&mut tc, caller, sp);
+        let loc = ValueId::Instruction(
+            qcode::value::BasicBlock::from_id(&tc.ctx, k_entry)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id,
+        );
+        regpure_call(&mut tc, k_call, memset, vec![loc]);
+        tc.ctx.add_cfg_edge(k_call, k_cont);
+
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, Some(sp));
+
+        // The external's own footprint is a single Param(0) write object.
+        let ext = s.get(memset).as_ref().expect("external summary");
+        let fp = ext
+            .precise
+            .as_ref()
+            .expect("argmem footprint is expressible");
+        assert_eq!(
+            fp.objects.iter().copied().collect::<Vec<_>>(),
+            vec![RamObject {
+                base: RamBase::Param(0),
+                write: true
+            }]
+        );
+        assert!(
+            ext.written
+                .as_ref()
+                .is_some_and(|w| w.contains(&tc.ctx.shared.default_space)),
+            "a mutable-pointer external writes the default ram space"
+        );
+        assert!(
+            !is_memory_free(&s, memset),
+            "the external's own write is real"
+        );
+        assert!(
+            is_memory_free(&s, caller),
+            "memset(&local) into the caller's own frame is contained — memory-free"
+        );
+    }
+
+    /// STAGE 2: a `strlen`-like external (one `const` pointer) gets a read-only
+    /// object; a caller passing an own-frame local composes to ⊤ — a callee read
+    /// through a frame pointer needs freshness licensing the transfer lacks.
+    #[test]
+    fn strlen_argmem_const_ptr_frame_local_is_top() {
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        let strlen = external_argmem(&mut tc, 0x9100, "strlen", vec![ArgMemKind::ConstPtr], false);
+        qcode!(
+            tc.ctx,
+            "
+            fn caller:
+                <k_entry @RSP:i64>
+                    %loc = @RSP - i64 0x20;
+                    goto <k_call>;
+                <k_call>
+                    call fn caller();
+                <k_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (k_entry, k_cont);
+        materialize(&mut tc, caller);
+        set_sp_origin(&mut tc, caller, sp);
+        let loc = ValueId::Instruction(
+            qcode::value::BasicBlock::from_id(&tc.ctx, k_entry)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id,
+        );
+        regpure_call(&mut tc, k_call, strlen, vec![loc]);
+        tc.ctx.add_cfg_edge(k_call, k_cont);
+
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, Some(sp));
+
+        let ext = s.get(strlen).as_ref().expect("external summary");
+        let fp = ext
+            .precise
+            .as_ref()
+            .expect("argmem footprint is expressible");
+        assert_eq!(
+            fp.objects.iter().copied().collect::<Vec<_>>(),
+            vec![RamObject {
+                base: RamBase::Param(0),
+                write: false
+            }]
+        );
+        assert!(
+            ext.written.as_ref().is_some_and(|w| w.is_empty()),
+            "a read-only external writes nothing"
+        );
+        let caller_eff = s.get(caller).as_ref().expect("caller summary");
+        assert!(
+            caller_eff.precise.is_none(),
+            "a const-ptr read through a frame local needs freshness licensing — ⊤"
+        );
+        assert!(!is_memory_free(&s, caller));
+    }
+
+    /// STAGE 2: a `qsort`-like external with a function-pointer (callback)
+    /// parameter is ⊤ — it re-enters our code and can touch anything.
+    #[test]
+    fn qsort_argmem_callback_is_top() {
+        let mut tc = qcode::testing::TestContext::new();
+        let qsort = external_argmem(
+            &mut tc,
+            0x9200,
+            "qsort",
+            vec![
+                ArgMemKind::MutPtr,
+                ArgMemKind::NonPtr,
+                ArgMemKind::NonPtr,
+                ArgMemKind::Opaque,
+            ],
+            false,
+        );
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, None);
+        let ext = s.get(qsort).as_ref().expect("external summary");
+        assert!(
+            ext.precise.is_none(),
+            "a callback param sends the footprint to ⊤"
+        );
+        assert!(ext.written.is_none(), "and the coarse channel to ⊤");
+        assert!(!is_memory_free(&s, qsort));
+    }
+
+    /// STAGE 2: an `abs`-like external with no pointer parameters has an empty
+    /// footprint — memory-free — and writes nothing.
+    #[test]
+    fn abs_argmem_no_pointer_is_memory_free() {
+        let mut tc = qcode::testing::TestContext::new();
+        let abs = external_argmem(&mut tc, 0x9300, "abs", vec![ArgMemKind::NonPtr], false);
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, None);
+        let ext = s.get(abs).as_ref().expect("external summary");
+        let fp = ext
+            .precise
+            .as_ref()
+            .expect("empty footprint is expressible");
+        assert!(
+            fp.objects.is_empty(),
+            "no pointer params ⇒ no argmem objects"
+        );
+        assert!(
+            ext.written.as_ref().is_some_and(|w| w.is_empty()),
+            "a pointer-free external writes nothing"
+        );
+        assert!(
+            is_memory_free(&s, abs),
+            "a pointer-free external is memory-free"
+        );
+    }
+
+    /// STAGE 2: an external with no argmem stamp (un-prototyped) stays fully-⊤ —
+    /// the pre-argmem behavior a shadow-promoted caller must not pass the gate
+    /// through.
+    #[test]
+    fn unprototyped_external_stays_top() {
+        let mut tc = qcode::testing::TestContext::new();
+        let ext =
+            qcode::value::FunctionBody::make_external(&mut tc.ctx, 0x9400, Some("mystery".into()))
+                .id;
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, None);
+        let e = s.get(ext).as_ref().expect("external summary");
+        assert!(e.precise.is_none(), "no prototype ⇒ precise ⊤");
+        assert!(e.written.is_none(), "no prototype ⇒ written ⊤");
     }
 
     /// FIX 6a: joining two footprints past `MAX_EFFECT_ENTRIES` saturates to ⊤ —

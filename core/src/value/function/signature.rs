@@ -64,6 +64,48 @@ pub struct ExternArg {
     pub attrs: ParamAttrs,
 }
 
+/// The memory kind of one prototyped-external parameter, as seen by the RAM
+/// argmem model. An external can only touch memory *we* model through pointers
+/// *we* pass it (its own libc-internal state lives outside the lifted image), so
+/// each pointer parameter bounds a whole-object effect on the caller's argument.
+///
+/// The variants are ordered so the analysis layer needs no C-type data of its
+/// own: it reads this per-input kind (kept in lockstep with the materialized
+/// register-interface inputs) plus the function-level variadic flag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ArgMemKind {
+    /// A non-pointer scalar (integer/float): the external cannot reach any memory
+    /// we model through it. No effect.
+    NonPtr,
+    /// A mutable data pointer (`char *`, `void *`, `struct S *`): a whole-object
+    /// read+write effect on the addressed object.
+    MutPtr,
+    /// A `const`-qualified data pointer (`const char *`): a whole-object read-only
+    /// effect on the addressed object.
+    ConstPtr,
+    /// A pointer the shallow whole-object model cannot bound: a function/callback
+    /// pointer (re-enters our code — `qsort`'s comparator), or a pointer to
+    /// another pointer / an unmodeled pointee (a transitive write escapes the
+    /// addressed object). Its presence sends the whole external footprint to ⊤.
+    Opaque,
+}
+
+/// C-prototype-derived argmem summary for a prototyped external: the ordered
+/// per-parameter [`ArgMemKind`]s (in lockstep with the materialized register
+/// interface inputs, so `params[i]` describes the `i`-th positional argument /
+/// `Param(i)`) and whether the callee is variadic. Read by the RAM effect
+/// channel's `external_leaf` to derive a bounded argmem footprint in place of ⊤.
+/// `None` on the signature for non-externals and un-prototyped externals.
+/// Serde-defaulted, so older `.harbinger` snapshots load with it absent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExternArgmem {
+    /// Per-input parameter kinds, lockstep with the register-interface inputs.
+    pub params: Vec<ArgMemKind>,
+    /// Whether the prototype takes a trailing `...` (unknowable pointer args).
+    #[serde(default)]
+    pub variadic: bool,
+}
+
 /// C-prototype-derived call interface for an external (imported, bodyless)
 /// function, planned once by `external_sigs` and consumed by
 /// `argpromote_external`, which needs neither the binary nor `cabi` afterwards.
@@ -154,4 +196,13 @@ pub struct FunctionSignature {
     /// snapshots load with it absent.
     #[serde(default)]
     pub extern_interface: Option<ExternInterface>,
+    /// C-prototype-derived argmem summary for a prototyped **external** callee:
+    /// the ordered per-input pointer kinds and variadic flag, planned once by
+    /// `external_sigs`. The RAM effect channel's `external_leaf` reads this to
+    /// bound the external's memory footprint through the pointers we pass it,
+    /// instead of treating every external as unbounded (⊤). `None` for
+    /// non-externals and externals with no known prototype. Serde-defaulted, so
+    /// older `.harbinger` snapshots load with it absent.
+    #[serde(default)]
+    pub argmem: Option<ExternArgmem>,
 }

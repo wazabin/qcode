@@ -95,9 +95,9 @@ pub use bytes::{
     render_bytes_literal,
 };
 pub use function::{
-    BodyArenaKindStats, BodyArenaStats, ExternArg, ExternInterface, ExternSlot, FunctionBody,
-    FunctionEffects, FunctionId, FunctionKind, FunctionMutRef, FunctionRef, GlobalSlot, ParamAttrs,
-    RegisterEffectSets, RegisterInterfaceMap, WrittenSpaces,
+    ArgMemKind, BodyArenaKindStats, BodyArenaStats, ExternArg, ExternArgmem, ExternInterface,
+    ExternSlot, FunctionBody, FunctionEffects, FunctionId, FunctionKind, FunctionMutRef,
+    FunctionRef, GlobalSlot, ParamAttrs, RegisterEffectSets, RegisterInterfaceMap, WrittenSpaces,
 };
 pub use insn::LocalInsnId;
 pub use insn::{Instruction, InstructionId, InstructionRef};
