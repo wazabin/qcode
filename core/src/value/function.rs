@@ -329,6 +329,22 @@ impl BodyArenaStats {
     }
 }
 
+/// Tri-state view of a function's `written_spaces` verdict, distinguishing a
+/// never-computed fresh mint from a deliberately recorded ⊤. See
+/// [`FunctionSignature::written_spaces`](super::function::FunctionSignature) and
+/// [`FunctionRef::written_spaces_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrittenSpaces<'a> {
+    /// Analysis has never recorded a verdict — a freshly minted function.
+    /// Treated conservatively (may write any space) but distinct from a
+    /// recorded ⊤: it is a candidate for (re-)seeding, not a stale bound.
+    Unstamped,
+    /// Recorded, but unbounded (⊤): the function may write any space.
+    Unbounded,
+    /// A recorded exact witnessed bound: a space not listed is never written.
+    Bounded(&'a [crate::space::SpaceId]),
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FunctionKind {
     #[default]
@@ -1594,13 +1610,28 @@ where
 
     /// The non-register memory spaces this function may (transitively) write, as
     /// set by analysis. `Some(spaces)` is exact (a space not listed is never
-    /// written); `None` means unknown/unbounded. See
-    /// [`FunctionSignature::written_spaces`].
+    /// written); `None` conflates "unstamped" and "stamped unbounded" — both are
+    /// treated conservatively (may write any space) by consumers. For the
+    /// tri-state distinction use [`written_spaces_state`](Self::written_spaces_state).
+    /// See [`FunctionSignature::written_spaces`].
     pub fn written_spaces(&'s self) -> Option<&'ctx [crate::space::SpaceId]> {
         self.interface()
             .signature
             .as_ref()
             .and_then(|s| s.written_spaces.as_deref())
+    }
+
+    /// The tri-state `written_spaces` verdict, distinguishing a never-stamped
+    /// fresh mint ([`WrittenSpaces::Unstamped`]) from a deliberately recorded
+    /// ⊤ ([`WrittenSpaces::Unbounded`]). See [`FunctionSignature::written_spaces`].
+    pub fn written_spaces_state(&'s self) -> WrittenSpaces<'ctx> {
+        match self.interface().signature.as_ref() {
+            Some(s) if s.written_spaces_stamped => match s.written_spaces.as_deref() {
+                Some(spaces) => WrittenSpaces::Bounded(spaces),
+                None => WrittenSpaces::Unbounded,
+            },
+            _ => WrittenSpaces::Unstamped,
+        }
     }
 
     /// Whether this function's register interface has been materialized (argpromote
@@ -2121,13 +2152,14 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     }
 
     /// Records the analysis-computed set of non-register spaces this function may
-    /// write (`None` = unknown/unbounded). See
-    /// [`FunctionSignature::written_spaces`].
+    /// write. This is always a deliberate stamp: `Some(spaces)` is a bounded
+    /// witnessed set, `None` records *stamped unbounded* (⊤) — never clears the
+    /// stamp back to unstamped. See [`FunctionSignature::written_spaces`] and
+    /// [`FunctionRef::written_spaces_state`].
     pub fn set_written_spaces(&mut self, spaces: Option<Vec<crate::space::SpaceId>>) {
-        self.interface_mut()
-            .signature
-            .get_or_insert_default()
-            .written_spaces = spaces;
+        let sig = self.interface_mut().signature.get_or_insert_default();
+        sig.written_spaces = spaces;
+        sig.written_spaces_stamped = true;
     }
 
     /// Records the C-prototype-derived external call interface on this function.

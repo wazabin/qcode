@@ -131,8 +131,21 @@ pub struct FunctionSignature {
     /// This is what lets a functionalized (`pure_reg`) callee that writes only its
     /// own private scratch space be seen as touching no real `ram`, so a spilled
     /// pointer in the caller's frame survives the call and its reload forwards.
+    ///
+    /// The `written_spaces` vector alone conflates "never stamped" (a fresh mint)
+    /// with "stamped unbounded" (⊤) — both are `None`. The companion
+    /// [`written_spaces_stamped`](Self::written_spaces_stamped) flag distinguishes
+    /// them; consult [`FunctionRef::written_spaces_state`] for the tri-state.
     #[serde(default)]
     pub written_spaces: Option<Vec<crate::space::SpaceId>>,
+    /// Whether analysis has recorded a `written_spaces` verdict at all. `false`
+    /// (the default, a freshly minted function) is *unstamped* — never computed.
+    /// `true` with `written_spaces == None` is *stamped unbounded* (⊤): analysis
+    /// deliberately recorded that the function may write any space. `true` with
+    /// `written_spaces == Some(..)` is a bounded witnessed set. See
+    /// [`FunctionRef::written_spaces_state`].
+    #[serde(default)]
+    pub written_spaces_stamped: bool,
     /// C-prototype-derived call interface for an **external** callee: the ordered
     /// argument slots (register or stack) and variadic flag, planned once by
     /// `external_sigs`. `argpromote_external` reads this to rewrite call sites

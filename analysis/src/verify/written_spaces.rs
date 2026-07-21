@@ -16,16 +16,13 @@
 //! 2. it contains no unbounded escape — `CallInd`, unresolved `BranchInd`, or
 //!    a direct-like call/tail-call to an unresolved target;
 //! 3. every resolved direct-like callee (`Call` or `TailCall`) nests. A callee
-//!    with its own `Some(cs)` stamp must satisfy `cs ⊆ ws`. A callee recorded
-//!    *unbounded* over a bounded caller is exactly the stale state this rule
-//!    exists to catch — but the core signature cannot distinguish "explicitly
-//!    recorded `None` (unbounded)" from "never stamped" (both read back as
-//!    `written_spaces() == None`; see `FunctionSignature::written_spaces`). To
-//!    avoid false-positiving freshly minted outlined functions (internal, pure,
-//!    re-seeded on the next run), only an **external** callee — genuinely
-//!    unbounded, never a fresh mint — is flagged when its `None` sits under a
-//!    bounded caller. Residual gap: an internal callee explicitly recorded
-//!    unbounded is still skipped, indistinguishable from a not-yet-seeded mint.
+//!    with a `Bounded(cs)` stamp must satisfy `cs ⊆ ws`. A callee recorded
+//!    *unbounded* (⊤) over a bounded caller is exactly the stale state this rule
+//!    exists to catch, and the tri-state `written_spaces_state` now distinguishes
+//!    a deliberately recorded `Unbounded` from a never-stamped `Unstamped` fresh
+//!    mint. Any resolved callee stamped `Unbounded` — internal or external — is
+//!    flagged under a bounded caller; a genuinely `Unstamped` callee (a freshly
+//!    minted, not-yet-seeded function) is still skipped.
 //!
 //! Dirty-scoping: `written_spaces` is transitive, so growing a callee's
 //! write-set stales every caller's stamp even when the caller is out of scope.
@@ -123,38 +120,47 @@ pub(crate) fn verify_written_spaces_scoped(ctx: &Context, scope: super::Scope<'_
 }
 
 /// Check one resolved direct-like call/tail-call against the caller's bound
-/// `ws`. An unresolved target (`None`) is an escape; a callee stamped with a
-/// bounded set must nest; an *external* callee stamped unbounded flags (see the
-/// module doc for why only externals).
+/// `ws`. An unresolved target (`None`) is an escape; a `Bounded` callee must
+/// nest; an `Unbounded` callee (internal or external) flags; a genuinely
+/// `Unstamped` fresh mint is skipped (see the module doc).
 fn check_callee(
     ctx: &Context,
     name: &str,
     ws: &[qcode::space::SpaceId],
     callee: Option<FunctionId>,
 ) -> Option<String> {
+    use qcode::value::WrittenSpaces;
     let Some(callee) = callee else {
         return Some(format!(
             "{name}: calls an unresolved target but has a bounded written_spaces {ws:?}"
         ));
     };
     let cf = FunctionBody::from_id(ctx, callee);
-    match cf.written_spaces() {
-        Some(cs) => cs.iter().find(|s| !ws.contains(s)).map(|bad| {
+    match cf.written_spaces_state() {
+        WrittenSpaces::Bounded(cs) => cs.iter().find(|s| !ws.contains(s)).map(|bad| {
             format!(
                 "{name}: callee {} may write space {bad:?} outside the caller's \
                  witnessed bound {ws:?}",
                 cf.name(),
             )
         }),
-        // Unbounded external under a bounded caller: the stale state the rule
-        // catches. An internal `None` callee is indistinguishable from a fresh
-        // mint and skipped (residual gap, see module doc).
-        None if cf.is_external() => Some(format!(
+        // Deliberately recorded unbounded under a bounded caller: the stale state
+        // the rule catches. Now flagged for internal callees too — the tri-state
+        // distinguishes this from an unstamped fresh mint.
+        WrittenSpaces::Unbounded => Some(format!(
+            "{name}: callee {} is recorded unbounded but the caller has a bounded \
+             written_spaces {ws:?}",
+            cf.name(),
+        )),
+        // An external is never stamped (`set_written_spaces` skips externals) but
+        // is genuinely unbounded — never a fresh mint — so it flags too.
+        WrittenSpaces::Unstamped if cf.is_external() => Some(format!(
             "{name}: external callee {} is unbounded but the caller has a bounded \
              written_spaces {ws:?}",
             cf.name(),
         )),
-        None => None,
+        // A never-stamped internal fresh mint: skipped, re-seeded on the next run.
+        WrittenSpaces::Unstamped => None,
     }
 }
 
@@ -268,6 +274,43 @@ mod tests {
         assert!(
             diags.iter().any(|d| d.contains("external callee")),
             "an unbounded external under a bounded caller must be flagged: {diags:?}"
+        );
+    }
+
+    /// ITEM 2: an *internal* (non-external) callee stamped unbounded (`None` via
+    /// `set_written_spaces`, now recorded as `WrittenSpaces::Unbounded`) under a
+    /// bounded caller is now caught — the tri-state distinguishes it from a
+    /// never-stamped fresh mint, which stays skipped.
+    #[test]
+    fn unbounded_internal_callee_over_bounded_caller_is_flagged() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn callee:
+                <c_entry @p:i64>
+                    store(ram:8, @p <- i64 1);
+                    return at i64 0;
+            fn caller:
+                <k_entry>
+                    call <callee>;
+                <k_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (c_entry, k_entry, k_cont);
+        // A fresh (unstamped) internal callee under a bounded caller is skipped.
+        set_ws(&mut tc, caller, Some(vec![]));
+        assert!(
+            verify_written_spaces(&tc.ctx).is_empty(),
+            "an unstamped fresh-mint callee must not be flagged"
+        );
+        // Once the callee is deliberately stamped unbounded, it is caught.
+        set_ws(&mut tc, callee, None);
+        let diags = verify_written_spaces(&tc.ctx);
+        assert!(
+            diags.iter().any(|d| d.contains("is recorded unbounded")),
+            "an internal callee recorded unbounded under a bounded caller must be flagged: {diags:?}"
         );
     }
 

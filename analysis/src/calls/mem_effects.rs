@@ -50,7 +50,19 @@ fn set_written_spaces_targeted_with_sp(
                 .as_ref()
                 .map(|set| set.iter().copied().collect::<Vec<SpaceId>>()),
         };
-        if FunctionBody::from_id(ctx, id).written_spaces() != summary.as_deref() {
+        // A ⊤ summary now records *stamped unbounded* rather than clearing the
+        // stamp, so a fresh mint transitioning Unstamped → Unbounded counts as a
+        // change (its callers' bounds may need re-verifying).
+        use qcode::value::WrittenSpaces;
+        let changed = match (
+            FunctionBody::from_id(ctx, id).written_spaces_state(),
+            &summary,
+        ) {
+            (WrittenSpaces::Bounded(a), Some(b)) => a != b.as_slice(),
+            (WrittenSpaces::Unbounded, None) => false,
+            _ => true,
+        };
+        if changed {
             changed_functions.insert(id);
         }
         FunctionBody::from_id_mut(ctx, id).set_written_spaces(summary);
