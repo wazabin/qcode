@@ -262,7 +262,10 @@ passes = ["assume_arg_frame"]
 [[stage]]
 name = "argpromote"
 scope = "module"
-passes = ["argpromote"]
+# `retail_apply` first rewrites functionalized tail calls (`tailcall g`) into
+# `apply g; return`, so the RAM channel vets the callee through its summary
+# rather than blanket-blocking the caller on the tail transfer.
+passes = ["retail_apply", "argpromote"]
 
 # Sweep the instructions the rewrite makes dead (redirected/forwarded loads and
 # stores, now-unused address computations): `dead_store` drops the now-unread
@@ -322,7 +325,7 @@ passes = ["gvn", "dead_store", "dce"]
 [[stage]]
 name = "mark-pure"
 scope = "module"
-passes = ["mark_pure", "module(gvn)", "emulate_map", "array_project", "pure_call", "module(dce)", "module(dead_store)", "assume_arg_frame", "argpromote"]
+passes = ["mark_pure", "module(gvn)", "emulate_map", "array_project", "pure_call", "module(dce)", "module(dead_store)", "assume_arg_frame", "retail_apply", "argpromote"]
 repeat_until = "no_change"
 
 # Promote bounded memory regions in pure functions to first-class array values so

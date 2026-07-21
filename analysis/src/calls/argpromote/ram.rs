@@ -675,7 +675,7 @@ enum Promotion {
 /// dereference a pointer passed to it — for reading *or writing* — anywhere in
 /// its call tree, so handing it a promoted pointer is safe (nothing it reaches
 /// can observe our shadow, alias it, or mutate a promoted address behind it).
-fn function_makes_blocking_call(
+pub(super) fn function_makes_blocking_call(
     ctx: &Context,
     function_id: FunctionId,
     ram_summaries: &super::summary::EffectSummaries<super::ram_summary::RamChannel>,
@@ -700,11 +700,22 @@ fn function_makes_blocking_call(
                             || absorbed.contains(&target)
                     })
             }
+            // An `Apply` can now be impure (a tail call rewritten to
+            // `apply g; return` by `retail_apply`), so it is vetted exactly like a
+            // `Call`: inert iff its target is transitively memory-free or was
+            // absorbed this sweep. `Apply` has no `clobbers` field, so there is no
+            // clobber check — the register interface is threaded through its pack.
+            Mnemonic::Apply(a) => !a.target.real().is_some_and(|target| {
+                super::ram_summary::is_memory_free(ram_summaries, target)
+                    || absorbed.contains(&target)
+            }),
             // Other call-like transfers escape vetting entirely: a tail callee's
             // memory effects never bubble through the summary, and the
             // write-replays `apply` emits at Return exits would be skipped on the
             // tail path. A surviving BranchInd is a computed tail-jump into code
-            // we cannot see. Both block.
+            // we cannot see. Both block. (`Map`/`Scan` are unvetted-by-assumption:
+            // their bodies are pure by construction, so they never appear here as a
+            // memory hazard.)
             Mnemonic::TailCall(_) | Mnemonic::BranchInd(_) => true,
             // Non-transfer mnemonics are inert; any new call-like transfer must
             // be matched explicitly above rather than falling through here.

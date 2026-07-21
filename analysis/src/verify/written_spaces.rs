@@ -58,6 +58,7 @@ fn functions_to_check(ctx: &Context, scope: super::Scope<'_>) -> Vec<FunctionId>
         let callee = match insn.mnemonic() {
             Mnemonic::Call(c) => c.target.real(),
             Mnemonic::TailCall(t) => t.target.real(),
+            Mnemonic::Apply(a) => a.target.real(),
             _ => None,
         };
         if callee.is_some_and(|c| set.contains(&c)) {
@@ -110,6 +111,13 @@ pub(crate) fn verify_written_spaces_scoped(ctx: &Context, scope: super::Scope<'_
                     }
                     Mnemonic::TailCall(t) => {
                         out.extend(check_callee(ctx, &name, ws, t.target.real()));
+                    }
+                    // An `Apply` (e.g. a tail call rewritten to `apply g; return`)
+                    // can carry a real memory effect, so its callee nests too.
+                    // (`Map`/`Scan` stay unvetted: their bodies are pure by
+                    // construction, never storing to a shared space.)
+                    Mnemonic::Apply(a) => {
+                        out.extend(check_callee(ctx, &name, ws, a.target.real()));
                     }
                     _ => {}
                 }
