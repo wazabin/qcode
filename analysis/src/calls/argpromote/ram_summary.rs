@@ -358,7 +358,15 @@ impl EffectChannel for RamChannel {
                     Mnemonic::Load(l) => (l.space, l.ptr, l.size, false),
                     Mnemonic::Store(s) => (s.space, s.ptr, s.size, true),
                     Mnemonic::BranchInd(_) => {
+                        // A surviving BranchInd is a genuine escape — a computed
+                        // tail-jump into code the summary cannot see (jump-table
+                        // resolution ran long before this). It unbounds the
+                        // coarse channel *and* refutes the precise footprint: a
+                        // function like `f(p) { goto [p] }` has no load/store of
+                        // its own, but the code it jumps into may deref `p`
+                        // arbitrarily, so it must not read as memory-free.
                         written = None;
+                        precise_top = true;
                         continue;
                     }
                     _ => continue,
@@ -1008,5 +1016,34 @@ mod tests {
             !is_memory_free(&s, rcaller),
             "a callee read through a frame pointer needs freshness licensing — ⊤"
         );
+    }
+
+    /// FIX 1: a surviving `BranchInd` (computed tail-jump) has no load/store of
+    /// its own, but the code it jumps into may deref its pointer param
+    /// arbitrarily. It must be footprint-⊤ (not memory-free) and coarse-⊤.
+    #[test]
+    fn branchind_on_param_is_not_memory_free() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn jump:
+                <entry @p:i64>
+                    goto [i64 @p];
+            "
+        );
+        let _ = entry;
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, None);
+        assert!(
+            !is_memory_free(&s, jump),
+            "a surviving BranchInd is an escape into unseen code — not memory-free"
+        );
+        let eff = s.get(jump).as_ref().expect("summary");
+        assert!(
+            eff.precise.is_none(),
+            "BranchInd refutes the precise footprint"
+        );
+        assert!(eff.written.is_none(), "BranchInd unbounds the coarse channel");
     }
 }
