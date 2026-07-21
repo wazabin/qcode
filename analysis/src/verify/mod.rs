@@ -24,6 +24,7 @@ mod pointer_spaces;
 mod pure_function;
 mod pure_reg_call_args;
 mod users_map;
+mod written_spaces;
 
 pub use arena_integrity::verify_body_arena_integrity;
 pub use block_terminators::verify_block_terminators;
@@ -38,6 +39,7 @@ pub use pure_reg_call_args::{
     PureRegCallArgsRule, PureRegCallArgsViolation, verify_pure_reg_call_args,
 };
 pub use users_map::verify_users_map;
+pub use written_spaces::verify_written_spaces;
 
 use std::sync::OnceLock;
 
@@ -136,6 +138,7 @@ pub fn verify_scoped(ctx: &Context<'_>, scope: Scope<'_>) -> Vec<String> {
             .into_iter()
             .map(|v| v.diagnostic(ctx)),
     );
+    diagnostics.extend(written_spaces::verify_written_spaces_scoped(ctx, scope));
     diagnostics
 }
 
