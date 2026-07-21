@@ -1047,7 +1047,10 @@ mod tests {
             eff.precise.is_none(),
             "BranchInd refutes the precise footprint"
         );
-        assert!(eff.written.is_none(), "BranchInd unbounds the coarse channel");
+        assert!(
+            eff.written.is_none(),
+            "BranchInd unbounds the coarse channel"
+        );
     }
 
     /// FIX 2: an external's memory is fully-⊤ (a prototype bounds registers, not
@@ -1094,5 +1097,116 @@ mod tests {
             "a clobber-free RegPure call to an external must block the caller — \
              external memory is ⊤"
         );
+    }
+
+    /// FIX 6a: joining two footprints past `MAX_EFFECT_ENTRIES` saturates to ⊤ —
+    /// a saturated summary is never memory-free.
+    #[test]
+    fn saturation_becomes_top() {
+        let ch = RamChannel::new(None);
+        let mk = |range: std::ops::Range<i64>| {
+            let mut fp = Footprint::default();
+            for offset in range {
+                fp.fields.insert(RamField {
+                    base: RamBase::Param(0),
+                    offset,
+                    size: 1,
+                    write: false,
+                });
+            }
+            RamEffects {
+                precise: Some(fp),
+                written: Some(Default::default()),
+            }
+        };
+        let mut into = mk(0..40);
+        let from = mk(40..80);
+        ch.join(&mut into, &from);
+        assert!(
+            into.precise.is_none(),
+            "80 distinct entries overflow MAX_EFFECT_ENTRIES ({MAX_EFFECT_ENTRIES}) → ⊤"
+        );
+        assert!(
+            !into.outward_invisible(),
+            "a saturated summary is not memory-free"
+        );
+    }
+
+    /// FIX 6b: a self-recursive function that derefs a pointer param and recurses
+    /// on `param + const` must reach a sound fixpoint (the solve terminates) and
+    /// carry a real footprint — not memory-free.
+    #[test]
+    fn recursive_rebasing_terminates_and_blocks() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn rec:
+                <rec_entry @p:i64>
+                    %v = load(ram:8, @p);
+                    %next = @p + i64 0x8;
+                    goto <rec_call>;
+                <rec_call>
+                    call fn rec();
+                <rec_cont>
+                    return at %v;
+            "
+        );
+        let _ = (rec_entry, rec_cont);
+        materialize(&mut tc, rec);
+        let next = {
+            let block = qcode::value::BasicBlock::from_id(&tc.ctx, rec_entry);
+            block
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id
+        };
+        regpure_call(&mut tc, rec_call, rec, vec![ValueId::Instruction(next)]);
+        tc.ctx.add_cfg_edge(rec_call, rec_cont);
+
+        let graph = CallGraph::analyze(&tc.ctx);
+        // Terminates (returning at all is the fixpoint assertion) and blocks.
+        let s = solve(&tc.ctx, &graph, None);
+        assert!(
+            !is_memory_free(&s, rec),
+            "the recursive pointer deref is a real footprint — not memory-free"
+        );
+    }
+
+    /// FIX 6c: the `written` component tracks ram stores and unbounds on escapes,
+    /// and an external leaf is coarse-⊤.
+    #[test]
+    fn written_component_tracks_ram_and_escapes() {
+        let mut tc = qcode::testing::TestContext::new();
+        let ext =
+            qcode::value::FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("ext".into())).id;
+        qcode!(
+            tc.ctx,
+            "
+            fn writer:
+                <w_entry @p:i64>
+                    store(ram:8, @p <- i64 1);
+                    return at i64 0;
+            fn jumper:
+                <j_entry @p:i64>
+                    goto [i64 @p];
+            "
+        );
+        let _ = (w_entry, j_entry);
+        let ram = tc.ctx.shared.default_space;
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, None);
+
+        let w = s.get(writer).as_ref().expect("writer summary");
+        assert!(
+            w.written.as_ref().is_some_and(|set| set.contains(&ram)),
+            "a ram store lands in the written component"
+        );
+        let j = s.get(jumper).as_ref().expect("jumper summary");
+        assert!(j.written.is_none(), "BranchInd ⇒ written = None");
+        let e = s.get(ext).as_ref().expect("external summary");
+        assert!(e.written.is_none(), "external_leaf ⇒ written = None");
+        assert!(e.precise.is_none(), "external_leaf ⇒ precise = ⊤");
     }
 }
