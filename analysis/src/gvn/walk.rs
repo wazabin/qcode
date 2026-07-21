@@ -106,6 +106,13 @@ impl Editor {
         insn: InstructionId,
         with: ValueId,
     ) {
+        // Replacing an instruction with itself is a no-op: forwarding its uses
+        // does nothing, and marking it redundant would schedule the deletion of a
+        // value that is still (self-)referenced. A fold/identity that resolves an
+        // instruction to itself must leave it in place, not delete it.
+        if with == ValueId::Instruction(insn) {
+            return;
+        }
         body.replace_all_uses_with(ValueId::Instruction(insn), with);
         self.redundant.insert(insn);
     }
@@ -482,6 +489,71 @@ mod tests {
         ) -> Claim {
             Claim::Pass
         }
+    }
+
+    /// A sub-pass that resolves the *first non-terminator* instruction to itself
+    /// and calls `Editor::replace(insn, insn)`. This must be a no-op: the value
+    /// survives the block walk's `finish` rather than being deleted with its uses
+    /// still pointing at it (the crash class fixed in `Editor::replace`).
+    struct ReplaceFirstWithItself;
+
+    impl<'str> SubPass<'str> for ReplaceFirstWithItself {
+        fn init_state(&self) -> Box<dyn Any> {
+            Box::new(false) // "already fired" flag
+        }
+        fn clone_state(&self, state: &dyn Any) -> Box<dyn Any> {
+            Box::new(*state.downcast_ref::<bool>().unwrap())
+        }
+        fn on_insn(
+            &self,
+            _body: &mut FunctionBody<'str>,
+            _cx: crate::ContextView<'_, 'str>,
+            state: &mut dyn Any,
+            ic: &InsnCtx,
+            ed: &mut Editor,
+        ) -> Claim {
+            let fired = state.downcast_mut::<bool>().unwrap();
+            if *fired || ic.mnemonic.is_terminator() {
+                return Claim::Pass;
+            }
+            *fired = true;
+            ed.replace(_body, _cx, ic.insn_id, ValueId::Instruction(ic.insn_id));
+            Claim::Done
+        }
+    }
+
+    #[test]
+    fn editor_replace_with_itself_is_a_noop() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <entry @a:i32>
+                %x = @a + 1;
+                %y = %x + 2;
+                return %y;
+            "
+        );
+        let root = FunctionBody::from_id(&ctx, f).root().unwrap().id;
+        let x = BasicBlock::from_id(&ctx, root).instruction_ids()[0];
+        let users_before = ctx.bodies[f].users_of(ValueId::Instruction(x));
+        assert!(!users_before.is_empty());
+
+        let passes: Vec<Box<dyn SubPass<'_>>> = vec![Box::new(ReplaceFirstWithItself)];
+        crate::with_body_mut(&mut ctx, f, |body, cx| {
+            run_dominator_walk(body, cx, f, &passes, None);
+        });
+
+        assert!(
+            ctx.contains_instruction(x),
+            "a self-replaced instruction must survive the walk's finish"
+        );
+        assert_eq!(
+            FunctionBody::from_id(&ctx, f).users_of(ValueId::Instruction(x)),
+            users_before,
+            "its users must be untouched"
+        );
     }
 
     #[test]

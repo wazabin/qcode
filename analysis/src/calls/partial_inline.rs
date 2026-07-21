@@ -306,6 +306,14 @@ fn try_partial_inline(ctx: &mut Context, fid: FunctionId, call_sites: &[Instruct
             // Every `extract` of this field at this call site (usually one).
             for extract_id in extracts_by_index.remove(&inl.index).unwrap_or_default() {
                 let clone = clone_expr(ctx, extract_id, inl.value, &inl.order, &inputs, &args);
+                // A degenerate recompute can resolve straight back to the extract
+                // itself (empty clone order whose root value is the projection).
+                // Replacing it with itself would delete a still-referenced value
+                // (`replace_all_uses_with` is a no-op on `old == new`, but the
+                // deletion is not) — and report spurious change. Skip it.
+                if clone == ValueId::Instruction(extract_id) {
+                    continue;
+                }
                 ctx.replace_instruction(extract_id, clone);
                 changed = true;
             }

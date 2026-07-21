@@ -1091,6 +1091,12 @@ impl<'str> FunctionBody<'str> {
     /// ([`replace_all_uses_with`](Self::replace_all_uses_with) +
     /// [`remove_instruction`](Self::remove_instruction)).
     pub fn replace_instruction(&mut self, id: InstructionId, new: ValueId) {
+        // Replacing an instruction with itself is a contradiction: the use
+        // forwarding is a no-op, so removing `id` would delete a value that is
+        // still referenced. Leave it in place.
+        if new == ValueId::Instruction(id) {
+            return;
+        }
         self.replace_all_uses_with(ValueId::Instruction(id), new);
         self.remove_instruction(id);
     }
@@ -2458,6 +2464,46 @@ mod tests {
         (
             ctx, raw_a, raw_b, a_block, b_block, a_insn, b_insn, a_param, b_param,
         )
+    }
+
+    /// `replace_instruction(id, id)` must be a no-op: forwarding uses to itself
+    /// does nothing, so deleting `id` would strand its still-live users. A pass
+    /// that resolves an instruction to itself must leave it in place.
+    #[test]
+    fn replace_instruction_with_itself_is_a_noop() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <entry @a:i32>
+                %x = @a + 1;
+                %y = %x + 2;
+                return %y;
+            "
+        );
+        // `%x` is used by `%y`; find both.
+        let root = FunctionBody::from_id(&ctx, f).root().unwrap().id;
+        let insns: Vec<InstructionId> = BasicBlock::from_id(&ctx, root)
+            .instruction_ids()
+            .into_iter()
+            .collect();
+        let x = insns[0];
+        let users_before = ctx.bodies[f].users_of(ValueId::Instruction(x));
+        assert!(!users_before.is_empty(), "x should have a user (%y)");
+
+        // Replace x with itself — must not delete x or disturb its users.
+        ctx.bodies[f].replace_instruction(x, ValueId::Instruction(x));
+
+        assert!(
+            ctx.bodies[f].insns.contains(x.local),
+            "x must survive a self-replacement"
+        );
+        assert_eq!(
+            ctx.bodies[f].users_of(ValueId::Instruction(x)),
+            users_before,
+            "x's users must be unchanged"
+        );
     }
 
     #[test]
