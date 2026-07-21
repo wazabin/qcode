@@ -77,6 +77,9 @@ mod tests;
 
 pub use mark_pure::mark_pure_functions;
 pub use ram::argpromote;
+/// The unified RAM-channel summary solve, exposed for the `written_spaces`
+/// deriver in [`crate::calls::mem_effects`] (stage 3: one solve, two consumers).
+pub(crate) use ram_summary::solve as ram_summary_solve;
 pub use registers::{RegPurityGates, RegPurityReason, argpromote_registers, reg_purity};
 
 /// The call-argument index whose synthesized name matches `name`.

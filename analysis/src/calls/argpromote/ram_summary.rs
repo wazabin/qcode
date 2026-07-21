@@ -95,35 +95,61 @@ pub(crate) struct RamRegion {
     pub write: bool,
 }
 
-/// A function's solved outward footprint (see the module docs).
+/// The precise half of a summary: the exhaustively classified footprint.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct RamEffects {
+pub(crate) struct Footprint {
     pub fields: FxHashSet<RamField>,
     pub regions: FxHashSet<RamRegion>,
-    /// Entry budget exceeded: the sets are no longer exhaustive. Monotone
-    /// (never cleared by joins) and treated as ⊤ by every consumer.
-    pub saturated: bool,
 }
 
-impl RamEffects {
+impl Footprint {
     fn len(&self) -> usize {
         self.fields.len() + self.regions.len()
     }
 
-    /// Whether nothing in this footprint is observable by any caller: empty,
-    /// or `Frame`-contained (writes into the owner's own frame, dead at
-    /// return). This is the blocking-call gate's admission predicate until
-    /// materialization learns to compose real footprints.
-    pub(crate) fn outward_invisible(&self) -> bool {
-        !self.saturated
-            && self
-                .fields
-                .iter()
-                .all(|f| matches!(f.base, RamBase::Frame(_)))
+    fn invisible(&self) -> bool {
+        self.fields
+            .iter()
+            .all(|f| matches!(f.base, RamBase::Frame(_)))
             && self
                 .regions
                 .iter()
                 .all(|r| matches!(r.base, RamBase::Frame(_)))
+    }
+}
+
+/// A function's solved memory summary, two independently-⊤ components:
+///
+/// - `precise`: the exhaustive outward footprint (`None` = inexpressible —
+///   an unclassifiable access, a non-lockstep interface, budget saturation, or
+///   an unrebasable call edge). The blocking-call gate's authority.
+/// - `written`: the coarse set of shared non-register spaces the function may
+///   *store* to, own-frame and all (`None` = unbounded — an external, an
+///   unresolved `BranchInd` escape, or an unbounded callee). What
+///   `written_spaces` / `mem_forward`'s call-prune consume. Deliberately laxer
+///   than `precise`: a function whose footprint defies classification still
+///   usually has a bounded space set.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RamEffects {
+    pub precise: Option<Footprint>,
+    pub written: Option<std::collections::BTreeSet<qcode::space::SpaceId>>,
+}
+
+impl Default for RamEffects {
+    fn default() -> Self {
+        Self {
+            precise: Some(Footprint::default()),
+            written: Some(Default::default()),
+        }
+    }
+}
+
+impl RamEffects {
+    /// Whether nothing in this footprint is observable by any caller: empty,
+    /// or `Frame`-contained (writes into the owner's own frame, dead at
+    /// return). This is the blocking-call gate's admission predicate.
+    pub(crate) fn outward_invisible(&self) -> bool {
+        self.precise.as_ref().is_some_and(Footprint::invisible)
     }
 }
 
@@ -212,91 +238,20 @@ impl RamChannel {
         // assume_arg_frame). ⊤ until the assumption plumbing lands.
         None
     }
-}
 
-impl EffectChannel for RamChannel {
-    type Effects = RamEffects;
-
-    fn scan(&self, ctx: &Context, fid: FunctionId) -> Option<RamEffects> {
-        // ---- outward-access filter (2a + freshness licensing) --------------
-        // Built on the first shared-space access only: most memory-free
-        // candidates have none, and the affine numbering behind the frame
-        // classifier is the expensive part.
-        let mut own_frame: Option<OwnFrame> = None;
-        // Shared-space accesses that are caller-observable, to be claimed by
-        // the footprint extraction below. `(access, raw ptr, space)` keeps the
-        // unqualified pointer for `global_slot`.
-        let mut outward: Vec<MemoryAccess> = Vec::new();
-        let mut raw: Vec<(qcode::value::LocalValueId, qcode::space::LocalMemorySpaceId)> =
-            Vec::new();
-        let mut register_touch = false;
-        for block in FunctionBody::from_id(ctx, fid).blocks() {
-            // Own-frame slots this block has stored to, in program order (see
-            // the freshness licensing rationale in the module docs).
-            let mut stored: FxHashSet<(i64, usize)> = FxHashSet::default();
-            for insn in block.iter() {
-                let (space, lptr, size, is_store) = match insn.mnemonic() {
-                    Mnemonic::Load(l) => (l.space, l.ptr, l.size, false),
-                    Mnemonic::Store(s) => (s.space, s.ptr, s.size, true),
-                    _ => continue,
-                };
-                // Function-private (shadow/temp) space: outward-invisible.
-                let Some(shared) = space.shared() else {
-                    continue;
-                };
-                // Register traffic is the register channel's business; a
-                // function still moving registers through loads/stores is not
-                // functionalized and its footprint is not expressible here.
-                if matches!(
-                    qcode::space::Space::from_id(ctx, shared).ty,
-                    qcode::space::SpaceType::Register
-                ) {
-                    register_touch = true;
-                    continue;
-                }
-                let ptr = lptr.qualify(insn.id.func);
-                let frame = own_frame.get_or_insert_with(|| OwnFrame::new(ctx, fid, self.sp));
-                if frame.is_local(ctx, ptr) {
-                    if is_store {
-                        if let Some(off) = frame.local_offset(ctx, ptr) {
-                            stored.insert((off, size));
-                        }
-                        continue;
-                    }
-                    if frame
-                        .local_offset(ctx, ptr)
-                        .is_some_and(|off| stored.contains(&(off, size)))
-                    {
-                        continue; // licensed reload of an own write
-                    }
-                    // Unlicensed own-frame read: observes the previous dead
-                    // frame — the freshness hypothesis is refuted.
-                    return None;
-                }
-                if frame.is_frame_slot(ctx, ptr) {
-                    // A caller-frame slot (`@SP + k`, `k ≥ 0`): the return
-                    // address / incoming stack arguments. promote_stack_args
-                    // territory; not expressible here yet.
-                    return None;
-                }
-                outward.push(MemoryAccess {
-                    id: insn.id,
-                    block: block.id,
-                    is_store,
-                    ptr,
-                    size,
-                });
-                raw.push((lptr, space));
-            }
-        }
-        if register_touch {
-            return None;
-        }
+    /// The precise footprint of `fid`'s classified outward accesses, or `None`
+    /// (footprint-⊤) when any access defies the lattice.
+    fn extract_footprint(
+        &self,
+        ctx: &Context,
+        fid: FunctionId,
+        own_frame: &mut Option<OwnFrame>,
+        outward: &[MemoryAccess],
+        raw: &[(qcode::value::LocalValueId, qcode::space::LocalMemorySpaceId)],
+    ) -> Option<Footprint> {
         if outward.is_empty() {
-            return Some(RamEffects::default());
+            return Some(Footprint::default());
         }
-
-        // ---- footprint extraction ------------------------------------------
         // Effects hang off positional argument indices, which are meaningful
         // only for a lockstep (`pure_reg`) interface.
         let f = FunctionBody::from_id(ctx, fid);
@@ -313,10 +268,10 @@ impl EffectChannel for RamChannel {
             .map(|(i, p)| (p.id(), i as u32))
             .collect();
 
-        let mut eff = RamEffects::default();
+        let mut eff = Footprint::default();
         let mut claimed: FxHashSet<InstructionId> = FxHashSet::default();
         for &(param, idx) in &params {
-            for access in &outward {
+            for access in outward {
                 if let AddressRelation::Const(off) =
                     relate_address(ctx, numbering, param, access.ptr, access.block)
                 {
@@ -329,7 +284,7 @@ impl EffectChannel for RamChannel {
                     claimed.insert(access.id);
                 }
             }
-            let region_set = collect_regions_for_base(ctx, numbering, param, &outward);
+            let region_set = collect_regions_for_base(ctx, numbering, param, outward);
             for ru in &region_set.regions {
                 let lo = i64::try_from(ru.region.base_off).ok()?;
                 let hi = lo.checked_add(i64::try_from(ru.region.byte_len()).ok()?)?;
@@ -344,7 +299,7 @@ impl EffectChannel for RamChannel {
             // `rejected_accesses` stay unclaimed; the completeness check below
             // sends the function to ⊤ if nothing else claims them.
         }
-        for (access, &(lptr, space)) in outward.iter().zip(&raw) {
+        for (access, &(lptr, space)) in outward.iter().zip(raw) {
             if claimed.contains(&access.id) {
                 continue;
             }
@@ -368,20 +323,132 @@ impl EffectChannel for RamChannel {
         }
         Some(eff)
     }
+}
+
+impl EffectChannel for RamChannel {
+    type Effects = RamEffects;
+
+    fn scan(&self, ctx: &Context, fid: FunctionId) -> Option<RamEffects> {
+        // The two components fail independently: `written` collects every
+        // shared non-register store space regardless of classifiability, and
+        // only an unresolved `BranchInd` (a PLT-stub `goto [GOT]` escape into
+        // code the summary cannot see) unbounds it. `precise` dies on the
+        // first access the footprint lattice cannot express.
+        let mut written: Option<std::collections::BTreeSet<qcode::space::SpaceId>> =
+            Some(Default::default());
+        let mut precise_top = false;
+        // ---- outward-access filter (2a + freshness licensing) --------------
+        // Built on the first shared-space access only: most memory-free
+        // candidates have none, and the affine numbering behind the frame
+        // classifier is the expensive part.
+        let mut own_frame: Option<OwnFrame> = None;
+        // Shared-space accesses that are caller-observable, to be claimed by
+        // the footprint extraction below. `(access, raw ptr, space)` keeps the
+        // unqualified pointer for `global_slot`.
+        let mut outward: Vec<MemoryAccess> = Vec::new();
+        let mut raw: Vec<(qcode::value::LocalValueId, qcode::space::LocalMemorySpaceId)> =
+            Vec::new();
+        let mut register_touch = false;
+        for block in FunctionBody::from_id(ctx, fid).blocks() {
+            // Own-frame slots this block has stored to, in program order (see
+            // the freshness licensing rationale in the module docs).
+            let mut stored: FxHashSet<(i64, usize)> = FxHashSet::default();
+            for insn in block.iter() {
+                let (space, lptr, size, is_store) = match insn.mnemonic() {
+                    Mnemonic::Load(l) => (l.space, l.ptr, l.size, false),
+                    Mnemonic::Store(s) => (s.space, s.ptr, s.size, true),
+                    Mnemonic::BranchInd(_) => {
+                        written = None;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                // Function-private (shadow/temp) space: outward-invisible.
+                let Some(shared) = space.shared() else {
+                    continue;
+                };
+                // Register traffic is the register channel's business; a
+                // function still moving registers through loads/stores is not
+                // functionalized and its footprint is not expressible here.
+                if matches!(
+                    qcode::space::Space::from_id(ctx, shared).ty,
+                    qcode::space::SpaceType::Register
+                ) {
+                    register_touch = true;
+                    continue;
+                }
+                // Coarse channel: every shared non-register *store* space,
+                // own-frame included — parity with the retired SpaceChannel.
+                if is_store && let Some(w) = written.as_mut() {
+                    w.insert(shared);
+                }
+                let ptr = lptr.qualify(insn.id.func);
+                let frame = own_frame.get_or_insert_with(|| OwnFrame::new(ctx, fid, self.sp));
+                if frame.is_local(ctx, ptr) {
+                    if is_store {
+                        if let Some(off) = frame.local_offset(ctx, ptr) {
+                            stored.insert((off, size));
+                        }
+                        continue;
+                    }
+                    if frame
+                        .local_offset(ctx, ptr)
+                        .is_some_and(|off| stored.contains(&(off, size)))
+                    {
+                        continue; // licensed reload of an own write
+                    }
+                    // Unlicensed own-frame read: observes the previous dead
+                    // frame — the freshness hypothesis is refuted.
+                    precise_top = true;
+                    continue;
+                }
+                if frame.is_frame_slot(ctx, ptr) {
+                    // A caller-frame slot (`@SP + k`, `k ≥ 0`): the return
+                    // address / incoming stack arguments. promote_stack_args
+                    // territory; not expressible here yet.
+                    precise_top = true;
+                    continue;
+                }
+                outward.push(MemoryAccess {
+                    id: insn.id,
+                    block: block.id,
+                    is_store,
+                    ptr,
+                    size,
+                });
+                raw.push((lptr, space));
+            }
+        }
+        Some(RamEffects {
+            precise: (!precise_top && !register_touch)
+                .then(|| self.extract_footprint(ctx, fid, &mut own_frame, &outward, &raw))
+                .flatten(),
+            written,
+        })
+    }
 
     fn external_leaf(&self, _ctx: &Context, _fid: FunctionId) -> Option<RamEffects> {
-        // Parity with the legacy gate: a resolved bodyless external was treated
-        // as memory-free (`function_accesses_memory` over an empty body), and
-        // in practice every external call site carries ABI clobbers, which the
-        // caller-side clobber check rejects on its own. Stage 3 (persisted
-        // memory effects) revisits this with the materialized interface.
-        Some(RamEffects::default())
+        // Componentwise external parity: the *gate* keeps treating a resolved
+        // bodyless external as footprint-inert (legacy behavior — in practice
+        // every external call site carries ABI clobbers, which the caller-side
+        // clobber check rejects on its own), while the *coarse* channel keeps
+        // it unbounded (an external may write anywhere), exactly as the
+        // retired SpaceChannel did.
+        Some(RamEffects {
+            precise: Some(Footprint::default()),
+            written: None,
+        })
     }
 
     fn transfer(&self, ctx: &Context, edge: &CallEdge, callee: &RamEffects) -> Option<RamEffects> {
-        if callee.saturated {
-            return None;
-        }
+        // The coarse component moves by identity: space ids are global.
+        let written = callee.written.clone();
+        let Some(fp) = &callee.precise else {
+            return Some(RamEffects {
+                precise: None,
+                written,
+            });
+        };
         // Only a real positional `Call` site can rebase `Param` entries. Any
         // other direct-like edge (tail call, `Apply`/`Map`/`Scan`, synthetic)
         // composes only an invisible footprint.
@@ -392,74 +459,113 @@ impl EffectChannel for RamChannel {
                 _ => None,
             });
         let Some(args) = call_args else {
-            return callee.outward_invisible().then(RamEffects::default);
+            return Some(RamEffects {
+                precise: fp.invisible().then(Footprint::default),
+                written,
+            });
         };
         let caller = edge.caller;
-        let mut out = RamEffects::default();
-        // Rebase one entry's base; `write`-ness gates the own-frame landing.
-        let rebase = |base: RamBase, write: bool| -> Option<Option<(RamBase, i64)>> {
-            Some(match base {
-                // Contained in the callee's own frame — invisible here.
-                RamBase::Frame(_) => None,
-                RamBase::Global(a) => Some((RamBase::Global(a), 0)),
-                RamBase::Param(i) => {
-                    let arg = args.get(i as usize)?.qualify(caller);
-                    let (new_base, shift) = self.classify_arg(ctx, caller, arg)?;
-                    if matches!(new_base, RamBase::Frame(_)) && !write {
-                        // A callee *read* through a frame argument needs
-                        // store-licensing knowledge (freshness) — ⊤.
-                        return None;
+        // The precise rebase degrades to footprint-⊤ on its own (an
+        // unrebasable argument never unbounds the coarse component).
+        let precise = (|| -> Option<Footprint> {
+            let mut out = Footprint::default();
+            // Rebase one entry's base; `write`-ness gates the own-frame landing.
+            let rebase = |base: RamBase, write: bool| -> Option<Option<(RamBase, i64)>> {
+                Some(match base {
+                    // Contained in the callee's own frame — invisible here.
+                    RamBase::Frame(_) => None,
+                    RamBase::Global(a) => Some((RamBase::Global(a), 0)),
+                    RamBase::Param(i) => {
+                        let arg = args.get(i as usize)?.qualify(caller);
+                        let (new_base, shift) = self.classify_arg(ctx, caller, arg)?;
+                        if matches!(new_base, RamBase::Frame(_)) && !write {
+                            // A callee *read* through a frame argument needs
+                            // store-licensing knowledge (freshness) — ⊤.
+                            return None;
+                        }
+                        Some((new_base, shift))
                     }
-                    Some((new_base, shift))
-                }
-            })
-        };
-        for f in &callee.fields {
-            match rebase(f.base, f.write)? {
-                None => {}
-                Some((base, shift)) => {
-                    let offset = f.offset.checked_add(shift)?;
-                    // A frame landing must stay strictly below the caller's
-                    // entry SP — crossing into the return-address slot or the
-                    // caller's caller frame is not containable.
-                    if let RamBase::Frame(t) = base
-                        && t.checked_add(offset)?
-                            .checked_add(i64::try_from(f.size).ok()?)?
-                            > 0
-                    {
-                        return None;
+                })
+            };
+            for f in &fp.fields {
+                match rebase(f.base, f.write)? {
+                    None => {}
+                    Some((base, shift)) => {
+                        let offset = f.offset.checked_add(shift)?;
+                        // A frame landing must stay strictly below the caller's
+                        // entry SP — crossing into the return-address slot or the
+                        // caller's caller frame is not containable.
+                        if let RamBase::Frame(t) = base
+                            && t.checked_add(offset)?
+                                .checked_add(i64::try_from(f.size).ok()?)?
+                                > 0
+                        {
+                            return None;
+                        }
+                        out.fields.insert(RamField { base, offset, ..*f });
                     }
-                    out.fields.insert(RamField { base, offset, ..*f });
-                }
-            }
-        }
-        for r in &callee.regions {
-            match rebase(r.base, r.write)? {
-                None => {}
-                Some((base, shift)) => {
-                    let lo = r.lo.checked_add(shift)?;
-                    let hi = r.hi.checked_add(shift)?;
-                    if let RamBase::Frame(t) = base
-                        && t.checked_add(hi)? > 0
-                    {
-                        return None;
-                    }
-                    out.regions.insert(RamRegion { base, lo, hi, ..*r });
                 }
             }
-        }
-        if out.len() > MAX_EFFECT_ENTRIES {
-            return None;
-        }
-        Some(out)
+            for r in &fp.regions {
+                match rebase(r.base, r.write)? {
+                    None => {}
+                    Some((base, shift)) => {
+                        let lo = r.lo.checked_add(shift)?;
+                        let hi = r.hi.checked_add(shift)?;
+                        if let RamBase::Frame(t) = base
+                            && t.checked_add(hi)? > 0
+                        {
+                            return None;
+                        }
+                        out.regions.insert(RamRegion { base, lo, hi, ..*r });
+                    }
+                }
+            }
+            if out.len() > MAX_EFFECT_ENTRIES {
+                return None;
+            }
+            Some(out)
+        })();
+        Some(RamEffects { precise, written })
     }
 
     fn join(&self, into: &mut RamEffects, from: &RamEffects) -> bool {
-        let before = (into.len(), into.saturated);
-        into.fields.extend(from.fields.iter().copied());
-        into.regions.extend(from.regions.iter().copied());
-        into.saturated |= from.saturated || into.len() > MAX_EFFECT_ENTRIES;
-        (into.len(), into.saturated) != before
+        let mut grew = false;
+        // Precise: union under the entry budget; ⊤ absorbs.
+        into.precise = match (into.precise.take(), &from.precise) {
+            (Some(mut a), Some(b)) => {
+                let before = a.len();
+                a.fields.extend(b.fields.iter().copied());
+                a.regions.extend(b.regions.iter().copied());
+                grew |= a.len() != before;
+                if a.len() > MAX_EFFECT_ENTRIES {
+                    grew = true;
+                    None
+                } else {
+                    Some(a)
+                }
+            }
+            (None, _) => None,
+            (Some(_), None) => {
+                grew = true;
+                None
+            }
+        };
+        // Coarse: space-set union; ⊤ absorbs.
+        into.written = match (into.written.take(), &from.written) {
+            (Some(mut a), Some(b)) => {
+                let before = a.len();
+                a.extend(b.iter().copied());
+                grew |= a.len() != before;
+                Some(a)
+            }
+            (None, _) => None,
+            (Some(_), None) => {
+                grew = true;
+                None
+            }
+        };
+        grew
     }
 }
 
@@ -725,8 +831,9 @@ mod tests {
         materialize(&mut tc, callee);
         let graph = CallGraph::analyze(&tc.ctx);
         let s = solve(&tc.ctx, &graph, None);
-        let eff = s.get(callee).as_ref().expect("footprint is expressible");
-        let mut fields: Vec<RamField> = eff.fields.iter().copied().collect();
+        let eff = s.get(callee).as_ref().expect("summary is expressible");
+        let fp = eff.precise.as_ref().expect("footprint is expressible");
+        let mut fields: Vec<RamField> = fp.fields.iter().copied().collect();
         fields.sort_by_key(|f| (f.base, f.offset));
         assert_eq!(
             fields,
@@ -796,8 +903,9 @@ mod tests {
 
         let graph = CallGraph::analyze(&tc.ctx);
         let s = solve(&tc.ctx, &graph, None);
-        let eff = s.get(caller).as_ref().expect("rebase must succeed");
-        let mut fields: Vec<RamField> = eff.fields.iter().copied().collect();
+        let eff = s.get(caller).as_ref().expect("summary is expressible");
+        let fp = eff.precise.as_ref().expect("rebase must succeed");
+        let mut fields: Vec<RamField> = fp.fields.iter().copied().collect();
         fields.sort_by_key(|f| (f.base, f.offset));
         assert_eq!(
             fields,

@@ -1,98 +1,24 @@
 //! Interprocedural memory-write summaries: which memory spaces each function may
-//! store to.
-//!
-//! [`set_all_written_spaces`] computes, for every non-external function, the
-//! exact set of non-register memory [`SpaceId`]s it may write — directly in its
-//! own body, or transitively through a (direct, resolved) callee. The result is
-//! recorded on the function's
-//! [`written_spaces`](qcode::value::FunctionRef::written_spaces)
-//! signature field.
+//! store to, recorded on [`written_spaces`](qcode::value::FunctionRef::written_spaces).
 //!
 //! The consumer is store-to-load forwarding's call-prune
 //! ([`crate::gvn::mem_forward`]): a call to a callee whose witnessed write-set
 //! does **not** include a cell's space cannot clobber that cell, so the forwarded
-//! value survives the call. This is what keeps a buffer pointer spilled into the
-//! caller's frame forwardable across a call to a functionalized (`pure_reg`)
-//! callee that writes only its own private scratch space — never the real `ram`
-//! the buffer lives in.
+//! value survives the call.
 //!
-//! A function whose effect cannot be bounded — it makes an indirect call or
-//! tail-branch, or calls an external function — is recorded `None` (unknown /
-//! may write any space), the conservative answer the prune already assumes.
-//!
-//! The fixpoint itself is the channel-generic effect engine
-//! ([`crate::calls::effect_engine`]); this module contributes only the
-//! space-set channel and the signature write-back.
-
-use rustc_hash::FxHashSet as HashSet;
+//! Stage 3 of the RAM effects migration retired the standalone `SpaceChannel`:
+//! the coarse space set is now the `written` component of the unified
+//! [`RamChannel`](super::argpromote) summary — one engine solve feeds both the
+//! argpromote blocking gate (`precise`) and this record (`written`). A function
+//! whose effect cannot be bounded — an unresolved `BranchInd`, an external, an
+//! indirect call — is recorded `None` (may write any space), the conservative
+//! answer the prune already assumes.
 
 use qcode::{
     context::Context,
-    space::{Space, SpaceId, SpaceType},
-    value::{FunctionBody, FunctionId, insn::Mnemonic},
+    space::SpaceId,
+    value::{FunctionBody, FunctionId},
 };
-
-use super::{
-    CallEdge, CallGraph,
-    effect_engine::{EffectChannel, solve_summaries},
-};
-
-/// The memory-write [`EffectChannel`]: effects are the set of non-register
-/// shared spaces a function may store to; ⊤ (unbounded) is any escape to code the
-/// summary cannot see. Externals are ⊤ leaves (a prototype bounds their
-/// *register* effect, not their memory accesses), and an unresolved `BranchInd`
-/// (the PLT-stub shape `goto [GOT_slot]`) is a channel-⊤ in the scan — a
-/// `BranchInd` that stayed in-function would have been resolved to a direct
-/// `Branch` by the jump-table pass, so one that survives is a genuine escape.
-/// `CallInd` is the engine's shared indirect gate (default ⊤).
-struct SpaceChannel;
-
-impl EffectChannel for SpaceChannel {
-    type Effects = HashSet<SpaceId>;
-
-    fn scan(&self, ctx: &Context, fid: FunctionId) -> Option<Self::Effects> {
-        let mut writes = HashSet::default();
-        for block in FunctionBody::from_id(ctx, fid).blocks() {
-            for insn in block.iter() {
-                match insn.mnemonic() {
-                    // Register writes are tracked separately (via
-                    // `FunctionEffects`); only memory spaces matter to the
-                    // forwarding prune. Function-local temporary writes never
-                    // escape into the published interprocedural summary.
-                    Mnemonic::Store(s) => {
-                        if let Some(space) = s.space.shared()
-                            && !matches!(Space::from_id(ctx, space).ty, SpaceType::Register)
-                        {
-                            writes.insert(space);
-                        }
-                    }
-                    Mnemonic::BranchInd(_) => return None,
-                    _ => {}
-                }
-            }
-        }
-        Some(writes)
-    }
-
-    fn external_leaf(&self, _ctx: &Context, _fid: FunctionId) -> Option<Self::Effects> {
-        None
-    }
-
-    fn transfer(
-        &self,
-        _ctx: &Context,
-        _edge: &CallEdge,
-        callee: &Self::Effects,
-    ) -> Option<Self::Effects> {
-        Some(callee.clone())
-    }
-
-    fn join(&self, into: &mut Self::Effects, from: &Self::Effects) -> bool {
-        let before = into.len();
-        into.extend(from.iter().copied());
-        into.len() != before
-    }
-}
 
 /// Compute and record [`written_spaces`](qcode::value::FunctionRef::written_spaces)
 /// for every non-external function: the engine's least fixpoint over the call
@@ -108,8 +34,16 @@ fn set_written_spaces_targeted(
     ctx: &mut Context,
     targets: &[FunctionId],
 ) -> rustc_hash::FxHashSet<FunctionId> {
-    let graph = CallGraph::analyze(ctx);
-    let summaries = solve_summaries(ctx, &graph, &SpaceChannel);
+    set_written_spaces_targeted_with_sp(ctx, targets, None)
+}
+
+fn set_written_spaces_targeted_with_sp(
+    ctx: &mut Context,
+    targets: &[FunctionId],
+    sp: Option<qcode::value::VarnodeId>,
+) -> rustc_hash::FxHashSet<FunctionId> {
+    let graph = crate::CallGraph::analyze(ctx);
+    let summaries = super::argpromote::ram_summary_solve(ctx, &graph, sp);
 
     let mut changed_functions = rustc_hash::FxHashSet::default();
     for &id in targets {
@@ -118,11 +52,10 @@ fn set_written_spaces_targeted(
         }
         let summary = match summaries.get(id) {
             Err(_) => None,
-            Ok(set) => {
-                let mut v: Vec<SpaceId> = set.iter().copied().collect();
-                v.sort_by_key(|&s| usize::from(s));
-                Some(v)
-            }
+            Ok(eff) => eff
+                .written
+                .as_ref()
+                .map(|set| set.iter().copied().collect::<Vec<SpaceId>>()),
         };
         if FunctionBody::from_id(ctx, id).written_spaces() != summary.as_deref() {
             changed_functions.insert(id);
@@ -150,7 +83,7 @@ impl Pass for SeedWrittenSpaces {
         _env: &PipelineEnv,
         targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
-        let changed = set_written_spaces_targeted(ctx, targets);
+        let changed = set_written_spaces_targeted_with_sp(ctx, targets, _env.sp_varnode);
         Ok(crate::ModulePassOutcome::functions(changed)
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>())
