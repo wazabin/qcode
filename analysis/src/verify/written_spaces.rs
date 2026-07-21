@@ -160,8 +160,12 @@ fn check_callee(
              written_spaces {ws:?}",
             cf.name(),
         )),
-        // An external is never stamped (`set_written_spaces` skips externals) but
-        // is genuinely unbounded — never a fresh mint — so it flags too.
+        // A defensive fallback: `SeedWrittenSpaces` now stamps externals too (a
+        // prototyped one gets a bounded argmem write-set, an un-prototyped one
+        // `Unbounded`), so a stamped external takes the `Bounded`/`Unbounded`
+        // arms above. An external that reaches here *unstamped* never ran through
+        // the seed pass; it is genuinely unbounded — never a fresh mint — so it
+        // still flags.
         WrittenSpaces::Unstamped if cf.is_external() => Some(format!(
             "{name}: external callee {} is unbounded but the caller has a bounded \
              written_spaces {ws:?}",
@@ -319,6 +323,69 @@ mod tests {
         assert!(
             diags.iter().any(|d| d.contains("is recorded unbounded")),
             "an internal callee recorded unbounded under a bounded caller must be flagged: {diags:?}"
+        );
+    }
+
+    /// STAGE 3: `SeedWrittenSpaces` stamps a prototyped external with its argmem
+    /// write-set ({ram} for a mutable-pointer external), so a caller bounded over
+    /// it nests cleanly — no false "external is unbounded" flag.
+    #[test]
+    fn prototyped_external_written_set_nests_under_caller() {
+        use qcode::value::insn::{Call, CallTag, Callee, Mnemonic};
+        use qcode::value::{ArgMemKind, BasicBlock, ExternArgmem, FunctionBody, QCodeMut};
+        let mut tc = qcode::testing::TestContext::new();
+        let memset = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("memset".into())).id;
+        FunctionBody::from_id_mut(&mut tc.ctx, memset).set_argmem(ExternArgmem {
+            params: vec![ArgMemKind::MutPtr, ArgMemKind::NonPtr, ArgMemKind::NonPtr],
+            variadic: false,
+        });
+        qcode!(
+            tc.ctx,
+            "
+            fn caller:
+                <k_entry @p:i64>
+                    call fn caller();
+                <k_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (k_entry, k_cont);
+        let p = FunctionBody::from_id(&tc.ctx, caller)
+            .root()
+            .unwrap()
+            .params()
+            .next()
+            .unwrap()
+            .id();
+        let call_id = BasicBlock::from_id(&tc.ctx, k_entry)
+            .iter()
+            .find(|i| matches!(i.mnemonic(), Mnemonic::Call(_)))
+            .unwrap()
+            .id;
+        tc.ctx.replace_instruction_mnemonic(
+            call_id,
+            Mnemonic::Call(Call {
+                target: Callee::Real(memset),
+                args: vec![p.localize(call_id.func)],
+                clobbers: vec![],
+                tag: CallTag::RegPure,
+            }),
+        );
+        crate::calls::set_all_written_spaces(&mut tc.ctx);
+
+        use qcode::value::WrittenSpaces;
+        let ram = tc.ctx.shared.default_space;
+        assert!(
+            matches!(
+                FunctionBody::from_id(&tc.ctx, memset).written_spaces_state(),
+                WrittenSpaces::Bounded(cs) if cs == [ram]
+            ),
+            "a mutable-pointer external is stamped Bounded({{ram}})"
+        );
+        assert!(
+            verify_written_spaces(&tc.ctx).is_empty(),
+            "a caller bounded over a prototyped external must not be flagged: {:?}",
+            verify_written_spaces(&tc.ctx)
         );
     }
 

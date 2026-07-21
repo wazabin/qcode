@@ -21,10 +21,18 @@ use qcode::{
 };
 
 /// Compute and record [`written_spaces`](qcode::value::FunctionRef::written_spaces)
-/// for every non-external function: the `written` component of the unified
-/// [`RamChannel`](super::argpromote) summary (`ram_summary_solve`). A ⊤ summary
-/// (unbounded) records `None`, the conservative value the prune already assumes,
-/// so an under-approximation is impossible.
+/// for every function — externals included: the `written` component of the
+/// unified [`RamChannel`](super::argpromote) summary (`ram_summary_solve`). A ⊤
+/// summary (unbounded) records `None`, the conservative value the prune already
+/// assumes, so an under-approximation is impossible.
+///
+/// Externals are stamped uniformly with the rest: a prototyped external's argmem
+/// derivation bounds its `written` (e.g. `memset` writes only the default ram
+/// space), an un-prototyped one records `Unbounded`. Stamping them keeps the
+/// `written_spaces` verify rule consistent — it reads the same tri-state for a
+/// callee whether internal or external, so a caller bounded over a prototyped
+/// external no longer trips the "external is unbounded" arm when the external's
+/// derived write-set nests inside the caller's.
 pub fn set_all_written_spaces(ctx: &mut Context) {
     let targets = ctx.function_ids();
     set_written_spaces_targeted_with_sp(ctx, &targets, None);
@@ -40,9 +48,6 @@ fn set_written_spaces_targeted_with_sp(
 
     let mut changed_functions = rustc_hash::FxHashSet::default();
     for &id in targets {
-        if FunctionBody::from_id(ctx, id).is_external() {
-            continue;
-        }
         let summary = match summaries.get(id) {
             Err(_) => None,
             Ok(eff) => eff
