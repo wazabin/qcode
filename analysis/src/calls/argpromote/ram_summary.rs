@@ -95,16 +95,32 @@ pub(crate) struct RamRegion {
     pub write: bool,
 }
 
+/// One **whole-object** effect: the callee touches the entire (extent-unknown)
+/// object addressed by `base`, read (and written iff `write`). Minted **only**
+/// by [`external_leaf`](EffectChannel::external_leaf) from a prototype's pointer
+/// parameters — a non-const pointer param yields a `write` object, a const one a
+/// read object. Bodied-function scans never mint object entries (their footprint
+/// is exhaustively classified into fields/regions), so `extract_footprint`/`scan`
+/// leave `objects` empty; only the external-leaf and the `transfer` rebase touch
+/// them. `write == true` models a read+write (possibly in-out) access — the
+/// object is both potentially read and clobbered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RamObject {
+    pub base: RamBase,
+    pub write: bool,
+}
+
 /// The precise half of a summary: the exhaustively classified footprint.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Footprint {
     pub fields: FxHashSet<RamField>,
     pub regions: FxHashSet<RamRegion>,
+    pub objects: FxHashSet<RamObject>,
 }
 
 impl Footprint {
     fn len(&self) -> usize {
-        self.fields.len() + self.regions.len()
+        self.fields.len() + self.regions.len() + self.objects.len()
     }
 
     fn invisible(&self) -> bool {
@@ -115,6 +131,20 @@ impl Footprint {
                 .regions
                 .iter()
                 .all(|r| matches!(r.base, RamBase::Frame(_)))
+            && self.objects.iter().all(|o| {
+                // A `Frame`-based whole-object entry is invisible: a `Frame`
+                // write dies with the owner's frame (contained under the
+                // confinement assumption, see `external_leaf` / the module docs).
+                // A `Frame`-based object *read* must never exist — `transfer`
+                // sends a frame-landing read to ⊤ (freshness), same as a field —
+                // so it should never reach this predicate; treat it defensively
+                // as not-invisible if one somehow does.
+                debug_assert!(
+                    o.write || !matches!(o.base, RamBase::Frame(_)),
+                    "a Frame-based object read must have been rejected by transfer"
+                );
+                matches!(o.base, RamBase::Frame(_)) && o.write
+            })
     }
 }
 
@@ -550,6 +580,23 @@ impl EffectChannel for RamChannel {
                     }
                 }
             }
+            for o in &fp.objects {
+                // A whole-object entry has no extent, so — unlike fields and
+                // regions — there is NO containment/boundary arithmetic on a
+                // frame landing: a callee's whole-object write into a caller
+                // own-frame local is admitted outright under the confinement
+                // assumption (the external writes only within the addressed
+                // object, and the caller's frame local dies at return). See
+                // stage 4 (`ExternalArgmemConfinement`) in the module docs. A
+                // frame-landing object *read* is still rejected by `rebase`
+                // (freshness), exactly like a field read.
+                match rebase(o.base, o.write)? {
+                    None => {}
+                    Some((base, _shift)) => {
+                        out.objects.insert(RamObject { base, ..*o });
+                    }
+                }
+            }
             if out.len() > MAX_EFFECT_ENTRIES {
                 return None;
             }
@@ -566,6 +613,7 @@ impl EffectChannel for RamChannel {
                 let before = a.len();
                 a.fields.extend(b.fields.iter().copied());
                 a.regions.extend(b.regions.iter().copied());
+                a.objects.extend(b.objects.iter().copied());
                 grew |= a.len() != before;
                 if a.len() > MAX_EFFECT_ENTRIES {
                     grew = true;
@@ -1195,6 +1243,194 @@ mod tests {
             !is_memory_free(&s, caller),
             "a clobber-free RegPure call to an external must block the caller — \
              external memory is ⊤"
+        );
+    }
+
+    /// STAGE 1: a whole-object entry rebases through the call arguments exactly
+    /// like a field's base — a caller pointer param composes positionally, a
+    /// literal lands on `Global`, and an own-frame-local write lands (contained)
+    /// on `Frame`, all with **no** extent arithmetic.
+    #[test]
+    fn object_rebases_through_param_global_and_frame() {
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        qcode!(
+            tc.ctx,
+            "
+            fn callee:
+                <c_entry @p:i64 @q:i64 @r:i64>
+                    return at i64 0;
+
+            fn caller:
+                <k_entry @a:i64 @RSP:i64>
+                    %loc = @RSP - i64 0x20;
+                    goto <k_call>;
+                <k_call>
+                    call <callee>;
+                <k_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (c_entry, k_entry);
+        materialize(&mut tc, callee);
+        materialize(&mut tc, caller);
+        set_sp_origin(&mut tc, caller, sp);
+        let lit = tc.ctx.get_const(0x4000, 8).id();
+        let (a_param, loc) = {
+            let f = FunctionBody::from_id(&tc.ctx, caller);
+            let a_param = f.root().unwrap().params().next().unwrap().id();
+            let loc = qcode::value::BasicBlock::from_id(&tc.ctx, k_entry)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id;
+            (a_param, ValueId::Instruction(loc))
+        };
+        let site = regpure_call(&mut tc, k_call, callee, vec![a_param, lit, loc]);
+        tc.ctx.add_cfg_edge(k_call, k_cont);
+
+        let ch = RamChannel::new(Some(sp));
+        let callee_eff = RamEffects {
+            precise: Some(Footprint {
+                objects: [
+                    RamObject {
+                        base: RamBase::Param(0),
+                        write: true,
+                    },
+                    RamObject {
+                        base: RamBase::Param(1),
+                        write: true,
+                    },
+                    RamObject {
+                        base: RamBase::Param(2),
+                        write: true,
+                    },
+                ]
+                .into_iter()
+                .collect(),
+                ..Footprint::default()
+            }),
+            written: Some(Default::default()),
+        };
+        let edge = CallEdge {
+            caller,
+            site: Some(site),
+            target: crate::calls::CallTarget::Function(callee),
+            kind: crate::calls::CallKind::Direct,
+        };
+        let out = ch
+            .transfer(&tc.ctx, &edge, &callee_eff)
+            .expect("transfer succeeds")
+            .precise
+            .expect("rebase succeeds");
+        let mut objs: Vec<RamObject> = out.objects.iter().copied().collect();
+        objs.sort_by_key(|o| o.base);
+        assert_eq!(
+            objs,
+            vec![
+                RamObject {
+                    base: RamBase::Param(0),
+                    write: true
+                },
+                RamObject {
+                    base: RamBase::Frame(-0x20),
+                    write: true
+                },
+                RamObject {
+                    base: RamBase::Global(0x4000),
+                    write: true
+                },
+            ]
+        );
+    }
+
+    /// STAGE 1: a whole-object *read* rebased through an own-frame-local argument
+    /// needs freshness licensing the transfer does not have — the same rule as a
+    /// field read — so the caller's footprint is ⊤.
+    #[test]
+    fn frame_landing_object_read_is_top() {
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        qcode!(
+            tc.ctx,
+            "
+            fn callee:
+                <c_entry @p:i64>
+                    return at i64 0;
+
+            fn caller:
+                <k_entry @RSP:i64>
+                    %loc = @RSP - i64 0x20;
+                    goto <k_call>;
+                <k_call>
+                    call <callee>;
+                <k_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (c_entry, k_entry);
+        materialize(&mut tc, callee);
+        materialize(&mut tc, caller);
+        set_sp_origin(&mut tc, caller, sp);
+        let loc = ValueId::Instruction(
+            qcode::value::BasicBlock::from_id(&tc.ctx, k_entry)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id,
+        );
+        let site = regpure_call(&mut tc, k_call, callee, vec![loc]);
+        tc.ctx.add_cfg_edge(k_call, k_cont);
+
+        let ch = RamChannel::new(Some(sp));
+        let callee_eff = RamEffects {
+            precise: Some(Footprint {
+                objects: [RamObject {
+                    base: RamBase::Param(0),
+                    write: false,
+                }]
+                .into_iter()
+                .collect(),
+                ..Footprint::default()
+            }),
+            written: Some(Default::default()),
+        };
+        let edge = CallEdge {
+            caller,
+            site: Some(site),
+            target: crate::calls::CallTarget::Function(callee),
+            kind: crate::calls::CallKind::Direct,
+        };
+        let out = ch
+            .transfer(&tc.ctx, &edge, &callee_eff)
+            .expect("transfer returns a summary");
+        assert!(
+            out.precise.is_none(),
+            "a frame-landing object read must send the footprint to ⊤"
+        );
+    }
+
+    /// STAGE 1: a footprint holding only a `Frame`-based whole-object *write* is
+    /// outward-invisible (contained, dead at return).
+    #[test]
+    fn invisible_with_frame_write_object() {
+        let mut fp = Footprint::default();
+        fp.objects.insert(RamObject {
+            base: RamBase::Frame(-0x20),
+            write: true,
+        });
+        assert!(
+            fp.invisible(),
+            "a Frame-contained object write is outward-invisible"
+        );
+        let mut real = Footprint::default();
+        real.objects.insert(RamObject {
+            base: RamBase::Param(0),
+            write: true,
+        });
+        assert!(
+            !real.invisible(),
+            "a Param-based object write is caller-observable"
         );
     }
 
