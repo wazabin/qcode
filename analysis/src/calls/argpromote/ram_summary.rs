@@ -460,13 +460,31 @@ impl EffectChannel for RamChannel {
                 written,
             });
         };
-        // Only a real positional `Call` site can rebase `Param` entries. Any
-        // other direct-like edge (tail call, `Apply`/`Map`/`Scan`, synthetic)
-        // composes only an invisible footprint.
+        // A positional site whose `args` are in `param[i] ↔ args[i]` lockstep
+        // with the callee's root params can rebase `Param` entries. `Call`,
+        // `TailCall`, and `Apply` all bind positionally against the callee's
+        // root interface, so the same rebase logic applies unchanged.
+        //
+        // For a `TailCall` the caller's epilogue has already run before the tail
+        // jump, so `@SP` at the site equals the caller's *entry* `@SP`. Any
+        // `Frame(t)` offset a callee effect rebases through an own-frame-local
+        // tail argument is therefore relative to that same entry `@SP`, and the
+        // frame-containment check below (`t + offset + size > 0` rejects) stays
+        // sound — a tail callee's frame overlaps the caller's already-dead frame
+        // and its `Frame` writes die one level up exactly as a `Call`'s do.
+        // (`classify_arg`'s own-frame view is value-based via `local_offset`, so
+        // it does not depend on the runtime `@SP` value at the site regardless.)
+        //
+        // `Map`/`Scan` stay on the conservative branch: their element-wise
+        // binding (`body(src[i])`) is NOT a positional lockstep against the
+        // body's root params, so a `Param(i)` entry cannot be rebased through a
+        // site argument.
         let call_args = edge
             .site
             .and_then(|site| match ctx.get_insn(site).mnemonic() {
                 Mnemonic::Call(c) => Some(c.args.clone()),
+                Mnemonic::TailCall(c) => Some(c.args.clone()),
+                Mnemonic::Apply(a) => Some(a.args.clone()),
                 _ => None,
             });
         let Some(args) = call_args else {
@@ -934,6 +952,87 @@ mod tests {
                     write: false
                 },
             ]
+        );
+        assert!(!is_memory_free(&s, caller));
+    }
+
+    /// ITEM 1: a `TailCall` site rebases `Param` entries exactly like a `Call` —
+    /// its args are positional-lockstep with the callee's root params. A callee
+    /// that writes `Param(0)`, tail-called with a caller pointer param, lands a
+    /// `Param(0)` write in the caller's summary.
+    #[test]
+    fn transfer_rebases_tailcall_args() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn callee:
+                <c_entry @p:i64>
+                    store(ram:8, @p <- i64 1);
+                    return at i64 0;
+
+            fn caller:
+                <k_entry @r:i64>
+                    tailcall fn callee(i64 @r);
+            "
+        );
+        let _ = (c_entry, k_entry);
+        materialize(&mut tc, callee);
+        materialize(&mut tc, caller);
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, None);
+        let eff = s.get(caller).as_ref().expect("summary is expressible");
+        let fp = eff.precise.as_ref().expect("tail rebase must succeed");
+        let fields: Vec<RamField> = fp.fields.iter().copied().collect();
+        assert_eq!(
+            fields,
+            vec![RamField {
+                base: RamBase::Param(0),
+                offset: 0,
+                size: 8,
+                write: true
+            }],
+            "the tail callee's Param(0) write rebases onto the caller's Param(0)"
+        );
+        assert!(!is_memory_free(&s, caller));
+    }
+
+    /// ITEM 1: an `Apply` site rebases `Param` entries exactly like a `Call` —
+    /// its args are positional-lockstep with the callee's root params too.
+    #[test]
+    fn transfer_rebases_apply_args() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn callee:
+                <c_entry @p:i64>
+                    store(ram:8, @p <- i64 1);
+                    return at i64 0;
+
+            fn caller:
+                <k_entry @r:i64>
+                    %pack = apply callee(i64 @r);
+                    return at i64 0;
+            "
+        );
+        let _ = (c_entry, k_entry);
+        materialize(&mut tc, callee);
+        materialize(&mut tc, caller);
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, None);
+        let eff = s.get(caller).as_ref().expect("summary is expressible");
+        let fp = eff.precise.as_ref().expect("apply rebase must succeed");
+        let fields: Vec<RamField> = fp.fields.iter().copied().collect();
+        assert_eq!(
+            fields,
+            vec![RamField {
+                base: RamBase::Param(0),
+                offset: 0,
+                size: 8,
+                write: true
+            }],
+            "the applied callee's Param(0) write rebases onto the caller's Param(0)"
         );
         assert!(!is_memory_free(&s, caller));
     }
