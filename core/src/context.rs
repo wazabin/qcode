@@ -3867,24 +3867,341 @@ mod tests {
         #[test]
         fn mints_a_conventional_function_when_no_stub_exists() {
             let mut ctx = Context::new();
-            let f = FunctionBody::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
-            let entry = block_at(&mut ctx, f, 0x1000);
-            let mid = block_at(&mut ctx, f, 0x1008);
-            branch_at(&mut ctx, entry, mid, 0x1000);
-            return_at(&mut ctx, mid, 0x1008);
-            FunctionBody::from_id_mut(&mut ctx, f)
-                .set_root(entry)
-                .unwrap();
+            qcode_macro::qcode!(
+                ctx,
+                "
+                fn f:
+                <entry>
+                    goto <0x1008>;
+                <0x1008>
+                    return 0x0;
+                "
+            );
 
+            let mid = block_at_addr(&ctx, f, 0x1008);
             let g = ctx.split_function_at(mid);
             assert_eq!(FunctionBody::from_id(&ctx, g).name(), "fn_1008");
-            assert_eq!(addrs(&ctx, f), vec![0x1000]);
+            // f keeps only its (unaddressed) entry; the addressed mid block moved.
+            assert_eq!(FunctionBody::from_id(&ctx, f).block_ids().len(), 1);
             assert_eq!(addrs(&ctx, g), vec![0x1008]);
             let addresses = crate::address_index::AddressIndex::analyze(&ctx);
             assert_eq!(addresses.function_at(0x1008), Some(g));
             for b in FunctionBody::from_id(&ctx, g).block_ids() {
                 assert_eq!(b.func, g);
             }
+        }
+
+        /// Assert every live block's static terminator target is a live block of
+        /// its own arena and has a matching CFG edge — the split invariant that,
+        /// when violated, later dereferences a dead `LocalBlockId`.
+        fn assert_no_dangling_terminators(ctx: &Context) {
+            for b in ctx.block_ids() {
+                let Some(mnemonic) = BasicBlock::from_id(ctx, b)
+                    .instructions()
+                    .last()
+                    .map(|t| t.mnemonic().clone())
+                else {
+                    continue;
+                };
+                let targets = match &mnemonic {
+                    Mnemonic::Branch(crate::value::insn::Branch { target, .. }) => vec![*target],
+                    Mnemonic::CBranch(crate::value::insn::CBranch {
+                        success_block,
+                        failure_block,
+                        ..
+                    }) => vec![*success_block, *failure_block],
+                    _ => vec![],
+                };
+                let succs: std::collections::HashSet<BlockId> = BasicBlock::from_id(ctx, b)
+                    .successors()
+                    .map(|(_, s)| s)
+                    .collect();
+                for t in targets {
+                    let tid = BlockId::new(b.func, t);
+                    assert!(
+                        ctx.contains_block(tid),
+                        "block {b:?} terminator names dead block {tid:?}"
+                    );
+                    assert!(
+                        succs.contains(&tid),
+                        "block {b:?} terminator target {tid:?} has no CFG edge (operand/edge desync)"
+                    );
+                }
+            }
+        }
+
+        /// A *retained* predecessor branching into the middle of the split tail
+        /// forces that landing to be promoted to its own function (recursive
+        /// split), so every predecessor — retained and in-tail — tail-calls it
+        /// rather than naming a block that is about to relocate.
+        #[test]
+        fn retained_predecessor_into_mid_tail_promotes_the_landing() {
+            let mut ctx = Context::new();
+            // entry -> {tail@2000, retained@1008}; both retained@1008 and the tail
+            // entry@2000 branch into the mid-tail landing@2008.
+            qcode_macro::qcode!(
+                ctx,
+                "
+                fn f:
+                <entry @c:i8>
+                    if @c goto <0x2000> else goto <0x1008>;
+                <0x1008>
+                    goto <0x2008>;
+                <0x2000>
+                    goto <0x2008>;
+                <0x2008>
+                    return 0x0;
+                "
+            );
+
+            let tail = block_at_addr(&ctx, f, 0x2000);
+            let g = ctx.split_function_at(tail);
+
+            // The landing became its own function; every branch into it is a
+            // TailCall, and nothing dangles.
+            let addresses = crate::address_index::AddressIndex::analyze(&ctx);
+            let landing_fn = addresses
+                .function_at(0x2008)
+                .expect("mid-tail landing must be promoted to a function");
+            assert_ne!(landing_fn, g);
+            assert_eq!(addrs(&ctx, g), vec![0x2000]);
+            assert_no_dangling_terminators(&ctx);
+
+            for (holder, addr) in [(f, 0x1008u64), (g, 0x2000u64)] {
+                let block = block_at_addr(&ctx, holder, addr);
+                let term = BasicBlock::from_id(&ctx, block)
+                    .instructions()
+                    .last()
+                    .map(|i| i.mnemonic().clone());
+                assert!(
+                    matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == Callee::Real(landing_fn)),
+                    "branch at {addr:#x} into the landing must tail-call it, got {term:?}",
+                );
+            }
+        }
+
+        /// A *tail* block whose conditional arm targets a foreign entry gets a
+        /// trampoline that must relocate into `g` alongside it. Regression test:
+        /// the trampoline was previously minted in the origin arena and stranded,
+        /// leaving the moved predecessor's arm naming a dead local.
+        #[test]
+        fn tail_conditional_to_foreign_entry_relocates_its_trampoline() {
+            let mut ctx = Context::new();
+            let f = FunctionBody::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+            let entry = block_at(&mut ctx, f, 0x1000);
+            let tail = block_at(&mut ctx, f, 0x2000);
+            let cont = block_at(&mut ctx, f, 0x2008);
+            let foreign = block_at(&mut ctx, f, 0x3000);
+            branch_at(&mut ctx, entry, tail, 0x1000);
+            // tail (which will move into g) conditionally jumps to a foreign entry.
+            cbranch_at(&mut ctx, tail, foreign, cont, 0x2000);
+            return_at(&mut ctx, cont, 0x2008);
+            return_at(&mut ctx, foreign, 0x3000);
+            FunctionBody::from_id_mut(&mut ctx, f)
+                .set_root(entry)
+                .unwrap();
+            let h = FunctionBody::make_at_addr(&mut ctx, 0x3000, Some(Cow::Borrowed("h"))).id;
+
+            let g = ctx.split_function_at(tail);
+
+            assert_no_dangling_terminators(&ctx);
+            let diagnostics = crate::verify_body_arena_integrity(&ctx);
+            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+            // The moved tail's success arm points to a trampoline that now lives in
+            // g and tail-calls the foreign function H.
+            let moved_tail = block_at_addr(&ctx, g, 0x2000);
+            let Mnemonic::CBranch(cb) = BasicBlock::from_id(&ctx, moved_tail)
+                .instructions()
+                .last()
+                .unwrap()
+                .mnemonic()
+                .clone()
+            else {
+                panic!("moved tail must still end in a cbranch");
+            };
+            let tramp = BlockId::new(g, cb.success_block);
+            assert_eq!(tramp.func, g, "trampoline must have relocated into g");
+            let term = BasicBlock::from_id(&ctx, tramp)
+                .instructions()
+                .last()
+                .map(|i| i.mnemonic().clone());
+            assert!(
+                matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == Callee::Real(h)),
+                "relocated trampoline must tail-call H, got {term:?}",
+            );
+        }
+
+        /// The *failure* arm of a retained conditional into the split entry is
+        /// routed through a trampoline (mirror of the success-arm case), leaving
+        /// the success arm untouched.
+        #[test]
+        fn conditional_failure_arm_into_split_block_uses_a_trampoline() {
+            let mut ctx = Context::new();
+            // split target (tail@2000) reached via the FAILURE arm; the fall-through
+            // success arm (cont@1008) is left untouched.
+            qcode_macro::qcode!(
+                ctx,
+                "
+                fn f:
+                <entry @c:i8>
+                    if @c goto <0x1008> else goto <0x2000>;
+                <0x1008>
+                    return 0x0;
+                <0x2000>
+                    return 0x0;
+                "
+            );
+
+            let tail = block_at_addr(&ctx, f, 0x2000);
+            let g = ctx.split_function_at(tail);
+
+            assert_no_dangling_terminators(&ctx);
+            let entry = BlockId::new(f, ctx.bodies[f].root_id().unwrap());
+            let cont = block_at_addr(&ctx, f, 0x1008);
+            let Mnemonic::CBranch(cb) = BasicBlock::from_id(&ctx, entry)
+                .instructions()
+                .last()
+                .unwrap()
+                .mnemonic()
+                .clone()
+            else {
+                panic!("entry must still end in a cbranch");
+            };
+            assert_eq!(
+                cb.success_block, cont.local,
+                "success (fall-through) untouched"
+            );
+            let tramp = BlockId::new(entry.func, cb.failure_block);
+            let term = BasicBlock::from_id(&ctx, tramp)
+                .instructions()
+                .last()
+                .map(|i| i.mnemonic().clone());
+            assert!(
+                matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == Callee::Real(g)),
+                "failure arm must route through a trampoline tail-calling G, got {term:?}",
+            );
+        }
+
+        /// A conditional terminator *inside* the moved tail, targeting two other
+        /// moved blocks, has both arms re-pointed at the clones.
+        #[test]
+        fn moved_tail_internal_conditional_remaps_both_arms() {
+            let mut ctx = Context::new();
+            // tail@2000 conditionally branches to two other moved blocks
+            // (arm_a@2008, arm_b@2010); all three relocate into g together.
+            qcode_macro::qcode!(
+                ctx,
+                "
+                fn f:
+                <entry>
+                    goto <0x2000>;
+                <0x2000>
+                    %c = 0x0 == 0x0;
+                    if %c goto <0x2008> else goto <0x2010>;
+                <0x2008>
+                    return 0x0;
+                <0x2010>
+                    return 0x0;
+                "
+            );
+
+            let tail = block_at_addr(&ctx, f, 0x2000);
+            let g = ctx.split_function_at(tail);
+
+            assert_eq!(addrs(&ctx, g), vec![0x2000, 0x2008, 0x2010]);
+            assert_no_dangling_terminators(&ctx);
+            let moved_tail = block_at_addr(&ctx, g, 0x2000);
+            let Mnemonic::CBranch(cb) = BasicBlock::from_id(&ctx, moved_tail)
+                .instructions()
+                .last()
+                .unwrap()
+                .mnemonic()
+                .clone()
+            else {
+                panic!("moved tail must still end in a cbranch");
+            };
+            let a = block_at_addr(&ctx, g, 0x2008);
+            let b = block_at_addr(&ctx, g, 0x2010);
+            assert_eq!(cb.success_block, a.local, "success arm re-pointed to clone");
+            assert_eq!(cb.failure_block, b.local, "failure arm re-pointed to clone");
+        }
+
+        /// An unconditional `Branch` *inside* the moved tail, between two moved
+        /// blocks, has its target re-pointed at the clone.
+        #[test]
+        fn moved_tail_internal_branch_remaps_target() {
+            let mut ctx = Context::new();
+            qcode_macro::qcode!(
+                ctx,
+                "
+                fn f:
+                <entry>
+                    goto <0x2000>;
+                <0x2000>
+                    goto <0x2008>;
+                <0x2008>
+                    return 0x0;
+                "
+            );
+
+            let tail = block_at_addr(&ctx, f, 0x2000);
+            let g = ctx.split_function_at(tail);
+
+            assert_eq!(addrs(&ctx, g), vec![0x2000, 0x2008]);
+            assert_no_dangling_terminators(&ctx);
+            let moved_tail = block_at_addr(&ctx, g, 0x2000);
+            let Mnemonic::Branch(br) = BasicBlock::from_id(&ctx, moved_tail)
+                .instructions()
+                .last()
+                .unwrap()
+                .mnemonic()
+                .clone()
+            else {
+                panic!("moved tail must still end in a branch");
+            };
+            let end = block_at_addr(&ctx, g, 0x2008);
+            assert_eq!(br.target, end.local, "internal branch re-pointed to clone");
+        }
+
+        /// A relocated block carrying a `Store` into a temporary space keeps its
+        /// space provenance rebased into the destination arena.
+        #[test]
+        fn split_rehomes_store_temporary_space() {
+            let mut ctx = Context::new();
+            let f = FunctionBody::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+            let entry = block_at(&mut ctx, f, 0x1000);
+            let tail = block_at(&mut ctx, f, 0x2000);
+            branch_at(&mut ctx, entry, tail, 0x1000);
+
+            let slot = ctx.builder(tail).make_named_temp(Cow::Borrowed("slot"), 8);
+            let space = ctx.bodies[f].temps[slot.local].space;
+            let value = ctx.get_const(0x2a, 8).id();
+            {
+                let mut builder = ctx.builder(tail);
+                builder.push_store(value, ValueId::Temp(slot), LocalMemorySpaceId::Temp(space));
+                builder.push_return(value);
+            }
+            FunctionBody::from_id_mut(&mut ctx, f)
+                .set_root(entry)
+                .unwrap();
+
+            let g = ctx.split_function_at(tail);
+            let diagnostics = crate::verify_body_arena_integrity(&ctx);
+            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+            let moved_store = FunctionBody::from_id(&ctx, g)
+                .blocks()
+                .flat_map(|block| block.instructions())
+                .find(|insn| matches!(insn.mnemonic(), Mnemonic::Store(_)))
+                .expect("store moved with the split");
+            let Mnemonic::Store(moved) = moved_store.mnemonic() else {
+                unreachable!()
+            };
+            let LocalMemorySpaceId::Temp(moved_space) = moved.space else {
+                panic!("store lost temporary-space provenance")
+            };
+            assert!(usize::from(moved_space) < ctx.bodies[g].temp_spaces.len());
         }
     }
 }
