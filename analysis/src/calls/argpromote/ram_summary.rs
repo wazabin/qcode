@@ -436,14 +436,17 @@ impl EffectChannel for RamChannel {
     }
 
     fn external_leaf(&self, _ctx: &Context, _fid: FunctionId) -> Option<RamEffects> {
-        // Componentwise external parity: the *gate* keeps treating a resolved
-        // bodyless external as footprint-inert (legacy behavior — in practice
-        // every external call site carries ABI clobbers, which the caller-side
-        // clobber check rejects on its own), while the *coarse* channel keeps
-        // it unbounded (an external may write anywhere), exactly as the
-        // retired SpaceChannel did.
+        // A bodyless external is fully-⊤ on both components: a prototype bounds
+        // an external's *register* effect, not its memory. The clobber pack that
+        // used to make it safe to treat as footprint-inert is not a load-bearing
+        // invariant — `rewrite_external_call_regpure` rewrites external calls
+        // into RegPure calls with `clobbers: vec![]`, so a shadow-promoted
+        // caller could otherwise pass the blocking gate while the external (e.g.
+        // memset) writes real ram through a promoted pointer. Both components
+        // are unbounded until prototype-declared argmem footprints exist
+        // (future direction).
         Some(RamEffects {
-            precise: Some(Footprint::default()),
+            precise: None,
             written: None,
         })
     }
@@ -1045,5 +1048,51 @@ mod tests {
             "BranchInd refutes the precise footprint"
         );
         assert!(eff.written.is_none(), "BranchInd unbounds the coarse channel");
+    }
+
+    /// FIX 2: an external's memory is fully-⊤ (a prototype bounds registers, not
+    /// memory). A caller making a *clobber-free* RegPure call to an external —
+    /// exactly what `rewrite_external_call_regpure` produces — must therefore not
+    /// read as memory-free: the external (e.g. memset) may write real ram through
+    /// a promoted pointer.
+    #[test]
+    fn clobber_free_external_call_blocks_caller() {
+        let mut tc = qcode::testing::TestContext::new();
+        let ext =
+            qcode::value::FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("memset".into()))
+                .id;
+        qcode!(
+            tc.ctx,
+            "
+            fn caller:
+                <k_entry @p:i64>
+                    goto <k_call>;
+                <k_call>
+                    call fn caller();
+                <k_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (k_entry, k_cont);
+        materialize(&mut tc, caller);
+        let p = FunctionBody::from_id(&tc.ctx, caller)
+            .root()
+            .unwrap()
+            .params()
+            .next()
+            .unwrap()
+            .id();
+        // Redirect the placeholder call to the external as a clobber-free RegPure
+        // site (regpure_call clears clobbers and tags RegPure).
+        regpure_call(&mut tc, k_call, ext, vec![p]);
+        tc.ctx.add_cfg_edge(k_call, k_cont);
+
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, None);
+        assert!(
+            !is_memory_free(&s, caller),
+            "a clobber-free RegPure call to an external must block the caller — \
+             external memory is ⊤"
+        );
     }
 }
