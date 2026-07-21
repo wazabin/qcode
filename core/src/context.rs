@@ -1255,7 +1255,18 @@ impl<'str> Context<'str> {
         // is now a foreign entry (a boundary tail-call, or a back-edge into the
         // origin's retained entry). Both must become function-level `TailCall`s.
         let mut tail_calls: Vec<(InstructionId, FunctionId)> = Vec::new();
-        let mut cond_calls: Vec<(InstructionId, BlockId, FunctionId)> = Vec::new();
+        // (terminator, owner_block, callee, the arm's local target that triggered
+        // this cond-call). The arm target is recorded so the rewrite below repoints
+        // exactly that arm — it must never re-derive the decision via `foreign_entry`
+        // with a different `owner` than the scan used (the scan's `owner` is the
+        // tail block's *effective* owner `g`; the storing arena differs), which would
+        // silently skip the rewrite and strand the operand.
+        let mut cond_calls: Vec<(
+            InstructionId,
+            BlockId,
+            FunctionId,
+            crate::value::LocalBlockId,
+        )> = Vec::new();
         let relevant: Vec<BlockId> = self.block_ids();
         for b in relevant {
             let Some(owner) = effective_owner(self, b) else {
@@ -1284,12 +1295,12 @@ impl<'str> Context<'str> {
                     if let Some(callee) =
                         foreign_entry(self, BlockId::new(b.func, success_block), owner)
                     {
-                        cond_calls.push((term_id, b, callee));
+                        cond_calls.push((term_id, b, callee, success_block));
                     }
                     if let Some(callee) =
                         foreign_entry(self, BlockId::new(b.func, failure_block), owner)
                     {
-                        cond_calls.push((term_id, b, callee));
+                        cond_calls.push((term_id, b, callee, failure_block));
                     }
                 }
                 _ => {}
@@ -1305,14 +1316,13 @@ impl<'str> Context<'str> {
                 }),
             );
         }
-        for (insn, owner_block, callee) in cond_calls {
-            // Ownership is derived from the storing arena.
-            let owner = owner_block.func;
-            let tramp = BasicBlock::make(self, owner).id;
+        for (insn, owner_block, callee, arm_target) in cond_calls {
+            // The trampoline is a fresh block of `owner_block`'s storing arena.
+            let tramp = BasicBlock::make(self, owner_block.func).id;
             (self).builder(tramp).push_tail_call(callee);
             self.add_cfg_edge(owner_block, tramp);
 
-            // A trampoline is a fresh block of `owner`'s arena. When its
+            // A trampoline is a fresh block of the storing arena. When its
             // predecessor is a *tail* block (about to relocate into `g`), the
             // trampoline must relocate with it: otherwise the storage move below
             // rewrites the predecessor's arm to a tramp that stays behind in the
@@ -1327,15 +1337,16 @@ impl<'str> Context<'str> {
             let Mnemonic::CBranch(mut cb) = self.instruction(insn).mnemonic().clone() else {
                 continue;
             };
-            // The CBranch and its targets share the terminator's arena (`insn.func`);
-            // qualify the local targets to compare, localize `tramp` on the way in.
-            if foreign_entry(self, BlockId::new(insn.func, cb.success_block), owner) == Some(callee)
-            {
-                cb.success_block = tramp.localize(insn.func);
+            // Repoint exactly the arm the scan resolved to a foreign entry, matched
+            // by its recorded local target. Re-deriving via `foreign_entry` here
+            // would use the storing arena as `owner` instead of the scan's effective
+            // owner `g` and could disagree — silently skipping the rewrite.
+            let tramp_local = tramp.localize(insn.func);
+            if cb.success_block == arm_target {
+                cb.success_block = tramp_local;
             }
-            if foreign_entry(self, BlockId::new(insn.func, cb.failure_block), owner) == Some(callee)
-            {
-                cb.failure_block = tramp.localize(insn.func);
+            if cb.failure_block == arm_target {
+                cb.failure_block = tramp_local;
             }
             self.replace_instruction_mnemonic(insn, Mnemonic::CBranch(cb));
         }
@@ -3978,6 +3989,58 @@ mod tests {
                     "branch at {addr:#x} into the landing must tail-call it, got {term:?}",
                 );
             }
+        }
+
+        /// A tail block whose conditional arm targets an entry registered in its
+        /// *own* storing arena (a back-edge to the origin function's registered
+        /// entry). Regression: the rewrite loop recomputed `foreign_entry` with the
+        /// storing arena as `owner` instead of the scan's effective owner `g`; when
+        /// the arm's callee equals that storing arena the recheck returned `None`
+        /// and the arm rewrite was skipped, stranding the operand after the move
+        /// (StableArena panic on objdump -Os).
+        #[test]
+        fn tail_conditional_to_own_registered_entry_uses_a_trampoline() {
+            let mut ctx = Context::new();
+            let f = FunctionBody::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+            let entry = block_at(&mut ctx, f, 0x1000);
+            let tail = block_at(&mut ctx, f, 0x2000);
+            let cont = block_at(&mut ctx, f, 0x2008);
+            branch_at(&mut ctx, entry, tail, 0x1000);
+            // tail conditionally branches back to f's own registered entry (0x1000).
+            cbranch_at(&mut ctx, tail, entry, cont, 0x2000);
+            return_at(&mut ctx, cont, 0x2008);
+            FunctionBody::from_id_mut(&mut ctx, f)
+                .set_root(entry)
+                .unwrap();
+
+            let g = ctx.split_function_at(tail);
+
+            assert_no_dangling_terminators(&ctx);
+            let diagnostics = crate::verify_body_arena_integrity(&ctx);
+            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+            // The moved tail's back-edge arm routes through a trampoline that
+            // tail-calls f (its own function), relocated into g.
+            let moved_tail = block_at_addr(&ctx, g, 0x2000);
+            let Mnemonic::CBranch(cb) = BasicBlock::from_id(&ctx, moved_tail)
+                .instructions()
+                .last()
+                .unwrap()
+                .mnemonic()
+                .clone()
+            else {
+                panic!("moved tail must still end in a cbranch");
+            };
+            let tramp = BlockId::new(g, cb.success_block);
+            assert_eq!(tramp.func, g, "trampoline must have relocated into g");
+            let term = BasicBlock::from_id(&ctx, tramp)
+                .instructions()
+                .last()
+                .map(|i| i.mnemonic().clone());
+            assert!(
+                matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == Callee::Real(f)),
+                "back-edge trampoline must tail-call f, got {term:?}",
+            );
         }
 
         /// A *tail* block whose conditional arm targets a foreign entry gets a
