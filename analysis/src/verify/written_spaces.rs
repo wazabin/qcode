@@ -14,26 +14,66 @@
 //!
 //! 1. every shared non-register space its body stores to is in `ws`;
 //! 2. it contains no unbounded escape — `CallInd`, unresolved `BranchInd`, or
-//!    a direct-like call to an unresolved target;
-//! 3. every resolved direct-like callee with its own `Some(cs)` stamp nests:
-//!    `cs ⊆ ws`. (A callee stamped `None` — e.g. a freshly minted, not yet
-//!    re-seeded function — is not flagged here: mints are pure and the next
-//!    seed run re-establishes the bound; flagging would false-positive every
-//!    outline.)
+//!    a direct-like call/tail-call to an unresolved target;
+//! 3. every resolved direct-like callee (`Call` or `TailCall`) nests. A callee
+//!    with its own `Some(cs)` stamp must satisfy `cs ⊆ ws`. A callee recorded
+//!    *unbounded* over a bounded caller is exactly the stale state this rule
+//!    exists to catch — but the core signature cannot distinguish "explicitly
+//!    recorded `None` (unbounded)" from "never stamped" (both read back as
+//!    `written_spaces() == None`; see `FunctionSignature::written_spaces`). To
+//!    avoid false-positiving freshly minted outlined functions (internal, pure,
+//!    re-seeded on the next run), only an **external** callee — genuinely
+//!    unbounded, never a fresh mint — is flagged when its `None` sits under a
+//!    bounded caller. Residual gap: an internal callee explicitly recorded
+//!    unbounded is still skipped, indistinguishable from a not-yet-seeded mint.
+//!
+//! Dirty-scoping: `written_spaces` is transitive, so growing a callee's
+//! write-set stales every caller's stamp even when the caller is out of scope.
+//! Like the sibling call-driven rules ([`super::pure_reg_call_args`],
+//! [`super::materialized_interface`]) the checked set is expanded with the
+//! callers of in-scope functions.
+
+use rustc_hash::FxHashSet;
 
 use qcode::{
     context::Context,
     space::{Space, SpaceType},
-    value::{FunctionBody, insn::Mnemonic},
+    value::{FunctionBody, FunctionId, insn::Mnemonic},
 };
 
 pub fn verify_written_spaces(ctx: &Context) -> Vec<String> {
     verify_written_spaces_scoped(ctx, super::Scope::All)
 }
 
+/// The functions to check: everything in `scope`, plus — for a scoped run —
+/// every out-of-scope function with a direct-like call/tail-call into the scope,
+/// since growing an in-scope callee's write-set stales those callers' stamps.
+fn functions_to_check(ctx: &Context, scope: super::Scope<'_>) -> Vec<FunctionId> {
+    let mut ids: Vec<FunctionId> = scope.function_ids(ctx);
+    let super::Scope::Functions(set) = scope else {
+        return ids; // `All` already covers every function.
+    };
+    let mut extra: FxHashSet<FunctionId> = FxHashSet::default();
+    for insn in ctx.instructions() {
+        if set.contains(&insn.id.func) {
+            continue; // already in scope
+        }
+        let callee = match insn.mnemonic() {
+            Mnemonic::Call(c) => c.target.real(),
+            Mnemonic::TailCall(t) => t.target.real(),
+            _ => None,
+        };
+        if callee.is_some_and(|c| set.contains(&c)) {
+            extra.insert(insn.id.func);
+        }
+    }
+    ids.extend(extra.into_iter().filter(|id| !set.contains(id)));
+    ids
+}
+
 pub(crate) fn verify_written_spaces_scoped(ctx: &Context, scope: super::Scope<'_>) -> Vec<String> {
     let mut out = Vec::new();
-    for fid in scope.function_ids(ctx) {
+    for fid in functions_to_check(ctx, scope) {
         let f = FunctionBody::from_id(ctx, fid);
         let Some(ws) = f.written_spaces() else {
             continue;
@@ -68,29 +108,54 @@ pub(crate) fn verify_written_spaces_scoped(ctx: &Context, scope: super::Scope<'_
                              written_spaces {ws:?} — an escape may write any space"
                         ));
                     }
-                    Mnemonic::Call(c) => match c.target.real() {
-                        None => out.push(format!(
-                            "{name}: calls an unresolved target but has a bounded \
-                             written_spaces {ws:?}"
-                        )),
-                        Some(callee) => {
-                            if let Some(cs) = FunctionBody::from_id(ctx, callee).written_spaces()
-                                && let Some(bad) = cs.iter().find(|s| !ws.contains(s))
-                            {
-                                out.push(format!(
-                                    "{name}: callee {} may write space {bad:?} outside \
-                                     the caller's witnessed bound {ws:?}",
-                                    FunctionBody::from_id(ctx, callee).name(),
-                                ));
-                            }
-                        }
-                    },
+                    Mnemonic::Call(c) => {
+                        out.extend(check_callee(ctx, &name, ws, c.target.real()));
+                    }
+                    Mnemonic::TailCall(t) => {
+                        out.extend(check_callee(ctx, &name, ws, t.target.real()));
+                    }
                     _ => {}
                 }
             }
         }
     }
     out
+}
+
+/// Check one resolved direct-like call/tail-call against the caller's bound
+/// `ws`. An unresolved target (`None`) is an escape; a callee stamped with a
+/// bounded set must nest; an *external* callee stamped unbounded flags (see the
+/// module doc for why only externals).
+fn check_callee(
+    ctx: &Context,
+    name: &str,
+    ws: &[qcode::space::SpaceId],
+    callee: Option<FunctionId>,
+) -> Option<String> {
+    let Some(callee) = callee else {
+        return Some(format!(
+            "{name}: calls an unresolved target but has a bounded written_spaces {ws:?}"
+        ));
+    };
+    let cf = FunctionBody::from_id(ctx, callee);
+    match cf.written_spaces() {
+        Some(cs) => cs.iter().find(|s| !ws.contains(s)).map(|bad| {
+            format!(
+                "{name}: callee {} may write space {bad:?} outside the caller's \
+                 witnessed bound {ws:?}",
+                cf.name(),
+            )
+        }),
+        // Unbounded external under a bounded caller: the stale state the rule
+        // catches. An internal `None` callee is indistinguishable from a fresh
+        // mint and skipped (residual gap, see module doc).
+        None if cf.is_external() => Some(format!(
+            "{name}: external callee {} is unbounded but the caller has a bounded \
+             written_spaces {ws:?}",
+            cf.name(),
+        )),
+        None => None,
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +195,113 @@ mod tests {
         ws: Option<Vec<qcode::space::SpaceId>>,
     ) {
         qcode::value::FunctionBody::from_id_mut(&mut tc.ctx, fid).set_written_spaces(ws);
+    }
+
+    /// FIX 4a: a `TailCall` to a resolved callee whose bounded write-set exceeds
+    /// the caller's bound is flagged, just like a `Call`.
+    #[test]
+    fn tailcall_callee_over_bound_is_flagged() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn callee:
+                <c_entry @p:i64>
+                    store(ram:8, @p <- i64 1);
+                    return at i64 0;
+            fn caller:
+                <k_entry>
+                    tailcall fn callee();
+            "
+        );
+        let _ = (c_entry, k_entry);
+        let ram = tc.ctx.shared.default_space;
+        set_ws(&mut tc, callee, Some(vec![ram]));
+        // Caller's stamp omits ram though its tail callee writes it.
+        set_ws(&mut tc, caller, Some(vec![]));
+        let diags = verify_written_spaces(&tc.ctx);
+        assert!(
+            diags.iter().any(|d| d.contains("callee callee may write")),
+            "a tail-call callee over the caller's bound must be flagged: {diags:?}"
+        );
+    }
+
+    /// FIX 4b: a resolved direct callee that is an *external* recorded unbounded
+    /// (`None`) under a bounded caller is flagged — the stale state the rule
+    /// exists to catch, distinguishable from a fresh internal mint via
+    /// `is_external`.
+    #[test]
+    fn unbounded_external_callee_over_bounded_caller_is_flagged() {
+        use qcode::value::insn::{Call, CallTag, Callee, Mnemonic};
+        use qcode::value::{BasicBlock, FunctionBody, QCodeMut};
+        let mut tc = qcode::testing::TestContext::new();
+        let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("ext".into())).id;
+        qcode!(
+            tc.ctx,
+            "
+            fn caller:
+                <k_entry>
+                    call fn caller();
+                <k_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (k_entry, k_cont);
+        // Redirect the placeholder call to the external.
+        let call_id = BasicBlock::from_id(&tc.ctx, k_entry)
+            .iter()
+            .find(|i| matches!(i.mnemonic(), Mnemonic::Call(_)))
+            .unwrap()
+            .id;
+        tc.ctx.replace_instruction_mnemonic(
+            call_id,
+            Mnemonic::Call(Call {
+                target: Callee::Real(ext),
+                args: vec![],
+                clobbers: vec![],
+                tag: CallTag::Opaque,
+            }),
+        );
+        // External keeps its default unbounded (None) write-set; caller is bounded.
+        set_ws(&mut tc, caller, Some(vec![]));
+        let diags = verify_written_spaces(&tc.ctx);
+        assert!(
+            diags.iter().any(|d| d.contains("external callee")),
+            "an unbounded external under a bounded caller must be flagged: {diags:?}"
+        );
+    }
+
+    /// FIX 4c: written_spaces is transitive — growing an in-scope callee's
+    /// write-set stales an out-of-scope caller's stamp. The dirty-scoped run must
+    /// sweep callers of in-scope functions and catch it.
+    #[test]
+    fn caller_sweep_catches_stale_caller_when_callee_in_scope() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn callee:
+                <c_entry @p:i64>
+                    store(ram:8, @p <- i64 1);
+                    return at i64 0;
+            fn caller:
+                <k_entry>
+                    call <callee>;
+                <k_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (c_entry, k_entry, k_cont);
+        let ram = tc.ctx.shared.default_space;
+        set_ws(&mut tc, callee, Some(vec![ram]));
+        // Stale bound: predates the callee gaining the ram store.
+        set_ws(&mut tc, caller, Some(vec![]));
+        // Scope only the callee — the caller is out of scope.
+        let scope: FxHashSet<FunctionId> = [callee].into_iter().collect();
+        let diags = verify_written_spaces_scoped(&tc.ctx, super::super::Scope::Functions(&scope));
+        assert!(
+            diags.iter().any(|d| d.contains("callee callee may write")),
+            "the caller sweep must catch the out-of-scope stale caller: {diags:?}"
+        );
     }
 }
