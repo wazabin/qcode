@@ -21,20 +21,13 @@ use qcode::{
 };
 
 /// Compute and record [`written_spaces`](qcode::value::FunctionRef::written_spaces)
-/// for every non-external function: the engine's least fixpoint over the call
-/// graph on the [`SpaceChannel`]. A ⊤ summary (unbounded) records `None`, the
-/// conservative value the prune already assumes, so an under-approximation is
-/// impossible.
+/// for every non-external function: the `written` component of the unified
+/// [`RamChannel`](super::argpromote) summary (`ram_summary_solve`). A ⊤ summary
+/// (unbounded) records `None`, the conservative value the prune already assumes,
+/// so an under-approximation is impossible.
 pub fn set_all_written_spaces(ctx: &mut Context) {
     let targets = ctx.function_ids();
-    set_written_spaces_targeted(ctx, &targets);
-}
-
-fn set_written_spaces_targeted(
-    ctx: &mut Context,
-    targets: &[FunctionId],
-) -> rustc_hash::FxHashSet<FunctionId> {
-    set_written_spaces_targeted_with_sp(ctx, targets, None)
+    set_written_spaces_targeted_with_sp(ctx, &targets, None);
 }
 
 fn set_written_spaces_targeted_with_sp(
