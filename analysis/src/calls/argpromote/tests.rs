@@ -1772,7 +1772,7 @@ mod tests {
         ));
         let shadow = qcode::space::LocalMemorySpaceId::Temp(shadow.local);
         let h_root = FunctionBody::from_id(&tc.ctx, h).root().unwrap().id;
-        let mut b = (&mut tc.ctx).builder(h_root);
+        let mut b = tc.ctx.builder(h_root);
         b.set_insert_point_to_start();
         let addr = b.shr().get_const(0x10, 8);
         let val = b.shr().get_const(0x1, 4);

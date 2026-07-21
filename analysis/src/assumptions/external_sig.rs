@@ -125,18 +125,20 @@ fn gp64(gp: &crate::pipeline::GpReg) -> Option<VarnodeId> {
     gp.for_bytes(8)
 }
 
-/// The argument registers and return register for `proto` under `abi`, or `None`
-/// if any parameter (or the return) is an aggregate/unsupported type — such
-/// functions are left unsigned rather than mapped incorrectly.
-fn map_prototype(
-    proto: &CFunctionProto,
-    abi: &CallingConvention,
-) -> Option<(
+/// The mapped register interface of a prototyped external: argument registers,
+/// return register(s), per-input [`ParamAttrs`], and per-input [`ArgMemKind`],
+/// all in lockstep with the argument registers.
+type MappedProto = (
     Vec<VarnodeId>,
     Vec<VarnodeId>,
     Vec<ParamAttrs>,
     Vec<ArgMemKind>,
-)> {
+);
+
+/// The argument registers and return register for `proto` under `abi`, or `None`
+/// if any parameter (or the return) is an aggregate/unsupported type — such
+/// functions are left unsigned rather than mapped incorrectly.
+fn map_prototype(proto: &CFunctionProto, abi: &CallingConvention) -> Option<MappedProto> {
     // An aggregate return uses a hidden pointer argument (memory class), which
     // would shift every argument. Rather than mis-map, skip the function.
     if matches!(proto.return_type, CType::Other | CType::Struct { .. }) {

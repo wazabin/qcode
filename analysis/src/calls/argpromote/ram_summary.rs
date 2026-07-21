@@ -34,6 +34,38 @@
 //! does not have, so it stays ⊤). Loaded-pointer arguments under existing
 //! disjointness assumptions are TODO — ⊤ for now.
 //!
+//! # External argmem and the confinement assumption
+//!
+//! A bodyless external with a known C prototype gets a real footprint instead of
+//! ⊤: an external can only touch memory *we* model through the pointers *we* pass
+//! it (its own libc-internal state lives outside the lifted image). So
+//! [`external_leaf`](EffectChannel::external_leaf) mints one whole-object
+//! [`RamObject`] per pointer parameter — a mutable pointer a `write` object, a
+//! `const` pointer a read object — hung off the `Param(i)` it arrived on. A
+//! callback/function-pointer param (`qsort` re-enters our code), a `char **`
+//! (transitive write escapes the addressed object), varargs (`printf`'s `%n`),
+//! or no usable prototype fall back to ⊤.
+//!
+//! Because a whole-object entry has **no extent**, containing its rebased
+//! `Frame` landing (the `memset(&local)` fold) rests on a *confinement
+//! assumption*: **an external writes only within the object addressed by the
+//! pointer we pass it** (e.g. `memset`'s length stays in bounds), and does not
+//! depend on the pre-call contents of a caller frame local. This is **not**
+//! statically sound on its own — kin to `CopyBuffersDisjoint` /
+//! `LoadedPointerDisjointFromSlot`, which are recorded `Assumed` in the
+//! [assumptions registry](qcode::assumption::Proposition) with the
+//! checkpoint+replay net as backstop.
+//!
+//! TODO(assumptions-registry): register an `ExternalArgmemConfinement`
+//! [`Proposition`](qcode::assumption::Proposition) at the point the assumption is
+//! load-bearing — a `Frame`-landing whole-object write admitted in `transfer`.
+//! It is **not** wired up yet because `transfer` runs inside the read-only
+//! (`&Context`) summary solve and cannot call `assume_true` (which needs
+//! `&mut Context`), and the `&mut` promotion site (the retail pass) is out of
+//! scope here. Until then the assumption is documented, not recorded; a caller
+//! folded through a prototyped external's mutable-pointer argmem relies on it
+//! implicitly. See the report / `argpromote` design notes.
+//!
 //! The blocking-call gate still admits only outward-invisible callees
 //! (`Frame`-only or empty summaries); letting a caller compose a callee's
 //! real `Param`/`Global` footprint into its own interface is the
@@ -868,7 +900,7 @@ mod tests {
             .next()
             .unwrap()
             .id();
-        let mut b = (&mut tc.ctx).builder(root);
+        let mut b = tc.ctx.builder(root);
         b.set_insert_point_to_start();
         let a = b.shr().get_const(0x10, 8);
         b.push_store(p, a, shadow);
