@@ -30,7 +30,7 @@
 
 use std::any::Any;
 
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::value::{
     FunctionId, QCodeView, Value, ValueId, ValueRef,
@@ -81,7 +81,17 @@ impl<'str> SubPass<'str> for NarrowTrunc {
             return Claim::Pass;
         }
         let mut memo: HashMap<ValueId, ValueId> = HashMap::default();
-        let narrowed = narrow_to(body, cx, src, w, ic.insn_id, ic.block_id, &mut memo);
+        let mut active: HashSet<ValueId> = HashSet::default();
+        let narrowed = narrow_to(
+            body,
+            cx,
+            src,
+            w,
+            ic.insn_id,
+            ic.block_id,
+            &mut memo,
+            &mut active,
+        );
         if narrowed == ic.id {
             return Claim::Pass;
         }
@@ -142,6 +152,7 @@ fn range_low(src: ValueId, size: usize, func: FunctionId) -> Mnemonic {
 // ---------------------------------------------------------------------------
 
 /// Recursively narrow a value to `w` bytes.
+#[allow(clippy::too_many_arguments)]
 fn narrow_to<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
@@ -150,12 +161,24 @@ fn narrow_to<'str>(
     before: InstructionId,
     block: BlockId,
     memo: &mut HashMap<ValueId, ValueId>,
+    active: &mut HashSet<ValueId>,
 ) -> ValueId {
     if value_size(cx.body_view(body), v) == w {
         return v;
     }
     if let Some(&cached) = memo.get(&v) {
         return cached;
+    }
+    // Cycle backstop: a self-referential value (e.g. a block parameter whose
+    // narrowing recurses back through itself) would otherwise recurse forever,
+    // since the memo is only populated after the recursive call returns. If `v`
+    // is already on the active recursion path, wrap it opaquely instead — a
+    // bounded, correct (if unoptimized) low-`w`-byte slice — rather than pushing
+    // through the cycle. This must never be load-bearing: a sound IR has no cyclic
+    // pure-value dependency (verification rejects one); it only prevents a stack
+    // overflow if one slips through.
+    if !active.insert(v) {
+        return push_insn(body, cx, range_low(v, w, block.func), w, before, block);
     }
 
     let result = match v {
@@ -165,8 +188,26 @@ fn narrow_to<'str>(
                 lhs,
                 rhs,
             }) if distributive(o) => {
-                let l = narrow_to(body, cx, lhs.qualify(iid.func), w, before, block, memo);
-                let rr = narrow_to(body, cx, rhs.qualify(iid.func), w, before, block, memo);
+                let l = narrow_to(
+                    body,
+                    cx,
+                    lhs.qualify(iid.func),
+                    w,
+                    before,
+                    block,
+                    memo,
+                    active,
+                );
+                let rr = narrow_to(
+                    body,
+                    cx,
+                    rhs.qualify(iid.func),
+                    w,
+                    before,
+                    block,
+                    memo,
+                    active,
+                );
                 push_insn(
                     body,
                     cx,
@@ -181,7 +222,16 @@ fn narrow_to<'str>(
                 )
             }
             Mnemonic::Unop(Unary { op, src }) if matches!(op, Unop::IntNot | Unop::IntNegate) => {
-                let s = narrow_to(body, cx, src.qualify(iid.func), w, before, block, memo);
+                let s = narrow_to(
+                    body,
+                    cx,
+                    src.qualify(iid.func),
+                    w,
+                    before,
+                    block,
+                    memo,
+                    active,
+                );
                 push_insn(
                     body,
                     cx,
@@ -203,6 +253,7 @@ fn narrow_to<'str>(
                 before,
                 block,
                 memo,
+                active,
             ),
             Mnemonic::Zext(Zext { src, .. }) => narrow_extension(
                 body,
@@ -213,10 +264,18 @@ fn narrow_to<'str>(
                 before,
                 block,
                 memo,
+                active,
             ),
-            Mnemonic::Range(Range { src, start: 0, .. }) => {
-                narrow_to(body, cx, src.qualify(iid.func), w, before, block, memo)
-            }
+            Mnemonic::Range(Range { src, start: 0, .. }) => narrow_to(
+                body,
+                cx,
+                src.qualify(iid.func),
+                w,
+                before,
+                block,
+                memo,
+                active,
+            ),
             _ => push_insn(body, cx, range_low(v, w, block.func), w, before, block),
         },
         _ if numeric_const(cx.body_view(body).shared(), v).is_some() => {
@@ -226,6 +285,7 @@ fn narrow_to<'str>(
         _ => push_insn(body, cx, range_low(v, w, block.func), w, before, block),
     };
 
+    active.remove(&v);
     memo.insert(v, result);
     result
 }
@@ -241,9 +301,10 @@ fn narrow_extension<'str>(
     before: InstructionId,
     block: BlockId,
     memo: &mut HashMap<ValueId, ValueId>,
+    active: &mut HashSet<ValueId>,
 ) -> ValueId {
     if value_size(cx.body_view(body), src) >= w {
-        return narrow_to(body, cx, src, w, before, block, memo);
+        return narrow_to(body, cx, src, w, before, block, memo, active);
     }
     let m = if sext {
         Mnemonic::Sext(Sext {
