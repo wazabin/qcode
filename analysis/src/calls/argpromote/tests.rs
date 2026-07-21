@@ -286,6 +286,61 @@ mod tests {
         let _ = call_id;
     }
 
+    /// FIX 3: a promotable function whose body also contains a `TailCall` must
+    /// NOT be shadow-promoted — the tail callee's memory effects would bypass
+    /// vetting and the per-return write-replays would be skipped on the tail
+    /// path. Identical promotable shape to `promotes_single_inout_stack_param`,
+    /// but with an extra block ending in a tail call: the blocking-call walk must
+    /// veto it. (A `Return` block is still present, so the veto is the blocking
+    /// gate, not the empty-returns guard.)
+    #[test]
+    fn tailcall_in_body_blocks_shadow_promotion() {
+        let mut tc = qcode::testing::TestContext::new();
+        let _input = stack_input(&mut tc, 4, 8);
+
+        qcode!(
+            tc.ctx,
+            "
+            fn helper:
+                <h_entry>
+                    return at i64 0;
+
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    %v = load(ram:4, @stack_10000004);
+                    store(ram:4, @stack_10000004 <- %v);
+                    goto <f_ret>;
+                <f_ret>
+                    return at i64 0;
+                <f_tc>
+                    tailcall fn helper();
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (helper, h_entry, g, f_entry, f_ret, f_tc, g_entry);
+
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
+            qcode::value::FunctionEffects::Materialized(
+                qcode::value::RegisterInterfaceMap::default(),
+            ),
+        );
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, g_call, f, vec![ptr]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(
+            !argpromote(&mut tc.ctx),
+            "a function with a TailCall in its body must not be shadow-promoted"
+        );
+    }
+
     /// Regression: the RAM channel's caller rewrite (appending snapshot-load
     /// args) must preserve the site's `CallTag`. Stomping a `RegPure` site back
     /// to `Opaque` desyncs the binding convention from the already-explicit

@@ -700,6 +700,14 @@ fn function_makes_blocking_call(
                             || absorbed.contains(&target)
                     })
             }
+            // Other call-like transfers escape vetting entirely: a tail callee's
+            // memory effects never bubble through the summary, and the
+            // write-replays `apply` emits at Return exits would be skipped on the
+            // tail path. A surviving BranchInd is a computed tail-jump into code
+            // we cannot see. Both block.
+            Mnemonic::TailCall(_) | Mnemonic::BranchInd(_) => true,
+            // Non-transfer mnemonics are inert; any new call-like transfer must
+            // be matched explicitly above rather than falling through here.
             _ => false,
         })
     })
