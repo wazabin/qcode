@@ -39,6 +39,57 @@ use crate::pipeline::{CallingConvention, cabi_abi_target};
 
 use crate::{Pass, PipelineEnv};
 
+use rustc_hash::FxHashMap;
+use std::sync::LazyLock;
+
+/// The checked-in write-only destination table (`extern_argmem.toml`), compiled
+/// into the binary. Lists, per external symbol name, the C-prototype positional
+/// parameter indices that libc semantics guarantee are *pure destinations*
+/// (never read before write). See the file header for the inclusion bar.
+const EXTERN_ARGMEM_TOML: &str = include_str!("extern_argmem.toml");
+
+/// The TOML shape of [`EXTERN_ARGMEM_TOML`]: a single `[write_only]` table
+/// mapping symbol name → the write-only parameter indices.
+#[derive(serde::Deserialize)]
+struct ExternArgmemTable {
+    #[serde(default)]
+    write_only: FxHashMap<String, Vec<usize>>,
+}
+
+/// Parse-once view of the write-only table: symbol name → write-only C-prototype
+/// param indices. Parsed lazily on first use (matching the `cabi` `OnceLock`
+/// idiom); a malformed embedded table is a build-time authoring bug, so a parse
+/// failure panics rather than silently disabling the upgrade.
+fn write_only_table() -> &'static FxHashMap<String, Vec<usize>> {
+    static TABLE: LazyLock<FxHashMap<String, Vec<usize>>> = LazyLock::new(|| {
+        toml::from_str::<ExternArgmemTable>(EXTERN_ARGMEM_TOML)
+            .expect("embedded extern_argmem.toml must parse")
+            .write_only
+    });
+    &TABLE
+}
+
+/// Upgrade the write-only destination parameters of `name` from `MutPtr` to
+/// `OutPtr` in `argmem_kinds`, per the [`write_only_table`]. `argmem_kinds` is
+/// lockstep with the register-interface inputs, which are the register-passed
+/// prefix of the prototype parameters *in prototype order*, so a C-prototype
+/// positional index maps directly onto it (bounds-checked for the overflow tail
+/// that spilled to the stack). Only a `MutPtr` is upgraded — a `ConstPtr`,
+/// `Opaque`, or non-pointer at that index is left alone (the table only claims
+/// write-only-ness for what the prototype already made a mutable pointer).
+fn upgrade_write_only(name: &str, argmem_kinds: &mut [ArgMemKind]) {
+    let Some(indices) = write_only_table().get(name) else {
+        return;
+    };
+    for &i in indices {
+        if let Some(kind) = argmem_kinds.get_mut(i)
+            && *kind == ArgMemKind::MutPtr
+        {
+            *kind = ArgMemKind::OutPtr;
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ExternalSigs;
 
@@ -346,9 +397,16 @@ pub fn apply_external_signature(
     let Some(proto) = sel.lookup(name) else {
         return;
     };
-    let Some((inputs, outputs, param_attrs, argmem_kinds)) = map_prototype(proto, abi) else {
+    let Some((inputs, outputs, param_attrs, mut argmem_kinds)) = map_prototype(proto, abi) else {
         return;
     };
+    // Ruling 1b: distinguish write-only destination pointers (memset/memcpy dest
+    // — safe to admit through a frame local) from read-write mutable pointers
+    // (must keep their read half so a frame landing goes ⊤). The prototype alone
+    // cannot tell them apart (both are non-`const` pointers → `MutPtr`), so the
+    // curated `extern_argmem.toml` table names the pure destinations by symbol,
+    // upgrading them to `OutPtr`. `name` is already `@`-suffix-stripped above.
+    upgrade_write_only(name, &mut argmem_kinds);
     let plan = plan_args(proto, abi, ptr_width, stack_only);
 
     // The register-channel interface mapping (argpromote v2, ruling 6a): this
@@ -669,10 +727,82 @@ mod tests {
         assert!(!argmem.variadic, "memcpy is not variadic");
         // Only two GP registers in the toy ABI, so only the first two params are
         // register-passed (lockstep with `inputs`).
+        // memcpy's dest is a curated write-only destination (never reads dest),
+        // so ruling 1b upgrades index 0 from MutPtr to OutPtr; src stays const.
         assert_eq!(
             argmem.params,
-            vec![ArgMemKind::MutPtr, ArgMemKind::ConstPtr],
-            "dst is a mutable pointer, src is a const pointer"
+            vec![ArgMemKind::OutPtr, ArgMemKind::ConstPtr],
+            "dst is a write-only destination (upgraded), src is a const pointer"
+        );
+    }
+
+    /// The embedded `extern_argmem.toml` write-only table parses and carries the
+    /// curated entries (smoke test), including memset's dest at index 0.
+    #[test]
+    fn write_only_table_parses() {
+        let table = write_only_table();
+        assert_eq!(table.get("memset").map(Vec::as_slice), Some(&[0][..]));
+        assert_eq!(table.get("memcpy").map(Vec::as_slice), Some(&[0][..]));
+        assert!(
+            table.get("strcat").is_none(),
+            "strcat reads its dest — must NOT be in the write-only table"
+        );
+        assert!(
+            table.get("realloc").is_none(),
+            "realloc reads the old block — must NOT be write-only"
+        );
+    }
+
+    /// `upgrade_write_only` upgrades only the listed `MutPtr` indices to `OutPtr`,
+    /// bounds-checked, and leaves everything else (including a `ConstPtr` at a
+    /// listed index) untouched.
+    #[test]
+    fn upgrade_write_only_upgrades_listed_mutptrs() {
+        // memset dest at 0 upgrades; a NonPtr scalar at 1 is unchanged.
+        let mut kinds = vec![ArgMemKind::MutPtr, ArgMemKind::NonPtr];
+        upgrade_write_only("memset", &mut kinds);
+        assert_eq!(kinds, vec![ArgMemKind::OutPtr, ArgMemKind::NonPtr]);
+        // A symbol not in the table is left alone.
+        let mut kinds = vec![ArgMemKind::MutPtr];
+        upgrade_write_only("strcat", &mut kinds);
+        assert_eq!(kinds, vec![ArgMemKind::MutPtr]);
+    }
+
+    /// Ruling 1b, index-mapping pin: applying the full signature to `memset`
+    /// upgrades exactly the dest parameter (positional index 0) to `OutPtr`, in
+    /// lockstep with the register inputs — the read half is dropped so the
+    /// `memset(&local)` fold survives.
+    #[test]
+    fn memset_dest_is_upgraded_to_outptr() {
+        let mut tc = TestContext::new();
+        let abi = toy_abi(&tc);
+        let f = external(&mut tc, "memset");
+        apply(&mut tc.ctx, f, &abi, &host_sel());
+        let func = FunctionBody::from_id(&tc.ctx, f);
+        let argmem = func.argmem().expect("prototyped external has argmem");
+        // memset(void *dest, int c, size_t n): dest (index 0) → OutPtr; the toy
+        // ABI has two GP regs so index 1 (the int) is also present as NonPtr.
+        assert_eq!(
+            argmem.params[0],
+            ArgMemKind::OutPtr,
+            "memset's dest is a curated write-only destination"
+        );
+    }
+
+    /// A mutable-pointer external NOT in the write-only table keeps `MutPtr`
+    /// (its read half is retained → a frame landing goes ⊤).
+    #[test]
+    fn strcat_dest_stays_mutptr() {
+        let mut tc = TestContext::new();
+        let abi = toy_abi(&tc);
+        let f = external(&mut tc, "strcat");
+        apply(&mut tc.ctx, f, &abi, &host_sel());
+        let func = FunctionBody::from_id(&tc.ctx, f);
+        let argmem = func.argmem().expect("prototyped external has argmem");
+        assert_eq!(
+            argmem.params[0],
+            ArgMemKind::MutPtr,
+            "strcat reads its dest — stays a read-write MutPtr"
         );
     }
 

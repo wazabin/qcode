@@ -78,7 +78,10 @@ pub enum ArgMemKind {
     /// we model through it. No effect.
     NonPtr,
     /// A mutable data pointer (`char *`, `void *`, `struct S *`): a whole-object
-    /// read+write effect on the addressed object.
+    /// **read+write** effect on the addressed object — the callee may both read
+    /// the pre-call contents and clobber them (`strcat`'s dest, `realloc`). The
+    /// read half means a frame-local landing goes ⊤ (freshness), so such a
+    /// pointer is *not* memory-free-composable through an uninitialized local.
     MutPtr,
     /// A `const`-qualified data pointer (`const char *`): a whole-object read-only
     /// effect on the addressed object.
@@ -88,6 +91,16 @@ pub enum ArgMemKind {
     /// another pointer / an unmodeled pointee (a transitive write escapes the
     /// addressed object). Its presence sends the whole external footprint to ⊤.
     Opaque,
+    /// A **write-only** destination pointer (`memset`/`memcpy` dest): the callee
+    /// never reads the pre-call contents, only clobbers them. A pure whole-object
+    /// *write*, so a frame-local landing is contained (the `memset(&local)` fold).
+    /// Minted only for symbols the `extern_argmem` write-only table vouches for
+    /// (libc semantics guarantee the destination is never read before write).
+    ///
+    /// Appended last on purpose: bincode encodes a fieldless enum by variant
+    /// **index**, so keeping `NonPtr`/`MutPtr`/`ConstPtr`/`Opaque` at their old
+    /// indices lets pre-`OutPtr` `.harbinger` snapshots still decode.
+    OutPtr,
 }
 
 /// C-prototype-derived argmem summary for a prototyped external: the ordered

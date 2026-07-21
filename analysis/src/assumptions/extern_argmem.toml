@@ -1,0 +1,43 @@
+# Write-only destination parameters of known external (libc) functions.
+#
+# The RAM argmem model (see `ram_summary::external_leaf`) treats a mutable
+# pointer parameter (`ArgMemKind::MutPtr`) as a whole-object **read+write**: the
+# callee may read the pre-call contents through it, so rebasing that read onto an
+# uninitialized caller frame local goes to ⊤ (the freshness rule). That is the
+# sound default and it is what refutes `strcat(buf, s)` (reads `buf`).
+#
+# A few libc functions, however, treat a destination pointer as a *pure*
+# destination: they overwrite it and never read its pre-call contents. Those
+# parameters are safe to admit through a frame local (the `memset(&local, 0, n)`
+# fold), so they are upgraded to `ArgMemKind::OutPtr` (write-only).
+#
+# BAR FOR INCLUSION (strict): a parameter goes here ONLY if libc semantics
+# guarantee the destination is *never read before it is written*, under ANY call
+# mode / argument value. `memset`/`memcpy` never read the destination at all —
+# that is the bar. If a function may read the destination under any mode, leave
+# it out:
+#   * strcat/strncat  — read `dest` to find its terminating NUL, then append.
+#   * realloc         — reads the old block to copy it.
+#   * strncpy/stpncpy — see note below; NUL-padding does not read, so listed.
+#
+# Deliberately OMITTED until a concrete need arises: wide-character variants
+# (`wmemset`, `wcscpy`, ...) and locale/`_l` variants. Add them here (never by
+# widening the default) when a corpus binary actually links them.
+#
+# Indices are C-prototype positional parameter indices (0-based). They map
+# lockstep onto `ExternArgmem::params` (the register-passed prefix), so index 0
+# is the first prototype parameter.
+[write_only]
+memset = [0]
+memcpy = [0]
+mempcpy = [0]
+memmove = [0]
+strcpy = [0]
+strncpy = [0]
+stpcpy = [0]
+stpncpy = [0]
+sprintf = [0]
+snprintf = [0]
+# fgets(char *s, int size, FILE *stream): `s` is filled from the stream and its
+# prior contents are never read — a pure destination.
+fgets = [0]

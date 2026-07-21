@@ -39,19 +39,34 @@
 //! A bodyless external with a known C prototype gets a real footprint instead of
 //! ⊤: an external can only touch memory *we* model through the pointers *we* pass
 //! it (its own libc-internal state lives outside the lifted image). So
-//! [`external_leaf`](EffectChannel::external_leaf) mints one whole-object
-//! [`RamObject`] per pointer parameter — a mutable pointer a `write` object, a
-//! `const` pointer a read object — hung off the `Param(i)` it arrived on. A
-//! callback/function-pointer param (`qsort` re-enters our code), a `char **`
+//! [`external_leaf`](EffectChannel::external_leaf) mints whole-object
+//! [`RamObject`] entries per pointer parameter — hung off the `Param(i)` it
+//! arrived on — keyed off the parameter's [`ArgMemKind`]:
+//!
+//! - `ConstPtr` (`const char *`) → one read object.
+//! - `OutPtr` (a write-only destination the `extern_argmem` table vouches for,
+//!   `memset`/`memcpy` dest) → one `write` object, no read half.
+//! - `MutPtr` (an ordinary non-`const` pointer, `strcat` dest / `realloc`) →
+//!   **both** a `write` object and a read object. The read half is the point:
+//!   it means a `Frame`-local landing goes ⊤ in `transfer` (freshness), so a
+//!   caller cannot memory-free-fold a mutable-pointer external through an
+//!   uninitialized local — the same uninit-local-read hole the bodied-function
+//!   scan refutes (`uninit_frame_read_refutes_freshness`).
+//!
+//! A callback/function-pointer param (`qsort` re-enters our code), a `char **`
 //! (transitive write escapes the addressed object), varargs (`printf`'s `%n`),
 //! or no usable prototype fall back to ⊤.
 //!
-//! Because a whole-object entry has **no extent**, containing its rebased
-//! `Frame` landing (the `memset(&local)` fold) rests on a *confinement
-//! assumption*: **an external writes only within the object addressed by the
-//! pointer we pass it** (e.g. `memset`'s length stays in bounds), and does not
-//! depend on the pre-call contents of a caller frame local. This is **not**
-//! statically sound on its own — kin to `CopyBuffersDisjoint` /
+//! Because a whole-object entry has **no extent**, containing a rebased `Frame`
+//! landing (the `memset(&local)` fold) rests on a *confinement assumption*, but
+//! one now narrowed to true confinement: **a write-only (`OutPtr`) external
+//! writes only within the object addressed by the pointer we pass it** (e.g.
+//! `memset`'s length stays in bounds) — it never reads the frame local's stale
+//! pre-call contents, because `OutPtr` carries no read object at all. A `MutPtr`
+//! external, which *might* read those contents, now carries its read half and so
+//! goes ⊤ on a frame landing instead of resting on the assumption. This
+//! remaining confinement is **not** statically sound on its own — kin to
+//! `CopyBuffersDisjoint` /
 //! `LoadedPointerDisjointFromSlot`, which are recorded `Assumed` in the
 //! [assumptions registry](qcode::assumption::Proposition) with the
 //! checkpoint+replay net as backstop.
@@ -132,8 +147,10 @@ pub(crate) struct RamRegion {
 /// One **whole-object** effect: the callee touches the entire (extent-unknown)
 /// object addressed by `base`, read (and written iff `write`). Minted **only**
 /// by [`external_leaf`](EffectChannel::external_leaf) from a prototype's pointer
-/// parameters — a non-const pointer param yields a `write` object, a const one a
-/// read object. Bodied-function scans never mint object entries (their footprint
+/// parameters — a write-only (`OutPtr`) param yields one `write` object, a
+/// read-write (`MutPtr`) param a `write` object **and** a read object, and a
+/// `const` param a read object. Bodied-function scans never mint object entries
+/// (their footprint
 /// is exhaustively classified into fields/regions), so `extract_footprint`/`scan`
 /// leave `objects` empty; only the external-leaf and the `transfer` rebase touch
 /// them. `write == true` models a read+write (possibly in-out) access — the
@@ -539,22 +556,31 @@ impl EffectChannel for RamChannel {
             });
         }
         let mut objects: FxHashSet<RamObject> = FxHashSet::default();
-        let mut any_mut_ptr = false;
+        let mut any_write_ptr = false;
         for (i, kind) in argmem.params.iter().enumerate() {
+            let base = RamBase::Param(i as u32);
             match kind {
                 ArgMemKind::NonPtr => {}
                 ArgMemKind::MutPtr => {
-                    objects.insert(RamObject {
-                        base: RamBase::Param(i as u32),
-                        write: true,
-                    });
-                    any_mut_ptr = true;
+                    // Read+write mutable pointer (`strcat` dest, `realloc`): BOTH
+                    // a write object AND a read object. The read half is what
+                    // sends a frame-local landing to ⊤ in `transfer` (freshness),
+                    // so a caller cannot memory-free-fold this through an
+                    // uninitialized local.
+                    objects.insert(RamObject { base, write: true });
+                    objects.insert(RamObject { base, write: false });
+                    any_write_ptr = true;
+                }
+                ArgMemKind::OutPtr => {
+                    // Write-only destination (`memset`/`memcpy` dest, per the
+                    // `extern_argmem` table): a pure whole-object write, no read
+                    // half — a frame landing is contained (the `memset(&local)`
+                    // fold).
+                    objects.insert(RamObject { base, write: true });
+                    any_write_ptr = true;
                 }
                 ArgMemKind::ConstPtr => {
-                    objects.insert(RamObject {
-                        base: RamBase::Param(i as u32),
-                        write: false,
-                    });
+                    objects.insert(RamObject { base, write: false });
                 }
                 // Filtered out above.
                 ArgMemKind::Opaque => unreachable!(),
@@ -563,7 +589,7 @@ impl EffectChannel for RamChannel {
         // Pointers passed to externals target the default ram space (TLS/FS is
         // out of scope, per the existing conventions). A read-only footprint
         // writes nothing.
-        let written = if any_mut_ptr {
+        let written = if any_write_ptr {
             Some([ctx.shared.default_space].into_iter().collect())
         } else {
             Some(std::collections::BTreeSet::new())
@@ -685,7 +711,10 @@ impl EffectChannel for RamChannel {
                 // object, and the caller's frame local dies at return). See
                 // stage 4 (`ExternalArgmemConfinement`) in the module docs. A
                 // frame-landing object *read* is still rejected by `rebase`
-                // (freshness), exactly like a field read.
+                // (freshness), exactly like a field read — which is why a
+                // read-write `MutPtr` external (both objects) goes ⊤ on a frame
+                // landing while a write-only `OutPtr` one (write object only)
+                // is contained.
                 match rebase(o.base, o.write)? {
                     None => {}
                     Some((base, _shift)) => {
@@ -1550,10 +1579,13 @@ mod tests {
         );
     }
 
-    /// STAGE 2: a `memset`-like external (mutable ptr, int, int) gets a single
-    /// `Param(0)` whole-object write, and a caller whose only effect is calling it
-    /// through an own-frame local composes to memory-free — the `memset(&local)`
-    /// fold, the whole payoff.
+    /// STAGE 2 / ruling 1b: a `memset`-like external whose dest is a **write-only**
+    /// (`OutPtr`) param gets a single `Param(0)` whole-object write, and a caller
+    /// whose only effect is calling it through an own-frame local composes to
+    /// memory-free — the `memset(&local)` fold, the whole payoff. (`OutPtr` is
+    /// what the `extern_argmem` write-only table upgrades memset's dest to; a bare
+    /// `MutPtr` would carry a read half and block — see
+    /// `strcat_mutptr_frame_local_is_top`.)
     #[test]
     fn memset_argmem_frame_local_call_is_memory_free() {
         let mut tc = qcode::testing::TestContext::new();
@@ -1562,7 +1594,7 @@ mod tests {
             &mut tc,
             0x9000,
             "memset",
-            vec![ArgMemKind::MutPtr, ArgMemKind::NonPtr, ArgMemKind::NonPtr],
+            vec![ArgMemKind::OutPtr, ArgMemKind::NonPtr, ArgMemKind::NonPtr],
             false,
         );
         qcode!(
@@ -1620,6 +1652,81 @@ mod tests {
         assert!(
             is_memory_free(&s, caller),
             "memset(&local) into the caller's own frame is contained — memory-free"
+        );
+    }
+
+    /// Ruling 1b: a `strcat`-like external whose dest is a read-write `MutPtr`
+    /// carries BOTH a write object and a read object. The read object rebased
+    /// through an own-frame local needs freshness licensing the transfer lacks,
+    /// so a caller passing an own-frame local composes to ⊤ — NOT memory-free.
+    /// This is the uninit-local-read hole the write-only/read-write split closes:
+    /// `strcat(&local, s)` reads `&local`'s stale contents.
+    #[test]
+    fn strcat_mutptr_frame_local_is_top() {
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        let strcat = external_argmem(
+            &mut tc,
+            0x9500,
+            "strcat",
+            vec![ArgMemKind::MutPtr, ArgMemKind::ConstPtr],
+            false,
+        );
+        qcode!(
+            tc.ctx,
+            "
+            fn caller:
+                <k_entry @RSP:i64>
+                    %loc = @RSP - i64 0x20;
+                    goto <k_call>;
+                <k_call>
+                    call fn caller();
+                <k_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (k_entry, k_cont);
+        materialize(&mut tc, caller);
+        set_sp_origin(&mut tc, caller, sp);
+        let loc = ValueId::Instruction(
+            qcode::value::BasicBlock::from_id(&tc.ctx, k_entry)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id,
+        );
+        // Pass the frame local as the mutable dest; a literal as the const src.
+        let lit = tc.ctx.get_const(0x4000, 8).id();
+        regpure_call(&mut tc, k_call, strcat, vec![loc, lit]);
+        tc.ctx.add_cfg_edge(k_call, k_cont);
+
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, Some(sp));
+
+        // The external's own footprint is a Param(0) write AND a Param(0) read.
+        let ext = s.get(strcat).as_ref().expect("external summary");
+        let fp = ext
+            .precise
+            .as_ref()
+            .expect("argmem footprint is expressible");
+        assert!(
+            fp.objects.contains(&RamObject {
+                base: RamBase::Param(0),
+                write: true,
+            }) && fp.objects.contains(&RamObject {
+                base: RamBase::Param(0),
+                write: false,
+            }),
+            "a MutPtr dest carries both a write and a read object"
+        );
+        let caller_eff = s.get(caller).as_ref().expect("caller summary");
+        assert!(
+            caller_eff.precise.is_none(),
+            "the MutPtr read through a frame local needs freshness licensing — ⊤"
+        );
+        assert!(
+            !is_memory_free(&s, caller),
+            "strcat(&local, s) reads the stale frame local — not memory-free"
         );
     }
 
