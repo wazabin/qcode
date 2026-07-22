@@ -4535,4 +4535,325 @@ mod tests {
         let _ = g;
         assert!(sp_load, "the SP-relative stack RAM load stays in the body");
     }
+
+    // ---- ExternalArgmemConfinement registration ----------------------------
+
+    /// Stamp `RSP`'s incoming block param as originating from the SP register
+    /// varnode, so own-frame locals (`@RSP - k`) are recognised by the frame view.
+    fn stamp_sp_origin(tc: &mut qcode::testing::TestContext, fid: FunctionId, sp: VarnodeId) {
+        let pid = {
+            let f = FunctionBody::from_id(&tc.ctx, fid);
+            let p = f
+                .root()
+                .unwrap()
+                .params()
+                .find(|p| p.name() == Some("RSP"))
+                .unwrap();
+            match p.id() {
+                ValueId::BlockParam(pid) => pid,
+                _ => unreachable!(),
+            }
+        };
+        tc.ctx
+            .block_param_mut(pid)
+            .set_origin_id(ValueId::Varnode(sp).localize(pid.func));
+    }
+
+    fn materialize_fn(tc: &mut qcode::testing::TestContext, fid: FunctionId) {
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
+            qcode::value::FunctionEffects::Materialized(
+                qcode::value::RegisterInterfaceMap::default(),
+            ),
+        );
+    }
+
+    /// A bodyless external at `addr` stamped with a prototype-derived argmem
+    /// summary (as `external_sigs` would produce).
+    fn make_argmem_external(
+        tc: &mut qcode::testing::TestContext,
+        addr: u64,
+        name: &str,
+        params: Vec<qcode::value::ArgMemKind>,
+    ) -> FunctionId {
+        let f = FunctionBody::make_external(&mut tc.ctx, addr, Some(name.to_string().into())).id;
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_argmem(qcode::value::ExternArgmem {
+            params,
+            variadic: false,
+        });
+        f
+    }
+
+    /// Whether any `ExternalArgmemConfinement` proposition is recorded true for
+    /// the promoted function `f` naming external `e`.
+    fn confinement_recorded(ctx: &qcode::context::Context, f: FunctionId, e: FunctionId) -> bool {
+        use qcode::assumption::Proposition;
+        ctx.truth(Proposition::ExternalArgmemConfinement(f, e))
+            .is_some_and(|t| t.value)
+    }
+
+    /// Whether *any* `ExternalArgmemConfinement` proposition is recorded at all.
+    fn any_confinement(ctx: &qcode::context::Context) -> bool {
+        use qcode::assumption::Proposition;
+        ctx.truths()
+            .any(|(p, _)| matches!(p, Proposition::ExternalArgmemConfinement(..)))
+    }
+
+    /// Direct case: `caller` derefs its own pointer param and calls `f`, which
+    /// memsets an own-frame local through a prototyped `OutPtr` external. `f` is
+    /// outward-invisible (the `memset` write lands in `f`'s dead frame), so
+    /// `caller` promotes past it; the external flag propagates into `caller`'s
+    /// summary, and committing `caller`'s promotion records
+    /// `ExternalArgmemConfinement(caller, memset)`.
+    #[test]
+    fn promotion_records_external_confinement_direct() {
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        let memset = make_argmem_external(
+            &mut tc,
+            0x9000,
+            "memset",
+            vec![
+                qcode::value::ArgMemKind::OutPtr,
+                qcode::value::ArgMemKind::NonPtr,
+                qcode::value::ArgMemKind::NonPtr,
+            ],
+        );
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @RSP:i64>
+                    %loc = @RSP - i64 0x20;
+                    goto <f_call>;
+                <f_call>
+                    call <f>;
+                <f_cont>
+                    return at i64 0;
+
+            fn caller:
+                <k_entry @RSP:i64 @p:i64>
+                    %x = load(ram:8, @p);
+                    goto <k_call>;
+                <k_call>
+                    call <caller>;
+                <k_cont>
+                    return at %x;
+
+            fn top:
+                <t_entry>
+                    goto <t_call>;
+                <t_call>
+                    call <top>;
+                <t_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (f_entry, f_cont, k_entry, k_cont, t_entry, t_cont);
+        for fid in [f, caller] {
+            materialize_fn(&mut tc, fid);
+            stamp_sp_origin(&mut tc, fid, sp);
+        }
+
+        // f: memset(&own_frame_local, 0, 16).
+        let loc = ValueId::Instruction(
+            BasicBlock::from_id(&tc.ctx, f_entry)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id,
+        );
+        let zero = tc.ctx.get_const(0, 8).id();
+        let n = tc.ctx.get_const(16, 8).id();
+        set_call(&mut tc, f_call, memset, vec![loc, zero, n]);
+        tc.ctx.add_cfg_edge(f_call, f_cont);
+
+        // caller: derefs @p, then calls f (passing its own @RSP).
+        let caller_rsp = FunctionBody::from_id(&tc.ctx, caller)
+            .root()
+            .unwrap()
+            .params()
+            .find(|p| p.name() == Some("RSP"))
+            .unwrap()
+            .id();
+        set_call(&mut tc, k_call, f, vec![caller_rsp]);
+        tc.ctx.add_cfg_edge(k_call, k_cont);
+
+        // top: calls caller with (rsp, p) literal args.
+        let rsp_arg = tc.ctx.get_const(0x7000, 8).id();
+        let p_arg = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, t_call, caller, vec![rsp_arg, p_arg]);
+        tc.ctx.add_cfg_edge(t_call, t_cont);
+
+        argpromote_with_sp(&mut tc.ctx, Some(sp));
+
+        assert!(
+            confinement_recorded(&tc.ctx, caller, memset),
+            "committing caller's promotion must record ExternalArgmemConfinement(caller, memset)"
+        );
+    }
+
+    /// Transitive case: `g` → `mid` → `f` → `memset(&frame)`. The external flag
+    /// propagates unconditionally up the chain (even through the outward-invisible
+    /// `mid`/`f`), so promoting `g` records `ExternalArgmemConfinement(g, memset)`.
+    #[test]
+    fn promotion_records_external_confinement_transitive() {
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        let memset = make_argmem_external(
+            &mut tc,
+            0x9000,
+            "memset",
+            vec![
+                qcode::value::ArgMemKind::OutPtr,
+                qcode::value::ArgMemKind::NonPtr,
+                qcode::value::ArgMemKind::NonPtr,
+            ],
+        );
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @RSP:i64>
+                    %loc = @RSP - i64 0x20;
+                    goto <f_call>;
+                <f_call>
+                    call <f>;
+                <f_cont>
+                    return at i64 0;
+
+            fn mid:
+                <m_entry @RSP:i64>
+                    goto <m_call>;
+                <m_call>
+                    call <mid>;
+                <m_cont>
+                    return at i64 0;
+
+            fn g:
+                <g_entry @RSP:i64 @p:i64>
+                    %x = load(ram:8, @p);
+                    goto <g_call>;
+                <g_call>
+                    call <g>;
+                <g_cont>
+                    return at %x;
+
+            fn top:
+                <t_entry>
+                    goto <t_call>;
+                <t_call>
+                    call <top>;
+                <t_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (
+            f_entry, f_cont, m_entry, m_cont, g_entry, g_cont, t_entry, t_cont,
+        );
+        for fid in [f, mid, g] {
+            materialize_fn(&mut tc, fid);
+            stamp_sp_origin(&mut tc, fid, sp);
+        }
+
+        let loc = ValueId::Instruction(
+            BasicBlock::from_id(&tc.ctx, f_entry)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id,
+        );
+        let zero = tc.ctx.get_const(0, 8).id();
+        let n = tc.ctx.get_const(16, 8).id();
+        set_call(&mut tc, f_call, memset, vec![loc, zero, n]);
+        tc.ctx.add_cfg_edge(f_call, f_cont);
+
+        let mid_rsp = FunctionBody::from_id(&tc.ctx, mid)
+            .root()
+            .unwrap()
+            .params()
+            .next()
+            .unwrap()
+            .id();
+        set_call(&mut tc, m_call, f, vec![mid_rsp]);
+        tc.ctx.add_cfg_edge(m_call, m_cont);
+
+        let g_rsp = FunctionBody::from_id(&tc.ctx, g)
+            .root()
+            .unwrap()
+            .params()
+            .find(|p| p.name() == Some("RSP"))
+            .unwrap()
+            .id();
+        set_call(&mut tc, g_call, mid, vec![g_rsp]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        let rsp_arg = tc.ctx.get_const(0x7000, 8).id();
+        let p_arg = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, t_call, g, vec![rsp_arg, p_arg]);
+        tc.ctx.add_cfg_edge(t_call, t_cont);
+
+        argpromote_with_sp(&mut tc.ctx, Some(sp));
+
+        assert!(
+            confinement_recorded(&tc.ctx, g, memset),
+            "the external flag must propagate transitively: ExternalArgmemConfinement(g, memset)"
+        );
+    }
+
+    /// Negative case: a promoted caller whose call cone reaches no prototyped
+    /// external records no confinement proposition at all.
+    #[test]
+    fn promotion_without_external_records_no_confinement() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn pure:
+                <p_entry>
+                    return at i64 0;
+
+            fn caller:
+                <k_entry @p:i64>
+                    %x = load(ram:8, @p);
+                    goto <k_call>;
+                <k_call>
+                    call <caller>;
+                <k_cont>
+                    return at %x;
+
+            fn top:
+                <t_entry>
+                    goto <t_call>;
+                <t_call>
+                    call <top>;
+                <t_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (p_entry, k_entry, k_cont, t_entry, t_cont);
+        materialize_fn(&mut tc, caller);
+
+        set_call(&mut tc, k_call, pure, vec![]);
+        // A zero-arg (implicit) call to `pure` is not a promotion-blocking site
+        // for `caller` — `pure` is memory-free — but retag it RegPure so the
+        // regpure direct-site gate on `caller` is not what we accidentally test.
+        let _ = pure;
+        tc.ctx.add_cfg_edge(k_call, k_cont);
+
+        let p_arg = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, t_call, caller, vec![p_arg]);
+        tc.ctx.add_cfg_edge(t_call, t_cont);
+
+        argpromote_with_sp(&mut tc.ctx, None);
+
+        // The assertion is only meaningful if `caller` actually promoted.
+        assert!(
+            has_val_param(&tc.ctx, caller),
+            "caller must have been promoted (gained a _val_ snapshot param)"
+        );
+        assert!(
+            !any_confinement(&tc.ctx),
+            "no external in the cone ⇒ no ExternalArgmemConfinement recorded"
+        );
+    }
 }

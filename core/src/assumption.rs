@@ -138,6 +138,34 @@ pub enum Proposition {
     /// never proven, so it is not discharged and the checkpoint+replay net never
     /// acts on it).
     AssumeCallingConvention,
+    /// The external function (second field), reached from the caller (first
+    /// field), has a prototype-derived argmem footprint that it honours: it
+    /// writes and reads **only within the objects addressed by its pointer
+    /// arguments** — e.g. `memset(dst, c, n)` touches only `[dst, dst+n)`, never
+    /// spilling past the object we hand it. `argpromote`'s RAM effect lattice
+    /// mints whole-object entries for such externals and rebases them onto the
+    /// caller's bases (`Frame`/`Param`/`Global`); the `memset(&local)` fold — a
+    /// write-only external landing on an own-frame local, contained and dead at
+    /// return — rests on exactly this confinement.
+    ///
+    /// Like [`LoadedPointerDisjointFromSlot`] it is **not** statically sound on
+    /// its own: the prototype could be lying (an `OutPtr` that secretly reads, a
+    /// callback hidden behind a plain pointer) or the length could run out of
+    /// bounds (`memset(dst, c, huge_n)`), either of which would touch memory
+    /// outside the addressed object. A pass records it `Assumed` at the point a
+    /// promotion is committed that relied on the containment (the promoted
+    /// function's summary flag-set names every external it transitively folded
+    /// through); v1 has **no verifier**, the checkpoint+replay net catching any
+    /// future refutation. A cheap future refuter is available where the caller
+    /// passes a *constant* length whose value exceeds the frame-layout distance
+    /// from the landing slot to the next live slot — a provable overflow.
+    ///
+    /// The first field is the invalidation target (the promoted caller whose IR
+    /// must be discarded on refutation); the second is the trust anchor (the
+    /// external whose prototype is being believed).
+    ///
+    /// [`LoadedPointerDisjointFromSlot`]: Proposition::LoadedPointerDisjointFromSlot
+    ExternalArgmemConfinement(FunctionId, FunctionId),
 }
 
 /// How certain we are about a proposition's recorded value.

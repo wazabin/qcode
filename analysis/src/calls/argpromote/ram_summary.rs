@@ -71,15 +71,20 @@
 //! [assumptions registry](qcode::assumption::Proposition) with the
 //! checkpoint+replay net as backstop.
 //!
-//! TODO(assumptions-registry): register an `ExternalArgmemConfinement`
-//! [`Proposition`](qcode::assumption::Proposition) at the point the assumption is
-//! load-bearing — a `Frame`-landing whole-object write admitted in `transfer`.
-//! It is **not** wired up yet because `transfer` runs inside the read-only
-//! (`&Context`) summary solve and cannot call `assume_true` (which needs
-//! `&mut Context`), and the `&mut` promotion site (the retail pass) is out of
-//! scope here. Until then the assumption is documented, not recorded; a caller
-//! folded through a prototyped external's mutable-pointer argmem relies on it
-//! implicitly. See the report / `argpromote` design notes.
+//! This confinement is now *recorded*, not merely documented, via a flag-set on
+//! the summary lattice. `transfer` runs inside the read-only (`&Context`) solve
+//! and cannot call `assume_true`, so it does not register anything itself;
+//! instead each [`RamEffects`] carries an `externals` flag-set naming every
+//! prototyped external whose whole-object entry was folded into it — minted by
+//! the caller doing the rebase (any landing base) and union-propagated
+//! transitively up the call graph (so `g → f → memset` reaches `g`). The flag-set
+//! is provenance, not footprint: it is exempt from [`MAX_EFFECT_ENTRIES`]
+//! saturation. Then at the `&mut Context` promotion commit point (`ram::try_promote`,
+//! any outcome ≠ `No`) the retail pass reads the promoted function `f`'s solved
+//! flag-set and records one
+//! [`Proposition::ExternalArgmemConfinement(f, e)`](qcode::assumption::Proposition)
+//! per external `e`, so a future refutation invalidates exactly `f` under the
+//! checkpoint+replay net (v1 has no verifier).
 //!
 //! The blocking-call gate still admits only outward-invisible callees
 //! (`Frame`-only or empty summaries); letting a caller compose a callee's
@@ -97,7 +102,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 
 use crate::CallGraph;
-use crate::calls::CallEdge;
+use crate::calls::{CallEdge, CallTarget};
 use crate::sequence::{AddressRelation, MemoryAccess, collect_regions_for_base, relate_address};
 
 use super::globals::global_slot;
@@ -214,6 +219,17 @@ impl Footprint {
 pub(crate) struct RamEffects {
     pub precise: Option<Footprint>,
     pub written: Option<std::collections::BTreeSet<qcode::space::SpaceId>>,
+    /// Provenance flag-set: every prototyped **external** whose whole-object
+    /// argmem entries were folded into this summary — directly (a
+    /// [`transfer`](EffectChannel::transfer) rebased the external's own object,
+    /// on any landing base) or transitively (a callee summary that already
+    /// carried the flag). It is **not** part of the footprint: it is exempt from
+    /// [`MAX_EFFECT_ENTRIES`] saturation and is union-joined monotonically. Empty
+    /// in [`external_leaf`](EffectChannel::external_leaf) — an external's own
+    /// summary describes only its footprint; the flag is minted by the *caller*
+    /// doing the rebase. At the promotion commit point each entry becomes an
+    /// [`ExternalArgmemConfinement`](qcode::assumption::Proposition) assumption.
+    pub externals: FxHashSet<FunctionId>,
 }
 
 impl Default for RamEffects {
@@ -221,6 +237,7 @@ impl Default for RamEffects {
         Self {
             precise: Some(Footprint::default()),
             written: Some(Default::default()),
+            externals: FxHashSet::default(),
         }
     }
 }
@@ -513,6 +530,8 @@ impl EffectChannel for RamChannel {
                 .then(|| self.extract_footprint(ctx, fid, &mut own_frame, &outward, &raw))
                 .flatten(),
             written,
+            // A bodied scan folds no externals; the flag is minted at rebase.
+            externals: FxHashSet::default(),
         })
     }
 
@@ -538,6 +557,7 @@ impl EffectChannel for RamChannel {
             return Some(RamEffects {
                 precise: None,
                 written: None,
+                externals: FxHashSet::default(),
             });
         };
         // ⊤ carve-outs: a variadic external (`printf`'s `%n` / unknowable pointer
@@ -553,6 +573,7 @@ impl EffectChannel for RamChannel {
             return Some(RamEffects {
                 precise: None,
                 written: None,
+                externals: FxHashSet::default(),
             });
         }
         let mut objects: FxHashSet<RamObject> = FxHashSet::default();
@@ -600,16 +621,32 @@ impl EffectChannel for RamChannel {
                 ..Footprint::default()
             }),
             written,
+            // An external's own summary describes only its footprint; the
+            // confinement flag is minted by the caller that rebases it.
+            externals: FxHashSet::default(),
         })
     }
 
     fn transfer(&self, ctx: &Context, edge: &CallEdge, callee: &RamEffects) -> Option<RamEffects> {
         // The coarse component moves by identity: space ids are global.
         let written = callee.written.clone();
+        // Provenance propagation (rule 3): a callee's confinement flags always
+        // rise into the caller — even when the callee is outward-invisible
+        // (`Frame`-only) and contributes no footprint entry — so that
+        // `g → f → memset` still stamps `g`'s summary with `{memset}`.
+        let mut externals = callee.externals.clone();
+        // The prototyped external this edge targets, if any — the only source of
+        // whole-object entries. Rule 2 flags it below whenever one of its objects
+        // is rebased into the caller's footprint, on any landing base.
+        let callee_ext = match edge.target {
+            CallTarget::Function(fid) if FunctionBody::from_id(ctx, fid).is_external() => Some(fid),
+            _ => None,
+        };
         let Some(fp) = &callee.precise else {
             return Some(RamEffects {
                 precise: None,
                 written,
+                externals,
             });
         };
         // A positional site whose `args` are in `param[i] ↔ args[i]` lockstep
@@ -643,9 +680,13 @@ impl EffectChannel for RamChannel {
             return Some(RamEffects {
                 precise: fp.invisible().then(Footprint::default),
                 written,
+                externals,
             });
         };
         let caller = edge.caller;
+        // Whether an external's whole-object entry actually landed in the
+        // caller's footprint below (rule 2 flags `callee_ext` only then).
+        let mut ext_object_landed = false;
         // The precise rebase degrades to footprint-⊤ on its own (an
         // unrebasable argument never unbounds the coarse component).
         let precise = (|| -> Option<Footprint> {
@@ -718,6 +759,10 @@ impl EffectChannel for RamChannel {
                 match rebase(o.base, o.write)? {
                     None => {}
                     Some((base, _shift)) => {
+                        // A prototyped external's object was folded into the
+                        // caller (any landing base) — the confinement assumption
+                        // is now load-bearing here (rule 2).
+                        ext_object_landed = true;
                         out.objects.insert(RamObject { base, ..*o });
                     }
                 }
@@ -727,7 +772,17 @@ impl EffectChannel for RamChannel {
             }
             Some(out)
         })();
-        Some(RamEffects { precise, written })
+        // Rule 2: stamp the external whose whole-object entry actually landed.
+        if let Some(fid) = callee_ext
+            && ext_object_landed
+        {
+            externals.insert(fid);
+        }
+        Some(RamEffects {
+            precise,
+            written,
+            externals,
+        })
     }
 
     fn join(&self, into: &mut RamEffects, from: &RamEffects) -> bool {
@@ -767,6 +822,11 @@ impl EffectChannel for RamChannel {
                 None
             }
         };
+        // Provenance flag-set: monotone union, exempt from the entry budget (it
+        // is provenance, not footprint, so it never drives saturation to ⊤).
+        let before = into.externals.len();
+        into.externals.extend(from.externals.iter().copied());
+        grew |= into.externals.len() != before;
         grew
     }
 }
@@ -1456,6 +1516,7 @@ mod tests {
                 ..Footprint::default()
             }),
             written: Some(Default::default()),
+            externals: FxHashSet::default(),
         };
         let edge = CallEdge {
             caller,
@@ -1539,6 +1600,7 @@ mod tests {
                 ..Footprint::default()
             }),
             written: Some(Default::default()),
+            externals: FxHashSet::default(),
         };
         let edge = CallEdge {
             caller,
@@ -1880,6 +1942,7 @@ mod tests {
             RamEffects {
                 precise: Some(fp),
                 written: Some(Default::default()),
+                externals: FxHashSet::default(),
             }
         };
         let mut into = mk(0..40);

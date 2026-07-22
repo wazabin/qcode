@@ -167,7 +167,7 @@ fn argpromote_changed_functions_with_sp(
             changed.insert(fid);
             changed.extend(callers.iter().copied());
         }
-        match try_promote(
+        let outcome = try_promote(
             ctx,
             fid,
             sp_reg,
@@ -175,7 +175,21 @@ fn argpromote_changed_functions_with_sp(
             graph,
             &ram_summaries,
             &absorbed,
-        ) {
+        );
+        // Any committed promotion (Shadow or Partial) that folded through a
+        // prototyped external's argmem footprint rests on the confinement
+        // assumption: record one `ExternalArgmemConfinement(f, e)` per external
+        // `e` in `f`'s solved summary flag-set, so a refutation invalidates `f`
+        // (checkpoint+replay). `No` changes nothing, so it registers nothing.
+        if outcome != Promotion::No
+            && let Ok(eff) = ram_summaries.get(fid)
+        {
+            let externals: Vec<FunctionId> = eff.externals.iter().copied().collect();
+            for e in externals {
+                ctx.assume_true(Proposition::ExternalArgmemConfinement(fid, e));
+            }
+        }
+        match outcome {
             Promotion::No => {}
             Promotion::Partial => {
                 changed.insert(fid);
