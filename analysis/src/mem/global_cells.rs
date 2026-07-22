@@ -1,21 +1,15 @@
-//! `promote_global_cells`: classify constant real-RAM globals and prepare them
-//! for the register effect channel (see `GLOBALS_AS_VARNODES.md`).
+//! `promote_global_cells`: fold read-only constant real-RAM globals.
 //!
-//! An early, whole-program pre-pass with two jobs, both keyed on a single
-//! syntactic scan for constant-address accesses:
+//! An early, whole-program pre-pass keyed on a single syntactic scan for
+//! constant-address accesses. A global that appears as a `store(ram, <const>)`
+//! *nowhere* in the program, and lives outside a section the loader may rewrite
+//! (`is_known_writable`), is immutable. Every `load(ram, <const>)` of it folds
+//! to the byte value in the binary image, guarded by a
+//! [`Proposition::ImmutableMemory`] assumption (a later-proven write refutes it
+//! → checkpoint+replay). Such a global never enters any interface.
 //!
-//! 1. **Read-only fold.** A global that appears as a `store(ram, <const>)`
-//!    *nowhere* in the program, and lives outside a section the loader may
-//!    rewrite (`is_known_writable`), is immutable. Every `load(ram, <const>)`
-//!    of it folds to the byte value in the binary image, guarded by a
-//!    [`Proposition::ImmutableMemory`] assumption (a later-proven write refutes
-//!    it → checkpoint+replay). Such a global never enters any interface.
-//!
-//! 2. **Pre-mint mutable cells.** Every *remaining* constant-RAM access (a
-//!    global that is written somewhere) gets a stable identity varnode minted
-//!    via [`Context::get_or_make_global_varnode`], so the immutable register
-//!    effect scan can look it up and thread the global's **value** like a
-//!    register.
+//! A global that *is* written somewhere is left alone here: the RAM effect
+//! channel (`argpromote::ram`) owns its materialization.
 //!
 //! # Accepted unsoundness (read this before touching the write-set logic)
 //!
@@ -113,7 +107,6 @@ impl Pass for PromoteGlobalCells {
         let binary = env.binary.as_deref();
         let mut folds: HashMap<FunctionId, Vec<(qcode::value::insn::InstructionId, u64, usize)>> =
             HashMap::default();
-        let mut mutable_cells: HashSet<(u64, usize)> = HashSet::default();
         for &fid in &fun_ids {
             for block in FunctionBody::from_id(ctx, fid).blocks() {
                 for insn in block.iter() {
@@ -127,8 +120,8 @@ impl Pass for PromoteGlobalCells {
                         continue;
                     };
                     if written.contains(&addr) {
-                        // Written somewhere → a value-threaded cell.
-                        mutable_cells.insert((addr, data_size));
+                        // Written somewhere → a mutable cell owned by the RAM
+                        // effect channel (`argpromote::ram`); not a read-only fold.
                         continue;
                     }
                     // Read-only candidate: fold the load (only loads produce a
@@ -168,12 +161,6 @@ impl Pass for PromoteGlobalCells {
                     changed.insert(fid);
                 }
             }
-        }
-
-        // Phase 3b: pre-mint identity varnodes for every mutable global cell so
-        // the register effect scan can look them up.
-        for (addr, size) in mutable_cells {
-            ctx.get_or_make_global_varnode(addr, size);
         }
 
         Ok(crate::ModulePassOutcome {

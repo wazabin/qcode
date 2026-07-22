@@ -67,18 +67,6 @@ pub struct ValueRegistry<'str> {
     /// Varnode storage.
     pub varnodes: Registry<VarnodeId, Varnode<'str>>,
 
-    /// Dedup cache for *global-cell* varnodes: a constant real-RAM address,
-    /// keyed `(address, size)`, mapped to a single stable [`VarnodeId`]. Unlike
-    /// registers, RAM addresses are not pre-interned, and the plain `varnodes`
-    /// registry is append-only (never dedups), so the register effect channel
-    /// mints these through [`Context::get_or_make_global_varnode`] to give a
-    /// global a stable identity in its `loads`/`stores` sets. This varnode is an
-    /// **effect-set identity token only** — it is never emitted as a real
-    /// `load`/`store` `ptr` (materialization maps it to an address-literal
-    /// access); a RAM `ptr` must stay a dataflow *value* for the alias oracle.
-    #[serde(default, skip)]
-    pub(crate) global_cells: HashMap<(u64, usize), VarnodeId>,
-
     /// Per-varnode type overrides. A varnode is normally typed `Int(size)`; an
     /// entry here gives it a richer *global* type instead (e.g. the `FS_OFFSET`
     /// register typed `PtrTo<TEB>` by the TEB-seeding pass). Consulted by

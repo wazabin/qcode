@@ -1861,32 +1861,6 @@ impl<'str> Context<'str> {
         self.shared.values.varnode_types.insert(varnode, type_id);
     }
 
-    /// Get (or mint once) the stable *global-cell* varnode for a constant
-    /// real-RAM address of the given width. The register effect channel uses it
-    /// as the identity of a global in its `loads`/`stores` sets, exactly as a
-    /// register varnode identifies a register cell.
-    ///
-    /// This varnode is an **effect-set identity token only**: it is never
-    /// emitted as a real `load`/`store` `ptr`. Materialization maps it back to
-    /// an address-literal access (`load/store(ram, addr)`), because a RAM `ptr`
-    /// must remain a dataflow value the alias oracle can reason about.
-    pub fn get_or_make_global_varnode(&mut self, addr: u64, size: usize) -> VarnodeId {
-        if let Some(&id) = self.shared.values.global_cells.get(&(addr, size)) {
-            return id;
-        }
-        let ram = self.shared.default_space;
-        let id = Varnode::make(self, addr as i64, size, ram).id;
-        self.shared.values.global_cells.insert((addr, size), id);
-        id
-    }
-
-    /// The previously-minted global-cell varnode for `(addr, size)`, if any.
-    /// Immutable companion to [`get_or_make_global_varnode`](Self::get_or_make_global_varnode),
-    /// for read-only effect scanning after the cells have been pre-minted.
-    pub fn global_varnode(&self, addr: u64, size: usize) -> Option<VarnodeId> {
-        self.shared.values.global_cells.get(&(addr, size)).copied()
-    }
-
     /// Return all instructions that use `value` as an operand.
     ///
     /// For an SSA value (instruction result or block param) this is the complete
