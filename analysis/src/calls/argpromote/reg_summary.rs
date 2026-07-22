@@ -184,9 +184,7 @@ pub(crate) fn finalize_register_effects(
         canonicalize_to_coarsest(ctx, &read_set).ok_or(RegPurityReason::NonCanonicalRegisters)?;
 
     // Deterministic order shared by callee param creation and the regpure-site
-    // argument threading. Global cells (constant-RAM varnodes) sort in with the
-    // registers by `(address, size)`; a RAM address never collides with a
-    // register address space, so the order is stable across the two spaces.
+    // argument threading: sort by `(space, address, size)`.
     let key = |ctx: &Context, vn: &VarnodeId| {
         let v = Varnode::from_id(ctx, *vn);
         (v.space().id, v.address(), v.size())

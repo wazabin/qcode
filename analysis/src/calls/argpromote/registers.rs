@@ -1,6 +1,6 @@
 use qcode::{
     context::Context,
-    space::{Space, SpaceId, SpaceType},
+    space::{SpaceId, SpaceType},
     types::TypeId,
     value::{
         BasicBlock, FunctionBody, FunctionEffects, FunctionId, Instruction, LocalValueId, QCodeMut,
@@ -23,56 +23,12 @@ pub(crate) fn is_register(ctx: &Context, vn: VarnodeId) -> bool {
     matches!(Varnode::from_id(ctx, vn).space().ty, SpaceType::Register)
 }
 
-/// The `ptr` operand for a materialized access to storage cell `r`.
-///
-/// A **register** cell is addressed by the varnode itself (`load/store(register,
-/// R)`). A **global RAM** cell — a constant real-RAM address admitted to the
-/// effect channel via [`Context::get_or_make_global_varnode`] — is addressed by
-/// its constant address as a *literal value* (`load/store(ram, addr)`). The
-/// identity varnode of a global is an effect-set token only and must NEVER
-/// appear as a `ptr`: the alias oracle reads a RAM `ptr` as a dataflow value,
-/// and a varnode-as-ptr in RAM space would be meaningless to it.
-fn access_ptr(b: &mut qcode::builder::Builder, r: VarnodeId) -> ValueId {
-    let (is_reg, addr, ptr_width) = {
-        let v = Varnode::from_id(b.shr(), r);
-        let space = v.space();
-        (
-            matches!(space.ty, SpaceType::Register),
-            v.address() as u64,
-            space.addr_size,
-        )
-    };
-    if is_reg {
-        ValueId::Varnode(r)
-    } else {
-        b.shr().get_const(addr, ptr_width)
-    }
-}
-
-/// Derive the RAM-backed (`GlobalSlot`) record from the constant-RAM varnodes in
-/// a materialized interface's `inputs`/`outputs`. Globals ride in those sets as
-/// ordinary varnodes; this record is redundant (deletable once the varnode
-/// merge is proven — see GLOBALS_AS_VARNODES.md).
-fn global_slot_record(
-    ctx: &Context,
-    inputs: &[VarnodeId],
-    outputs: &[VarnodeId],
-) -> Vec<qcode::value::GlobalSlot> {
-    let mut seen = FxHashSet::default();
-    let mut out = Vec::new();
-    for &r in inputs.iter().chain(outputs) {
-        let v = Varnode::from_id(ctx, r);
-        if !matches!(v.space().ty, SpaceType::Register) {
-            let slot = (v.address() as u64, v.size());
-            if seen.insert(slot) {
-                out.push(qcode::value::GlobalSlot {
-                    addr: slot.0,
-                    size: slot.1,
-                });
-            }
-        }
-    }
-    out
+/// The `ptr` operand for a materialized access to register cell `r`: the varnode
+/// itself (`load/store(register, R)`). Every materialized interface cell is a
+/// register now — globals moved to the RAM effect channel — so this is always a
+/// varnode `ptr`.
+fn access_ptr(_b: &mut qcode::builder::Builder, r: VarnodeId) -> ValueId {
+    ValueId::Varnode(r)
 }
 
 // ===========================================================================
@@ -94,8 +50,6 @@ pub(crate) struct RegisterEffects {
     /// (over-approximated: a written-first register yields a dead param that
     /// mem2reg/DCE prune). Sorted by `(address, size)` for a deterministic
     /// param/argument order shared with the caller rewrite.
-    /// Global cells (constant real-RAM varnodes) ride in `inputs`/`outputs`
-    /// alongside registers — no separate list (see GLOBALS_AS_VARNODES.md).
     pub(crate) inputs: Vec<VarnodeId>,
     /// Registers the body stores, canonicalized to the coarsest register per
     /// overlap group so the caller's replay is order-independent. Sorted.
@@ -426,17 +380,15 @@ pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff:
                 v.size(),
                 v.space().id,
                 v.name().map(str::to_owned),
-                // Inherit a global varnode type override so the by-value entry
-                // param carries the register's richer type, not `Int(size)`.
+                // Inherit a varnode type override so the by-value entry param
+                // carries the register's richer type, not `Int(size)`.
                 ctx.stored_type_of(ValueId::Varnode(r)),
             )
         })
         .collect();
     for (r, size, space, name, ty) in input_meta {
         // A register cell binds from the register file by name (implicit
-        // convention); a global RAM cell has no register origin — its entry seed
-        // and every access address through `access_ptr` (the constant address).
-        let is_reg = matches!(Space::from_id(&*ctx, space).ty, SpaceType::Register);
+        // convention), keyed on the register varnode.
         add_input(
             ctx,
             fid,
@@ -444,7 +396,7 @@ pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff:
             // Name the param after its register so the implicit convention binds
             // it from the register file (`seed_entry_params` keys on the name).
             name,
-            is_reg.then_some(ValueId::Varnode(r)),
+            Some(ValueId::Varnode(r)),
             ty,
             // Empty call sites: add the param + entry seed, touch no caller.
             Some(&[]),
@@ -459,11 +411,6 @@ pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff:
             },
         );
     }
-
-    // Record the RAM-backed cells among the interface slots (globals ride in
-    // `inputs`/`outputs` as constant-RAM varnodes; this is a redundant record
-    // — see GLOBALS_AS_VARNODES.md, deletable once the merge is proven).
-    let global_slots = global_slot_record(ctx, &reg_eff.inputs, &reg_eff.outputs);
 
     // --- outputs: a flat positional return pack, one field per output register --
     let outputs = output_meta(ctx, &reg_eff.outputs);
@@ -488,7 +435,7 @@ pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff:
     // outputs[i]. `add_input`/`append_outputs` iterate in these same orders.
     FunctionBody::from_id_mut(ctx, fid).set_effects(FunctionEffects::Materialized(
         RegisterInterfaceMap {
-            globals: global_slots,
+            globals: vec![],
             inputs: reg_eff.inputs.clone(),
             outputs: reg_eff.outputs.clone(),
             // Every pack slot of a bodied function is a real computed value.
@@ -572,9 +519,7 @@ pub(crate) fn rewrite_call_regpure(
         })
         .collect();
     // Each input cell becomes a positional argument: a register loaded from the
-    // register file, a global loaded from its constant RAM address (`access_ptr`
-    // — globals ride in `map.inputs` as constant-RAM varnodes, so there is no
-    // separate global argument block any more).
+    // register file.
     let args: Vec<LocalValueId> = {
         let mut b = (ctx).builder(call_block);
         b.set_insert_point_before(call_id);
