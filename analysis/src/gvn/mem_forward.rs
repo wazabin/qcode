@@ -592,10 +592,38 @@ impl MemForward {
         self.byte_map.retain(|&(base, off), _| {
             let space = base.space();
             if !is_reg(space) {
-                // A body-local scratch space is owned by the caller. No callee,
-                // including an unresolved indirect one, can name or mutate it.
+                // A body-local scratch space is normally owned by the caller and
+                // unnameable by any callee — but argpromote's shadow-materialization
+                // may rebase an own-frame pointer into a private shadow space and
+                // pass it to a prototyped external (see `argpromote/ram.rs`). Such a
+                // rebased pointer *does* escape into the callee, breaking the old
+                // "private space is unreachable" axiom. So a private-space cell now
+                // survives the call only when no escaping pointer may reach into
+                // *this* space — conservative exactly the way the pinned-RAM arm is:
+                // a `symbolic_escape` (unknown callee or an interval-less escaping
+                // pointer) drops it, as does an escaping pointer whose alias interval
+                // lands in this same private space. A plain RAM/register escaping
+                // pointer resolves to a different space, so it leaves the cell intact
+                // (no regression for ordinary scratch spaces).
                 if space.shared().is_none() {
-                    return true;
+                    // A direct callee whose witnessed write-set is empty stores
+                    // nothing anywhere, so it cannot clobber this (or any) cell —
+                    // keep it regardless of what escapes. (A callee that *does*
+                    // write must have its escaping shadow pointer caught below.)
+                    if matches!(&callee_written_spaces, Some(ws) if ws.is_empty()) {
+                        return true;
+                    }
+                    return match base {
+                        Base::Symbolic(_, _) => {
+                            !symbolic_escape
+                                && !escaping.iter().any(|&p| {
+                                    aliases
+                                        .and_then(|a| a.interval(p))
+                                        .is_some_and(|(sp, ..)| sp == space)
+                                })
+                        }
+                        Base::Pinned(_) => !pinned_ram_clobbered(space, off),
+                    };
                 }
                 // A direct callee with a witnessed write-set that excludes this
                 // space cannot touch the cell no matter what escapes into it, so
@@ -1412,7 +1440,90 @@ mod tests {
         );
         assert!(
             mf.byte_map.contains_key(&(caller_scratch_cell, 0)),
-            "a callee cannot clobber its caller's body-local scratch"
+            "a callee that writes nothing cannot clobber its caller's body-local scratch"
+        );
+    }
+
+    /// Barrier fix (argpromote shadow materialization): a private-space cell is
+    /// clobbered across a call when an escaping pointer's alias interval lands in
+    /// *that* private space (the rebased shadow pointer handed to memset), and
+    /// survives when the escaping pointer resolves to a different space. The
+    /// callee here writes real ram (non-empty write-set), so the empty-write-set
+    /// keep does not apply and the escape check governs.
+    fn shadow_cell_survives_call(arg_reaches_shadow: bool) -> bool {
+        use qcode::value::insn::Call;
+        let mut tc = TestContext::new();
+        let ram = tc.ctx.shared.default_space;
+        let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        // A callee that writes real ram (non-empty witnessed set).
+        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_written_spaces(Some(vec![ram]));
+
+        let caller = FunctionBody::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let block = { tc.ctx.get_or_make_block(0x1000, caller) };
+        {
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, caller);
+            f.set_root(block).unwrap();
+            f.add_block(block);
+        }
+        let shadow = tc.ctx.bodies[caller].push_temp_space(TempSpace::new(Some("shadow"), 1, 8));
+        let shadow = LocalMemorySpaceId::Temp(shadow.local);
+
+        let arg = ValueId::Varnode(tc.r1);
+        {
+            let mut b = tc.ctx.builder(block);
+            b.push_call(callee);
+        }
+        let cid = BasicBlock::from_id(&tc.ctx, block)
+            .iter()
+            .find(|i| matches!(i.mnemonic(), Mnemonic::Call(_)))
+            .unwrap()
+            .id;
+        tc.ctx.replace_instruction_mnemonic(
+            cid,
+            Mnemonic::Call(Call {
+                target: qcode::value::insn::Callee::Real(callee),
+                args: vec![arg.localize(cid.func)],
+                clobbers: vec![],
+                tag: Default::default(),
+            }),
+        );
+
+        // The escaping pointer resolves either into the caller's shadow space
+        // (a rebased shadow pointer) or into real ram (an ordinary pointer).
+        let mut value_to_interval = HashMap::default();
+        let arg_space = if arg_reaches_shadow {
+            shadow
+        } else {
+            ram.into()
+        };
+        value_to_interval.insert(arg, (arg_space, 0x0u64, 0x8u64));
+        let aliases = AliasResult {
+            value_to_root: HashMap::default(),
+            value_to_interval,
+            frame: None,
+        };
+
+        let cell = Base::Pinned(shadow);
+        let src = ValueId::Varnode(tc.r2);
+        let mut mf = MemForward::default();
+        mf.byte_map.insert((cell, 0), Cell { src, src_off: 0 });
+        mf.prune_clobbered_by_call(
+            qcode::value::ModuleView::new(&tc.ctx),
+            block,
+            Some(&aliases),
+        );
+        mf.byte_map.contains_key(&(cell, 0))
+    }
+
+    #[test]
+    fn shadow_cell_clobbered_when_pointer_rebased_into_it() {
+        assert!(
+            !shadow_cell_survives_call(true),
+            "a pointer rebased into the shadow space clobbers the shadow cell across the call"
+        );
+        assert!(
+            shadow_cell_survives_call(false),
+            "a pointer resolving to real ram cannot reach the private shadow cell"
         );
     }
 }

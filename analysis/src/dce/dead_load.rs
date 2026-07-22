@@ -589,6 +589,13 @@ fn scan_block_aliased<'a, 'str: 'a>(
                 // A callee may read memory through pointer arguments, so no
                 // relative (RAM/temp) overwrite survives across the call.
                 rel_killed.clear();
+                // Axiom sweep (argpromote shadow materialization): a private
+                // body-local (shadow/temp) space is no longer unreachable by a
+                // callee — a rebased shadow pointer handed to a prototyped
+                // external lets the callee read that space. So a pre-call store
+                // to a private space can no longer be proven dead by a covering
+                // store after the call; drop private-space kills at the barrier.
+                killed.retain(|k| k.space.shared().is_some());
             }
             // Any other call may read any register before its continuation
             // overwrites it, so a register store preceding the call cannot be proven
@@ -598,7 +605,14 @@ fn scan_block_aliased<'a, 'str: 'a>(
             // stack-pointer decrement (see call_summary::decrement_stack_pointer)
             // alive so the callee's entry stack pointer is seeded correctly.
             Mnemonic::Call(_) | Mnemonic::CallInd(_) => {
-                killed.retain(|k| !is_reg_space(host.shared(), k.space));
+                // Drop register-space kills, and (axiom sweep) private
+                // body-local space kills too: a rebased shadow pointer passed to
+                // a callee lets it read the caller's shadow/temp space, so a
+                // pre-call private-space store is no longer dead across the call.
+                // Shared non-register (RAM/global) kills pass through as before.
+                killed.retain(|k| {
+                    k.space.shared().is_some() && !is_reg_space(host.shared(), k.space)
+                });
                 // The callee may read any memory it can reach (pointer args,
                 // globals), so drop every relative overwrite at the barrier.
                 rel_killed.clear();
