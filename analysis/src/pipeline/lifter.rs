@@ -17,6 +17,11 @@ pub struct PipelineServices<'a> {
     /// of the most-grown IR best-effort (pending discoveries stay queued).
     /// `None` falls back to the fixed round cap (wasm has no monotonic clock).
     pub deadline: Option<std::time::Instant>,
+    /// Reconstruction obligations accumulated across every discovery round.
+    ///
+    /// Lives here because each round analyzes a context clone that is dropped
+    /// at its end, so nothing in the IR remembers what earlier rounds learned.
+    pub obligations: crate::reconstruction::ObligationDb,
 }
 
 impl<'a> PipelineServices<'a> {
@@ -24,6 +29,7 @@ impl<'a> PipelineServices<'a> {
         Self {
             lifter: None,
             deadline: None,
+            obligations: crate::reconstruction::ObligationDb::default(),
         }
     }
 
@@ -31,6 +37,7 @@ impl<'a> PipelineServices<'a> {
         Self {
             lifter: Some(lifter),
             deadline: None,
+            obligations: crate::reconstruction::ObligationDb::default(),
         }
     }
 

@@ -77,6 +77,13 @@ pub struct PipelineEnv {
     /// is `Sync` and can be shared across worker threads (Stage 6); the base is
     /// immutable once built and never rebuilt.
     alias_base: OnceLock<RegisterBase>,
+    /// Where resolvers report reconstruction-obligation outcomes.
+    ///
+    /// Lives on the env rather than in `Context` because obligations are derived
+    /// analysis state that must not enter serialized qcode bodies — and because
+    /// address discovery runs on a context clone that is dropped each round,
+    /// while the env is owned by the pipeline and survives it.
+    pub obligations: crate::reconstruction::ObligationSink,
 }
 
 impl PipelineEnv {
@@ -120,6 +127,7 @@ impl PipelineEnv {
             sp_varnode: sp_varnode.into(),
             binary: None,
             alias_base: OnceLock::new(),
+            obligations: crate::reconstruction::ObligationSink::default(),
         }
     }
 

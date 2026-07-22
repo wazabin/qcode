@@ -6,5 +6,7 @@
 //! identity lives in `qcode` core.
 
 pub mod obligation;
+pub mod sink;
 
 pub use obligation::{Obligation, ObligationDb, ObligationStatus, enumerate_obligations};
+pub use sink::ObligationSink;

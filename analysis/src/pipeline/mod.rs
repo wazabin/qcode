@@ -373,6 +373,7 @@ pub fn analyze_with_progress<'s>(
         // Stop on a clean fixpoint, or bail out best-effort if lifting could not
         // converge (budget / error) — never panic on input-dependent paths.
         if !converged || analyzed.has_no_discoveries() {
+            log_obligations(&services.obligations);
             progress(PipelineProgress::Finished);
             return Ok(analyzed);
         }
@@ -385,6 +386,7 @@ pub fn analyze_with_progress<'s>(
                 "analyze/lift budget exhausted after {discovery_round} rounds; returning best-effort analysis of the most-grown IR ({} pending discoveries)",
                 analyzed.discoveries().count(),
             );
+            log_obligations(&services.obligations);
             progress(PipelineProgress::Finished);
             return Ok(analyzed);
         }
@@ -482,6 +484,20 @@ fn lift_and_discover_until_quiet(
         for discovery in ctx.drain_discoveries() {
             clean.discover(discovery);
         }
+
+        // Harvest reconstruction obligations before `ctx` is dropped. Two
+        // sources, deliberately: enumerating the clone recovers the full set of
+        // live indirect transfers (so a site no resolver touched is still
+        // recorded), while the sink carries the outcomes resolvers reported.
+        // `merge_round` reconciles them by status precedence.
+        //
+        // Enumeration runs on the analyzed clone rather than on `clean` because
+        // that is the IR resolvers actually saw; a transfer already rewritten in
+        // the clone has genuinely been discharged.
+        let observed = crate::reconstruction::enumerate_obligations(&ctx)
+            .into_iter()
+            .chain(analysis_env.obligations.take());
+        services.obligations.merge_round(observed);
 
         // Function boundaries are settled at construction: the lifter emits
         // strict-local IR (tail calls for inter-procedural transfers, function
@@ -694,6 +710,37 @@ pub fn analyze_with_overrides_with_progress<'s>(
 
 /// Drain the per-pass counters accumulated during this round (via
 /// [`qcode::stat!`]) and log them as one `debug` table.
+/// Report the reconstruction obligations left standing at the end of a run.
+///
+/// This is the milestone's "expose obligations in logs and headless reports"
+/// surface. Outstanding obligations are indirect transfers a resolver could
+/// have handled and did not; inert ones are indirect calls, which have no
+/// resolver yet and are counted separately so a missing feature never reads as
+/// a reconstruction failure.
+fn log_obligations(db: &crate::reconstruction::ObligationDb) {
+    if db.is_empty() {
+        return;
+    }
+
+    let outstanding = db.outstanding().count();
+    let inert = db.inert().count();
+    let resolved = db.iter().filter(|o| o.status.is_resolved()).count();
+
+    log::info!(
+        target: "obligations",
+        "reconstruction obligations: {resolved} resolved, {outstanding} outstanding, \
+         {inert} inert (indirect calls, no resolver yet)",
+    );
+    qcode::stat!("obligations_outstanding", outstanding as u64);
+    qcode::stat!("obligations_resolved", resolved as u64);
+
+    // Per-obligation detail is debug-level: a large binary can carry thousands,
+    // and the summary above is what a normal run needs.
+    for obligation in db.outstanding() {
+        log::debug!(target: "obligations", "  {}", obligation.explain());
+    }
+}
+
 fn log_round_stats(round: usize) {
     let stats = qcode::pass_scope::drain_stats();
     if stats.is_empty() || !log::log_enabled!(target: "pipeline", log::Level::Debug) {

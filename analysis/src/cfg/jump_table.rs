@@ -29,6 +29,7 @@ use qcode::{
     address_index::{AddressIndex, AddressTarget},
     assumption::Proposition,
     context::Context,
+    obligation::ObligationKey,
     value::{
         BasicBlock, BlockMutRef, FunctionBody, FunctionId, Value, ValueId, ValueRef,
         block::{BlockId, EdgeId},
@@ -37,7 +38,11 @@ use qcode::{
     },
 };
 
-use crate::{Pass, PipelineEnv, value_range::value_range};
+use crate::{
+    Pass, PipelineEnv,
+    reconstruction::{Obligation, ObligationSink, ObligationStatus},
+    value_range::value_range,
+};
 
 /// Largest table the pass will materialize. Guards against a mis-bounded index
 /// turning into millions of bogus edges.
@@ -107,7 +112,13 @@ impl Pass for HandleJumpTables {
         targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
         let mut addresses = AddressIndex::analyze(ctx);
-        self.run_indexed(ctx, env.binary.as_deref(), targets, &mut addresses)
+        self.run_indexed(
+            ctx,
+            env.binary.as_deref(),
+            targets,
+            &mut addresses,
+            &env.obligations,
+        )
     }
 
     fn run_with_analyses(
@@ -118,7 +129,13 @@ impl Pass for HandleJumpTables {
         analyses: &mut crate::AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
         let mut addresses = analyses.take_global::<crate::AddressAnalysis>(ctx);
-        let result = self.run_indexed(ctx, env.binary.as_deref(), targets, &mut addresses);
+        let result = self.run_indexed(
+            ctx,
+            env.binary.as_deref(),
+            targets,
+            &mut addresses,
+            &env.obligations,
+        );
         analyses.put_global::<crate::AddressAnalysis>(addresses);
         result.map(|outcome| outcome.preserving_global::<crate::AddressAnalysis>())
     }
@@ -131,6 +148,7 @@ impl HandleJumpTables {
         binary: Option<&dyn binfmt::BinaryFormat>,
         targets: &[FunctionId],
         addresses: &mut AddressIndex,
+        obligations: &ObligationSink,
     ) -> Result<crate::ModulePassOutcome, String> {
         // No binary handle (headless/textual run): initialized memory is
         // unreadable, so no table can resolve.
@@ -151,7 +169,7 @@ impl HandleJumpTables {
             .collect();
         let mut changed = rustc_hash::FxHashSet::default();
         for fun_id in fun_ids {
-            if Self::resolve_function_indexed(ctx, binary, addresses, fun_id)? {
+            if Self::resolve_function_indexed(ctx, binary, addresses, fun_id, obligations)? {
                 changed.insert(fun_id);
             }
         }
@@ -176,7 +194,13 @@ impl HandleJumpTables {
         fun_id: FunctionId,
     ) -> Result<bool, String> {
         let mut addresses = AddressIndex::analyze(ctx);
-        Self::resolve_function_indexed(ctx, binary, &mut addresses, fun_id)
+        Self::resolve_function_indexed(
+            ctx,
+            binary,
+            &mut addresses,
+            fun_id,
+            &ObligationSink::default(),
+        )
     }
 
     /// Indexed implementation shared by the whole-module pass and focused
@@ -187,6 +211,7 @@ impl HandleJumpTables {
         binary: &dyn binfmt::BinaryFormat,
         addresses: &mut AddressIndex,
         fun_id: FunctionId,
+        obligations: &ObligationSink,
     ) -> Result<bool, String> {
         let function = FunctionBody::from_id(ctx, fun_id);
 
@@ -214,9 +239,27 @@ impl HandleJumpTables {
         let block_ids = function.blocks().map(|b| b.id).collect::<Vec<_>>();
 
         for id in block_ids {
+            // Captured before the mutable borrow: on the resolved path the
+            // terminator is rewritten, so the site address must be read while
+            // the indirect branch is still there.
+            let site = dispatch_source_addr(ctx, id);
             let block = BasicBlock::from_id_mut(ctx, id);
 
-            if let Some(mut block_edits) = resolve_block(block, binary) {
+            let outcome = resolve_block(block, binary);
+
+            // Report the attempt before acting on it. A site with no stable
+            // address has no obligation key and cannot be re-lifted from the
+            // image anyway, matching `discover`'s no-op for addressless code.
+            if let (Some(site), Some(status)) = (site, outcome.status()) {
+                obligations.record(Obligation {
+                    status,
+                    function: fn_entry,
+                    last_producer: Some(<Self as Pass>::NAME),
+                    ..Obligation::pending(ObligationKey::branch(site), fn_entry)
+                });
+            }
+
+            if let BranchOutcome::Resolved(mut block_edits) = outcome {
                 match block_edits.len() {
                     // A single fully-resolved case is a genuine unconditional jump:
                     // `resolve_block` resolves the *entire* bounded index range (or
@@ -497,9 +540,44 @@ fn discover(ctx: &mut Context, fn_entry: Option<u64>, source_block: Option<u64>,
     }
 }
 
+/// The result of examining one block for a resolvable indirect branch.
+///
+/// Distinguishes "this block has no obligation" from "it has one and here is
+/// why the attempt failed" — the distinction the pass could not previously
+/// express, since every failure path returned a bare `None`.
+enum BranchOutcome {
+    /// The block does not end in an indirect branch. No obligation.
+    NotIndirect,
+    /// One [`Edit`] per recovered case target.
+    Resolved(Vec<Edit>),
+    /// The block ends in an indirect branch that did not resolve.
+    Failed(ObligationStatus),
+}
+
+impl BranchOutcome {
+    /// The obligation status this outcome reports, or `None` when the block
+    /// carries no obligation at all.
+    ///
+    /// A successful table resolution is `ConditionallyResolved`, never
+    /// `Resolved`: every recovered slot is pinned with a
+    /// [`Proposition::ImmutableMemory`] assumption, so replay can contradict it.
+    /// Claiming unconditional resolution here would lose exactly the fact that
+    /// makes the result revisable.
+    fn status(&self) -> Option<ObligationStatus> {
+        match self {
+            BranchOutcome::NotIndirect => None,
+            BranchOutcome::Failed(status) => Some(status.clone()),
+            BranchOutcome::Resolved(edits) => Some(ObligationStatus::ConditionallyResolved {
+                targets: edits.iter().map(|e| e.target).collect(),
+                assumption: "table slots assumed immutable".to_string(),
+            }),
+        }
+    }
+}
+
 /// If `block_id` ends in an indirect branch whose table the pass can resolve,
-/// push one [`Edit`] per case target onto `edits`.
-fn resolve_block(mut block: BlockMutRef, binary: &dyn binfmt::BinaryFormat) -> Option<Vec<Edit>> {
+/// produce one [`Edit`] per case target; otherwise report why it did not.
+fn resolve_block(mut block: BlockMutRef, binary: &dyn binfmt::BinaryFormat) -> BranchOutcome {
     // A block still terminated by `BranchInd` is re-resolved every round, even
     // once the lifter has connected its targets in the clean IR: those edges let
     // function-splitting follow the switch, but the terminator itself is only
@@ -507,10 +585,12 @@ fn resolve_block(mut block: BlockMutRef, binary: &dyn binfmt::BinaryFormat) -> O
     // skips a block whose edges already match the resolution (reporting no
     // change), and otherwise clears them before rebuilding, so re-resolving an
     // already-connected block is a no-op rather than edge-doubling.
-    let insn = block.instructions().last()?;
+    let Some(insn) = block.instructions().last() else {
+        return BranchOutcome::NotIndirect;
+    };
 
     let Mnemonic::BranchInd(BranchInd { ptr }) = insn.mnemonic() else {
-        return None;
+        return BranchOutcome::NotIndirect;
     };
     let ptr = ptr.qualify(insn.id.func);
 
@@ -526,25 +606,38 @@ fn resolve_block(mut block: BlockMutRef, binary: &dyn binfmt::BinaryFormat) -> O
     // or index — a literal cannot gain more cases — so it is an unconditional
     // jump to that one address whenever it lands in executable memory.
     if let Some(target) = numeric_const(block.ctx(), ptr) {
-        return binary.is_executable(target).then(|| {
-            vec![Edit {
-                from: block.id,
-                target,
-                index: ptr,
-                value: 0,
-            }]
-        });
+        if !binary.is_executable(target) {
+            // A constant that does not point at code is not a resolution
+            // failure that better information would fix: the target is known
+            // exactly and it is not code.
+            return BranchOutcome::Failed(ObligationStatus::Rejected {
+                reason: format!("constant target {target:#x} is not in executable memory"),
+            });
+        }
+        return BranchOutcome::Resolved(vec![Edit {
+            from: block.id,
+            target,
+            index: ptr,
+            value: 0,
+        }]);
     }
 
     // Indirect jump through a single fixed pointer slot: `goto [load(const)]`.
     // Not a table (there is no index), but the slot is immutable data, so it
     // resolves to one concrete target.
     if let Some(edits) = resolve_constant_load(&mut block, binary, ptr) {
-        return Some(edits);
+        return BranchOutcome::Resolved(edits);
     }
 
     let ctx = block.ctx();
-    let table = recognize_table(ctx, ptr)?;
+    let Some(table) = recognize_table(ctx, ptr) else {
+        // No recognizer models this target expression. Not retryable on input
+        // changes alone — what would change this is a new recognizer, which is
+        // exactly the distinction `Rejected` carries.
+        return BranchOutcome::Failed(ObligationStatus::Rejected {
+            reason: "target expression matches no known jump-table shape".to_string(),
+        });
+    };
 
     log::debug!(
         target: "jump_table",
@@ -579,7 +672,29 @@ fn resolve_block(mut block: BlockMutRef, binary: &dyn binfmt::BinaryFormat) -> O
     // recovered by the run scan.
     if (!full_width && !range.is_bounded(index_size)) || range.count() > MAX_TABLE_ENTRIES {
         log::debug!(target: "jump_table", "skipping unbounded or huge table: range {range:?}");
-        return None;
+        // Two different failures share this guard, and they are not the same
+        // kind of problem: an over-large table hit a tunable cap, while an
+        // unbounded index means value-range could not bound the index yet and
+        // may well do better once more optimization has run.
+        // Classify by *why* there is no usable bound, not by which half of the
+        // guard fired. A range that merely fills its own width carries no
+        // information (value-range could not do better than the type) and
+        // reports a count of `u64::MAX`, so testing the entry cap first would
+        // mislabel "we could not bound this index" as "you hit a tunable limit"
+        // — inverting both the diagnosis and the fix. Only a genuinely bounded
+        // range that is simply too large is a budget problem.
+        return BranchOutcome::Failed(if full_width || !range.is_bounded(index_size) {
+            ObligationStatus::Unresolved {
+                reason: "index range is unbounded for its width".to_string(),
+            }
+        } else {
+            ObligationStatus::BudgetExhausted {
+                limit: format!(
+                    "table has {} entries, over the {MAX_TABLE_ENTRIES}-entry cap",
+                    range.count(),
+                ),
+            }
+        });
     }
     log::trace!(
         target: "jump_table",
@@ -622,7 +737,12 @@ fn resolve_block(mut block: BlockMutRef, binary: &dyn binfmt::BinaryFormat) -> O
                 break;
             }
             log::debug!(target: "jump_table", "skipping table: slot {entry_addr:x} invalid");
-            return None;
+            return BranchOutcome::Failed(ObligationStatus::Unresolved {
+                reason: format!(
+                    "table slot {entry_addr:#x} (index {index}) is writable, unmapped, \
+                     or targets non-executable memory",
+                ),
+            });
         };
 
         // Commit the slot: pin its bytes immutable so the resolution is replay-safe.
@@ -634,7 +754,9 @@ fn resolve_block(mut block: BlockMutRef, binary: &dyn binfmt::BinaryFormat) -> O
                 break;
             }
             log::debug!(target: "jump_table", "skipping table: entry {entry_addr:x} not immutable");
-            return None;
+            return BranchOutcome::Failed(ObligationStatus::Unresolved {
+                reason: format!("table slot {entry_addr:#x} could not be assumed immutable",),
+            });
         }
 
         log::debug!(
@@ -650,7 +772,7 @@ fn resolve_block(mut block: BlockMutRef, binary: &dyn binfmt::BinaryFormat) -> O
         });
     }
 
-    Some(resolved)
+    BranchOutcome::Resolved(resolved)
 }
 
 /// A `goto [load(const_addr)]`: the branch pointer is loaded from one fixed
@@ -1134,6 +1256,118 @@ mod tests {
         for t in [0x3100u64, 0x3200, 0x3300] {
             assert!(addresses.get(t).is_some(), "no block created for {t:#x}");
         }
+    }
+
+    /// Run the pass over one function and return the obligations it reported.
+    fn resolve_function_reporting(
+        ctx: &mut Context,
+        binary: &dyn binfmt::BinaryFormat,
+        fun_id: FunctionId,
+    ) -> Vec<Obligation> {
+        let sink = ObligationSink::default();
+        let mut addresses = AddressIndex::analyze(ctx);
+        HandleJumpTables::resolve_function_indexed(ctx, binary, &mut addresses, fun_id, &sink)
+            .expect("pass ran");
+        sink.take()
+    }
+
+    /// A failed resolution records *why*, instead of vanishing into a bare
+    /// `None` as it did before obligations existed.
+    #[test]
+    fn an_unresolvable_branch_reports_a_reason() {
+        let mut ctx = Context::new();
+        let mut image = image();
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            fn fun:
+            <entry>
+                %idx = load(A:8, &A);
+                goto <0x1010>;
+            <0x1010>
+                %off = %idx * 0x8;
+                %addr = i64 0x2000 + %off;
+                %t = load(ram:8, %addr);
+                goto [%t];
+            "
+        );
+        add_code(&mut image, 0x1000, 0x1000);
+        add_rodata(&mut image, 0x2000, vec![0u8; 0x100]);
+
+        let reported = resolve_function_reporting(&mut ctx, &image, fun);
+        assert_eq!(reported.len(), 1, "one indirect branch, one obligation");
+
+        let obligation = &reported[0];
+        assert_eq!(obligation.key, ObligationKey::branch(0x1010));
+        assert_eq!(obligation.last_producer, Some("handle_jump_tables"));
+        match &obligation.status {
+            ObligationStatus::Unresolved { reason } => {
+                assert!(
+                    reason.contains("unbounded"),
+                    "expected an unbounded-index reason, got {reason:?}",
+                );
+            }
+            other => panic!("expected a retryable failure, got {other:?}"),
+        }
+        // Retryable: a later round may bound the index once more optimization
+        // has run. This is the distinction the pass could not previously make.
+        assert!(obligation.status.is_retryable());
+    }
+
+    /// A resolved table is `ConditionallyResolved`, not `Resolved`: every slot
+    /// is pinned by an immutable-memory assumption that replay can contradict.
+    #[test]
+    fn a_resolved_table_records_its_assumption() {
+        let mut ctx = Context::new();
+        let mut image = image();
+        let targets = [0x1100u64, 0x1200, 0x1300];
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            fn fun:
+            <entry>
+                %idx = load(A:8, &A);
+                %c = %idx < 0x3;
+                if %c goto <0x1010> else goto <oob>;
+            <0x1010>
+                %off = %idx * 0x8;
+                %addr = i64 0x2000 + %off;
+                %t = load(ram:8, %addr);
+                goto [%t];
+            <oob>
+                goto <0x9000>;
+            "
+        );
+        add_code(&mut image, 0x1000, 0x1000);
+        let mut table = Vec::new();
+        for t in targets {
+            table.extend_from_slice(&t.to_le_bytes());
+        }
+        add_rodata(&mut image, 0x2000, table);
+        add_local_targets(&mut ctx, fun, &targets);
+
+        let reported = resolve_function_reporting(&mut ctx, &image, fun);
+        let obligation = reported
+            .iter()
+            .find(|o| o.key == ObligationKey::branch(0x1010))
+            .expect("the dispatch branch reported an obligation");
+
+        match &obligation.status {
+            ObligationStatus::ConditionallyResolved {
+                targets: found,
+                assumption,
+            } => {
+                assert_eq!(found.len(), targets.len());
+                assert!(assumption.contains("immutable"));
+            }
+            other => panic!("expected a conditional resolution, got {other:?}"),
+        }
+        assert!(obligation.status.is_resolved());
+        assert!(!obligation.status.is_retryable());
     }
 
     /// An unbounded index (no dominating guard) leaves the indirect branch alone.

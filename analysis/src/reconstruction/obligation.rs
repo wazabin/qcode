@@ -238,7 +238,16 @@ impl ObligationDb {
             // the bare re-enumeration every live transfer produces.
             let attempted = !matches!(fresh.status, ObligationStatus::Pending);
 
-            let merged = match self.records.remove(&fresh.key) {
+            // `next` first: a single round reports the same key more than once
+            // (enumeration yields `Pending` for every live site, then a resolver
+            // reports its real outcome), and those duplicates must go through
+            // the same precedence rule as cross-round merges — otherwise the
+            // last writer wins and a resolver's finding can be erased by the
+            // bare enumeration that accompanied it.
+            let merged = match next
+                .remove(&fresh.key)
+                .or_else(|| self.records.remove(&fresh.key))
+            {
                 None => Obligation {
                     attempts: fresh.attempts + u32::from(attempted),
                     ..fresh
@@ -388,6 +397,42 @@ mod tests {
         db.merge_round([Obligation::pending(key, Some(0x1000))]);
 
         assert!(db.get(&key).expect("kept").status.is_resolved());
+    }
+
+    #[test]
+    fn duplicates_within_one_round_obey_precedence() {
+        // The pipeline feeds enumeration and resolver outcomes into the same
+        // round, so both orderings must land on the resolved status.
+        let key = ObligationKey::branch(0x400);
+
+        let mut enumeration_first = ObligationDb::default();
+        enumeration_first.merge_round([
+            Obligation::pending(key, Some(0x1000)),
+            resolved(key, &[0x10]),
+        ]);
+
+        let mut outcome_first = ObligationDb::default();
+        outcome_first.merge_round([
+            resolved(key, &[0x10]),
+            Obligation::pending(key, Some(0x1000)),
+        ]);
+
+        assert!(
+            enumeration_first
+                .get(&key)
+                .expect("present")
+                .status
+                .is_resolved()
+        );
+        assert!(
+            outcome_first
+                .get(&key)
+                .expect("present")
+                .status
+                .is_resolved()
+        );
+        assert_eq!(enumeration_first.get(&key).expect("present").attempts, 1);
+        assert_eq!(outcome_first.get(&key).expect("present").attempts, 1);
     }
 
     #[test]
