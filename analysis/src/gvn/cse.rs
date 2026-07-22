@@ -84,6 +84,32 @@ impl<'str> SubPass<'str> for Cse {
         let form = arith_form(cx.body_view(body), ic.id, ic.mnemonic, ic.size, state);
         state.record_form(ic.id, form.clone());
         let key = key_for(&form, ic.id, ic.mnemonic);
+        // A value typed into a body-local *temporary* (shadow) space is an
+        // aliasing device whose result-type space is semantically load-bearing:
+        // argpromote rule 4 rebases an external's own-frame pointer arg into the
+        // shadow by *typing* that pointer, and the external's writes route on that
+        // type alone. The affine/int normal form discards the space, which would
+        // let the shadow pointer value-number identically to its spaceless
+        // real-space structural twin (e.g. `@SP - 0x20`) and be merged into it — or
+        // be rematerialized as a bare int — dropping the shadow provenance and
+        // reintroducing the externals-into-shadow miscompile. Key such a value
+        // opaquely (by its own normalized mnemonic) so it only de-dups with a
+        // syntactically identical value and is never rebuilt into a spaceless int.
+        // Real (shared-space) pointers keep their affine key, so ordinary pointer
+        // CSE and memory forwarding are untouched.
+        let key = if matches!(
+            cx.body_view(body)
+                .shared()
+                .types
+                .space_of(cx.body_view(body).type_of(ic.id)),
+            Some(qcode::space::MemorySpaceId::Temp(_))
+        ) {
+            let mut m = ic.mnemonic.clone();
+            normalize(&mut m);
+            NormalForm::Opaque(m)
+        } else {
+            key
+        };
 
         state.seed_operand_leaders(
             ic.mnemonic

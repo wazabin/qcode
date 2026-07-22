@@ -704,7 +704,9 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     /// two disagree or neither has a space.
     fn merge_space_ids(&self, lhs: LocalValueId, rhs: LocalValueId) -> Option<SpaceId> {
         match (self.lspace_of(lhs), self.lspace_of(rhs)) {
-            (Some(lhs), Some(rhs)) if lhs == rhs => Some(lhs),
+            // `ptr + literal` (exactly one operand carries a space) keeps that
+            // operand's space. `ptr + ptr` is ambiguous — which space does the
+            // sum point into? — so it drops to a plain integer.
             (Some(space), None) | (None, Some(space)) => Some(space),
             _ => None,
         }
@@ -1022,6 +1024,27 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                     self.shr().types.get_or_make_space_address(size, space)
                 }
                 _ => result_type,
+            }
+        } else {
+            result_type
+        };
+
+        // Rule 2: `ptr + ptr` — both operands carry a (non-register) space — is
+        // ambiguous (into which space does the sum point?), so `Add`/`Sub` drops
+        // the result to a plain integer. `binop_result` would otherwise propagate
+        // the left operand's space unconditionally.
+        let result_type = if matches!(op, Binop::Int(IntBinop::Add | IntBinop::Sub))
+            && self.shr().types.space_of(result_type).is_some()
+        {
+            let spaced = |b: &Self, v| {
+                b.lspace_of(v)
+                    .is_some_and(|s| !matches!(Space::from_id(b.shr(), s).ty, SpaceType::Register))
+            };
+            if spaced(self, lhs) && spaced(self, rhs) {
+                let size = self.shr().types.size_of(result_type);
+                self.shr().types.get_or_make_int(size)
+            } else {
+                result_type
             }
         } else {
             result_type
@@ -2488,6 +2511,79 @@ mod tests {
         assert_eq!(
             snap_a, snap_b,
             "a body built through a checked-out builder must match the module-built body"
+        );
+    }
+
+    /// Address arithmetic inherits the pointer operand's memory space:
+    /// `ptr + literal` (rule 1) keeps `ptr`'s space, so folding `x + 0 → x` (which
+    /// returns `lhs`) is space-preserving; `ptr + ptr` (rule 2) is ambiguous and
+    /// drops to a plain integer; `int + literal` is unaffected.
+    #[test]
+    fn address_arithmetic_inherits_pointer_space() {
+        use crate::value::function::FunctionBody;
+
+        let mut ctx = Context::new();
+        let fid = FunctionBody::make(&mut ctx, "f".into()).unwrap().id;
+        let entry = FunctionBody::from_id_mut(&mut ctx, fid).make_root().id;
+
+        let ram = ctx.shared.default_space;
+        let ptr_ty = ctx.shared.types.get_or_make_space_address(8, ram);
+        let ram_mem = ctx.shared.types.space_of(ptr_ty);
+
+        // Two space-typed pointer values: fresh instructions stamped into `ram`.
+        let (addr_a, addr_b) = {
+            let mut b = ctx.builder(entry);
+            let c1 = b.shr().get_const(0x1000, 8);
+            let c2 = b.shr().get_const(0x2000, 8);
+            (b.push_add(c1, c1).id(), b.push_add(c2, c2).id())
+        };
+        for v in [addr_a, addr_b] {
+            if let ValueId::Instruction(i) = v {
+                crate::value::Instruction::from_id_mut(&mut ctx, i).set_type(ptr_ty);
+            }
+        }
+
+        let (add_ptr_lit, add_lit_ptr, add_ptr_ptr, add_int_lit) = {
+            let mut b = ctx.builder(entry);
+            let k = b.shr().get_const(4, 8);
+            let zero = b.shr().get_const(0, 8);
+            (
+                b.push_add(addr_a, k).id(),      // ptr + literal
+                b.push_add(k, addr_a).id(),      // literal + ptr
+                b.push_add(addr_a, addr_b).id(), // ptr + ptr
+                b.push_add(k, zero).id(),        // int + literal
+            )
+        };
+
+        let space_of = |v: ValueId| ctx.shared.types.space_of(ctx.type_of(v));
+        assert_eq!(
+            space_of(add_ptr_lit),
+            ram_mem,
+            "ptr + literal keeps the pointer's space (rule 1)"
+        );
+        assert_eq!(
+            space_of(add_lit_ptr),
+            ram_mem,
+            "literal + ptr keeps the pointer's space (rule 1, commutative)"
+        );
+        assert_eq!(
+            space_of(add_ptr_ptr),
+            None,
+            "ptr + ptr is ambiguous and drops to a plain integer (rule 2)"
+        );
+        assert_eq!(
+            space_of(add_int_lit),
+            None,
+            "int + literal carries no space"
+        );
+
+        // Folding `x + 0 → x` returns `lhs`; since `lhs` (the ptr+literal above)
+        // carries `ram`, the fold is space-preserving — the property the argpromote
+        // rule-4 rewrite relies on.
+        assert_eq!(
+            space_of(addr_a),
+            ram_mem,
+            "the pointer operand a fold would return still carries its space"
         );
     }
 
