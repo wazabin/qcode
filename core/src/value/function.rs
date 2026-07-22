@@ -156,14 +156,6 @@ pub struct RegisterEffectSets {
 pub struct RegisterInterfaceMap {
     /// Register bound by each by-value input parameter, in parameter order.
     pub inputs: Vec<VarnodeId>,
-    /// Constant real-RAM addresses lifted into by-value pointer parameters
-    /// (`glob_<addr>`), in parameter order *after* `inputs`. A regpure call
-    /// site passes each slot's address literal verbatim; an implicit (`Opaque`)
-    /// site passes nothing — the binder seeds the param from the literal
-    /// recorded as its origin. Grown after materialization when later rounds
-    /// (constprop) surface new constant addresses; growth appends.
-    #[serde(default)]
-    pub globals: Vec<GlobalSlot>,
     /// Register written back by each return-pack slot, in pack order. Ordered
     /// returns-first: slots `..returns` carry real computed values, the rest
     /// are clobbers (undefined — poison — at a rewritten call site).
@@ -173,15 +165,6 @@ pub struct RegisterInterfaceMap {
     /// `returns == outputs.len()`; a prototyped external returns only its ABI
     /// return register(s) and clobbers the caller-saved tail.
     pub returns: usize,
-}
-
-/// One lifted constant-address (global) input slot of a materialized interface:
-/// the address value and its byte width (the pointer/address width, which is
-/// also the size of the by-value parameter carrying it).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct GlobalSlot {
-    pub addr: u64,
-    pub size: usize,
 }
 
 /// A function *body*: arenas, roster, root, reverse use-def, local names. The

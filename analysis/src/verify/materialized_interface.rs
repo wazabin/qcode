@@ -26,11 +26,6 @@ use qcode::{context::Context, value::FunctionId};
 /// Containment, not equality — the RAM channel (`argpromote`, `promote_stack_args`)
 /// appends by-value memory params *after* the register block, so the root is a
 /// superset. Only the leading register prefix is constrained.
-///
-/// Note `map.globals` is deliberately not counted: global cells ride *inside*
-/// `inputs` as constant-RAM varnodes, and `globals` is a redundant record of
-/// which ones they are (see `GLOBALS_AS_VARNODES.md`). Treating it as a second
-/// run of params after `inputs` would flag every healthy function that has one.
 pub fn verify_materialized_interfaces(ctx: &Context) -> Vec<String> {
     verify_materialized_interfaces_scoped(ctx, super::Scope::All)
 }
@@ -148,7 +143,6 @@ mod tests {
         }
         FunctionBody::from_id_mut(ctx, f).set_effects(FunctionEffects::Materialized(
             RegisterInterfaceMap {
-                globals: vec![],
                 inputs: inputs.to_vec(),
                 outputs: vec![],
                 returns: 0,

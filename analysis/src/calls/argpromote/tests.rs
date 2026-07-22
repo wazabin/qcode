@@ -105,7 +105,6 @@ mod tests {
         let _ = g;
 
         let iface = RegisterInterfaceMap {
-            globals: vec![],
             inputs: vec![r1],
             outputs: vec![r0],
             returns: 1,
@@ -3756,7 +3755,6 @@ mod tests {
     fn set_materialized(tc: &mut qcode::testing::TestContext, fid: FunctionId, regs: &[VarnodeId]) {
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
             qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
-                globals: vec![],
                 inputs: regs.to_vec(),
                 outputs: regs.to_vec(),
                 returns: regs.len(),
@@ -4327,7 +4325,6 @@ mod tests {
         {
             let mut f = FunctionBody::from_id_mut(&mut tc.ctx, ext);
             f.set_effects(FunctionEffects::Materialized(RegisterInterfaceMap {
-                globals: vec![],
                 inputs: vec![r1],
                 outputs: vec![r0, r2],
                 returns: 1,
@@ -4423,7 +4420,6 @@ mod tests {
         {
             let mut f = FunctionBody::from_id_mut(&mut tc.ctx, ext);
             f.set_effects(FunctionEffects::Materialized(RegisterInterfaceMap {
-                globals: vec![],
                 inputs: vec![],
                 outputs: vec![r0],
                 returns: 1,

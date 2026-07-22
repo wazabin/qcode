@@ -281,7 +281,6 @@ mod tests {
         let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("printf".into())).id;
         FunctionBody::from_id_mut(&mut tc.ctx, ext).set_effects(
             qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
-                globals: vec![],
                 inputs: vec![tc.r1],
                 outputs: vec![tc.r0],
                 returns: 1,

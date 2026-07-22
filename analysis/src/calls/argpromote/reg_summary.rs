@@ -62,10 +62,9 @@ impl EffectChannel for RegChannel {
         for block in FunctionBody::from_id(ctx, fid).blocks() {
             for insn in block.iter() {
                 match insn.mnemonic() {
-                    // Globals (constant real-RAM addresses) are no longer a
-                    // register-channel concern: the RAM channel owns their
-                    // materialization (see `argpromote::ram`). Only true register
-                    // varnodes enter the load/store effect sets here.
+                    // Only true register varnodes enter the load/store effect
+                    // sets. Globals (constant real-RAM addresses) are the RAM
+                    // channel's concern (see `argpromote::ram`).
                     Mnemonic::Load(l) => {
                         if let qcode::value::LocalValueId::Varnode(vn) = l.ptr
                             && is_register(ctx, vn)
@@ -136,10 +135,9 @@ impl EffectChannel for RegChannel {
         _edge: &CallEdge,
         callee: &RegEffects,
     ) -> Option<RegEffects> {
-        // Registers and globals alike are a global namespace (identity
-        // transfer): a callee's read/write of a cell is a read/write of that
-        // same cell in every caller. Global cells ride in `loads`/`stores` as
-        // constant-RAM varnodes, so they compose here for free.
+        // Registers are a global namespace (identity transfer): a callee's
+        // read/write of a register is a read/write of that same register in
+        // every caller.
         Some(RegEffects {
             loads: callee.loads.clone(),
             stores: callee.stores.clone(),
@@ -361,7 +359,6 @@ mod tests {
         let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("ext".into())).id;
         FunctionBody::from_id_mut(&mut tc.ctx, ext).set_effects(FunctionEffects::Materialized(
             RegisterInterfaceMap {
-                globals: vec![],
                 inputs: vec![],
                 outputs: vec![r0],
                 returns: 0,

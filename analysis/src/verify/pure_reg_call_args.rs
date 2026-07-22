@@ -303,7 +303,6 @@ mod tests {
             .collect();
         FunctionBody::from_id_mut(&mut tc.ctx, callee).set_effects(FunctionEffects::Materialized(
             RegisterInterfaceMap {
-                globals: vec![],
                 inputs,
                 outputs: vec![],
                 returns: 0,

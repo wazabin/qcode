@@ -487,7 +487,6 @@ mod tests {
         }
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
             qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
-                globals: vec![],
                 inputs,
                 outputs: vec![],
                 returns: 0,

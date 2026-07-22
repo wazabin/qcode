@@ -435,7 +435,6 @@ pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff:
     // outputs[i]. `add_input`/`append_outputs` iterate in these same orders.
     FunctionBody::from_id_mut(ctx, fid).set_effects(FunctionEffects::Materialized(
         RegisterInterfaceMap {
-            globals: vec![],
             inputs: reg_eff.inputs.clone(),
             outputs: reg_eff.outputs.clone(),
             // Every pack slot of a bodied function is a real computed value.
