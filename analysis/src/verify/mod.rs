@@ -21,6 +21,7 @@ mod dangling_refs;
 mod intra_function_ssa;
 mod materialized_interface;
 mod pointer_spaces;
+mod private_space_call_args;
 mod pure_function;
 mod pure_reg_call_args;
 mod users_map;
@@ -34,6 +35,7 @@ pub use dangling_refs::verify_no_dangling_refs;
 pub use intra_function_ssa::verify_intra_function_ssa;
 pub use materialized_interface::verify_materialized_interfaces;
 pub use pointer_spaces::verify_pointer_spaces;
+pub use private_space_call_args::verify_private_space_call_args;
 pub use pure_function::{PureFunctionViolation, verify_pure_functions};
 pub use pure_reg_call_args::{
     PureRegCallArgsRule, PureRegCallArgsViolation, verify_pure_reg_call_args,
@@ -139,6 +141,7 @@ pub fn verify_scoped(ctx: &Context<'_>, scope: Scope<'_>) -> Vec<String> {
             .map(|v| v.diagnostic(ctx)),
     );
     diagnostics.extend(written_spaces::verify_written_spaces_scoped(ctx, scope));
+    diagnostics.extend(private_space_call_args::verify_private_space_call_args_scoped(ctx, scope));
     diagnostics
 }
 
