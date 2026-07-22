@@ -254,6 +254,20 @@ name = "assume-arg-frame"
 scope = "module"
 passes = ["assume_arg_frame"]
 
+# Forward spilled incoming-pointer-param reloads away before the RAM argpromote
+# solve sees them. Under the `LoadedPointerDisjointFromSlot` /
+# `ArgsDisjointFromCallerFrame` assumptions just recorded by `assume-arg-frame`,
+# `gvn`'s frame-freshness `mem_forward` rewrites a `%buf = load(slot)` reload of a
+# spilled pointer param back to the param itself, so the call argument the RAM
+# effect solve classifies is the bare param (composing onto `Param(j)`) instead of
+# an unclassifiable loaded pointer (⊤). `dead_store`/`dce` sweep the now-dead
+# reload. Must run *after* `assume-arg-frame` (the assumption keys the forward)
+# and *before* `argpromote` (which consumes the classified argument).
+[[stage]]
+name = "argpromote-forward"
+scope = "function"
+passes = ["gvn", "dead_store", "dce"]
+
 # Functionalize memory side effects: rewrite a callee that mutates memory through
 # pointer params to operate on a private shadow copy and return its writes as a
 # `(address, value)` write-set, replayed at every caller. Runs once, late: it
@@ -325,7 +339,7 @@ passes = ["gvn", "dead_store", "dce"]
 [[stage]]
 name = "mark-pure"
 scope = "module"
-passes = ["mark_pure", "module(gvn)", "emulate_map", "array_project", "pure_call", "module(dce)", "module(dead_store)", "assume_arg_frame", "retail_apply", "argpromote"]
+passes = ["mark_pure", "module(gvn)", "emulate_map", "array_project", "pure_call", "module(dce)", "module(dead_store)", "assume_arg_frame", "module(gvn)", "module(dead_store)", "module(dce)", "retail_apply", "argpromote"]
 repeat_until = "no_change"
 
 # Promote bounded memory regions in pure functions to first-class array values so

@@ -31,8 +31,13 @@
 //! **writes only** — the callee's write lands in the caller's frame and dies
 //! with it, so it is dropped again one level further up; a callee *read*
 //! through a frame argument would need store-licensing knowledge the transfer
-//! does not have, so it stays ⊤). Loaded-pointer arguments under existing
-//! disjointness assumptions are TODO — ⊤ for now.
+//! does not have, so it stays ⊤). A loaded-pointer argument that is a spilled
+//! incoming pointer param reloaded from a frame slot is forwarded back to its
+//! bare param *before* the solve runs (the `argpromote-forward` pipeline step and
+//! the `module(gvn)` after `assume_arg_frame` in `mark-pure`, under the
+//! `LoadedPointerDisjointFromSlot` / `ArgsDisjointFromCallerFrame` assumptions),
+//! so it reaches `classify_arg` as the param itself and composes on `Param(i)`; a
+//! reload the assumption does not license stays ⊤.
 //!
 //! # External argmem and the confinement assumption
 //!
@@ -357,9 +362,15 @@ impl RamChannel {
         {
             return Some((RamBase::Param(j), off));
         }
-        // TODO(stage 2b): loaded-pointer arguments admitted by existing
-        // disjointness assumptions (LoadedPointerDisjointFromSlot /
-        // assume_arg_frame). ⊤ until the assumption plumbing lands.
+        // A loaded-pointer argument (a spilled incoming pointer param reloaded
+        // from a frame slot) is NOT classified here: the forward-first pipeline
+        // step (`argpromote-forward` / the `module(gvn)` after `assume_arg_frame`
+        // in `mark-pure`) forwards such a reload back to its bare param under the
+        // `LoadedPointerDisjointFromSlot` / `ArgsDisjointFromCallerFrame`
+        // assumptions *before* the RAM solve runs, so the argument reaching this
+        // classifier is already the param and lands on the `Param(j)` arm above.
+        // Anything still loaded here (an own-frame spill of a local, a global, or
+        // a reload the assumption did not license) is genuinely unrebasable — ⊤.
         None
     }
 
@@ -2350,6 +2361,107 @@ mod tests {
 
     /// FIX 6c: the `written` component tracks ram stores and unbounds on escapes,
     /// and an external leaf is coarse-⊤.
+    /// Forward-first (stage 2b): a caller that spills an incoming pointer param
+    /// to an own-frame slot, reloads it, and passes the reload to a memory-writing
+    /// callee is ⊤ on the raw IR (the loaded-pointer argument is unclassifiable),
+    /// but once the pipeline's `argpromote-forward` `gvn` (built with
+    /// frame-freshness under the recorded assumptions) forwards the reload back to
+    /// the bare param, the argument reaching `classify_arg` is the param itself and
+    /// the callee's `Param(0)` write composes onto the caller's `Param(1)`.
+    #[test]
+    fn spilled_param_reload_composes_after_forward() {
+        use crate::alias::AliasResult;
+        use crate::gvn::gvn_function;
+        use qcode::assumption::Proposition;
+        use qcode::value::ModuleView;
+
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        qcode!(
+            tc.ctx,
+            "
+            fn callee:
+                <c_entry @p:i64>
+                    store(ram:8, @p <- i64 1);
+                    return at i64 0;
+
+            fn caller:
+                <k_entry @RSP:i64 @buf_in:i64 @other:i64>
+                    %slot = @RSP - i64 0x8;
+                    store(ram:8, %slot <- @buf_in);
+                    store(ram:8, @other <- i64 0x99);
+                    %buf = load(ram:8, %slot);
+                    call fn caller();
+                <k_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (c_entry, k_entry, k_cont);
+        materialize(&mut tc, callee);
+        materialize(&mut tc, caller);
+        set_sp_origin(&mut tc, caller, sp);
+        // The spilled reload passed as the (only) call argument.
+        let buf = ValueId::Instruction(
+            qcode::value::BasicBlock::from_id(&tc.ctx, k_entry)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Load(_)))
+                .unwrap()
+                .id,
+        );
+        regpure_call(&mut tc, k_entry, callee, vec![buf]);
+        tc.ctx.add_cfg_edge(k_entry, k_cont);
+
+        // Baseline: on the raw IR the argument is a loaded pointer — unclassifiable,
+        // so the transfer degrades the whole caller summary to ⊤.
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, Some(sp));
+        assert!(
+            s.get(caller)
+                .as_ref()
+                .expect("caller summary")
+                .precise
+                .is_none(),
+            "raw spilled-pointer reload is ⊤ (loaded-pointer argument unrebasable)"
+        );
+
+        // Forward-first: record the assumptions `assume_arg_frame` records, build
+        // the frame-freshness alias oracle, and run `gvn` — exactly the
+        // `argpromote-forward` pipeline step. This forwards `%buf` back to
+        // `@buf_in`, the caller's `Param(1)`.
+        tc.ctx
+            .assume_true(Proposition::ArgsDisjointFromCallerFrame(caller));
+        tc.ctx
+            .assume_true(Proposition::LoadedPointerDisjointFromSlot(caller));
+        let aliases = AliasResult::simple_for_function(&tc.ctx, caller).with_frame_freshness(
+            ModuleView::new(&tc.ctx),
+            caller,
+            Some(sp),
+        );
+        gvn_function(&mut tc.ctx, caller, Some(&aliases));
+
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, Some(sp));
+        let eff = s.get(caller).as_ref().expect("caller summary");
+        let fp = eff
+            .precise
+            .as_ref()
+            .expect("the reload forwarded to the param — no longer ⊤");
+        assert!(
+            fp.fields.contains(&RamField {
+                base: RamBase::Param(1),
+                offset: 0,
+                size: 8,
+                write: true,
+            }),
+            "the callee's Param(0) write composes onto the caller's Param(1) \
+             (the spilled `@buf_in`): {fp:?}"
+        );
+        assert!(
+            !is_memory_free(&s, caller),
+            "the composed footprint is a real (non-⊤) caller effect"
+        );
+    }
+
     #[test]
     fn written_component_tracks_ram_and_escapes() {
         let mut tc = qcode::testing::TestContext::new();
