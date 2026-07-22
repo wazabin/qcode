@@ -48,12 +48,15 @@ fn set_written_spaces_targeted_with_sp(
 
     let mut changed_functions = rustc_hash::FxHashSet::default();
     for &id in targets {
-        let summary = match summaries.get(id) {
-            Err(_) => None,
-            Ok(eff) => eff
-                .written
-                .as_ref()
-                .map(|set| set.iter().copied().collect::<Vec<SpaceId>>()),
+        let (summary, precise) = match summaries.get(id) {
+            // ⊤: neither component is expressible.
+            Err(_) => (None, None),
+            Ok(eff) => (
+                eff.written
+                    .as_ref()
+                    .map(|set| set.iter().copied().collect::<Vec<SpaceId>>()),
+                eff.precise.clone(),
+            ),
         };
         // A ⊤ summary now records *stamped unbounded* rather than clearing the
         // stamp, so a fresh mint transitioning Unstamped → Unbounded counts as a
@@ -61,11 +64,17 @@ fn set_written_spaces_targeted_with_sp(
         // a direct equality on the memory channel (Unstamped ≠ Bounded/Unbounded,
         // Unbounded == Unbounded, Bounded(a) == Bounded(b) iff a == b) — the same
         // verdict the hand-rolled `WrittenSpaces` match produced.
+        //
+        // The precise footprint the same solve derived is stamped alongside the
+        // coarse set, so a memory-channel effect delta can compare addresses and
+        // not just space granularity. It has no consumer yet (Milestone 3 step
+        // 3); persisting it is inert.
         let new_memory = qcode::value::MemoryChannelState {
             coarse: match &summary {
                 Some(b) => qcode::value::WrittenSpacesState::Bounded(b.clone()),
                 None => qcode::value::WrittenSpacesState::Unbounded,
             },
+            precise,
         };
         if FunctionBody::from_id(ctx, id).effects().memory != new_memory {
             changed_functions.insert(id);

@@ -121,108 +121,11 @@ use super::summary::{EffectChannel, EffectSummaries, solve_summaries};
 /// a saturated summary is treated as ⊤ by every consumer.
 pub(crate) const MAX_EFFECT_ENTRIES: usize = 64;
 
-/// What an effect entry's offsets are relative to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum RamBase {
-    /// The pointer passed at this positional argument index of the summary
-    /// owner's `pure_reg` interface (`param[i] ↔ Call.args[i]` lockstep).
-    Param(u32),
-    /// A slot in the summary owner's **own frame**: a constant offset (`< 0`)
-    /// from its incoming `@SP`. Minted only by `transfer` (a callee effect
-    /// rebased through an own-frame-local argument), always a *write*, and
-    /// dropped again when transferred one level further up — the frame dies at
-    /// return, so the effect is contained.
-    Frame(i64),
-    /// An absolute (literal) address in real ram.
-    Global(u64),
-    /// A **function-private space** landing: a callee effect rebased through a
-    /// call argument that is a pointer into the summary owner's own private
-    /// (shadow/temp) space — what re-analysis of a shadow-rewritten body sees
-    /// after `ram::apply` rebases an admitted external's own-frame pointer arg
-    /// into the shadow (externals-into-shadow, rule 5). Outward-invisible: a
-    /// private-space object can neither be observed nor aliased by any caller, so
-    /// like a `Frame` write it is dropped from the outward footprint.
-    Private,
-}
-
-/// One scalar effect: `size` bytes at `base + offset`, read or written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct RamField {
-    pub base: RamBase,
-    pub offset: i64,
-    pub size: usize,
-    pub write: bool,
-}
-
-/// One bounded dynamic-index effect: the half-open byte span
-/// `[base + lo, base + hi)`, read (and written iff `write`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct RamRegion {
-    pub base: RamBase,
-    pub lo: i64,
-    pub hi: i64,
-    pub write: bool,
-}
-
-/// One **whole-object** effect: the callee touches the entire (extent-unknown)
-/// object addressed by `base`, read (and written iff `write`). Minted **only**
-/// by [`external_leaf`](EffectChannel::external_leaf) from a prototype's pointer
-/// parameters — a write-only (`OutPtr`) param yields one `write` object, a
-/// read-write (`MutPtr`) param a `write` object **and** a read object, and a
-/// `const` param a read object. Bodied-function scans never mint object entries
-/// (their footprint
-/// is exhaustively classified into fields/regions), so `extract_footprint`/`scan`
-/// leave `objects` empty; only the external-leaf and the `transfer` rebase touch
-/// them. `write == true` models a read+write (possibly in-out) access — the
-/// object is both potentially read and clobbered.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct RamObject {
-    pub base: RamBase,
-    pub write: bool,
-}
-
-/// The precise half of a summary: the exhaustively classified footprint.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct Footprint {
-    pub fields: FxHashSet<RamField>,
-    pub regions: FxHashSet<RamRegion>,
-    pub objects: FxHashSet<RamObject>,
-}
-
-impl Footprint {
-    fn len(&self) -> usize {
-        self.fields.len() + self.regions.len() + self.objects.len()
-    }
-
-    fn invisible(&self) -> bool {
-        self.fields
-            .iter()
-            .all(|f| matches!(f.base, RamBase::Frame(_) | RamBase::Private))
-            && self
-                .regions
-                .iter()
-                .all(|r| matches!(r.base, RamBase::Frame(_) | RamBase::Private))
-            && self.objects.iter().all(|o| {
-                if matches!(o.base, RamBase::Private) {
-                    // A private-space landing is fully self-contained (read or
-                    // write): the shadow can neither be observed nor aliased.
-                    return true;
-                }
-                // A `Frame`-based whole-object entry is invisible: a `Frame`
-                // write dies with the owner's frame (contained under the
-                // confinement assumption, see `external_leaf` / the module docs).
-                // A `Frame`-based object *read* must never exist — `transfer`
-                // sends a frame-landing read to ⊤ (freshness), same as a field —
-                // so it should never reach this predicate; treat it defensively
-                // as not-invisible if one somehow does.
-                debug_assert!(
-                    o.write || !matches!(o.base, RamBase::Frame(_)),
-                    "a Frame-based object read must have been rejected by transfer"
-                );
-                matches!(o.base, RamBase::Frame(_)) && o.write
-            })
-    }
-}
+// The footprint lattice value itself lives in `qcode` core — it is persisted on
+// [`MemoryChannelState`](qcode::value::MemoryChannelState), and core cannot
+// depend upward on this crate. Re-exported here under its historical path so
+// this module (its only producer) reads unchanged.
+pub(crate) use qcode::value::{Footprint, RamBase, RamField, RamObject, RamRegion};
 
 /// A function's solved memory summary, two independently-⊤ components:
 ///
@@ -731,7 +634,7 @@ impl EffectChannel for RamChannel {
                 externals: FxHashSet::default(),
             });
         }
-        let mut objects: FxHashSet<RamObject> = FxHashSet::default();
+        let mut objects: std::collections::BTreeSet<RamObject> = Default::default();
         let mut any_write_ptr = false;
         for (i, kind) in argmem.params.iter().enumerate() {
             let base = RamBase::Param(i as u32);

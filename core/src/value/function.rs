@@ -7,6 +7,9 @@ use std::{
     marker::PhantomData,
 };
 
+mod footprint;
+pub use footprint::{Footprint, RamBase, RamField, RamObject, RamRegion};
+
 mod signature;
 pub use signature::{
     ArgMemKind, ExternArg, ExternArgmem, ExternInterface, ExternSlot, FunctionSignature, ParamAttrs,
@@ -159,9 +162,13 @@ impl RegisterChannelState {
     }
 }
 
-/// The memory-channel component of a function's effects. Today it holds only the
-/// coarse written-space tri-state; the precise RAM footprint is deferred (no
-/// consumer today).
+/// The memory-channel component of a function's effects: the coarse
+/// written-space tri-state plus the precise RAM [`Footprint`] the same solve
+/// derived.
+///
+/// The two components are independently ⊤: `coarse` is deliberately laxer, so a
+/// function whose footprint defies classification (`precise == None`) usually
+/// still has a bounded space set.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryChannelState {
     /// The coarse set of non-register spaces this function may (transitively)
@@ -169,6 +176,19 @@ pub struct MemoryChannelState {
     /// signature pair.
     #[serde(default)]
     pub coarse: WrittenSpacesState,
+    /// The exhaustive outward memory footprint this function may touch, or
+    /// `None` for ⊤ — inexpressible in the lattice (an unclassifiable access, a
+    /// non-lockstep interface, budget saturation, or an unrebasable call edge).
+    ///
+    /// Persisted so that a memory-channel effect delta can compare *addresses*,
+    /// not merely space granularity: two solves that both write `{ram}` at
+    /// different addresses must not compare `Equal`, since `Equal` is the one
+    /// verdict that licenses stopping invalidation propagation.
+    ///
+    /// `#[serde(default)]` (→ `None`, i.e. ⊤) so snapshots written before the
+    /// footprint was persisted still load, conservatively.
+    #[serde(default)]
+    pub precise: Option<Footprint>,
 }
 
 /// Owned tri-state of a function's coarse written-space verdict, subsuming the
@@ -2220,7 +2240,10 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
             Some(spaces) => WrittenSpacesState::Bounded(spaces),
             None => WrittenSpacesState::Unbounded,
         };
-        self.set_memory_effects(MemoryChannelState { coarse });
+        // Coarse-only setter: the precise footprint is a separate component of
+        // the same channel and is left exactly as it was.
+        let precise = self.interface_mut().effects.memory.precise.take();
+        self.set_memory_effects(MemoryChannelState { coarse, precise });
     }
 
     /// Records the C-prototype-derived external call interface on this function.
