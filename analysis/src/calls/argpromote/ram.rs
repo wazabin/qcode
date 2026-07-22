@@ -7,10 +7,11 @@ use qcode::{
     assumption::Proposition,
     builder::Builder,
     context::Context,
-    space::LocalMemorySpaceId,
+    space::{LocalMemorySpaceId, MemorySpaceId},
     types::TypeId,
     value::{
-        BasicBlock, FunctionBody, FunctionId, TempSpace, Value, ValueId, VarnodeId,
+        ArgMemKind, BasicBlock, FunctionBody, FunctionId, TempSpace, TempSpaceId, Value, ValueId,
+        VarnodeId,
         insn::{Call, InstructionId, Mnemonic},
     },
 };
@@ -370,7 +371,7 @@ fn try_promote(
     // dereference a promoted pointer we hand it, or alias our shadow). Any
     // other call — indirect, clobbering, or memory-reaching — would have to bubble
     // its effects through ours, which stage 2's rebasing transfer will do; bail.
-    if function_makes_blocking_call(ctx, fid, ram_summaries, absorbed) {
+    if function_makes_blocking_call(ctx, fid, ram_summaries, absorbed, sp_reg) {
         return Promotion::No;
     }
 
@@ -427,9 +428,24 @@ fn try_promote(
         })
         .collect();
 
+    // Rule 2: own-frame reads may be modelled unseeded (redirected into shadow
+    // without a snapshot) exactly when the function's own solved summary already
+    // proved every read observes an own — or licensed-external — write, i.e. the
+    // function is outward-invisible. The scan did that reasoning; do not re-derive
+    // freshness here.
+    let own_frame_reads = OwnFrame::new(ctx, fid, sp_reg);
+    let model_frame_reads = super::ram_summary::is_memory_free(ram_summaries, fid);
+
     let mut promoted: Vec<Promoted> = Vec::new();
     for (param, name) in candidates {
-        let info = analyze_param(ctx, &numbering, &accesses_in, param);
+        let info = analyze_param(
+            ctx,
+            &numbering,
+            &accesses_in,
+            param,
+            &own_frame_reads,
+            model_frame_reads,
+        );
         if !info.is_deref {
             continue;
         }
@@ -512,10 +528,15 @@ fn try_promote(
     // Nothing to do unless some promoted pointer is actually dereferenced — read
     // (its loaded scalar moves to a by-value arg) or written (its stored value
     // moves to the returned write-set). A pointer touched only as data is a no-op.
-    if promoted
-        .iter()
-        .all(|p| p.reads.is_empty() && p.write_targets.is_empty() && p.region.is_none())
-    {
+    // A pointer touched only as data surfaces nothing; but a captured own-frame
+    // read (rule 2) redirected into the shadow is real work even with no surfaced
+    // read/write, so `accesses` must be considered too.
+    if promoted.iter().all(|p| {
+        p.reads.is_empty()
+            && p.write_targets.is_empty()
+            && p.region.is_none()
+            && p.accesses.is_empty()
+    }) {
         return Promotion::No;
     }
 
@@ -682,6 +703,73 @@ enum Promotion {
     Shadow,
 }
 
+/// Whether `call_id` is an admissible prototyped-external argmem call whose
+/// pointer arguments the shadow rewrite can rebase into the shadow space, and if
+/// so the `(arg index, own-frame local pointer value)` pairs to redirect. Shared
+/// by the blocking-call gate (rule 3) and the apply-side rebase (rule 4), so the
+/// two never disagree: the gate admits a call exactly when the rewrite can rebase
+/// every pointer argument.
+///
+/// Admission (all required):
+/// * a clobber-free `Call` to a bodyless external with an `ExternArgmem`,
+///   non-variadic, no `Opaque` param kinds;
+/// * every `OutPtr`/`MutPtr`/`ConstPtr` argument is one of this function's own
+///   frame locals (`OwnFrame::is_local`); `NonPtr` args are irrelevant;
+/// * the call's return value is unused (a used return may carry a real pointer we
+///   cannot rebase — an escape; `memset`'s return is dead). v1 approximates the
+///   ruled "return type is a pointer AND used" by "used", which is stricter and
+///   sound.
+fn admissible_external_argmem_call(
+    ctx: &Context,
+    call_id: InstructionId,
+    own_frame: &OwnFrame,
+) -> Option<Vec<(usize, ValueId)>> {
+    let Mnemonic::Call(c) = ctx.get_insn(call_id).mnemonic() else {
+        return None;
+    };
+    if !c.clobbers.is_empty() {
+        return None;
+    }
+    let ext = c.target.real()?;
+    let ef = FunctionBody::from_id(ctx, ext);
+    if !ef.is_external() {
+        return None;
+    }
+    let argmem = ef.argmem()?;
+    if argmem.variadic
+        || argmem
+            .params
+            .iter()
+            .any(|k| matches!(k, ArgMemKind::Opaque))
+    {
+        return None;
+    }
+    // Return-escape gate: a used return value may hand a real pointer to the
+    // caller that we cannot rebase.
+    if !FunctionBody::from_id(ctx, call_id.func)
+        .users_of(ValueId::Instruction(call_id))
+        .is_empty()
+    {
+        return None;
+    }
+    let mut rebase: Vec<(usize, ValueId)> = Vec::new();
+    for (i, kind) in argmem.params.iter().enumerate() {
+        match kind {
+            ArgMemKind::NonPtr => {}
+            ArgMemKind::OutPtr | ArgMemKind::MutPtr | ArgMemKind::ConstPtr => {
+                let arg = c.args.get(i)?.qualify(call_id.func);
+                if !own_frame.is_local(ctx, arg) {
+                    return None;
+                }
+                rebase.push((i, arg));
+            }
+            // Filtered out above.
+            ArgMemKind::Opaque => return None,
+        }
+    }
+    Some(rebase)
+}
+
 /// `true` if `function_id` makes any call this promotion cannot compose with.
 /// A body walk (not an edge walk) so an *unresolved* direct call — which never
 /// makes a [`CallGraph`] edge — still blocks. The callee verdict comes from the
@@ -694,7 +782,12 @@ pub(super) fn function_makes_blocking_call(
     function_id: FunctionId,
     ram_summaries: &super::summary::EffectSummaries<super::ram_summary::RamChannel>,
     absorbed: &FxHashSet<FunctionId>,
+    sp_reg: Option<VarnodeId>,
 ) -> bool {
+    // Own-frame view, built once, used to admit prototyped-external argmem calls
+    // whose pointer args are this function's own locals (rules 3/4). Inert when
+    // there is no stack pointer.
+    let own_frame = OwnFrame::new(ctx, function_id, sp_reg);
     FunctionBody::from_id(ctx, function_id).blocks().any(|b| {
         b.iter().any(|i| match i.mnemonic() {
             // Indirect transfers: target unknown, cannot vet.
@@ -703,8 +796,8 @@ pub(super) fn function_makes_blocking_call(
             // transitively memory-free; otherwise its effects would have to
             // bubble through ours.
             Mnemonic::Call(c) => {
-                !c.clobbers.is_empty()
-                    || !c.target.real().is_some_and(|target| {
+                let inert = c.clobbers.is_empty()
+                    && c.target.real().is_some_and(|target| {
                         // Inert: no caller-observable footprint per the solved
                         // summary, or the shadow path absorbed the footprint
                         // earlier in this sweep — the call-site rewrite has
@@ -712,7 +805,13 @@ pub(super) fn function_makes_blocking_call(
                         // which the scan below captures.
                         super::ram_summary::is_memory_free(ram_summaries, target)
                             || absorbed.contains(&target)
-                    })
+                    });
+                // A prototyped-external argmem call whose pointer args are all
+                // own-frame locals is also non-blocking: the shadow rewrite
+                // rebases those args into the shadow (rule 4), so the external's
+                // whole-object writes stay body-private and its footprint never
+                // bubbles into the caller.
+                !(inert || admissible_external_argmem_call(ctx, i.id, &own_frame).is_some())
             }
             // An `Apply` can now be impure (a tail call rewritten to
             // `apply g; return` by `retail_apply`), so it is vetted exactly like a
@@ -760,6 +859,8 @@ fn analyze_param(
     numbering: &Numbering,
     accesses_in: &[MemoryAccess],
     param: ValueId,
+    own_frame: &OwnFrame,
+    model_frame_reads: bool,
 ) -> ParamInfo {
     let mut accesses: Vec<InstructionId> = Vec::new();
     // (offset from base, access width) for each load — one snapshot scalar each.
@@ -805,6 +906,14 @@ fn analyze_param(
                         is_deref = true;
                         accesses.push(access.id);
                     }
+                } else if model_frame_reads && own_frame.is_local(ctx, access.ptr) {
+                    // Rule 2: an own-frame read whose content is self-contained in the
+                    // shadow (own stores + admitted external writes). Modelled by
+                    // redirecting it into the shadow, with NO snapshot/seed — the
+                    // summary already licensed it (outward-invisible), so no
+                    // caller-side reconstruction is needed.
+                    is_deref = true;
+                    accesses.push(access.id);
                 }
             }
             AddressRelation::Dynamic { .. } => {}
@@ -882,9 +991,10 @@ fn apply(
     let ram = ctx.shared.default_space;
     let default = ctx.shared.space(ram);
     let (word_size, addr_size) = (default.word_size, default.addr_size);
-    let shadow =
+    let shadow_ts =
         ctx.bodies[fid].push_temp_space(TempSpace::new(Some("argpromote"), word_size, addr_size));
-    let shadow = LocalMemorySpaceId::Temp(shadow.local);
+    let shadow_local = shadow_ts.local;
+    let shadow = LocalMemorySpaceId::Temp(shadow_local);
     // Every promoted pointer in this function shares one body-local shadow.
     // Equal addresses therefore collide for aliasing, while another function's
     // same-address shadow remains isolated by construction.
@@ -1087,6 +1197,55 @@ fn apply(
                 _ => {}
             }
             ctx.replace_instruction_mnemonic(acc, m);
+        }
+    }
+
+    // Rule 4: rebase each admitted prototyped-external call's own-frame pointer
+    // args into the shadow. The external's whole-object writes then land in the
+    // same shadow the body's own loads/stores were redirected to, keeping the
+    // (dead-on-exit) local's view coherent — its post-call shadow reads observe
+    // the external's writes, not the pre-call frame. The call itself stays (a real
+    // external call, clobbers and non-pointer args untouched). Each rebased arg is
+    // a SEPARATE address instruction (its pointer IS shadow-provenance here, but it
+    // must not share an instruction with any exported write-set/interface value).
+    {
+        let shadow_mem = MemorySpaceId::Temp(TempSpaceId::new(fid, shadow_local));
+        let ext_calls: Vec<(InstructionId, Vec<(usize, ValueId)>)> =
+            FunctionBody::from_id(ctx, fid)
+                .iter()
+                .flat_map(|b| b.iter().map(|i| i.id).collect::<Vec<_>>())
+                .filter_map(|id| {
+                    admissible_external_argmem_call(ctx, id, &own_frame).map(|pairs| (id, pairs))
+                })
+                .collect();
+        for (call_id, pairs) in ext_calls {
+            let Mnemonic::Call(mut call) = ctx.get_insn(call_id).mnemonic().clone() else {
+                continue;
+            };
+            let Some(block) = ctx.get_insn(call_id).parent().map(|b| b.id) else {
+                continue;
+            };
+            for (arg_idx, arg) in pairs {
+                let base_size = ctx.shared.types.size_of(ctx.type_of(arg));
+                let new_id = {
+                    let mut b = ctx.builder(block);
+                    b.set_insert_point_before(call_id);
+                    // `arg + 0`: a fresh instruction numerically equal to the local
+                    // pointer, whose provenance we then stamp shadow.
+                    let zero = b.shr().get_const(0, base_size);
+                    b.push_add(arg, zero).id()
+                };
+                let sty = ctx
+                    .shared
+                    .types
+                    .get_or_make_space_address(base_size, shadow_mem);
+                let ValueId::Instruction(new_insn) = new_id else {
+                    unreachable!("push_add yields an instruction");
+                };
+                qcode::value::Instruction::from_id_mut(ctx, new_insn).set_type(sty);
+                call.args[arg_idx] = new_id.localize(call_id.func);
+            }
+            ctx.replace_instruction_mnemonic(call_id, Mnemonic::Call(call));
         }
     }
 

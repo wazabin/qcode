@@ -334,7 +334,8 @@ mod tests {
                 &tc.ctx,
                 f,
                 &summaries,
-                &FxHashSet::default()
+                &FxHashSet::default(),
+                None
             ),
             "a rewritten tail to a memory-free callee no longer blocks f"
         );

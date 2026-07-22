@@ -130,6 +130,14 @@ pub(crate) enum RamBase {
     Frame(i64),
     /// An absolute (literal) address in real ram.
     Global(u64),
+    /// A **function-private space** landing: a callee effect rebased through a
+    /// call argument that is a pointer into the summary owner's own private
+    /// (shadow/temp) space — what re-analysis of a shadow-rewritten body sees
+    /// after `ram::apply` rebases an admitted external's own-frame pointer arg
+    /// into the shadow (externals-into-shadow, rule 5). Outward-invisible: a
+    /// private-space object can neither be observed nor aliased by any caller, so
+    /// like a `Frame` write it is dropped from the outward footprint.
+    Private,
 }
 
 /// One scalar effect: `size` bytes at `base + offset`, read or written.
@@ -184,12 +192,17 @@ impl Footprint {
     fn invisible(&self) -> bool {
         self.fields
             .iter()
-            .all(|f| matches!(f.base, RamBase::Frame(_)))
+            .all(|f| matches!(f.base, RamBase::Frame(_) | RamBase::Private))
             && self
                 .regions
                 .iter()
-                .all(|r| matches!(r.base, RamBase::Frame(_)))
+                .all(|r| matches!(r.base, RamBase::Frame(_) | RamBase::Private))
             && self.objects.iter().all(|o| {
+                if matches!(o.base, RamBase::Private) {
+                    // A private-space landing is fully self-contained (read or
+                    // write): the shadow can neither be observed nor aliased.
+                    return true;
+                }
                 // A `Frame`-based whole-object entry is invisible: a `Frame`
                 // write dies with the owner's frame (contained under the
                 // confinement assumption, see `external_leaf` / the module docs).
@@ -288,6 +301,17 @@ impl RamChannel {
     ) -> Option<(RamBase, i64)> {
         if let ValueRef::Literal(lit) = ValueRef::new(arg, ctx) {
             return Some((RamBase::Global(lit.value()), 0));
+        }
+        // Rule 5: a call argument that is a pointer into the caller's own private
+        // (shadow/temp) space — what re-analysis of a shadow-rewritten body sees
+        // for an admitted external's rebased own-frame pointer arg. The callee's
+        // whole-object entries land on `Private` and are dropped from the outward
+        // footprint (outward-invisible), still flagging the external.
+        if ValueRef::new(arg, ctx)
+            .memory_space()
+            .is_some_and(|ms| ms.shared().is_none())
+        {
+            return Some((RamBase::Private, 0));
         }
         let mut callers = self.callers.borrow_mut();
         let info = callers.entry(caller).or_insert_with(|| {
@@ -808,6 +832,8 @@ impl EffectChannel for RamChannel {
                 Some(match base {
                     // Contained in the callee's own frame — invisible here.
                     RamBase::Frame(_) => None,
+                    // Contained in the callee's own private space — invisible.
+                    RamBase::Private => None,
                     RamBase::Global(a) => Some((RamBase::Global(a), 0)),
                     RamBase::Param(i) => {
                         let arg = args.get(i as usize)?.qualify(caller);
