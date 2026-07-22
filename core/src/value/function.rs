@@ -95,8 +95,8 @@ pub struct FunctionEffects {
     /// Register-channel lifecycle summary (argpromote v2).
     #[serde(default)]
     pub register: RegisterChannelState,
-    /// Memory-channel effect summary (coarse written-space set only; the precise
-    /// RAM footprint is deferred).
+    /// Memory-channel effect summary: the coarse written-space verdict plus the
+    /// precise RAM footprint.
     #[serde(default)]
     pub memory: MemoryChannelState,
 }
