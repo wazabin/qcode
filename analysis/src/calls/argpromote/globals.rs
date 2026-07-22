@@ -75,6 +75,9 @@ pub(super) fn global_slot(
 /// appended positional argument — the caller passes the **regpure** sites only
 /// (materialization passes none; implicit sites bind the param from its
 /// literal origin). Returns the new param, or `None` if `fid` has no root.
+// Phase 3: deleted with the register-channel/grow_globals global sweep. Inert
+// now — the RAM channel materializes globals directly (see `argpromote::ram`).
+#[allow(dead_code)]
 fn mint_global_param(
     ctx: &mut Context,
     fid: FunctionId,
@@ -111,6 +114,7 @@ fn mint_global_param(
 /// rewritten access is param-relative, so re-scanning finds nothing, and an
 /// address already in the map only has its (new) accesses redirected to the
 /// existing param. Returns whether anything changed.
+#[allow(dead_code)] // Phase 3: retired; RAM channel now owns global materialization.
 pub(super) fn grow_globals(ctx: &mut Context, graph: &crate::CallGraph, fid: FunctionId) -> bool {
     let f = FunctionBody::from_id(ctx, fid);
     if f.is_external() || !f.is_reg_materialized() {
@@ -190,6 +194,7 @@ pub(super) fn grow_globals(ctx: &mut Context, graph: &crate::CallGraph, fid: Fun
 }
 
 /// The root param whose origin is the literal `lit`, if any.
+#[allow(dead_code)] // Phase 3: retired with grow_globals.
 fn param_with_origin(ctx: &Context, root: qcode::value::BlockId, lit: ValueId) -> Option<ValueId> {
     BasicBlock::from_id(ctx, root)
         .params()
@@ -198,6 +203,7 @@ fn param_with_origin(ctx: &Context, root: qcode::value::BlockId, lit: ValueId) -
 }
 
 /// Redirect every real-ram load/store at `addr` in `fid` to dereference `param`.
+#[allow(dead_code)] // Phase 3: retired with grow_globals.
 fn rewrite_accesses(ctx: &mut Context, fid: FunctionId, addr: ValueId, param: ValueId) {
     let ids: Vec<_> = FunctionBody::from_id(ctx, fid)
         .iter()

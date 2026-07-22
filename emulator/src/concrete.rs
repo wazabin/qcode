@@ -1571,9 +1571,11 @@ impl StandaloneEmulator {
         let root_id = root.id;
         enum Seed {
             Reg(VarnodeId),
-            /// A lifted global slot: the param's origin is its address literal,
-            /// so implicit binding is the literal value itself (see
-            /// `argpromote::globals` — an `Opaque` site passes no argument).
+            /// A materialized global value input: the param's origin is its
+            /// address literal, and its value is the *contents* at that address
+            /// (the RAM channel threads `mem[addr]` by value — see
+            /// `argpromote::ram`'s global materialization). Implicit binding
+            /// therefore reads memory at the literal, not the literal itself.
             Lit(u64),
         }
         let params: Vec<(BlockParamId, Option<Seed>, usize)> = BasicBlock::from_id(ctx, root_id)
@@ -1601,7 +1603,18 @@ impl StandaloneEmulator {
         for (param_id, src, size) in params {
             let value = match src {
                 Some(Seed::Reg(varnode_id)) => self.read_varnode(ctx, varnode_id),
-                Some(Seed::Lit(value)) => Some(value),
+                Some(Seed::Lit(addr)) => {
+                    // The literal is the global's *address*; the param carries the
+                    // value stored there. Seed from memory (little-endian, param
+                    // width) rather than the raw literal.
+                    let space = ctx.shared.default_space;
+                    self.read_memory(ctx, space, addr, size).ok().map(|bytes| {
+                        let mut buf = [0u8; 8];
+                        let n = bytes.len().min(8);
+                        buf[..n].copy_from_slice(&bytes[..n]);
+                        u64::from_le_bytes(buf)
+                    })
+                }
                 None => None,
             };
             if let Some(value) = value {

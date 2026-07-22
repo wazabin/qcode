@@ -173,15 +173,8 @@ fn argpromote_changed_functions_with_sp(
         if callers.iter().any(|id| !target_set.contains(id)) {
             continue;
         }
-        // Lift late-discovered constant-address (global) accesses into interface
-        // slots first (constprop may only now have folded the address), so the
-        // freshly param-relative derefs are visible to `try_promote`'s footprint
-        // scan in the same visit. Interface-honest growth: regpure sites get the
-        // literal argument, implicit sites bind from the param's literal origin.
-        if super::globals::grow_globals(ctx, graph, fid) {
-            changed.insert(fid);
-            changed.extend(callers.iter().copied());
-        }
+        // Globals (constant-address real-ram accesses) are materialized by the
+        // RAM channel itself inside `try_promote`/`apply` (grow_globals retired).
         let outcome = try_promote(
             ctx,
             fid,
@@ -313,6 +306,71 @@ struct ParamInfo {
     write_targets: Vec<(ValueId, usize)>,
     /// Dynamic-index region snapshotted through this param, if any.
     region: Option<SequenceRegion>,
+}
+
+/// A materialized global slot: a constant real-ram address this function accesses.
+/// The RAM channel owns global materialization — a read becomes a by-value input
+/// carrying `mem[addr]` (seeded into the shadow at the literal address), a write
+/// additionally rides out in the returned write-set. Grouped by `(addr, size)`.
+struct GlobalAccess {
+    /// Constant address value.
+    addr: u64,
+    /// Width of the address literal — the shadow index / pointer width.
+    addr_size: usize,
+    /// Access (value) width in bytes.
+    size: usize,
+    /// Whether any access at this slot is a store (rides out in the write-set).
+    has_write: bool,
+    /// The real-ram load/store instructions to redirect into the shadow.
+    accesses: Vec<InstructionId>,
+}
+
+/// Collect `fid`'s global (constant real-ram address) accesses, grouped by
+/// `(addr, size)` in first-seen (block/instruction) order — determinism the
+/// parallel/sequential differential test relies on. A slot whose `glob_<addr>`
+/// value param already exists on the root (its origin is the address literal) is
+/// skipped: it was materialized on an earlier `argpromote-cleanup` round, so
+/// re-minting would desync the interface (idempotence).
+fn collect_globals(ctx: &Context, fid: FunctionId) -> Vec<GlobalAccess> {
+    let Some(root) = FunctionBody::from_id(ctx, fid).root().map(|b| b.id) else {
+        return Vec::new();
+    };
+    let existing_origins: HashSet<ValueId> = BasicBlock::from_id(ctx, root)
+        .params()
+        .filter_map(|p| p.origin())
+        .collect();
+    let mut globals: Vec<GlobalAccess> = Vec::new();
+    for block in FunctionBody::from_id(ctx, fid).iter() {
+        for insn in block.iter() {
+            let (space, ptr, size, is_store) = match insn.mnemonic() {
+                Mnemonic::Load(l) => (l.space, l.ptr, l.size, false),
+                Mnemonic::Store(s) => (s.space, s.ptr, s.size, true),
+                _ => continue,
+            };
+            let Some((addr, addr_size)) = super::globals::global_slot(ctx, fid, ptr, space) else {
+                continue;
+            };
+            if existing_origins.contains(&ctx.get_const(addr, addr_size).id()) {
+                continue;
+            }
+            if let Some(g) = globals
+                .iter_mut()
+                .find(|g| g.addr == addr && g.size == size)
+            {
+                g.has_write |= is_store;
+                g.accesses.push(insn.id);
+            } else {
+                globals.push(GlobalAccess {
+                    addr,
+                    addr_size,
+                    size,
+                    has_write: is_store,
+                    accesses: vec![insn.id],
+                });
+            }
+        }
+    }
+    globals
 }
 
 fn try_promote(
@@ -545,17 +603,24 @@ fn try_promote(
     // A pointer touched only as data surfaces nothing; but a captured own-frame
     // read (rule 2) redirected into the shadow is real work even with no surfaced
     // read/write, so `accesses` must be considered too.
-    if promoted.iter().all(|p| {
-        p.reads.is_empty()
-            && p.write_targets.is_empty()
-            && p.region.is_none()
-            && p.accesses.is_empty()
-    }) {
+    // Global (constant-address) accesses the RAM channel materializes alongside
+    // the promoted params. Collected here so a globals-only function (no promoted
+    // deref params) still reaches `apply`.
+    let globals = collect_globals(ctx, fid);
+
+    if globals.is_empty()
+        && promoted.iter().all(|p| {
+            p.reads.is_empty()
+                && p.write_targets.is_empty()
+                && p.region.is_none()
+                && p.accesses.is_empty()
+        })
+    {
         return Promotion::No;
     }
 
     let call_sites = crate::calls::direct_call_sites(ctx, graph, fid);
-    if apply(ctx, fid, promoted, sp_reg, &call_sites) {
+    if apply(ctx, fid, promoted, globals, sp_reg, &call_sites) {
         Promotion::Shadow
     } else {
         Promotion::No
@@ -597,6 +662,21 @@ fn all_accesses_modelled(
                 _ => return true,
             };
             if space != ram || captured.contains(&insn.id) {
+                return true;
+            }
+            // A global (constant real-ram address) is materialized by the RAM
+            // channel's global path (a by-value input + optional write-set
+            // entry), so it is modelled and never blocks the shadow path.
+            let is_global = match insn.mnemonic() {
+                Mnemonic::Load(l) => {
+                    super::globals::global_slot(ctx, fid, l.ptr, l.space).is_some()
+                }
+                Mnemonic::Store(s) => {
+                    super::globals::global_slot(ctx, fid, s.ptr, s.space).is_some()
+                }
+                _ => false,
+            };
+            if is_global {
                 return true;
             }
             // Tolerate only an uncaptured caller-frame-slot *read* (the interface
@@ -1021,6 +1101,7 @@ fn apply(
     ctx: &mut Context,
     fid: FunctionId,
     mut promoted: Vec<Promoted>,
+    globals: Vec<GlobalAccess>,
     sp_reg: Option<VarnodeId>,
     call_sites: &[InstructionId],
 ) -> bool {
@@ -1096,6 +1177,18 @@ fn apply(
                 r.byte_len(),
                 Some(p.arg_idx),
             ));
+        }
+    }
+    // Each written global rides out as one write-set entry: shadow_addr = ram_addr
+    // = the constant address (base = the address literal, offset 0), value read out
+    // of shadow, replayed at the caller as `store(ram, addr, value)`. `arg_idx =
+    // None` → the replay falls back to the extracted literal address (no base+offset
+    // arithmetic). The initial value is seeded into shadow by the global input minted
+    // below, so a path that does not store replays a no-op.
+    for g in &globals {
+        if g.has_write {
+            let base = ctx.get_const(g.addr, g.addr_size).id();
+            write_slots.push((base, g.addr_size, 0, g.size, None));
         }
     }
 
@@ -1226,10 +1319,52 @@ fn apply(
         );
     }
 
+    // Materialize each global slot (read or written) as one by-value input
+    // carrying `mem[addr]`, seeded into the shadow at the literal address so the
+    // body's (about-to-be-redirected) access forwards from it. Minted *after* the
+    // per-param snapshot loop, in deterministic first-seen order, so callee params
+    // and caller args stay in lockstep. The origin is the address literal: implicit
+    // sites bind the value from it (the emulator reads `mem[addr]`), while the
+    // regpure/direct sites in `call_sites` load the value verbatim.
+    for g in &globals {
+        let (addr, addr_size, size) = (g.addr, g.addr_size, g.size);
+        let origin = ctx.get_const(addr, addr_size).id();
+        super::add_input(
+            ctx,
+            fid,
+            size,
+            Some(format!("glob_{:x}", addr)),
+            Some(origin),
+            None,
+            Some(call_sites),
+            shadow,
+            move |b| b.shr().get_const(addr, addr_size),
+            move |ctx, call_id, block| {
+                let mut b = (ctx).builder(block);
+                b.set_insert_point_before(call_id);
+                let a = b.shr().get_const(addr, addr_size);
+                b.push_load::<false>(a, size, ram).id()
+            },
+        );
+    }
+
     // Redirect every promoted load/store into the shadow space, keeping the real
     // address as the index.
     for p in &promoted {
         for &acc in &p.accesses {
+            let mut m = ctx.get_insn(acc).mnemonic().clone();
+            match &mut m {
+                Mnemonic::Load(l) => l.space = shadow,
+                Mnemonic::Store(s) => s.space = shadow,
+                _ => {}
+            }
+            ctx.replace_instruction_mnemonic(acc, m);
+        }
+    }
+    // Redirect every global access into the shadow at its (unchanged) literal
+    // address, so the seeded input value and the write-set read/replay all agree.
+    for g in &globals {
+        for &acc in &g.accesses {
             let mut m = ctx.get_insn(acc).mnemonic().clone();
             match &mut m {
                 Mnemonic::Load(l) => l.space = shadow,

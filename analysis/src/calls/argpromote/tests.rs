@@ -809,7 +809,10 @@ mod tests {
         assert!(argpromote(&mut tc.ctx), "the global write functionalizes");
 
         // f gained a `glob_9000` param for the lifted constant address, and no
-        // constant-address access remains in its body.
+        // constant-address access remains in *real ram*. (Phase 1 RAM-channel
+        // semantics: the global access is redirected into the private shadow
+        // keeping the literal as its index, rather than rewritten to dereference
+        // the param as the old grow_globals path did.)
         let pnames: Vec<String> = FunctionBody::from_id(&tc.ctx, f)
             .root()
             .unwrap()
@@ -824,23 +827,38 @@ mod tests {
             .iter()
             .flat_map(|b| b.iter())
             .any(|i| match i.mnemonic() {
-                Mnemonic::Load(l) => matches!(l.ptr, LocalValueId::Literal(_)),
-                Mnemonic::Store(s) => matches!(s.ptr, LocalValueId::Literal(_)),
+                Mnemonic::Load(l) => {
+                    matches!(l.ptr, LocalValueId::Literal(_)) && l.space.shared().is_some()
+                }
+                Mnemonic::Store(s) => {
+                    matches!(s.ptr, LocalValueId::Literal(_)) && s.space.shared().is_some()
+                }
                 _ => false,
             });
-        assert!(!const_access, "no constant-address access remains in f");
+        assert!(
+            !const_access,
+            "no constant-address access remains in f's real ram"
+        );
 
-        // The caller threads the address literal `0x9000` as an argument …
-        let Mnemonic::Call(call) = tc.ctx.get_insn(call_id).mnemonic().clone() else {
-            panic!("g_call is a call");
-        };
-        let passes_addr = call.args.iter().any(|&a| {
-            match qcode::value::ValueRef::new(a.qualify(call_id.func), &tc.ctx) {
-                qcode::value::ValueRef::Literal(l) => l.value() == 0x9000,
-                _ => false,
-            }
+        // The caller materializes the global at `0x9000`. (Phase 1 value-threading:
+        // the param carries `mem[0x9000]` by value, so the caller loads it for the
+        // input arg and replays the write as `store(ram, 0x9000, value)` — the
+        // address literal is a load/store pointer at the caller, no longer a bare
+        // positional argument.)
+        let refs_addr = FunctionBody::from_id(&tc.ctx, g).iter().any(|b| {
+            b.iter().any(|i| {
+                let ptr = match i.mnemonic() {
+                    Mnemonic::Load(l) => l.ptr,
+                    Mnemonic::Store(s) => s.ptr,
+                    _ => return false,
+                };
+                matches!(
+                    qcode::value::ValueRef::new(ptr.qualify(i.id.func), &tc.ctx),
+                    qcode::value::ValueRef::Literal(l) if l.value() == 0x9000
+                )
+            })
         });
-        assert!(passes_addr, "caller passes the global address literal");
+        assert!(refs_addr, "caller materializes the global address 0x9000");
 
         // … and replays the functionalized write-set out of the call result.
         let has_replay = FunctionBody::from_id(&tc.ctx, g).iter().any(|b| {

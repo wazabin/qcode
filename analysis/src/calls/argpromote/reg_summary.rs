@@ -20,7 +20,6 @@ use rustc_hash::FxHashSet;
 use crate::calls::CallEdge;
 
 use super::{
-    globals::global_slot,
     registers::{RegPurityReason, RegisterEffects, canonicalize_to_coarsest, is_register},
     summary::EffectChannel,
 };
@@ -63,19 +62,13 @@ impl EffectChannel for RegChannel {
         for block in FunctionBody::from_id(ctx, fid).blocks() {
             for insn in block.iter() {
                 match insn.mnemonic() {
-                    // A global (constant real-RAM address) is admitted to the
-                    // same effect sets as a register, keyed by its pre-minted
-                    // identity varnode (`(ram, addr, data-width)`). It composes
-                    // and value-threads exactly like a register — see
-                    // GLOBALS_AS_VARNODES.md. The cell width is the *access*
-                    // width (`l.size`), not the pointer literal's width.
+                    // Globals (constant real-RAM addresses) are no longer a
+                    // register-channel concern: the RAM channel owns their
+                    // materialization (see `argpromote::ram`). Only true register
+                    // varnodes enter the load/store effect sets here.
                     Mnemonic::Load(l) => {
                         if let qcode::value::LocalValueId::Varnode(vn) = l.ptr
                             && is_register(ctx, vn)
-                        {
-                            eff.loads.insert(vn);
-                        } else if let Some((addr, _)) = global_slot(ctx, fid, l.ptr, l.space)
-                            && let Some(vn) = ctx.global_varnode(addr, l.size)
                         {
                             eff.loads.insert(vn);
                         }
@@ -83,10 +76,6 @@ impl EffectChannel for RegChannel {
                     Mnemonic::Store(s) => {
                         if let qcode::value::LocalValueId::Varnode(vn) = s.ptr
                             && is_register(ctx, vn)
-                        {
-                            eff.stores.insert(vn);
-                        } else if let Some((addr, _)) = global_slot(ctx, fid, s.ptr, s.space)
-                            && let Some(vn) = ctx.global_varnode(addr, s.size)
                         {
                             eff.stores.insert(vn);
                         }
