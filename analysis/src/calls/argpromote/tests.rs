@@ -4929,6 +4929,123 @@ mod tests {
         );
     }
 
+    /// Regression (externals-into-shadow miscompile): after rule-4 rebases the
+    /// `memset` arg into the shadow, a subsequent GVN/CSE/copy-prop/DCE run must
+    /// NOT collapse the shadow pointer back into the real own-frame pointer
+    /// (`@SP - 0x20`). The rebased arg is minted as a genuine shadow-typed
+    /// `@SP + off` address (not a folded `arg + 0`), and its shadow (temp) space
+    /// keys it opaquely in CSE, so it survives simplification still shadow-typed.
+    /// If it did not, `memset` would write real RAM while the body's redirected
+    /// reads read uninitialised shadow.
+    #[test]
+    fn rebased_memset_arg_stays_shadow_after_gvn() {
+        use qcode::space::{LocalMemorySpaceId, MemorySpaceId};
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        let memset = make_argmem_external(
+            &mut tc,
+            0x9000,
+            "memset",
+            vec![
+                qcode::value::ArgMemKind::OutPtr,
+                qcode::value::ArgMemKind::NonPtr,
+                qcode::value::ArgMemKind::NonPtr,
+            ],
+        );
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @RSP:i64>
+                    %loc = @RSP - i64 0x20;
+                    goto <f_call>;
+                <f_call>
+                    call <f>;
+                <f_cont>
+                    %v = load(ram:8, %loc);
+                    return at %v;
+
+            fn caller:
+                <k_entry @RSP:i64>
+                    goto <k_call>;
+                <k_call>
+                    call <caller>;
+                <k_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (f_entry, f_call, f_cont, k_entry, k_call, k_cont);
+        for fid in [f, caller] {
+            materialize_fn(&mut tc, fid);
+            stamp_sp_origin(&mut tc, fid, sp);
+        }
+        let loc = ValueId::Instruction(
+            BasicBlock::from_id(&tc.ctx, f_entry)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id,
+        );
+        let zero = tc.ctx.get_const(0, 8).id();
+        let n = tc.ctx.get_const(16, 8).id();
+        set_call(&mut tc, f_call, memset, vec![loc, zero, n]);
+        tc.ctx.add_cfg_edge(f_call, f_cont);
+
+        let caller_rsp = FunctionBody::from_id(&tc.ctx, caller)
+            .root()
+            .unwrap()
+            .params()
+            .find(|p| p.name() == Some("RSP"))
+            .unwrap()
+            .id();
+        set_call(&mut tc, k_call, f, vec![caller_rsp]);
+        tc.ctx.add_cfg_edge(k_call, k_cont);
+
+        argpromote_with_sp(&mut tc.ctx, Some(sp));
+
+        // Simplify: this is the pass that previously stripped the shadow stamp,
+        // folding the rebased arg back to the real own-frame pointer.
+        let aliases = crate::AliasResult::simple_for_function(&tc.ctx, f);
+        crate::gvn::gvn_function(&mut tc.ctx, f, Some(&aliases));
+
+        // The surviving memset call's pointer arg must still be shadow-typed.
+        let mut saw_memset = false;
+        for block in FunctionBody::from_id(&tc.ctx, f).iter() {
+            for insn in block.iter() {
+                if let Mnemonic::Call(c) = insn.mnemonic()
+                    && c.target.real() == Some(memset)
+                {
+                    saw_memset = true;
+                    let arg0 = c.args[0].qualify(f);
+                    assert!(
+                        matches!(
+                            tc.ctx.shared.types.space_of(tc.ctx.type_of(arg0)),
+                            Some(MemorySpaceId::Temp(_))
+                        ),
+                        "the rebased memset arg must stay shadow-typed after GVN, \
+                         not collapse to the real own-frame pointer"
+                    );
+                }
+            }
+        }
+        assert!(saw_memset, "the memset call must survive the promotion");
+
+        // Sanity: a real-RAM load index still exists and is NOT shadow-typed.
+        let real_load_index_ok = FunctionBody::from_id(&tc.ctx, f).iter().any(|blk| {
+            blk.iter().any(|i| match i.mnemonic() {
+                Mnemonic::Load(l) if matches!(l.space, LocalMemorySpaceId::Temp(_)) => {
+                    let idx = i.operands().first().copied();
+                    idx.is_some()
+                }
+                _ => false,
+            })
+        });
+        assert!(
+            real_load_index_ok,
+            "the redirected shadow load must still be present after GVN"
+        );
+    }
+
     /// Blocked 4a: forwarding an *incoming pointer param* (not an own-frame local)
     /// to the external is not rebasable — f is not shadow-promoted.
     #[test]

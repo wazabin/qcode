@@ -796,6 +796,11 @@ fn admissible_external_argmem_call(
                 if !own_frame.is_local(ctx, arg) {
                     return None;
                 }
+                // The rewrite rebuilds the arg as a fresh shadow-typed `@SP + off`
+                // pointer (see rule 4), which needs a stable @SP-relative offset.
+                // A realigned-base local (`@SP & -mask`) has none, so it cannot be
+                // soundly rebased — leave the whole call unpromoted.
+                own_frame.local_offset(ctx, arg)?;
                 rebase.push((i, arg));
             }
             // Filtered out above.
@@ -1262,20 +1267,32 @@ fn apply(
             };
             for (arg_idx, arg) in pairs {
                 let base_size = ctx.shared.types.size_of(ctx.type_of(arg));
+                // Reconstruct the local as `@SP + off` from the incoming stack
+                // pointer (both gated present by `admissible_external_argmem_call`).
+                let off = own_frame
+                    .local_offset(ctx, arg)
+                    .expect("admissible call gates on a reconstructible @SP offset");
+                let sp = own_frame
+                    .sp_param()
+                    .expect("an own-frame local implies a recognised @SP param");
                 let new_id = {
                     let mut b = ctx.builder(block);
                     b.set_insert_point_before(call_id);
-                    // `arg + 0`: a fresh instruction numerically equal to the local
-                    // pointer, whose provenance we then stamp shadow.
-                    let zero = b.shr().get_const(0, base_size);
-                    b.push_add(arg, zero).id()
+                    // A FRESH `@SP + off` address instruction, then stamped into
+                    // the shadow space. `off != 0`, so it neither folds (`x+0→x`)
+                    // nor value-numbers with the real own-frame pointer — and being
+                    // shadow-typed it stays opaque to affine reassociation/CSE.
+                    // This is genuine shadow-provenance arithmetic, not an
+                    // `arg + 0` whose add-zero the folder would strip back to the
+                    // real pointer (the externals-into-shadow miscompile).
+                    seed_addr(&mut b, sp, base_size, off)
                 };
                 let sty = ctx
                     .shared
                     .types
                     .get_or_make_space_address(base_size, shadow_mem);
                 let ValueId::Instruction(new_insn) = new_id else {
-                    unreachable!("push_add yields an instruction");
+                    unreachable!("a non-zero @SP offset yields an add instruction");
                 };
                 qcode::value::Instruction::from_id_mut(ctx, new_insn).set_type(sty);
                 call.args[arg_idx] = new_id.localize(call_id.func);
