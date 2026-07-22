@@ -476,11 +476,10 @@ impl MemForward {
         // private scratch space leave the caller's spilled-pointer cell intact.
         let callee_written_spaces: Option<Vec<SpaceId>> = match &term {
             Some(Mnemonic::Call(call)) => call.target.real().and_then(|target| {
-                host.interface(target)
-                    .signature
-                    .as_ref()
-                    .and_then(|s| s.written_spaces.as_deref())
-                    .map(<[_]>::to_vec)
+                match &host.interface(target).effects.memory.coarse {
+                    qcode::value::WrittenSpacesState::Bounded(spaces) => Some(spaces.clone()),
+                    _ => None,
+                }
             }),
             _ => None,
         };

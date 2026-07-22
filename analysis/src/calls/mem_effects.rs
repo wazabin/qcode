@@ -57,20 +57,20 @@ fn set_written_spaces_targeted_with_sp(
         };
         // A ⊤ summary now records *stamped unbounded* rather than clearing the
         // stamp, so a fresh mint transitioning Unstamped → Unbounded counts as a
-        // change (its callers' bounds may need re-verifying).
-        use qcode::value::WrittenSpaces;
-        let changed = match (
-            FunctionBody::from_id(ctx, id).written_spaces_state(),
-            &summary,
-        ) {
-            (WrittenSpaces::Bounded(a), Some(b)) => a != b.as_slice(),
-            (WrittenSpaces::Unbounded, None) => false,
-            _ => true,
+        // change (its callers' bounds may need re-verifying). Change-detection is
+        // a direct equality on the memory channel (Unstamped ≠ Bounded/Unbounded,
+        // Unbounded == Unbounded, Bounded(a) == Bounded(b) iff a == b) — the same
+        // verdict the hand-rolled `WrittenSpaces` match produced.
+        let new_memory = qcode::value::MemoryChannelState {
+            coarse: match &summary {
+                Some(b) => qcode::value::WrittenSpacesState::Bounded(b.clone()),
+                None => qcode::value::WrittenSpacesState::Unbounded,
+            },
         };
-        if changed {
+        if FunctionBody::from_id(ctx, id).effects().memory != new_memory {
             changed_functions.insert(id);
         }
-        FunctionBody::from_id_mut(ctx, id).set_written_spaces(summary);
+        FunctionBody::from_id_mut(ctx, id).set_memory_effects(new_memory);
     }
     changed_functions
 }

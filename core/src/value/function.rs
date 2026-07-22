@@ -1657,22 +1657,20 @@ where
     /// tri-state distinction use [`written_spaces_state`](Self::written_spaces_state).
     /// See [`FunctionSignature::written_spaces`].
     pub fn written_spaces(&'s self) -> Option<&'ctx [crate::space::SpaceId]> {
-        self.interface()
-            .signature
-            .as_ref()
-            .and_then(|s| s.written_spaces.as_deref())
+        match &self.interface().effects.memory.coarse {
+            WrittenSpacesState::Bounded(spaces) => Some(spaces),
+            _ => None,
+        }
     }
 
     /// The tri-state `written_spaces` verdict, distinguishing a never-stamped
     /// fresh mint ([`WrittenSpaces::Unstamped`]) from a deliberately recorded
     /// ⊤ ([`WrittenSpaces::Unbounded`]). See [`FunctionSignature::written_spaces`].
     pub fn written_spaces_state(&'s self) -> WrittenSpaces<'ctx> {
-        match self.interface().signature.as_ref() {
-            Some(s) if s.written_spaces_stamped => match s.written_spaces.as_deref() {
-                Some(spaces) => WrittenSpaces::Bounded(spaces),
-                None => WrittenSpaces::Unbounded,
-            },
-            _ => WrittenSpaces::Unstamped,
+        match &self.interface().effects.memory.coarse {
+            WrittenSpacesState::Unstamped => WrittenSpaces::Unstamped,
+            WrittenSpacesState::Unbounded => WrittenSpaces::Unbounded,
+            WrittenSpacesState::Bounded(spaces) => WrittenSpaces::Bounded(spaces),
         }
     }
 
@@ -2212,9 +2210,11 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// stamp back to unstamped. See [`FunctionSignature::written_spaces`] and
     /// [`FunctionRef::written_spaces_state`].
     pub fn set_written_spaces(&mut self, spaces: Option<Vec<crate::space::SpaceId>>) {
-        let sig = self.interface_mut().signature.get_or_insert_default();
-        sig.written_spaces = spaces;
-        sig.written_spaces_stamped = true;
+        let coarse = match spaces {
+            Some(spaces) => WrittenSpacesState::Bounded(spaces),
+            None => WrittenSpacesState::Unbounded,
+        };
+        self.set_memory_effects(MemoryChannelState { coarse });
     }
 
     /// Records the C-prototype-derived external call interface on this function.
