@@ -644,9 +644,17 @@ impl EffectChannel for RamChannel {
                 }
                 if frame.is_frame_slot(ctx, ptr) {
                     // A caller-frame slot (`@SP + k`, `k ≥ 0`): the return
-                    // address / incoming stack arguments. promote_stack_args
-                    // territory; not expressible here yet.
-                    precise_top = true;
+                    // address / incoming stack arguments. Read/write asymmetry:
+                    // a *read* of this interface region is invisible — the caller
+                    // established that data and it is never redirected into the
+                    // shadow (the frame stays real for the ABI), so its value is
+                    // identical before and after promotion. It carries no new
+                    // info to callers, so we neither ⊤ the summary nor push it
+                    // outward. A *write* mutates an incoming arg slot — still
+                    // promote_stack_args territory, not expressible here yet.
+                    if is_store {
+                        precise_top = true;
+                    }
                     continue;
                 }
                 outward.push(MemoryAccess {
@@ -1776,6 +1784,75 @@ mod tests {
         assert!(
             !real.invisible(),
             "a Param-based object write is caller-observable"
+        );
+    }
+
+    /// A memory READ never blocks promotion; only writes and address escapes do.
+    /// A function that reads its own return address off a caller-frame slot
+    /// (`load(@RSP)`, `k = 0`) — as every real lifted function does — plus a
+    /// `memset(&local)` whose licensed read-back is contained, must stay
+    /// outward-invisible. Before the read/write asymmetry the caller-frame read
+    /// ⊤'d the summary and killed the fold. The negative half: a caller-frame
+    /// *write* (mutating an incoming stack-arg slot, `k > 0`) still forces ⊤.
+    #[test]
+    fn caller_frame_read_does_not_block_memory_free() {
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        let memset = external_argmem(
+            &mut tc,
+            0x9700,
+            "memset",
+            vec![ArgMemKind::OutPtr, ArgMemKind::NonPtr, ArgMemKind::NonPtr],
+            false,
+        );
+        qcode!(
+            tc.ctx,
+            "
+            fn reads_ok:
+                <r_entry @RSP:i64>
+                    %ret = load(ram:8, @RSP);
+                    %loc = @RSP - i64 0x20;
+                    goto <r_call>;
+                <r_call>
+                    call fn reads_ok();
+                <r_cont>
+                    %v = load(ram:1, %loc);
+                    return at %ret;
+
+            fn writes_arg:
+                <w_entry @RSP:i64>
+                    %slot = @RSP + i64 0x8;
+                    store(ram:8, %slot <- i64 0x0);
+                    return at i64 0;
+            "
+        );
+        let _ = (r_entry, r_call, r_cont, w_entry);
+        for fid in [reads_ok, writes_arg] {
+            materialize(&mut tc, fid);
+            set_sp_origin(&mut tc, fid, sp);
+        }
+        let loc = ValueId::Instruction(
+            qcode::value::BasicBlock::from_id(&tc.ctx, r_entry)
+                .iter()
+                .filter(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .last()
+                .unwrap()
+                .id,
+        );
+        regpure_call(&mut tc, r_call, memset, vec![loc]);
+        tc.ctx.add_cfg_edge(r_call, r_cont);
+
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, Some(sp));
+
+        assert!(
+            is_memory_free(&s, reads_ok),
+            "a caller-frame-slot read (the return address) is invisible; with the \
+             memset read-back licensed the function stays outward-invisible"
+        );
+        assert!(
+            !is_memory_free(&s, writes_arg),
+            "a caller-frame-slot *write* mutates an incoming arg slot — still ⊤"
         );
     }
 

@@ -97,6 +97,20 @@ impl OwnFrame {
             )
         })
     }
+
+    /// Whether `addr` is specifically a *caller-frame* slot (`@SP + k`, `k ≥ 0`):
+    /// the return address / incoming stack args, established by the caller and
+    /// never redirected into the shadow.
+    pub(super) fn is_caller_frame_slot(&self, ctx: &Context, addr: ValueId) -> bool {
+        self.sp_param.is_some_and(|sp| {
+            frame_class(
+                qcode::value::ModuleView::new(ctx),
+                &self.numbering,
+                sp,
+                addr,
+            ) == Some(FrameClass::CallerFrame)
+        })
+    }
 }
 
 /// Promotes every eligible by-reference in/out parameter in the module. Returns
@@ -492,7 +506,7 @@ fn try_promote(
     // that does not execute on some path replays a no-op, and no dominance reasoning
     // is needed. A function with any other (dynamic-address) write stays on the
     // partial path. (`other passes drop the redundant seed args.`)
-    if !all_accesses_modelled(ctx, fid, &promoted)
+    if !all_accesses_modelled(ctx, fid, &promoted, sp_reg)
         || !all_writes_resolvable(ctx, fid, &promoted, sp_reg)
         || !regions_disjoint(ctx, fid, &promoted, sp_reg)
     {
@@ -553,21 +567,42 @@ fn try_promote(
 /// shadow space (a prior promotion round) are inherently modelled and skipped, so
 /// the check is idempotent. A single uncaptured ram access fails it: see the
 /// all-or-nothing rationale at the call site.
-fn all_accesses_modelled(ctx: &Context, fid: FunctionId, promoted: &[Promoted]) -> bool {
+///
+/// Read/write asymmetry: an uncaptured real-ram **Load** whose address is a
+/// caller-frame slot (`@SP + k`, `k ≥ 0` — the return address / incoming stack
+/// args) is tolerated. Such a read is disjoint from everything the promotion
+/// redirects: the caller established that data, it is never routed into the
+/// shadow, and its value is identical before and after. A read never blocks
+/// promotion; only writes and address escapes do. Any uncaptured **Store**, and
+/// any uncaptured Load that is *not* a caller-frame slot (a genuine unmodeled
+/// deref), still fails the check.
+fn all_accesses_modelled(
+    ctx: &Context,
+    fid: FunctionId,
+    promoted: &[Promoted],
+    sp_reg: Option<VarnodeId>,
+) -> bool {
     let ram = ctx.shared.default_space;
     let captured: HashSet<InstructionId> = promoted
         .iter()
         .flat_map(|p| p.accesses.iter().copied())
         .collect();
+    let own_frame = OwnFrame::new(ctx, fid, sp_reg);
     FunctionBody::from_id(ctx, fid).iter().all(|block| {
         block.iter().all(|insn| {
-            let space = match insn.mnemonic() {
-                Mnemonic::Load(l) => l.space,
-                Mnemonic::Store(s) => s.space,
+            let (space, load_ptr) = match insn.mnemonic() {
+                Mnemonic::Load(l) => (l.space, Some(l.ptr.qualify(insn.id.func))),
+                Mnemonic::Store(s) => (s.space, None),
                 // Not a memory access — nothing to model.
                 _ => return true,
             };
-            space != ram || captured.contains(&insn.id)
+            if space != ram || captured.contains(&insn.id) {
+                return true;
+            }
+            // Tolerate only an uncaptured caller-frame-slot *read* (the interface
+            // region the promotion never touches). Everything else — any store,
+            // any other unmodeled deref — remains fatal.
+            load_ptr.is_some_and(|ptr| own_frame.is_caller_frame_slot(ctx, ptr))
         })
     })
 }
