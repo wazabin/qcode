@@ -700,6 +700,116 @@ mod tests {
         );
     }
 
+    /// The RAM channel materializes a *read* global even when the snapshot-args
+    /// gate blocks param/frame promotion. An address-taken function reading a
+    /// constant global gains its `glob_<addr>` value input (and becomes
+    /// promotable) rather than bailing to `Promotion::No` (the pre-change whole-
+    /// function bail). The mixed-site case is checked too: a regpure direct site
+    /// threads the loaded value positionally, while an Opaque direct site keeps
+    /// its implicit zero-arg (origin) binding.
+    #[test]
+    fn materializes_read_global_when_snapshots_gated() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    %p = load(ram:4, 0x454df8);
+                    return at i64 0;
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+
+            fn h:
+                <h_entry>
+                    goto <h_call>;
+                <h_call>
+                    call <f>;
+                <h_cont>
+                    return at i64 0;
+            "
+        );
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
+            qcode::value::FunctionEffects::Materialized(
+                qcode::value::RegisterInterfaceMap::default(),
+            ),
+        );
+
+        // Take f's address so it lands in `address_taken_set` — the old whole-
+        // function bail that killed global materialization too.
+        let addr = tc.ctx.get_const(0x9000, 8).id();
+        {
+            let mut b = tc.ctx.builder(h_entry);
+            b.set_insert_point_to_start();
+            b.push_store(ValueId::Function(f), addr, tc.reg_space);
+        }
+        assert!(
+            super::super::address_taken_set(&tc.ctx).contains(&f),
+            "test setup: f must be address-taken"
+        );
+
+        // A regpure direct site at g (lockstep), an Opaque direct site at h.
+        let g_call_id = set_call(&mut tc, g_call, f, vec![]);
+        set_call_tag(&mut tc, g_call_id, qcode::value::insn::CallTag::RegPure);
+        let h_call_id = set_call(&mut tc, h_call, f, vec![]);
+        set_call_tag(&mut tc, h_call_id, qcode::value::insn::CallTag::Opaque);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        tc.ctx.add_cfg_edge(h_call, h_cont);
+
+        assert!(
+            argpromote(&mut tc.ctx),
+            "the global materializes despite the snapshot-args gate"
+        );
+
+        // f gained a `glob_454df8` by-value input.
+        let pnames: Vec<String> = FunctionBody::from_id(&tc.ctx, f)
+            .root()
+            .unwrap()
+            .params()
+            .filter_map(|p| p.name().map(str::to_string))
+            .collect();
+        assert!(
+            pnames.iter().any(|n| n == "glob_454df8"),
+            "glob value input materialized: {pnames:?}"
+        );
+
+        // No constant-address real-ram access remains (redirected into shadow).
+        let ram = tc.ctx.shared.default_space;
+        let const_ram_access = FunctionBody::from_id(&tc.ctx, f)
+            .iter()
+            .flat_map(|b| b.iter())
+            .any(|i| match i.mnemonic() {
+                Mnemonic::Load(l) => l.space == ram && matches!(l.ptr, LocalValueId::Literal(_)),
+                Mnemonic::Store(s) => s.space == ram && matches!(s.ptr, LocalValueId::Literal(_)),
+                _ => false,
+            });
+        assert!(
+            !const_ram_access,
+            "the global load is redirected out of real ram"
+        );
+
+        // The regpure site threads the loaded value positionally...
+        let Mnemonic::Call(g_c) = tc.ctx.get_insn(g_call_id).mnemonic().clone() else {
+            panic!("g_call is a call");
+        };
+        assert_eq!(g_c.args.len(), 1, "regpure site threads the global value");
+
+        // ...while the Opaque site keeps its implicit zero-arg (origin) binding.
+        let Mnemonic::Call(h_c) = tc.ctx.get_insn(h_call_id).mnemonic().clone() else {
+            panic!("h_call is a call");
+        };
+        assert!(
+            h_c.args.is_empty(),
+            "an Opaque site binds the global from origin, no positional arg"
+        );
+    }
+
     /// Whether `f`'s root has a by-value snapshot param (a promoted read).
     fn has_val_param(ctx: &Context, f: FunctionId) -> bool {
         FunctionBody::from_id(ctx, f).root().is_some_and(|b| {

@@ -406,35 +406,45 @@ fn try_promote(
         return Promotion::No;
     };
 
-    // Closed-world / direct-only gate: if the function's address is taken it may
-    // be reached by an indirect call this pass cannot find and rewrite, leaving a
-    // caller on the old by-reference ABI. (Callers in undiscovered code are an
-    // accepted, unguardable gap — see the module docs.)
-    if address_taken.contains(&fid) {
-        return Promotion::No;
-    }
-
-    // Snapshot arguments are real data loaded at the caller — unlike a register
-    // input or a global's address literal they have no implicit binding, so a
-    // non-regpure (`Opaque`) direct site cannot be given one. Promoting past
-    // such a site would either desync the `param[i] ↔ arg[i]` lockstep or trip
-    // the `[lockstep]` asserts in `apply`; bail instead.
-    if crate::calls::direct_call_sites(ctx, graph, fid)
-        .into_iter()
-        .any(|site| {
-            !matches!(
+    // The two gates below block only SNAPSHOT (param/frame) promotion — never
+    // global materialization. A global binds call-site-independently through its
+    // address-literal origin (implicit sites read `mem[addr]`, regpure sites load
+    // it verbatim), so neither a taken address nor an Opaque site can desync it.
+    // A snapshot argument, by contrast, is real data loaded at the caller with no
+    // implicit binding, and needs the closed world an address-taken function
+    // lacks. So we compute a boolean and, when it is false, still fall through to
+    // materialize globals (with an empty `promoted` set) rather than bail.
+    let direct_sites = crate::calls::direct_call_sites(ctx, graph, fid);
+    // Only regpure direct sites can carry a positional snapshot/global argument;
+    // an Opaque site binds a global from its origin and cannot carry a snapshot.
+    let regpure_sites: Vec<InstructionId> = direct_sites
+        .iter()
+        .copied()
+        .filter(|&site| {
+            matches!(
                 ctx.get_insn(site).mnemonic(),
                 Mnemonic::Call(c) if c.tag.is_regpure()
             )
         })
-    {
+        .collect();
+    let all_direct_regpure = regpure_sites.len() == direct_sites.len();
+
+    // Closed-world / direct-only gate: if the function's address is taken it may
+    // be reached by an indirect call this pass cannot find and rewrite, leaving a
+    // caller on the old by-reference ABI. (Callers in undiscovered code are an
+    // accepted, unguardable gap — see the module docs.) And a non-regpure
+    // (`Opaque`) direct site cannot be given a positional snapshot argument
+    // without desyncing the `param[i] ↔ arg[i]` lockstep or tripping the
+    // `[lockstep]` asserts in `apply`. Either disables snapshots — but not
+    // globals.
+    let snapshots_allowed = !address_taken.contains(&fid) && all_direct_regpure;
+    if !snapshots_allowed {
         qcode::pass_log!(
             debug,
-            "argpromote {}: bail — a direct call site is not regpure (implicit binding \
-             cannot carry snapshot args)",
+            "argpromote {}: snapshot promotion disabled (address-taken or a non-regpure \
+             direct site); globals still materialize",
             FunctionBody::from_id(ctx, fid).name(),
         );
-        return Promotion::No;
     }
 
     // A call composes with our shadow promotion only if it is fully inert toward
@@ -466,10 +476,16 @@ fn try_promote(
     // Classify every named root parameter. Dereferenced pointers are promoted and
     // share one shadow space (so aliasing among them stays correct); everything
     // else is left as-is.
-    let candidates: Vec<(ValueId, String)> = BasicBlock::from_id(ctx, root)
-        .params()
-        .filter_map(|p| Some((p.id(), p.name()?.to_string())))
-        .collect();
+    // Snapshot candidates only when snapshots are allowed; otherwise leave
+    // `promoted` empty and let global materialization proceed below.
+    let candidates: Vec<(ValueId, String)> = if snapshots_allowed {
+        BasicBlock::from_id(ctx, root)
+            .params()
+            .filter_map(|p| Some((p.id(), p.name()?.to_string())))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // The affine view of every value, and the function's full real-ram load/store
     // list — both shared across all params so the per-param decomposition can peel
@@ -581,8 +597,9 @@ fn try_promote(
             "argpromote {}: partial (inputs-only) — footprint not fully modelled",
             FunctionBody::from_id(ctx, fid).name(),
         );
-        let call_sites = crate::calls::direct_call_sites(ctx, graph, fid);
-        return if apply_partial(ctx, fid, &promoted, &call_sites) {
+        // Partial mode is snapshot-only (it seeds read snapshots into real ram),
+        // so it threads at regpure sites just like the shadow path.
+        return if apply_partial(ctx, fid, &promoted, &regpure_sites) {
             Promotion::Partial
         } else {
             Promotion::No
@@ -606,7 +623,17 @@ fn try_promote(
     // Global (constant-address) accesses the RAM channel materializes alongside
     // the promoted params. Collected here so a globals-only function (no promoted
     // deref params) still reaches `apply`.
-    let globals = collect_globals(ctx, fid);
+    let mut globals = collect_globals(ctx, fid);
+    // When snapshots are disabled the function has an extra caller channel that
+    // cannot receive a write-set replay: an indirect caller (address-taken) or an
+    // implicit/Opaque direct site. A *read* global is still safe there — it binds
+    // from its address-literal origin and is value-preserving — but a *written*
+    // global's write-set has no replay site on that channel, so its store would be
+    // silently dropped for that caller. Keep only read globals; a written global
+    // is left as a real-ram store (value-preserving, function stays non-pure).
+    if !snapshots_allowed {
+        globals.retain(|g| !g.has_write);
+    }
 
     if globals.is_empty()
         && promoted.iter().all(|p| {
@@ -619,8 +646,11 @@ fn try_promote(
         return Promotion::No;
     }
 
-    let call_sites = crate::calls::direct_call_sites(ctx, graph, fid);
-    if apply(ctx, fid, promoted, globals, sp_reg, &call_sites) {
+    // Thread at regpure sites only: snapshot and global positional args land here,
+    // while Opaque sites bind globals from their origin (see `apply`). When
+    // snapshots are allowed every direct site is regpure, so this equals the full
+    // direct-site set and the existing shadow path is unchanged.
+    if apply(ctx, fid, promoted, globals, sp_reg, &regpure_sites) {
         Promotion::Shadow
     } else {
         Promotion::No
@@ -1105,7 +1135,12 @@ fn apply(
     sp_reg: Option<VarnodeId>,
     call_sites: &[InstructionId],
 ) -> bool {
-    if call_sites.is_empty() {
+    // With no regpure site to thread, snapshot promotion and written-global
+    // write-set replay have nowhere to land, so they cannot proceed. But a
+    // read-only global still materializes: its param binds from the address-literal
+    // origin at implicit/indirect callers with no positional argument (matching the
+    // retired `grow_globals`). So bail only when there is caller-threading work.
+    if call_sites.is_empty() && (!promoted.is_empty() || globals.iter().any(|g| g.has_write)) {
         return false;
     }
 
