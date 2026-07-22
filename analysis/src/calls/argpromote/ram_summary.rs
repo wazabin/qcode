@@ -91,10 +91,11 @@
 //! real `Param`/`Global` footprint into its own interface is the
 //! materialization step that follows.
 
+use jstd::graph::analysis::{DominatorTree, compute_dominators};
 use qcode::{
     context::Context,
     value::{
-        ArgMemKind, FunctionBody, FunctionId, ModuleView, ValueId, ValueRef, VarnodeId,
+        ArgMemKind, BlockId, FunctionBody, FunctionId, ModuleView, ValueId, ValueRef, VarnodeId,
         insn::{InstructionId, Mnemonic},
     },
 };
@@ -103,6 +104,7 @@ use std::cell::RefCell;
 
 use crate::CallGraph;
 use crate::calls::{CallEdge, CallTarget};
+use crate::gvn::affine::Numbering;
 use crate::sequence::{AddressRelation, MemoryAccess, collect_regions_for_base, relate_address};
 
 use super::globals::global_slot;
@@ -423,6 +425,97 @@ impl RamChannel {
     }
 }
 
+/// Own-frame read licenses minted by whole-object external *writes* (rule 1 of
+/// externals-into-shadow). A prototyped external called with an `OutPtr`/`MutPtr`
+/// argument that is one of the caller's own-frame locals writes that whole object;
+/// under the [`ExternalArgmemConfinement`](qcode::assumption::Proposition)
+/// assumption a subsequent same-base read of that local observes the external's
+/// write (not the dead pre-call frame), so it does **not** refute freshness.
+///
+/// This licensing is deliberately unsound on its own (a read past the written
+/// extent would still observe dead frame bytes) — it rests on the confinement
+/// assumption, which is why a consumed license unions the external into the
+/// summary's `externals` flag-set.
+struct FrameLicenses {
+    /// `(licensed own-frame pointer value, successor blocks of the licensing
+    /// call, the prototyped external minting the license)`.
+    entries: Vec<(ValueId, Vec<BlockId>, FunctionId)>,
+    /// Dominator tree of the function; a read is licensed only in a block
+    /// dominated by the licensing call's successor. `None` for a rootless body.
+    doms: Option<DominatorTree<BlockId>>,
+}
+
+impl FrameLicenses {
+    /// The external minting a license for an own-frame read at `read_ptr` in
+    /// `read_block`, if any: a `licensed_ptr + const` address whose licensing
+    /// call's successor dominates the read block. `None` = unlicensed.
+    fn license_for(
+        &self,
+        ctx: &Context,
+        numbering: &Numbering,
+        read_ptr: ValueId,
+        read_block: BlockId,
+    ) -> Option<FunctionId> {
+        let doms = self.doms.as_ref()?;
+        for (lptr, succs, ext) in &self.entries {
+            if !succs.iter().any(|s| doms.dominates(*s, read_block)) {
+                continue;
+            }
+            if matches!(
+                relate_address(ctx, numbering, *lptr, read_ptr, read_block),
+                AddressRelation::Const(_)
+            ) {
+                return Some(*ext);
+            }
+        }
+        None
+    }
+}
+
+/// Collect the [`FrameLicenses`] for `fid`: one per own-frame-local `OutPtr`/
+/// `MutPtr` argument of a prototyped-external call terminating a block.
+fn build_frame_licenses(ctx: &Context, fid: FunctionId, frame: &OwnFrame) -> FrameLicenses {
+    let function = FunctionBody::from_id(ctx, fid);
+    let root = function.root().map(|b| b.id);
+    let mut entries: Vec<(ValueId, Vec<BlockId>, FunctionId)> = Vec::new();
+    for block in function.blocks() {
+        let Some(term) = block.iter().last() else {
+            continue;
+        };
+        let Mnemonic::Call(c) = term.mnemonic() else {
+            continue;
+        };
+        let Some(ext) = c.target.real() else {
+            continue;
+        };
+        let ef = FunctionBody::from_id(ctx, ext);
+        if !ef.is_external() {
+            continue;
+        }
+        let Some(argmem) = ef.argmem() else {
+            continue;
+        };
+        if argmem.variadic {
+            continue;
+        }
+        let succs: Vec<BlockId> = block.successors().map(|(_, s)| s).collect();
+        for (i, kind) in argmem.params.iter().enumerate() {
+            if !matches!(kind, ArgMemKind::OutPtr | ArgMemKind::MutPtr) {
+                continue;
+            }
+            let Some(arg) = c.args.get(i) else {
+                continue;
+            };
+            let arg = arg.qualify(term.id.func);
+            if frame.is_local(ctx, arg) {
+                entries.push((arg, succs.clone(), ext));
+            }
+        }
+    }
+    let doms = root.map(|r| compute_dominators(&function, r));
+    FrameLicenses { entries, doms }
+}
+
 impl EffectChannel for RamChannel {
     type Effects = RamEffects;
 
@@ -447,6 +540,12 @@ impl EffectChannel for RamChannel {
         let mut raw: Vec<(qcode::value::LocalValueId, qcode::space::LocalMemorySpaceId)> =
             Vec::new();
         let mut register_touch = false;
+        // Read-after-external licensing (rule 1): built lazily on the first
+        // unlicensed own-frame read, and the externals whose whole-object writes
+        // license a read — folded into the summary's provenance flag-set, since
+        // the non-⊤ verdict now rests on the confinement assumption.
+        let mut licenses: Option<FrameLicenses> = None;
+        let mut licensed_externals: FxHashSet<FunctionId> = FxHashSet::default();
         for block in FunctionBody::from_id(ctx, fid).blocks() {
             // Own-frame slots this block has stored to, in program order (see
             // the freshness licensing rationale in the module docs).
@@ -489,7 +588,8 @@ impl EffectChannel for RamChannel {
                     w.insert(shared);
                 }
                 let ptr = lptr.qualify(insn.id.func);
-                let frame = own_frame.get_or_insert_with(|| OwnFrame::new(ctx, fid, self.sp));
+                let frame: &OwnFrame =
+                    own_frame.get_or_insert_with(|| OwnFrame::new(ctx, fid, self.sp));
                 if frame.is_local(ctx, ptr) {
                     if is_store {
                         if let Some(off) = frame.local_offset(ctx, ptr) {
@@ -502,6 +602,16 @@ impl EffectChannel for RamChannel {
                         .is_some_and(|off| stored.contains(&(off, size)))
                     {
                         continue; // licensed reload of an own write
+                    }
+                    // A whole-object external write may license this read (rule 1):
+                    // a same-base read after a dominating `memset(&local)` observes
+                    // the external's write, not the dead pre-call frame. Recorded
+                    // in the externals flag-set because it rests on the confinement
+                    // assumption.
+                    let lic = licenses.get_or_insert_with(|| build_frame_licenses(ctx, fid, frame));
+                    if let Some(ext) = lic.license_for(ctx, frame.numbering(), ptr, block.id) {
+                        licensed_externals.insert(ext);
+                        continue;
                     }
                     // Unlicensed own-frame read: observes the previous dead
                     // frame — the freshness hypothesis is refuted.
@@ -530,8 +640,10 @@ impl EffectChannel for RamChannel {
                 .then(|| self.extract_footprint(ctx, fid, &mut own_frame, &outward, &raw))
                 .flatten(),
             written,
-            // A bodied scan folds no externals; the flag is minted at rebase.
-            externals: FxHashSet::default(),
+            // A bodied scan folds no callee externals through transfer, but a
+            // read-after-external license *does* rest on the confinement
+            // assumption, so its external is recorded here (rule 1).
+            externals: licensed_externals,
         })
     }
 
@@ -1997,6 +2109,139 @@ mod tests {
         assert!(
             !is_memory_free(&s, rec),
             "the recursive pointer deref is a real footprint — not memory-free"
+        );
+    }
+
+    /// RULE 1: a whole-object `memset(&local)` write licenses a subsequent
+    /// same-base own-frame read in a dominated block — the summary is non-⊤,
+    /// outward-invisible, and records `memset` in its `externals` flag-set. The
+    /// same read WITHOUT the preceding memset stays ⊤ (uninit refutation).
+    #[test]
+    fn read_after_external_write_is_licensed() {
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        let memset = external_argmem(
+            &mut tc,
+            0x9000,
+            "memset",
+            vec![ArgMemKind::OutPtr, ArgMemKind::NonPtr, ArgMemKind::NonPtr],
+            false,
+        );
+        qcode!(
+            tc.ctx,
+            "
+            fn caller:
+                <k_entry @RSP:i64>
+                    %loc = @RSP - i64 0x20;
+                    goto <k_call>;
+                <k_call>
+                    call fn caller();
+                <k_cont>
+                    %v = load(ram:8, %loc);
+                    return at %v;
+            "
+        );
+        let _ = (k_entry, k_call, k_cont);
+        materialize(&mut tc, caller);
+        set_sp_origin(&mut tc, caller, sp);
+        let loc = ValueId::Instruction(
+            qcode::value::BasicBlock::from_id(&tc.ctx, k_entry)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id,
+        );
+        regpure_call(&mut tc, k_call, memset, vec![loc]);
+        tc.ctx.add_cfg_edge(k_call, k_cont);
+
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, Some(sp));
+        assert!(
+            is_memory_free(&s, caller),
+            "the licensed read + contained memset write is outward-invisible"
+        );
+        let eff = s.get(caller).as_ref().expect("caller summary");
+        assert!(
+            eff.externals.contains(&memset),
+            "a consumed read license records the external in the flag-set"
+        );
+    }
+
+    /// RULE 1 negative: the identical own-frame read with NO preceding memset
+    /// observes the dead frame — unlicensed, ⊤ (freshness refuted). Guards that
+    /// licensing did not weaken the uninit refutation.
+    #[test]
+    fn read_without_external_write_is_top() {
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        qcode!(
+            tc.ctx,
+            "
+            fn caller:
+                <k_entry @RSP:i64>
+                    %loc = @RSP - i64 0x20;
+                    %v = load(ram:8, %loc);
+                    return at %v;
+            "
+        );
+        let _ = k_entry;
+        materialize(&mut tc, caller);
+        set_sp_origin(&mut tc, caller, sp);
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, Some(sp));
+        assert!(
+            !is_memory_free(&s, caller),
+            "an unlicensed own-frame read is ⊤"
+        );
+    }
+
+    /// RULE 1: a read on a path that does NOT flow through the `memset` call is
+    /// not dominated by the call's successor — unlicensed, ⊤.
+    #[test]
+    fn non_dominated_read_is_top() {
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        let memset = external_argmem(
+            &mut tc,
+            0x9000,
+            "memset",
+            vec![ArgMemKind::OutPtr, ArgMemKind::NonPtr, ArgMemKind::NonPtr],
+            false,
+        );
+        qcode!(
+            tc.ctx,
+            "
+            fn caller:
+                <k_entry @RSP:i64 @c:bool>
+                    %loc = @RSP - i64 0x20;
+                    if @c goto <k_call> else goto <k_read>;
+                <k_call>
+                    call fn caller();
+                <k_cont>
+                    return at i64 0;
+                <k_read>
+                    %v = load(ram:8, %loc);
+                    return at %v;
+            "
+        );
+        let _ = (k_entry, k_call, k_cont, k_read);
+        materialize(&mut tc, caller);
+        set_sp_origin(&mut tc, caller, sp);
+        let loc = ValueId::Instruction(
+            qcode::value::BasicBlock::from_id(&tc.ctx, k_entry)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id,
+        );
+        regpure_call(&mut tc, k_call, memset, vec![loc]);
+        tc.ctx.add_cfg_edge(k_call, k_cont);
+
+        let graph = CallGraph::analyze(&tc.ctx);
+        let s = solve(&tc.ctx, &graph, Some(sp));
+        assert!(
+            !is_memory_free(&s, caller),
+            "a read the memset call does not dominate is unlicensed — ⊤"
         );
     }
 

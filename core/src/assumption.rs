@@ -139,14 +139,26 @@ pub enum Proposition {
     /// acts on it).
     AssumeCallingConvention,
     /// The external function (second field), reached from the caller (first
-    /// field), has a prototype-derived argmem footprint that it honours: it
-    /// writes and reads **only within the objects addressed by its pointer
-    /// arguments** — e.g. `memset(dst, c, n)` touches only `[dst, dst+n)`, never
-    /// spilling past the object we hand it. `argpromote`'s RAM effect lattice
-    /// mints whole-object entries for such externals and rebases them onto the
-    /// caller's bases (`Frame`/`Param`/`Global`); the `memset(&local)` fold — a
-    /// write-only external landing on an own-frame local, contained and dead at
-    /// return — rests on exactly this confinement.
+    /// field), has a prototype-derived argmem footprint that it honours. Two
+    /// halves, both assumed:
+    ///
+    /// (a) it writes and reads **only within the objects addressed by its
+    /// pointer arguments** — e.g. `memset(dst, c, n)` touches only
+    /// `[dst, dst+n)`, never spilling past the object we hand it; and
+    ///
+    /// (b) the caller's subsequent same-base reads of such an object observe the
+    /// external's writes — a read of `local` after `memset(&local, …)` sees the
+    /// bytes memset wrote, i.e. the read does not exceed the written extent (it
+    /// never reads past `[dst, dst+n)` into stale frame bytes the external left
+    /// untouched).
+    ///
+    /// `argpromote`'s RAM effect lattice mints whole-object entries for such
+    /// externals and rebases them onto the caller's bases (`Frame`/`Param`/
+    /// `Global`); the `memset(&local)` fold — a write-only external landing on an
+    /// own-frame local, contained and dead at return — rests on (a), and the
+    /// summary scan's read-after-external licensing (a `load(local)` in a block
+    /// dominated by the `memset` call reading as a captured own write rather than
+    /// refuting frame freshness) rests on (b).
     ///
     /// Like [`LoadedPointerDisjointFromSlot`] it is **not** statically sound on
     /// its own: the prototype could be lying (an `OutPtr` that secretly reads, a
