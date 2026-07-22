@@ -4800,6 +4800,361 @@ mod tests {
         );
     }
 
+    /// Whether any instruction in `fid` operates in / carries a function-private
+    /// (temp/shadow) space — i.e. the function was shadow-promoted.
+    fn has_shadow(tc: &qcode::testing::TestContext, fid: FunctionId) -> bool {
+        use qcode::space::{LocalMemorySpaceId, MemorySpaceId};
+        FunctionBody::from_id(&tc.ctx, fid).iter().any(|block| {
+            block.iter().any(|insn| {
+                let mnem_shadow = match insn.mnemonic() {
+                    Mnemonic::Load(l) => matches!(l.space, LocalMemorySpaceId::Temp(_)),
+                    Mnemonic::Store(s) => matches!(s.space, LocalMemorySpaceId::Temp(_)),
+                    _ => false,
+                };
+                mnem_shadow
+                    || matches!(
+                        tc.ctx
+                            .shared
+                            .types
+                            .space_of(tc.ctx.type_of(ValueId::Instruction(insn.id))),
+                        Some(MemorySpaceId::Temp(_))
+                    )
+            })
+        })
+    }
+
+    /// End-to-end (task test 3): a function that memsets an own-frame local
+    /// through a prototyped `OutPtr` external and then LOADS the local
+    /// shadow-promotes: the load is redirected into the shadow, the `memset` call
+    /// stays with its pointer arg rebased into the shadow space, and committing the
+    /// promotion records `ExternalArgmemConfinement(f, memset)`.
+    #[test]
+    fn memset_then_read_own_local_shadow_promotes() {
+        use qcode::space::{LocalMemorySpaceId, MemorySpaceId};
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        let memset = make_argmem_external(
+            &mut tc,
+            0x9000,
+            "memset",
+            vec![
+                qcode::value::ArgMemKind::OutPtr,
+                qcode::value::ArgMemKind::NonPtr,
+                qcode::value::ArgMemKind::NonPtr,
+            ],
+        );
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @RSP:i64>
+                    %loc = @RSP - i64 0x20;
+                    goto <f_call>;
+                <f_call>
+                    call <f>;
+                <f_cont>
+                    %v = load(ram:8, %loc);
+                    return at %v;
+
+            fn caller:
+                <k_entry @RSP:i64>
+                    goto <k_call>;
+                <k_call>
+                    call <caller>;
+                <k_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (f_entry, f_call, f_cont, k_entry, k_call, k_cont);
+        for fid in [f, caller] {
+            materialize_fn(&mut tc, fid);
+            stamp_sp_origin(&mut tc, fid, sp);
+        }
+        let loc = ValueId::Instruction(
+            BasicBlock::from_id(&tc.ctx, f_entry)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id,
+        );
+        let zero = tc.ctx.get_const(0, 8).id();
+        let n = tc.ctx.get_const(16, 8).id();
+        set_call(&mut tc, f_call, memset, vec![loc, zero, n]);
+        tc.ctx.add_cfg_edge(f_call, f_cont);
+
+        let caller_rsp = FunctionBody::from_id(&tc.ctx, caller)
+            .root()
+            .unwrap()
+            .params()
+            .find(|p| p.name() == Some("RSP"))
+            .unwrap()
+            .id();
+        set_call(&mut tc, k_call, f, vec![caller_rsp]);
+        tc.ctx.add_cfg_edge(k_call, k_cont);
+
+        argpromote_with_sp(&mut tc.ctx, Some(sp));
+
+        // The frame load is now a shadow load, and the memset call survives with a
+        // shadow-space pointer arg.
+        let mut load_in_shadow = false;
+        let mut memset_arg_shadow = false;
+        for block in FunctionBody::from_id(&tc.ctx, f).iter() {
+            for insn in block.iter() {
+                match insn.mnemonic() {
+                    Mnemonic::Load(l) if matches!(l.space, LocalMemorySpaceId::Temp(_)) => {
+                        load_in_shadow = true;
+                    }
+                    Mnemonic::Call(c) if c.target.real() == Some(memset) => {
+                        let arg0 = c.args[0].qualify(f);
+                        memset_arg_shadow = matches!(
+                            tc.ctx.shared.types.space_of(tc.ctx.type_of(arg0)),
+                            Some(MemorySpaceId::Temp(_))
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            load_in_shadow,
+            "the own-frame read must be redirected into the shadow"
+        );
+        assert!(
+            memset_arg_shadow,
+            "the memset pointer arg must be rebased into the shadow space"
+        );
+        assert!(
+            confinement_recorded(&tc.ctx, f, memset),
+            "committing f's promotion records ExternalArgmemConfinement(f, memset)"
+        );
+    }
+
+    /// Blocked 4a: forwarding an *incoming pointer param* (not an own-frame local)
+    /// to the external is not rebasable — f is not shadow-promoted.
+    #[test]
+    fn forwarded_pointer_param_blocks_shadow_promotion() {
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        let memset = make_argmem_external(
+            &mut tc,
+            0x9000,
+            "memset",
+            vec![
+                qcode::value::ArgMemKind::OutPtr,
+                qcode::value::ArgMemKind::NonPtr,
+                qcode::value::ArgMemKind::NonPtr,
+            ],
+        );
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @RSP:i64 @p:i64>
+                    %loc = @RSP - i64 0x20;
+                    goto <f_call>;
+                <f_call>
+                    call <f>;
+                <f_cont>
+                    %v = load(ram:8, %loc);
+                    return at %v;
+
+            fn caller:
+                <k_entry @RSP:i64 @q:i64>
+                    goto <k_call>;
+                <k_call>
+                    call <caller>;
+                <k_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (f_entry, f_call, f_cont, k_entry, k_call, k_cont);
+        for fid in [f, caller] {
+            materialize_fn(&mut tc, fid);
+            stamp_sp_origin(&mut tc, fid, sp);
+        }
+        let p = FunctionBody::from_id(&tc.ctx, f)
+            .root()
+            .unwrap()
+            .params()
+            .find(|p| p.name() == Some("p"))
+            .unwrap()
+            .id();
+        let zero = tc.ctx.get_const(0, 8).id();
+        let n = tc.ctx.get_const(16, 8).id();
+        set_call(&mut tc, f_call, memset, vec![p, zero, n]);
+        tc.ctx.add_cfg_edge(f_call, f_cont);
+
+        let (caller_rsp, caller_q) = {
+            let root = FunctionBody::from_id(&tc.ctx, caller).root().unwrap();
+            (
+                root.params()
+                    .find(|p| p.name() == Some("RSP"))
+                    .unwrap()
+                    .id(),
+                root.params().find(|p| p.name() == Some("q")).unwrap().id(),
+            )
+        };
+        set_call(&mut tc, k_call, f, vec![caller_rsp, caller_q]);
+        tc.ctx.add_cfg_edge(k_call, k_cont);
+
+        argpromote_with_sp(&mut tc.ctx, Some(sp));
+        assert!(
+            !has_shadow(&tc, f),
+            "forwarding an incoming pointer param to the external blocks promotion"
+        );
+    }
+
+    /// Blocked 4b: a live (used) external return value may hand back a real
+    /// pointer we cannot rebase — the call is not admissible, f is not promoted.
+    #[test]
+    fn live_external_return_blocks_shadow_promotion() {
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        let memset = make_argmem_external(
+            &mut tc,
+            0x9000,
+            "memset",
+            vec![
+                qcode::value::ArgMemKind::OutPtr,
+                qcode::value::ArgMemKind::NonPtr,
+                qcode::value::ArgMemKind::NonPtr,
+            ],
+        );
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @RSP:i64>
+                    %loc = @RSP - i64 0x20;
+                    goto <f_call>;
+                <f_call>
+                    call <f>;
+                <f_cont>
+                    %v = load(ram:8, %loc);
+                    return at %v;
+
+            fn caller:
+                <k_entry @RSP:i64>
+                    goto <k_call>;
+                <k_call>
+                    call <caller>;
+                <k_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (f_entry, f_call, f_cont, k_entry, k_call, k_cont);
+        for fid in [f, caller] {
+            materialize_fn(&mut tc, fid);
+            stamp_sp_origin(&mut tc, fid, sp);
+        }
+        let loc = ValueId::Instruction(
+            BasicBlock::from_id(&tc.ctx, f_entry)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id,
+        );
+        let zero = tc.ctx.get_const(0, 8).id();
+        let n = tc.ctx.get_const(16, 8).id();
+        let call_id = set_call(&mut tc, f_call, memset, vec![loc, zero, n]);
+        tc.ctx.add_cfg_edge(f_call, f_cont);
+        // Make the memset return value live: the f_cont return uses it.
+        {
+            let ret_id = BasicBlock::from_id(&tc.ctx, f_cont)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Return(_)))
+                .unwrap()
+                .id;
+            let ret = ValueId::Instruction(call_id).localize(f);
+            tc.ctx.replace_instruction_mnemonic(
+                ret_id,
+                Mnemonic::Return(qcode::value::insn::Return {
+                    ptr: ret,
+                    value: None,
+                }),
+            );
+        }
+        let caller_rsp = FunctionBody::from_id(&tc.ctx, caller)
+            .root()
+            .unwrap()
+            .params()
+            .find(|p| p.name() == Some("RSP"))
+            .unwrap()
+            .id();
+        set_call(&mut tc, k_call, f, vec![caller_rsp]);
+        tc.ctx.add_cfg_edge(k_call, k_cont);
+
+        argpromote_with_sp(&mut tc.ctx, Some(sp));
+        assert!(
+            !has_shadow(&tc, f),
+            "a used external return blocks shadow promotion"
+        );
+    }
+
+    /// Blocked 4c: a variadic external defeats the argmem model — f is not
+    /// promoted even though its pointer arg is an own-frame local.
+    #[test]
+    fn variadic_external_blocks_shadow_promotion() {
+        let mut tc = qcode::testing::TestContext::new();
+        let sp = tc.r3;
+        let vext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("vext".into())).id;
+        FunctionBody::from_id_mut(&mut tc.ctx, vext).set_argmem(qcode::value::ExternArgmem {
+            params: vec![qcode::value::ArgMemKind::OutPtr],
+            variadic: true,
+        });
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @RSP:i64>
+                    %loc = @RSP - i64 0x20;
+                    goto <f_call>;
+                <f_call>
+                    call <f>;
+                <f_cont>
+                    %v = load(ram:8, %loc);
+                    return at %v;
+
+            fn caller:
+                <k_entry @RSP:i64>
+                    goto <k_call>;
+                <k_call>
+                    call <caller>;
+                <k_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (f_entry, f_call, f_cont, k_entry, k_call, k_cont);
+        for fid in [f, caller] {
+            materialize_fn(&mut tc, fid);
+            stamp_sp_origin(&mut tc, fid, sp);
+        }
+        let loc = ValueId::Instruction(
+            BasicBlock::from_id(&tc.ctx, f_entry)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id,
+        );
+        set_call(&mut tc, f_call, vext, vec![loc]);
+        tc.ctx.add_cfg_edge(f_call, f_cont);
+        let caller_rsp = FunctionBody::from_id(&tc.ctx, caller)
+            .root()
+            .unwrap()
+            .params()
+            .find(|p| p.name() == Some("RSP"))
+            .unwrap()
+            .id();
+        set_call(&mut tc, k_call, f, vec![caller_rsp]);
+        tc.ctx.add_cfg_edge(k_call, k_cont);
+
+        argpromote_with_sp(&mut tc.ctx, Some(sp));
+        assert!(
+            !has_shadow(&tc, f),
+            "a variadic external is not admissible — no shadow promotion"
+        );
+    }
+
     /// Negative case: a promoted caller whose call cone reaches no prototyped
     /// external records no confinement proposition at all.
     #[test]
