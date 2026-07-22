@@ -53,6 +53,8 @@ pub use value_range::{ValueRange, value_range};
 
 pub mod sequence;
 
+pub mod reconstruction;
+
 pub mod verify;
 pub use verify::{PureRegCallArgsViolation, Verify, verify, verify_ir, verify_pure_reg_call_args};
 

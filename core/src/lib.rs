@@ -109,6 +109,7 @@ pub mod error;
 pub mod intrinsics;
 pub mod lower;
 pub mod memory_image;
+pub mod obligation;
 pub mod pass_scope;
 pub mod space;
 pub mod types;
