@@ -74,7 +74,7 @@ pub struct FunctionInterface<'str> {
     /// Serialized into the `.harbinger` wire shape so that rewritten regpure
     /// call sites and materialized interfaces stay in sync with the snapshot.
     /// Older snapshots that predate this field load as
-    /// [`FunctionEffects::Unsolved`] via `#[serde(default)]`.
+    /// [`RegisterChannelState::Unsolved`] via `#[serde(default)]`.
     #[serde(default)]
     pub effects: FunctionEffects,
 
@@ -84,6 +84,34 @@ pub struct FunctionInterface<'str> {
     pub import_ordinal: Option<u16>,
 }
 
+/// A function's full effect summary, one component per side-effect channel:
+/// the register-lifecycle state and the memory write-space verdict. Serialized
+/// as part of [`FunctionInterface`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FunctionEffects {
+    /// Register-channel lifecycle summary (argpromote v2).
+    #[serde(default)]
+    pub register: RegisterChannelState,
+    /// Memory-channel effect summary (coarse written-space set only; the precise
+    /// RAM footprint is deferred).
+    #[serde(default)]
+    pub memory: MemoryChannelState,
+}
+
+impl FunctionEffects {
+    /// The materialized register interface mapping, if the register channel has
+    /// been materialized. Delegates to [`RegisterChannelState::materialized`].
+    pub fn materialized(&self) -> Option<&RegisterInterfaceMap> {
+        self.register.materialized()
+    }
+
+    /// Whether the register channel is solved. Delegates to
+    /// [`RegisterChannelState::is_solved`].
+    pub fn is_solved(&self) -> bool {
+        self.register.is_solved()
+    }
+}
+
 /// The state of a function's register-channel effect summary (argpromote v2).
 ///
 /// Purity has moved from a function flag (`pure_reg`) to per-call-site tags, but
@@ -91,7 +119,7 @@ pub struct FunctionInterface<'str> {
 /// function — the emulator's implicit call convention, alias analysis, and the
 /// verifier all consume it. This enum records how far the summary has advanced.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum FunctionEffects {
+pub enum RegisterChannelState {
     /// Not yet solved by the effect-analysis pass (the default / post-load
     /// state).
     #[default]
@@ -111,12 +139,12 @@ pub enum FunctionEffects {
     Materialized(RegisterInterfaceMap),
 }
 
-impl FunctionEffects {
+impl RegisterChannelState {
     /// The materialized interface mapping, if this function has been
     /// materialized.
     pub fn materialized(&self) -> Option<&RegisterInterfaceMap> {
         match self {
-            FunctionEffects::Materialized(map) => Some(map),
+            RegisterChannelState::Materialized(map) => Some(map),
             _ => None,
         }
     }
@@ -126,9 +154,38 @@ impl FunctionEffects {
     pub fn is_solved(&self) -> bool {
         matches!(
             self,
-            FunctionEffects::Solved(_) | FunctionEffects::Materialized(_)
+            RegisterChannelState::Solved(_) | RegisterChannelState::Materialized(_)
         )
     }
+}
+
+/// The memory-channel component of a function's effects. Today it holds only the
+/// coarse written-space tri-state; the precise RAM footprint is deferred (no
+/// consumer today).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryChannelState {
+    /// The coarse set of non-register spaces this function may (transitively)
+    /// write. Subsumes the retired `written_spaces` + `written_spaces_stamped`
+    /// signature pair.
+    #[serde(default)]
+    pub coarse: WrittenSpacesState,
+}
+
+/// Owned tri-state of a function's coarse written-space verdict, subsuming the
+/// old `written_spaces: Option<Vec<SpaceId>>` + `written_spaces_stamped: bool`
+/// pair. The borrowing view [`WrittenSpaces`] is derived from this.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WrittenSpacesState {
+    /// Analysis has never recorded a verdict — a freshly minted function.
+    /// (Was `written_spaces_stamped == false`.)
+    #[default]
+    Unstamped,
+    /// Recorded, but unbounded (⊤): the function may write any space.
+    /// (Was stamped with `written_spaces == None`.)
+    Unbounded,
+    /// A recorded exact witnessed bound: a space not listed is never written.
+    /// (Was stamped with `written_spaces == Some(sorted)`.)
+    Bounded(Vec<crate::space::SpaceId>),
 }
 
 /// The solved (transitive) register effect of a function whose interface is
@@ -346,7 +403,7 @@ impl<'str> FunctionInterface<'str> {
             is_external: false,
             signature: None,
             kind: FunctionKind::Machine,
-            effects: FunctionEffects::Unsolved,
+            effects: FunctionEffects::default(),
             import_ordinal: None,
         }
     }
@@ -1420,7 +1477,7 @@ impl<'str> FunctionBody<'str> {
         let mut function = Self::make(ctx, name)?;
         function.interface_mut().kind = FunctionKind::Lambda;
         function.set_is_pure(true);
-        function.set_effects(FunctionEffects::Materialized(
+        function.set_register_effects(RegisterChannelState::Materialized(
             RegisterInterfaceMap::default(),
         ));
         Ok(function)
@@ -1621,14 +1678,17 @@ where
 
     /// Whether this function's register interface has been materialized (argpromote
     /// v2) — i.e. its [`effects`](FunctionInterface::effects) are
-    /// [`FunctionEffects::Materialized`]. Legacy name for the register-channel
+    /// [`RegisterChannelState::Materialized`]. Legacy name for the register-channel
     /// "functionalized" predicate.
     pub fn is_reg_materialized(&'s self) -> bool {
-        matches!(self.interface().effects, FunctionEffects::Materialized(_))
+        matches!(
+            self.interface().effects.register,
+            RegisterChannelState::Materialized(_)
+        )
     }
 
     /// This function's call-graph-closed register [`FunctionEffects`] summary.
-    /// [`FunctionEffects::Unsolved`] until the effect-analysis pass runs (and
+    /// [`RegisterChannelState::Unsolved`] until the effect-analysis pass runs (and
     /// after a snapshot load). See [`FunctionInterface::effects`].
     pub fn effects(&'s self) -> &'ctx FunctionEffects {
         &self.interface().effects
@@ -2119,7 +2179,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         self.interface_mut().kind = kind;
         if kind == FunctionKind::Lambda {
             self.set_is_pure(true);
-            self.set_effects(FunctionEffects::Materialized(
+            self.set_register_effects(RegisterChannelState::Materialized(
                 RegisterInterfaceMap::default(),
             ));
         }
@@ -2177,10 +2237,16 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
             .argmem = Some(argmem);
     }
 
-    /// Records this function's solved effect summary / materialized interface
-    /// mapping. See [`FunctionInterface::effects`].
-    pub fn set_effects(&mut self, effects: FunctionEffects) {
-        self.interface_mut().effects = effects;
+    /// Records this function's register-channel effect state, preserving the
+    /// memory channel (read-modify-write). See [`FunctionInterface::effects`].
+    pub fn set_register_effects(&mut self, register: RegisterChannelState) {
+        self.interface_mut().effects.register = register;
+    }
+
+    /// Records this function's memory-channel effect state, preserving the
+    /// register channel (read-modify-write). See [`FunctionInterface::effects`].
+    pub fn set_memory_effects(&mut self, memory: MemoryChannelState) {
+        self.interface_mut().effects.memory = memory;
     }
 
     /// Marks this function as fully functionalized over *every* side-effect

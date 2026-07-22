@@ -1552,8 +1552,8 @@ impl StandaloneEmulator {
         if call_is_regpure(ctx, call_id) {
             return;
         }
-        let outputs = match FunctionBody::from_id(ctx, callee).effects() {
-            qcode::value::FunctionEffects::Materialized(map) => map.outputs.clone(),
+        let outputs = match &FunctionBody::from_id(ctx, callee).effects().register {
+            qcode::value::RegisterChannelState::Materialized(map) => map.outputs.clone(),
             _ => return,
         };
         let Some(agg) = self.aggregate_values.get(&call_id).cloned() else {

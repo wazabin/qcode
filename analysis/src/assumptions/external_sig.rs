@@ -8,7 +8,7 @@
 //! passes need, so `cabi` is consulted in exactly this one pass:
 //!
 //! * the register interface, materialized as
-//!   [`FunctionEffects::Materialized`](qcode::value::FunctionEffects) under the
+//!   [`RegisterChannelState::Materialized`](qcode::value::FunctionEffects) under the
 //!   [`CallingConvention`] supplied by [`PipelineEnv`]: its inputs are the
 //!   argument registers, its outputs the return register(s) ∪ the caller-saved
 //!   clobber set — plus the per-parameter `param_attrs`;
@@ -30,8 +30,8 @@ use cabi::{CFunctionProto, CType, Config, Selection};
 use qcode::{
     context::Context,
     value::{
-        ArgMemKind, ExternArg, ExternArgmem, ExternInterface, ExternSlot, FunctionBody,
-        FunctionEffects, FunctionId, ParamAttrs, RegisterInterfaceMap, VarnodeId,
+        ArgMemKind, ExternArg, ExternArgmem, ExternInterface, ExternSlot, FunctionBody, FunctionId,
+        ParamAttrs, RegisterChannelState, RegisterInterfaceMap, VarnodeId,
     },
 };
 
@@ -445,7 +445,7 @@ pub fn apply_external_signature(
     // caller-saved clobber set. This is the single source of truth for the
     // register channel — the value passes read it (via `FunctionEffects`) and
     // drop the conservative "reads/writes every register" fallback.
-    f.set_effects(FunctionEffects::Materialized(reg_map));
+    f.set_register_effects(RegisterChannelState::Materialized(reg_map));
 
     // The materialized call interface consumed by `argpromote_external`: the
     // ordered call slots and the per-slot display names. Only set when the
@@ -648,13 +648,13 @@ mod tests {
     /// materialized caller's return pack can cover them (bug-2-external).
     #[test]
     fn prototyped_external_stamps_materialized_with_clobbers() {
-        use qcode::value::FunctionEffects;
+        use qcode::value::RegisterChannelState;
         let mut tc = TestContext::new();
         let abi = toy_abi(&tc); // caller_saved = [r3], int_ret = r3
         let f = external(&mut tc, "memcpy");
         apply(&mut tc.ctx, f, &abi, &host_sel());
         let func = FunctionBody::from_id(&tc.ctx, f);
-        let FunctionEffects::Materialized(map) = func.effects() else {
+        let RegisterChannelState::Materialized(map) = &func.effects().register else {
             panic!("prototyped external must be stamped Materialized");
         };
         // memcpy's two register args (r0, r1) are the inputs.

@@ -11,6 +11,7 @@ mod tests {
 
     use super::super::*;
     use super::super::{mark_pure::*, ram::*, registers::*};
+    use qcode::value::RegisterChannelState;
 
     /// Add a "stack" space (addr_size 4, as `brighten_stack` creates it) and a
     /// nameless stack-passed input varnode at `offset`. Its synthesized argument
@@ -81,8 +82,8 @@ mod tests {
     #[test]
     fn effects_and_call_tag_survive_serde_round_trip() {
         use qcode::context::Context;
+        use qcode::value::RegisterInterfaceMap;
         use qcode::value::insn::CallTag;
-        use qcode::value::{FunctionEffects, RegisterInterfaceMap};
 
         let mut tc = qcode::testing::TestContext::new();
         let (r0, r1) = (tc.r0, tc.r1);
@@ -110,7 +111,7 @@ mod tests {
             returns: 1,
         };
         FunctionBody::from_id_mut(&mut tc.ctx, f)
-            .set_effects(FunctionEffects::Materialized(iface.clone()));
+            .set_register_effects(RegisterChannelState::Materialized(iface.clone()));
 
         // Retag the call site RegPure.
         let call_id = BasicBlock::from_id(&tc.ctx, g_call)
@@ -137,8 +138,8 @@ mod tests {
             .expect("f survives")
             .id;
         assert_eq!(
-            FunctionBody::from_id(&restored, f2).effects(),
-            &FunctionEffects::Materialized(iface),
+            &FunctionBody::from_id(&restored, f2).effects().register,
+            &RegisterChannelState::Materialized(iface),
             "Materialized effects must survive the snapshot round-trip"
         );
 
@@ -252,8 +253,8 @@ mod tests {
         );
         let _ = g;
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -325,8 +326,8 @@ mod tests {
         );
         let _ = (helper, h_entry, g, f_entry, f_ret, f_tc, g_entry);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -371,8 +372,8 @@ mod tests {
         );
         let _ = (g, f_entry, g_entry, g_cont);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -459,8 +460,8 @@ mod tests {
         );
         let _ = (f_entry, f_cont);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, caller).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, caller).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -480,8 +481,8 @@ mod tests {
         );
 
         // mark_pure flags the caller once the callee is pure, order-independently.
-        FunctionBody::from_id_mut(&mut tc.ctx, caller).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, caller).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -527,8 +528,8 @@ mod tests {
                     return at i64 0;
             "
         );
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -642,8 +643,8 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -699,8 +700,8 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -800,8 +801,8 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -878,8 +879,8 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -924,8 +925,8 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -970,8 +971,8 @@ mod tests {
         );
         let _ = g;
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -1074,8 +1075,8 @@ mod tests {
         tc.ctx
             .replace_all_uses_with(ValueId::Instruction(add_id), gep);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -1192,8 +1193,8 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -1239,8 +1240,8 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -1281,8 +1282,8 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -1330,8 +1331,8 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -1371,8 +1372,8 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -1415,8 +1416,8 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -1463,8 +1464,8 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f1).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f1).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -1508,8 +1509,8 @@ mod tests {
         // function whose ABI register list is never filled in, with a one-field
         // register write-set already on `Return::value` (set as the register
         // channel does, since `return at ..` only sets the conventional operand).
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -1609,8 +1610,8 @@ mod tests {
         tc.ctx
             .block_param_mut(pid)
             .set_origin_id(ValueId::Varnode(sp_vn).localize(pid.func));
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -1698,8 +1699,8 @@ mod tests {
         let val = b.shr().get_const(0x1, 4);
         b.push_store(val, addr, shadow);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -1758,8 +1759,8 @@ mod tests {
         );
         let _ = (gee_entry, eff_entry, top_entry, top);
         for fid in [gee, eff] {
-            FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
-                qcode::value::FunctionEffects::Materialized(
+            FunctionBody::from_id_mut(&mut tc.ctx, fid).set_register_effects(
+                qcode::value::RegisterChannelState::Materialized(
                     qcode::value::RegisterInterfaceMap::default(),
                 ),
             );
@@ -1816,8 +1817,8 @@ mod tests {
             "
         );
         let _ = g;
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -1909,8 +1910,8 @@ mod tests {
             "
         );
         let _ = (g, r0, ret_a, ret_b);
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -1971,8 +1972,8 @@ mod tests {
             "
         );
         let _ = (g, r0, wr, skip);
-        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -2408,8 +2409,8 @@ mod tests {
             let ptr = b.shr().get_const(0x2000, 8);
             b.push_return(ptr);
         }
-        FunctionBody::from_id_mut(&mut tc.ctx, clean).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, clean).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -2431,8 +2432,8 @@ mod tests {
             let ptr = b.shr().get_const(0x4000, 8);
             b.push_return(ptr);
         }
-        FunctionBody::from_id_mut(&mut tc.ctx, dirty).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, dirty).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -2493,8 +2494,8 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -2610,8 +2611,8 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -2692,8 +2693,8 @@ mod tests {
         );
         let _ = (g, f_loop, f_exit);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -2759,8 +2760,8 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -2834,8 +2835,8 @@ mod tests {
         );
         let _ = g;
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -2930,8 +2931,8 @@ mod tests {
                 .block_param_mut(inner)
                 .set_origin_id(ValueId::Varnode(sp_reg).localize(inner.func));
         }
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -3033,8 +3034,8 @@ mod tests {
                 .block_param_mut(inner)
                 .set_origin_id(ValueId::Varnode(sp_reg).localize(inner.func));
         }
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -3133,8 +3134,8 @@ mod tests {
                 .block_param_mut(inner)
                 .set_origin_id(ValueId::Varnode(sp_reg).localize(inner.func));
         }
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -3226,8 +3227,8 @@ mod tests {
                 .block_param_mut(inner)
                 .set_origin_id(ValueId::Varnode(sp_reg).localize(inner.func));
         }
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -3297,8 +3298,8 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -3432,8 +3433,8 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit, f_entry, r);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -3567,8 +3568,8 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit, f_entry, r);
 
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -3629,7 +3630,6 @@ mod tests {
     /// its interface mapping — no `load(register, r0)` is left without a param.
     #[test]
     fn bug1_caller_before_callee_no_stranded_input() {
-        use qcode::value::FunctionEffects;
         let mut tc = qcode::testing::TestContext::new();
         let r0 = tc.r0;
         qcode!(
@@ -3660,7 +3660,8 @@ mod tests {
 
         // The callee's read of r0 propagated into the caller's solved interface —
         // it is a by-value input, not a stranded load.
-        let FunctionEffects::Materialized(map) = FunctionBody::from_id(&tc.ctx, caller).effects()
+        let RegisterChannelState::Materialized(map) =
+            &FunctionBody::from_id(&tc.ctx, caller).effects().register
         else {
             panic!("caller must be materialized");
         };
@@ -3677,7 +3678,6 @@ mod tests {
     /// mapping contains `r1`.
     #[test]
     fn bug2_clobber_visible_through_two_materialized_levels() {
-        use qcode::value::FunctionEffects;
         let mut tc = qcode::testing::TestContext::new();
         let r1 = tc.r1;
         qcode!(
@@ -3711,8 +3711,9 @@ mod tests {
 
         assert!(argpromote_registers(&mut tc.ctx));
 
-        let FunctionEffects::Materialized(map) =
-            FunctionBody::from_id(&tc.ctx, grandcaller).effects()
+        let RegisterChannelState::Materialized(map) = &FunctionBody::from_id(&tc.ctx, grandcaller)
+            .effects()
+            .register
         else {
             panic!("grandcaller must be materialized");
         };
@@ -3753,8 +3754,8 @@ mod tests {
     /// Materialize `fid` with the interface mapping `inputs`/`outputs` *without*
     /// rewriting its body — enough for a caller's mem2reg to classify a call to it.
     fn set_materialized(tc: &mut qcode::testing::TestContext, fid: FunctionId, regs: &[VarnodeId]) {
-        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
-            qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(qcode::value::RegisterInterfaceMap {
                 inputs: regs.to_vec(),
                 outputs: regs.to_vec(),
                 returns: regs.len(),
@@ -4013,7 +4014,7 @@ mod tests {
 
     /// A function that solves to a finite effect but is not materialized (here:
     /// no register writes) persists its solved load/store sets on the interface
-    /// — `FunctionEffects::Solved` carries the sets, not just a marker.
+    /// — `RegisterChannelState::Solved` carries the sets, not just a marker.
     #[test]
     fn solved_unmaterialized_function_persists_effect_sets() {
         let mut tc = qcode::testing::TestContext::new();
@@ -4036,8 +4037,8 @@ mod tests {
         set_call(&mut tc, g_entry, f, vec![]);
         argpromote_registers(&mut tc.ctx);
 
-        let qcode::value::FunctionEffects::Solved(sets) =
-            FunctionBody::from_id(&tc.ctx, f).effects().clone()
+        let qcode::value::RegisterChannelState::Solved(sets) =
+            FunctionBody::from_id(&tc.ctx, f).effects().register.clone()
         else {
             panic!("f reads r1 and writes nothing: solved but not materialized");
         };
@@ -4271,9 +4272,7 @@ mod tests {
 
     // ---- Phase 3: externals as regpure calls (design ruling 7a) --------------
 
-    use qcode::value::{
-        ExternArg, ExternInterface, ExternSlot, FunctionEffects, RegisterInterfaceMap,
-    };
+    use qcode::value::{ExternArg, ExternInterface, ExternSlot, RegisterInterfaceMap};
 
     /// Build caller `g` = `<g_entry> -> <g_call> call <ext> -> <g_cont>` and
     /// redirect the call at `g_call` to the external `ext`. Returns `(g, g_call,
@@ -4324,7 +4323,7 @@ mod tests {
         let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("ext".into())).id;
         {
             let mut f = FunctionBody::from_id_mut(&mut tc.ctx, ext);
-            f.set_effects(FunctionEffects::Materialized(RegisterInterfaceMap {
+            f.set_register_effects(RegisterChannelState::Materialized(RegisterInterfaceMap {
                 inputs: vec![r1],
                 outputs: vec![r0, r2],
                 returns: 1,
@@ -4402,8 +4401,8 @@ mod tests {
 
         assert!(
             matches!(
-                FunctionBody::from_id(&tc.ctx, g).effects(),
-                FunctionEffects::Top
+                &FunctionBody::from_id(&tc.ctx, g).effects().register,
+                RegisterChannelState::Top
             ),
             "caller of a prototype-less external must be ⊤, not summarized"
         );
@@ -4419,7 +4418,7 @@ mod tests {
         let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("ext".into())).id;
         {
             let mut f = FunctionBody::from_id_mut(&mut tc.ctx, ext);
-            f.set_effects(FunctionEffects::Materialized(RegisterInterfaceMap {
+            f.set_register_effects(RegisterChannelState::Materialized(RegisterInterfaceMap {
                 inputs: vec![],
                 outputs: vec![r0],
                 returns: 1,
@@ -4477,8 +4476,8 @@ mod tests {
     }
 
     fn materialize_fn(tc: &mut qcode::testing::TestContext, fid: FunctionId) {
-        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );

@@ -467,8 +467,8 @@ mod tests {
                 value: Some(ValueId::Instruction(tuple).localize(ret_id.func)),
             }),
         );
-        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
-            qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(qcode::value::RegisterInterfaceMap {
                 inputs,
                 outputs: vec![],
                 returns: 0,

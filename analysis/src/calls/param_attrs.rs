@@ -410,8 +410,8 @@ mod tests {
         let mut b = tc.ctx.builder_at(addr);
         body(&mut b, &params);
         drop(b);
-        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );

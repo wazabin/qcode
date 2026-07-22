@@ -431,26 +431,25 @@ fn classify_call_reg_effect<'a, 'str: 'a>(
             };
             // The callee's effect summary is the single source for register
             // reads/writes (`ARGPROMOTE_REGISTERS_V2.md`).
-            match &view.interface(target).effects {
+            match &view.interface(target).effects.register {
                 // Implicit (`Opaque`) call to a materialized callee: it reads
                 // exactly its input registers from the register file and writes
                 // exactly its output registers. Both are honored — a pre-call
                 // store to an input register is consumed here.
-                qcode::value::FunctionEffects::Materialized(map) => CallRegEffect::Exact {
+                qcode::value::RegisterChannelState::Materialized(map) => CallRegEffect::Exact {
                     reads: map.inputs.clone(),
                     writes: map.outputs.clone(),
                 },
                 // Solved but unmaterialized: the transitive load/store sets are
                 // known precisely even though call sites still bind implicitly.
-                qcode::value::FunctionEffects::Solved(sets) => CallRegEffect::Exact {
+                qcode::value::RegisterChannelState::Solved(sets) => CallRegEffect::Exact {
                     reads: sets.loads.clone(),
                     writes: sets.stores.clone(),
                 },
                 // ⊤ / not yet solved: reads and writes everything (unless the
                 // AssumeCallingConvention hypothesis refines this).
-                qcode::value::FunctionEffects::Top | qcode::value::FunctionEffects::Unsolved => {
-                    unknown_call_reg_effect(view)
-                }
+                qcode::value::RegisterChannelState::Top
+                | qcode::value::RegisterChannelState::Unsolved => unknown_call_reg_effect(view),
             }
         }
         _ => none(),
@@ -2084,7 +2083,7 @@ mod tests {
     /// reads none implicitly). The register call classifier reads this summary via
     /// [`FunctionEffects`], so this seeds the callee clobbers these tests rely on.
     fn seed_call_effects(ctx: &mut Context) {
-        use qcode::value::{FunctionEffects, RegisterEffectSets, Varnode};
+        use qcode::value::{RegisterChannelState, RegisterEffectSets, Varnode};
         let ids: Vec<_> = ctx
             .functions()
             .filter(|f| !f.is_external())
@@ -2103,7 +2102,7 @@ mod tests {
                     }
                 }
             }
-            FunctionBody::from_id_mut(ctx, id).set_effects(FunctionEffects::Solved(
+            FunctionBody::from_id_mut(ctx, id).set_register_effects(RegisterChannelState::Solved(
                 RegisterEffectSets {
                     loads: Vec::new(),
                     stores,
@@ -2458,8 +2457,8 @@ mod tests {
         FunctionBody::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
-        FunctionBody::from_id_mut(&mut tc.ctx, fun_id).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, fun_id).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -2961,8 +2960,8 @@ mod tests {
         seed_call_effects(&mut tc.ctx);
         assert!(
             matches!(
-                FunctionBody::from_id(&tc.ctx, callee).effects(),
-                qcode::value::FunctionEffects::Solved(sets) if sets.stores.contains(&r0)
+                &FunctionBody::from_id(&tc.ctx, callee).effects().register,
+                qcode::value::RegisterChannelState::Solved(sets) if sets.stores.contains(&r0)
             ),
             "callee must record r0 as call-clobbered"
         );

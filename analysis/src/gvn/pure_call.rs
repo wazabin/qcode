@@ -251,8 +251,8 @@ mod tests {
             ..Default::default()
         });
         // Materialize the register channel (what `is_reg_materialized` now reads).
-        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
@@ -428,8 +428,8 @@ mod tests {
             ..Default::default()
         });
         // Materialize the register channel (what `is_reg_materialized` now reads).
-        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );

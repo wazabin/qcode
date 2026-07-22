@@ -3,8 +3,8 @@ use qcode::{
     space::{SpaceId, SpaceType},
     types::TypeId,
     value::{
-        BasicBlock, FunctionBody, FunctionEffects, FunctionId, Instruction, LocalValueId, QCodeMut,
-        RegisterInterfaceMap, Value, ValueId, Varnode, VarnodeId,
+        BasicBlock, FunctionBody, FunctionId, Instruction, LocalValueId, QCodeMut,
+        RegisterChannelState, RegisterInterfaceMap, Value, ValueId, Varnode, VarnodeId,
         insn::{InstructionId, Mnemonic},
     },
 };
@@ -326,7 +326,7 @@ pub(crate) fn materialize_functions(
             // function's interface is final (its solved callees stay solved).
             if f.is_external()
                 || f.root().is_none()
-                || matches!(f.effects(), FunctionEffects::Materialized(_))
+                || matches!(f.effects().register, RegisterChannelState::Materialized(_))
             {
                 continue;
             }
@@ -336,7 +336,7 @@ pub(crate) fn materialize_functions(
             Err(_) => {
                 // ⊤: record it so alias analysis / the RAM gate see it, but do
                 // not materialize.
-                FunctionBody::from_id_mut(ctx, fid).set_effects(FunctionEffects::Top);
+                FunctionBody::from_id_mut(ctx, fid).set_register_effects(RegisterChannelState::Top);
                 continue;
             }
         };
@@ -344,7 +344,8 @@ pub(crate) fn materialize_functions(
             // Solved, but no register writes / non-canonical overlap: nothing to
             // materialize. Still a *solved* summary (the RAM gate keys on that);
             // persist the solved sets so call classifiers stay precise.
-            FunctionBody::from_id_mut(ctx, fid).set_effects(FunctionEffects::Solved(eff.to_sets()));
+            FunctionBody::from_id_mut(ctx, fid)
+                .set_register_effects(RegisterChannelState::Solved(eff.to_sets()));
             continue;
         };
         // The implicit (zero-arg) convention binds params from the register file
@@ -354,7 +355,8 @@ pub(crate) fn materialize_functions(
         // unbound params. Leave those solved-but-unmaterialized. (Address-taken
         // functions reached by `CallInd` *are* seeded, so they materialize.)
         if has_non_call_site(ctx, graph, fid) {
-            FunctionBody::from_id_mut(ctx, fid).set_effects(FunctionEffects::Solved(eff.to_sets()));
+            FunctionBody::from_id_mut(ctx, fid)
+                .set_register_effects(RegisterChannelState::Solved(eff.to_sets()));
             continue;
         }
         materialize_interface(ctx, fid, &reg_eff);
@@ -367,7 +369,7 @@ pub(crate) fn materialize_functions(
 /// add one by-value input param per input register (seeded into register space
 /// at entry) and append the outputs as a flat positional return pack — but
 /// inject *nothing* at any caller (empty call-site slice). Records the
-/// param/pack ↔ register mapping in [`FunctionEffects::Materialized`].
+/// param/pack ↔ register mapping in [`RegisterChannelState::Materialized`].
 pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff: &RegisterEffects) {
     // --- inputs: one by-value param per input register, seeded at entry ---------
     let input_meta: Vec<InputMeta> = reg_eff
@@ -433,7 +435,7 @@ pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff:
 
     // Record the interface mapping: param slot i ↔ inputs[i], pack slot i ↔
     // outputs[i]. `add_input`/`append_outputs` iterate in these same orders.
-    FunctionBody::from_id_mut(ctx, fid).set_effects(FunctionEffects::Materialized(
+    FunctionBody::from_id_mut(ctx, fid).set_register_effects(RegisterChannelState::Materialized(
         RegisterInterfaceMap {
             inputs: reg_eff.inputs.clone(),
             outputs: reg_eff.outputs.clone(),
@@ -488,8 +490,8 @@ pub(crate) fn rewrite_call_regpure(
     callee: FunctionId,
     sp: Option<VarnodeId>,
 ) {
-    let map = match FunctionBody::from_id(ctx, callee).effects() {
-        FunctionEffects::Materialized(m) => m.clone(),
+    let map = match &FunctionBody::from_id(ctx, callee).effects().register {
+        RegisterChannelState::Materialized(m) => m.clone(),
         _ => return,
     };
     // An external (bodyless) materialized callee has no return-pack type built by
@@ -707,8 +709,8 @@ pub(crate) fn regpure_all_sites(
     let mut changed = FxHashSet::default();
     for callee in targets.iter().copied() {
         if !matches!(
-            FunctionBody::from_id(ctx, callee).effects(),
-            FunctionEffects::Materialized(_)
+            FunctionBody::from_id(ctx, callee).effects().register,
+            RegisterChannelState::Materialized(_)
         ) {
             continue;
         }

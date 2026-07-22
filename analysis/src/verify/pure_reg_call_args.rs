@@ -139,8 +139,8 @@ pub(crate) fn verify_pure_reg_call_args_scoped(
             .into_iter()
             .filter(|&fid| {
                 matches!(
-                    FunctionBody::from_id(ctx, fid).effects(),
-                    qcode::value::FunctionEffects::Materialized(_)
+                    FunctionBody::from_id(ctx, fid).effects().register,
+                    qcode::value::RegisterChannelState::Materialized(_)
                 )
             })
             .collect();
@@ -232,7 +232,7 @@ fn check_call_site(
 /// published state, not from the call's origin.
 fn interface_param_sizes(ctx: &Context<'_>, callee: FunctionId) -> Option<Vec<usize>> {
     let function = FunctionBody::from_id(ctx, callee);
-    let qcode::value::FunctionEffects::Materialized(map) = function.effects() else {
+    let qcode::value::RegisterChannelState::Materialized(map) = &function.effects().register else {
         return None;
     };
     Some(match function.root().map(|b| b.id) {
@@ -270,6 +270,7 @@ fn first_size_mismatch(
 mod tests {
     use super::*;
     use qcode::value::QCodeMut;
+    use qcode::value::RegisterChannelState;
 
     use qcode::{
         testing::TestContext,
@@ -280,7 +281,7 @@ mod tests {
     };
 
     fn pure_callee_with_params(tc: &mut TestContext, sizes: &[usize]) -> FunctionId {
-        use qcode::value::{FunctionEffects, RegisterInterfaceMap};
+        use qcode::value::RegisterInterfaceMap;
         let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(0x1000, callee) };
         FunctionBody::from_id_mut(&mut tc.ctx, callee)
@@ -301,13 +302,13 @@ mod tests {
                 }
             })
             .collect();
-        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_effects(FunctionEffects::Materialized(
-            RegisterInterfaceMap {
+        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_register_effects(
+            RegisterChannelState::Materialized(RegisterInterfaceMap {
                 inputs,
                 outputs: vec![],
                 returns: 0,
-            },
-        ));
+            }),
+        );
         callee
     }
 
@@ -511,7 +512,7 @@ mod tests {
         let mut tc = TestContext::new();
         let callee = pure_callee_with_params(&mut tc, &[8, 4]);
         FunctionBody::from_id_mut(&mut tc.ctx, callee)
-            .set_effects(qcode::value::FunctionEffects::Unsolved);
+            .set_register_effects(qcode::value::RegisterChannelState::Unsolved);
         let a0 = tc.ctx.get_const(0x11, 8).id();
         caller_calling(&mut tc, callee, vec![a0]);
 

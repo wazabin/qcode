@@ -37,7 +37,7 @@ pub(crate) struct RegEffects {
 impl RegEffects {
     /// The persistable form of this solved lattice value: sorted, deduplicated
     /// load/store lists, stored on the interface as
-    /// [`FunctionEffects::Solved`](qcode::value::FunctionEffects).
+    /// [`RegisterChannelState::Solved`](qcode::value::FunctionEffects).
     pub(crate) fn to_sets(&self) -> qcode::value::RegisterEffectSets {
         let mut loads: Vec<VarnodeId> = self.loads.iter().copied().collect();
         let mut stores: Vec<VarnodeId> = self.stores.iter().copied().collect();
@@ -101,7 +101,7 @@ impl EffectChannel for RegChannel {
         // a solved summary for that caller would omit the external's real
         // clobbers, letting *its* callers forward caller-saved registers
         // across the call (bug-2-external reintroduced one level up).
-        let qcode::value::FunctionEffects::Materialized(map) = f.effects() else {
+        let qcode::value::RegisterChannelState::Materialized(map) = &f.effects().register else {
             return None;
         };
         eff.loads.extend(map.inputs.iter().copied());
@@ -197,6 +197,7 @@ mod tests {
     use super::*;
     use crate::CallGraph;
     use qcode::value::FunctionBody;
+    use qcode::value::RegisterChannelState;
     use qcode_macro::qcode;
 
     use super::super::summary::{EffectSummaries, solve_summaries};
@@ -348,7 +349,7 @@ mod tests {
     #[test]
     fn caller_inherits_external_clobber() {
         use qcode::value::{
-            FunctionEffects, QCodeMut, RegisterInterfaceMap, ValueId,
+            QCodeMut, RegisterInterfaceMap, ValueId,
             insn::{Call, Callee, Mnemonic as M},
         };
         let mut tc = qcode::testing::TestContext::new();
@@ -357,13 +358,13 @@ mod tests {
         // The prototyped external, stamped Materialized with r0 in its clobber
         // (output) pack — what `external_sigs` would produce.
         let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("ext".into())).id;
-        FunctionBody::from_id_mut(&mut tc.ctx, ext).set_effects(FunctionEffects::Materialized(
-            RegisterInterfaceMap {
+        FunctionBody::from_id_mut(&mut tc.ctx, ext).set_register_effects(
+            RegisterChannelState::Materialized(RegisterInterfaceMap {
                 inputs: vec![],
                 outputs: vec![r0],
                 returns: 0,
-            },
-        ));
+            }),
+        );
 
         // Caller `c`: stores r1, then calls the external.
         let cid = FunctionBody::make(&mut tc.ctx, "c".into()).unwrap().id;

@@ -1512,8 +1512,8 @@ mod tests {
 
     fn materialize_r0_out(ctx: &mut Context, callee: FunctionId) {
         let r0 = ctx.get_named("r0").unwrap().as_varnode().unwrap();
-        FunctionBody::from_id_mut(ctx, callee).set_effects(
-            qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
+        FunctionBody::from_id_mut(ctx, callee).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(qcode::value::RegisterInterfaceMap {
                 inputs: vec![],
                 outputs: vec![r0],
                 returns: 0,

@@ -17,7 +17,7 @@
 //! callers into verify scope — not on the pass that dropped the params. This rule
 //! catches it at the callee, where the defect actually is.
 
-use qcode::value::{BasicBlock, FunctionBody, FunctionEffects, Varnode};
+use qcode::value::{BasicBlock, FunctionBody, RegisterChannelState, Varnode};
 use qcode::{context::Context, value::FunctionId};
 
 /// A materialized function's root params must start with its `inputs` mapping:
@@ -43,7 +43,7 @@ pub(crate) fn verify_materialized_interfaces_scoped(
 
 fn check_function(ctx: &Context, fid: FunctionId) -> Option<String> {
     let function = FunctionBody::from_id(ctx, fid);
-    let FunctionEffects::Materialized(map) = function.effects() else {
+    let RegisterChannelState::Materialized(map) = &function.effects().register else {
         return None;
     };
     // A bodyless external has no root block; its `inputs` map *is* the interface
@@ -141,7 +141,7 @@ mod tests {
         for _ in 0..params {
             BasicBlock::from_id_mut(ctx, root).push_param(8);
         }
-        FunctionBody::from_id_mut(ctx, f).set_effects(FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(ctx, f).set_register_effects(RegisterChannelState::Materialized(
             RegisterInterfaceMap {
                 inputs: inputs.to_vec(),
                 outputs: vec![],

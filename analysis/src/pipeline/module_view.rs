@@ -354,7 +354,7 @@ pub fn mint_function<'str>(
         interface.signature.get_or_insert_default().is_pure = true;
         // A pure minted lambda's register channel is (vacuously) materialized —
         // the unified effect state that `is_reg_materialized` now reads.
-        interface.effects = qcode::value::FunctionEffects::Materialized(
+        interface.effects.register = qcode::value::RegisterChannelState::Materialized(
             qcode::value::RegisterInterfaceMap::default(),
         );
     }

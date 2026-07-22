@@ -279,8 +279,8 @@ mod tests {
     fn materialized_external_is_never_pure() {
         let mut tc = TestContext::new();
         let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("printf".into())).id;
-        FunctionBody::from_id_mut(&mut tc.ctx, ext).set_effects(
-            qcode::value::FunctionEffects::Materialized(qcode::value::RegisterInterfaceMap {
+        FunctionBody::from_id_mut(&mut tc.ctx, ext).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(qcode::value::RegisterInterfaceMap {
                 inputs: vec![tc.r1],
                 outputs: vec![tc.r0],
                 returns: 1,
@@ -312,8 +312,8 @@ mod tests {
             "
         );
         let _ = (f_entry, f_cont);
-        FunctionBody::from_id_mut(&mut tc.ctx, f).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );

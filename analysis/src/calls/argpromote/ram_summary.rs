@@ -1042,8 +1042,8 @@ mod tests {
     }
 
     fn materialize(tc: &mut qcode::testing::TestContext, fid: FunctionId) {
-        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_effects(
-            qcode::value::FunctionEffects::Materialized(
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
