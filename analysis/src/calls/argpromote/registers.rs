@@ -311,17 +311,20 @@ pub(crate) fn scan_register_effects(
 /// touched** — every caller keeps its valid zero-arg implicit-binding call.
 /// Returns the set of materialized functions.
 pub(crate) fn materialize_functions(
-    ctx: &mut Context,
+    cone: &mut crate::ConeMut,
     graph: &CallGraph,
     targets: &[FunctionId],
     sp: Option<VarnodeId>,
 ) -> FxHashSet<FunctionId> {
     let chan = RegChannel { sp };
-    let summaries = solve_summaries(ctx, graph, &chan);
+    // Whole-program solve reads through `&Context`; every write below is confined
+    // to `fid` (its published interface via `function_mut`, its body via
+    // `ctx_for`), and `fid` ranges only over the cone's `targets`.
+    let summaries = solve_summaries(cone.ctx(), graph, &chan);
     let mut changed = FxHashSet::default();
     for fid in targets.iter().copied() {
         {
-            let f = FunctionBody::from_id(ctx, fid);
+            let f = FunctionBody::from_id(cone.ctx(), fid);
             // Externals have no body to materialize; an already-materialized
             // function's interface is final (its solved callees stay solved).
             if f.is_external()
@@ -336,15 +339,16 @@ pub(crate) fn materialize_functions(
             Err(_) => {
                 // ⊤: record it so alias analysis / the RAM gate see it, but do
                 // not materialize.
-                FunctionBody::from_id_mut(ctx, fid).set_register_effects(RegisterChannelState::Top);
+                cone.function_mut(fid)
+                    .set_register_effects(RegisterChannelState::Top);
                 continue;
             }
         };
-        let Ok(reg_eff) = finalize_register_effects(ctx, eff) else {
+        let Ok(reg_eff) = finalize_register_effects(cone.ctx(), eff) else {
             // Solved, but no register writes / non-canonical overlap: nothing to
             // materialize. Still a *solved* summary (the RAM gate keys on that);
             // persist the solved sets so call classifiers stay precise.
-            FunctionBody::from_id_mut(ctx, fid)
+            cone.function_mut(fid)
                 .set_register_effects(RegisterChannelState::Solved(eff.to_sets()));
             continue;
         };
@@ -354,12 +358,12 @@ pub(crate) fn materialize_functions(
         // function reached that way would leave its entry seed-stores reading
         // unbound params. Leave those solved-but-unmaterialized. (Address-taken
         // functions reached by `CallInd` *are* seeded, so they materialize.)
-        if has_non_call_site(ctx, graph, fid) {
-            FunctionBody::from_id_mut(ctx, fid)
+        if has_non_call_site(cone.ctx(), graph, fid) {
+            cone.function_mut(fid)
                 .set_register_effects(RegisterChannelState::Solved(eff.to_sets()));
             continue;
         }
-        materialize_interface(ctx, fid, &reg_eff);
+        materialize_interface(cone.ctx_for(fid), fid, &reg_eff);
         changed.insert(fid);
     }
     changed
@@ -701,7 +705,7 @@ fn rewrite_external_call_regpure(
 /// Rewrite every direct `Opaque` call to a materialized function into a regpure
 /// call (pass 3). Returns the set of *caller* functions changed.
 pub(crate) fn regpure_all_sites(
-    ctx: &mut Context,
+    cone: &mut crate::ConeMut,
     graph: &CallGraph,
     targets: &[FunctionId],
     sp: Option<VarnodeId>,
@@ -709,18 +713,20 @@ pub(crate) fn regpure_all_sites(
     let mut changed = FxHashSet::default();
     for callee in targets.iter().copied() {
         if !matches!(
-            FunctionBody::from_id(ctx, callee).effects().register,
+            FunctionBody::from_id(cone.ctx(), callee).effects().register,
             RegisterChannelState::Materialized(_)
         ) {
             continue;
         }
-        for site in crate::calls::direct_call_sites(ctx, graph, callee) {
+        for site in crate::calls::direct_call_sites(cone.ctx(), graph, callee) {
             let opaque = matches!(
-                ctx.get_insn(site).mnemonic(),
+                cone.ctx().get_insn(site).mnemonic(),
                 Mnemonic::Call(c) if c.tag == qcode::value::insn::CallTag::Opaque
             );
             if opaque {
-                rewrite_call_regpure(ctx, site, callee, sp);
+                // The rewrite is a body edit of the *caller* `site.func`;
+                // `ctx_for` asserts it is in the cone.
+                rewrite_call_regpure(cone.ctx_for(site.func), site, callee, sp);
                 changed.insert(site.func);
             }
         }
@@ -735,9 +741,10 @@ pub fn argpromote_registers(ctx: &mut Context) -> bool {
     let graph = CallGraph::analyze(ctx);
     let targets = ctx.function_ids();
     let sp = guess_sp(ctx);
-    let mut changed = materialize_functions(ctx, &graph, &targets, sp);
-    let graph = CallGraph::analyze(ctx);
-    changed.extend(regpure_all_sites(ctx, &graph, &targets, sp));
+    let mut cone = crate::ConeMut::full(ctx);
+    let mut changed = materialize_functions(&mut cone, &graph, &targets, sp);
+    let graph = CallGraph::analyze(cone.ctx());
+    changed.extend(regpure_all_sites(&mut cone, &graph, &targets, sp));
     !changed.is_empty()
 }
 
@@ -788,12 +795,10 @@ impl Pass for ArgPromoteMaterialize {
         cone: &mut crate::ConeMut,
         env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when argpromote-registers migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
-        let graph = CallGraph::analyze(ctx);
+        let graph = CallGraph::analyze(cone.ctx());
         Ok(crate::ModulePassOutcome::functions(materialize_functions(
-            ctx,
+            cone,
             &graph,
             &targets,
             env.sp_varnode,
@@ -808,12 +813,10 @@ impl Pass for ArgPromoteMaterialize {
         env: &PipelineEnv,
         analyses: &mut AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when argpromote-registers migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
-        let graph = analyses.global::<CallGraphAnalysis>(ctx);
+        let graph = analyses.global::<CallGraphAnalysis>(cone.ctx());
         Ok(crate::ModulePassOutcome::functions(materialize_functions(
-            ctx,
+            cone,
             graph,
             &targets,
             env.sp_varnode,
@@ -841,12 +844,10 @@ impl Pass for ArgPromoteRegpureCalls {
         cone: &mut crate::ConeMut,
         env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when argpromote-registers migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
-        let graph = CallGraph::analyze(ctx);
+        let graph = CallGraph::analyze(cone.ctx());
         Ok(crate::ModulePassOutcome::functions(regpure_all_sites(
-            ctx,
+            cone,
             &graph,
             &targets,
             env.sp_varnode,
@@ -861,12 +862,10 @@ impl Pass for ArgPromoteRegpureCalls {
         env: &PipelineEnv,
         analyses: &mut AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when argpromote-registers migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
-        let graph = analyses.global::<CallGraphAnalysis>(ctx);
+        let graph = analyses.global::<CallGraphAnalysis>(cone.ctx());
         Ok(crate::ModulePassOutcome::functions(regpure_all_sites(
-            ctx,
+            cone,
             graph,
             &targets,
             env.sp_varnode,

@@ -4333,7 +4333,12 @@ mod tests {
 
         let graph = crate::CallGraph::analyze(&tc.ctx);
         let targets = tc.ctx.function_ids();
-        regpure_all_sites(&mut tc.ctx, &graph, &targets, None);
+        regpure_all_sites(
+            &mut crate::ConeMut::full(&mut tc.ctx),
+            &graph,
+            &targets,
+            None,
+        );
 
         let call_id = BasicBlock::from_id(&tc.ctx, g_call)
             .iter()
@@ -4377,7 +4382,12 @@ mod tests {
 
         let graph = crate::CallGraph::analyze(&tc.ctx);
         let targets = tc.ctx.function_ids();
-        regpure_all_sites(&mut tc.ctx, &graph, &targets, None);
+        regpure_all_sites(
+            &mut crate::ConeMut::full(&mut tc.ctx),
+            &graph,
+            &targets,
+            None,
+        );
 
         assert!(
             !call_at(&tc, g_call).tag.is_regpure(),
@@ -4436,7 +4446,12 @@ mod tests {
 
         let graph = crate::CallGraph::analyze(&tc.ctx);
         let targets = tc.ctx.function_ids();
-        regpure_all_sites(&mut tc.ctx, &graph, &targets, Some(r3));
+        regpure_all_sites(
+            &mut crate::ConeMut::full(&mut tc.ctx),
+            &graph,
+            &targets,
+            Some(r3),
+        );
 
         assert!(
             call_at(&tc, g_call).tag.is_regpure(),
