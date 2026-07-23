@@ -52,11 +52,12 @@ const MAX_ITERS: usize = 100_000;
 pub fn dead_signature(ctx: &mut Context) -> bool {
     let targets = ctx.function_ids();
     let graph = CallGraph::analyze(ctx);
-    !dead_signature_changed_functions(ctx, &targets, &graph).is_empty()
+    let mut cone = crate::ConeMut::full(ctx);
+    !dead_signature_changed_functions(&mut cone, &targets, &graph).is_empty()
 }
 
 fn dead_signature_changed_functions(
-    ctx: &mut Context,
+    cone: &mut crate::ConeMut,
     targets: &[FunctionId],
     graph: &CallGraph,
 ) -> HashSet<FunctionId> {
@@ -65,7 +66,7 @@ fn dead_signature_changed_functions(
     let mut worklist: Vec<FunctionId> = targets
         .iter()
         .copied()
-        .filter(|&f| FunctionBody::from_id(ctx, f).is_reg_materialized())
+        .filter(|&f| FunctionBody::from_id(cone.ctx(), f).is_reg_materialized())
         .collect();
     let mut queued: HashSet<_> = worklist.iter().copied().collect();
 
@@ -73,7 +74,7 @@ fn dead_signature_changed_functions(
     // pass. Call targets never change within this pass and instructions are only
     // ever deleted (never retargeted), so this superset stays valid for the whole
     // fixpoint — consumers just skip ids that have since been deleted.
-    let call_index = build_call_index(ctx, graph);
+    let call_index = build_call_index(cone.ctx(), graph);
 
     let mut iters = 0;
     while let Some(fid) = worklist.pop() {
@@ -82,15 +83,23 @@ fn dead_signature_changed_functions(
         if iters > MAX_ITERS {
             break;
         }
-        if !FunctionBody::from_id(ctx, fid).is_reg_materialized() {
+        if !FunctionBody::from_id(cone.ctx(), fid).is_reg_materialized() {
             continue;
         }
-        if direct_call_sites(ctx, fid, &call_index)
-            .iter()
-            .any(|site| !target_set.contains(&site.func))
-        {
+        let sites = direct_call_sites(cone.ctx(), fid, &call_index);
+        if sites.iter().any(|site| !target_set.contains(&site.func)) {
             continue;
         }
+
+        // Every function this iteration may write — the callee `fid` and each
+        // direct caller — must be in the cone. The `target_set` guard above
+        // already confines them to `targets` (= the cone on a narrowed run);
+        // these `ctx_for` asserts turn that into a hard tripwire (each caller
+        // then the callee, all individually checked).
+        for site in &sites {
+            let _ = cone.ctx_for(site.func);
+        }
+        let ctx = cone.ctx_for(fid);
 
         let mut touched: HashSet<FunctionId> = HashSet::default();
         let arg_changed = trim_dead_args(ctx, fid, &call_index, &mut touched);
@@ -362,13 +371,11 @@ impl Pass for DeadSignature {
         cone: &mut crate::ConeMut,
         _env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when dead_signature migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
-        let graph = CallGraph::analyze(ctx);
+        let graph = CallGraph::analyze(cone.ctx());
         Ok(
             crate::ModulePassOutcome::functions(dead_signature_changed_functions(
-                ctx, &targets, &graph,
+                cone, &targets, &graph,
             ))
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>(),
@@ -381,13 +388,11 @@ impl Pass for DeadSignature {
         _env: &PipelineEnv,
         analyses: &mut crate::AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when dead_signature migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
-        let graph = analyses.global::<crate::CallGraphAnalysis>(ctx);
+        let graph = analyses.global::<crate::CallGraphAnalysis>(cone.ctx());
         Ok(
             crate::ModulePassOutcome::functions(dead_signature_changed_functions(
-                ctx, &targets, graph,
+                cone, &targets, graph,
             ))
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>(),
