@@ -209,20 +209,21 @@ fn incoming_values(ctx: &Context, block: BlockId, index: usize) -> Vec<ValueId> 
     out
 }
 
-/// Flags `function_id` on its signature when it reads a passed pointer (or its
-/// own frame) unboundedly: it has a dynamic stack access, or forwards a pointer
-/// into an unbounded/indirect/external call, or writes through a stack-passed
-/// pointer at an unbounded offset. A caller that hands such a callee a pointer
-/// into its own frame cannot bound which of its stack slots the callee touches,
-/// so it must keep its whole frame in memory (see `mem2reg`'s stack-escape
-/// handling). The register effect/interface channel is owned by the `argpromote`
-/// register passes via `FunctionEffects`, not recomputed here.
-pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_ptr: VarnodeId) {
+/// Compute whether `function_id` reads a passed pointer (or its own frame)
+/// unboundedly, without writing the result. A caller that hands such a callee a
+/// pointer into its own frame cannot bound which of its stack slots the callee
+/// touches, so it must keep its whole frame in memory (see `mem2reg`'s
+/// stack-escape handling).
+fn compute_reads_unbounded_stack(
+    ctx: &Context,
+    function_id: FunctionId,
+    stack_ptr: VarnodeId,
+) -> Option<bool> {
     // A functionalized (`pure_reg`) function's interface is owned by
     // `argpromote_registers`; its unbounded-read fact is likewise established
     // there. Leave a materialized function's signature untouched.
     if FunctionBody::from_id(ctx, function_id).is_reg_materialized() {
-        return;
+        return None;
     }
 
     // Union with the seeded value so the fact only grows across checkpoint+replay
@@ -232,7 +233,21 @@ pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_
         || function_makes_unbounded_call(ctx, function_id)
         || function_writes_through_stack_arg(ctx, function_id, stack_ptr);
 
-    FunctionBody::from_id_mut(ctx, function_id).set_reads_unbounded_stack(reads_unbounded);
+    Some(reads_unbounded)
+}
+
+/// Flags `function_id` on its signature when it reads a passed pointer (or its
+/// own frame) unboundedly: it has a dynamic stack access, or forwards a pointer
+/// into an unbounded/indirect/external call, or writes through a stack-passed
+/// pointer at an unbounded offset. A caller that hands such a callee a pointer
+/// into its own frame cannot bound which of its stack slots the callee touches,
+/// so it must keep its whole frame in memory (see `mem2reg`'s stack-escape
+/// handling). The register effect/interface channel is owned by the `argpromote`
+/// register passes via `FunctionEffects`, not recomputed here.
+pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_ptr: VarnodeId) {
+    if let Some(reads_unbounded) = compute_reads_unbounded_stack(ctx, function_id, stack_ptr) {
+        FunctionBody::from_id_mut(ctx, function_id).set_reads_unbounded_stack(reads_unbounded);
+    }
 }
 
 /// Runs [`set_function_summaries`] over every non-external function.
@@ -402,19 +417,27 @@ impl Pass for Summaries {
         cone: &mut crate::ConeMut,
         env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when summaries migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
         let Some(stack_ptr) = env.sp_varnode else {
             return Ok(crate::ModulePassOutcome::default());
         };
-        let affected: Vec<FunctionId> = targets
-            .iter()
-            .copied()
-            .filter(|&id| !FunctionBody::from_id(ctx, id).is_external())
-            .collect();
-        for id in affected.iter().copied() {
-            set_function_summaries(ctx, id, stack_ptr);
+        // Every non-external function is reported as `affected` (matching the
+        // original `set_function_summaries` loop, which returned the full
+        // non-external set regardless of whether it actually rewrote a signature);
+        // reg-materialized functions yield `None` and are simply not written.
+        // Compute-then-write is interleaved per function so a later function's
+        // inference reads an earlier function's just-written summary.
+        let mut affected = Vec::new();
+        for id in targets {
+            if FunctionBody::from_id(cone.ctx(), id).is_external() {
+                continue;
+            }
+            affected.push(id);
+            if let Some(reads_unbounded) = compute_reads_unbounded_stack(cone.ctx(), id, stack_ptr)
+            {
+                cone.function_mut(id)
+                    .set_reads_unbounded_stack(reads_unbounded);
+            }
         }
         Ok(crate::ModulePassOutcome::functions(affected)
             .preserving_global::<crate::CallGraphAnalysis>()

@@ -36,18 +36,12 @@ use crate::{Pass, PipelineEnv};
 type Mask = u64;
 const MAX_PARAMS: usize = 64;
 
-/// Run the optimistic fixpoint and store the inferred attributes on every
-/// eligible (`pure_reg`, non-external) function. Returns `true` if any stored
-/// attribute vector changed.
-pub fn infer_param_attrs(ctx: &mut Context) -> bool {
-    let targets = ctx.function_ids();
-    !infer_param_attrs_changed_functions(ctx, &targets).is_empty()
-}
-
-fn infer_param_attrs_changed_functions(
-    ctx: &mut Context,
+/// Compute the optimistic fixpoint for every eligible (`pure_reg`, non-external)
+/// function and return the attributes that would be stored (without storing them).
+fn infer_param_attrs_changes(
+    ctx: &Context,
     targets: &[FunctionId],
-) -> rustc_hash::FxHashSet<FunctionId> {
+) -> Vec<(FunctionId, Vec<ParamAttrs>)> {
     let target_set: rustc_hash::FxHashSet<_> = targets.iter().copied().collect();
     // Eligible functions and their param counts. Only functionalized functions
     // have `param[i] ↔ arg[i]` alignment, so only they are inferred here.
@@ -87,8 +81,8 @@ fn infer_param_attrs_changed_functions(
         }
     }
 
-    // Commit.
-    let mut changed = rustc_hash::FxHashSet::default();
+    // Collect changes without applying them.
+    let mut changes = Vec::new();
     for (fid, vec) in attrs {
         if !target_set.contains(&fid) {
             continue;
@@ -97,9 +91,29 @@ fn infer_param_attrs_changed_functions(
             .param_attrs()
             .map(|a| a.to_vec());
         if prev.as_deref() != Some(vec.as_slice()) {
-            changed.insert(fid);
+            changes.push((fid, vec));
         }
+    }
+    changes
+}
+
+/// Run the optimistic fixpoint and store the inferred attributes on every
+/// eligible (`pure_reg`, non-external) function. Returns `true` if any stored
+/// attribute vector changed.
+pub fn infer_param_attrs(ctx: &mut Context) -> bool {
+    let targets = ctx.function_ids();
+    !infer_param_attrs_changed_functions(ctx, &targets).is_empty()
+}
+
+fn infer_param_attrs_changed_functions(
+    ctx: &mut Context,
+    targets: &[FunctionId],
+) -> rustc_hash::FxHashSet<FunctionId> {
+    let changes = infer_param_attrs_changes(ctx, targets);
+    let mut changed = rustc_hash::FxHashSet::default();
+    for (fid, vec) in changes {
         FunctionBody::from_id_mut(ctx, fid).set_param_attrs(vec);
+        changed.insert(fid);
     }
     changed
 }
@@ -372,14 +386,16 @@ impl Pass for ParamAttrsPass {
         cone: &mut crate::ConeMut,
         _env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when param_attrs migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
-        Ok(
-            crate::ModulePassOutcome::functions(infer_param_attrs_changed_functions(ctx, &targets))
-                .preserving_global::<crate::CallGraphAnalysis>()
-                .preserving_global::<crate::AddressAnalysis>(),
-        )
+        let changes = infer_param_attrs_changes(cone.ctx(), &targets);
+        let mut changed = rustc_hash::FxHashSet::default();
+        for (fid, vec) in changes {
+            cone.function_mut(fid).set_param_attrs(vec);
+            changed.insert(fid);
+        }
+        Ok(crate::ModulePassOutcome::functions(changed)
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>())
     }
 }
 

@@ -214,13 +214,20 @@ struct Inlinable {
     order: Vec<InstructionId>,
 }
 
-fn try_partial_inline(ctx: &mut Context, fid: FunctionId, call_sites: &[InstructionId]) -> bool {
-    let Some(root) = FunctionBody::from_id(ctx, fid).root().map(|b| b.id) else {
-        return false;
-    };
+/// The read-only half of a partial-inline: classify `fid`'s cheap output fields
+/// and the caller-arg → input-index map, without mutating anything. Returns
+/// `None` when nothing is inlinable. Split out so the module pass can plan
+/// against the whole program (read) and then apply per-caller through the
+/// cone-checked write surface.
+fn plan_partial_inline(
+    ctx: &Context,
+    fid: FunctionId,
+    call_sites: &[InstructionId],
+) -> Option<(Vec<Inlinable>, HashMap<ValueId, usize>)> {
+    let root = FunctionBody::from_id(ctx, fid).root().map(|b| b.id)?;
 
     if call_sites.is_empty() {
-        return false;
+        return None;
     }
 
     // Only the *register* arguments a caller passes positionally in `Call.args`
@@ -244,21 +251,19 @@ fn try_partial_inline(ctx: &mut Context, fid: FunctionId, call_sites: &[Instruct
 
     let returns = returns_of(ctx, fid);
     if returns.is_empty() {
-        return false;
+        return None;
     }
 
     // The write-set field values, required identical (same SSA value) across
     // every return. A return without a tuple value bails the whole function.
     let mut per_return: Vec<Vec<ValueId>> = Vec::with_capacity(returns.len());
     for &ret_id in &returns {
-        let Some(fields) = return_tuple_fields(ctx, ret_id) else {
-            return false;
-        };
+        let fields = return_tuple_fields(ctx, ret_id)?;
         per_return.push(fields);
     }
     let n = per_return[0].len();
     if n == 0 || per_return.iter().any(|f| f.len() != n) {
-        return false;
+        return None;
     }
 
     // Classify each field independently.
@@ -280,47 +285,69 @@ fn try_partial_inline(ctx: &mut Context, fid: FunctionId, call_sites: &[Instruct
         }
     }
     if inlinable.is_empty() {
+        return None;
+    }
+
+    Some((inlinable, inputs))
+}
+
+/// Apply the planned `inlinable` fields at a single call site `call_id`,
+/// rewriting each projecting `extract` in the *caller* (`call_id.func`) to a
+/// clone of the field's expression. Reads the callee's expression nodes and
+/// writes only `call_id.func`'s body. Returns whether anything changed.
+fn apply_inline_at_call(
+    ctx: &mut Context,
+    call_id: InstructionId,
+    inlinable: &[Inlinable],
+    inputs: &HashMap<ValueId, usize>,
+) -> bool {
+    let Mnemonic::Call(c) = ctx.get_insn(call_id).mnemonic().clone() else {
         return false;
+    };
+    let args: Vec<ValueId> = c.args.iter().map(|a| a.qualify(call_id.func)).collect();
+    let result = ValueId::Instruction(call_id);
+
+    // Index all projections once. Scanning the result's users separately
+    // for every inlinable field is quadratic in the returned field count.
+    let mut extracts_by_index: HashMap<usize, Vec<InstructionId>> = HashMap::default();
+    for user in ctx.users(result) {
+        if let Mnemonic::Extract(Extract { agg, index }) = ctx.get_insn(user).mnemonic()
+            && agg.qualify(user.func) == result
+        {
+            extracts_by_index.entry(*index).or_default().push(user);
+        }
     }
 
     let mut changed = false;
+    for inl in inlinable {
+        // Every `extract` of this field at this call site (usually one).
+        for extract_id in extracts_by_index.remove(&inl.index).unwrap_or_default() {
+            let clone = clone_expr(ctx, extract_id, inl.value, &inl.order, inputs, &args);
+            // The recompute can resolve back to (a value transitively
+            // referencing) the extract itself — e.g. the projected field just
+            // passes through a loop-carried argument that derives from this
+            // very projection. Replacing the extract with such a `clone` would
+            // rewrite an operand inside `clone` to `clone`, minting a
+            // self-referential pure value (an unsatisfiable cycle) that later
+            // recursive value-walkers loop on. A circular recompute is not a
+            // simplification: leave the extract in place.
+            if clone_references(ctx, clone, extract_id) {
+                continue;
+            }
+            ctx.replace_instruction(extract_id, clone);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn try_partial_inline(ctx: &mut Context, fid: FunctionId, call_sites: &[InstructionId]) -> bool {
+    let Some((inlinable, inputs)) = plan_partial_inline(ctx, fid, call_sites) else {
+        return false;
+    };
+    let mut changed = false;
     for &call_id in call_sites {
-        let Mnemonic::Call(c) = ctx.get_insn(call_id).mnemonic().clone() else {
-            continue;
-        };
-        let args: Vec<ValueId> = c.args.iter().map(|a| a.qualify(call_id.func)).collect();
-        let result = ValueId::Instruction(call_id);
-
-        // Index all projections once. Scanning the result's users separately
-        // for every inlinable field is quadratic in the returned field count.
-        let mut extracts_by_index: HashMap<usize, Vec<InstructionId>> = HashMap::default();
-        for user in ctx.users(result) {
-            if let Mnemonic::Extract(Extract { agg, index }) = ctx.get_insn(user).mnemonic()
-                && agg.qualify(user.func) == result
-            {
-                extracts_by_index.entry(*index).or_default().push(user);
-            }
-        }
-
-        for inl in &inlinable {
-            // Every `extract` of this field at this call site (usually one).
-            for extract_id in extracts_by_index.remove(&inl.index).unwrap_or_default() {
-                let clone = clone_expr(ctx, extract_id, inl.value, &inl.order, &inputs, &args);
-                // The recompute can resolve back to (a value transitively
-                // referencing) the extract itself — e.g. the projected field just
-                // passes through a loop-carried argument that derives from this
-                // very projection. Replacing the extract with such a `clone` would
-                // rewrite an operand inside `clone` to `clone`, minting a
-                // self-referential pure value (an unsatisfiable cycle) that later
-                // recursive value-walkers loop on. A circular recompute is not a
-                // simplification: leave the extract in place.
-                if clone_references(ctx, clone, extract_id) {
-                    continue;
-                }
-                ctx.replace_instruction(extract_id, clone);
-                changed = true;
-            }
-        }
+        changed |= apply_inline_at_call(ctx, call_id, &inlinable, &inputs);
     }
     changed
 }
@@ -403,6 +430,44 @@ fn clone_expr(
     resolve(value, &map)
 }
 
+/// Cone-checked module-pass driver: mirrors [`partial_inline_changed_functions`]
+/// exactly (same deterministic callee iteration, same eligibility gate, same
+/// `changed`-set contents) but plans read-only against the whole program and
+/// applies each call-site rewrite through the caller's cone-checked handle. The
+/// rewrite is a body edit of the *caller* (`call_id.func`); reading the callee's
+/// expression to clone it is a whole-program read, always sound.
+fn partial_inline_cone(
+    cone: &mut crate::ConeMut,
+    targets: &[FunctionId],
+    graph: &crate::CallGraph,
+) -> rustc_hash::FxHashSet<FunctionId> {
+    let mut changed = rustc_hash::FxHashSet::default();
+    let target_set: rustc_hash::FxHashSet<_> = targets.iter().copied().collect();
+    for fid in cone.ctx().function_ids() {
+        if !FunctionBody::from_id(cone.ctx(), fid).is_reg_materialized() {
+            continue;
+        }
+        let callers = graph.callers(fid);
+        if callers.is_empty() || !callers.iter().all(|id| target_set.contains(id)) {
+            continue;
+        }
+        let call_sites = super::direct_call_sites(cone.ctx(), graph, fid);
+        let Some((inlinable, inputs)) = plan_partial_inline(cone.ctx(), fid, &call_sites) else {
+            continue;
+        };
+        let mut any = false;
+        for &call_id in &call_sites {
+            if apply_inline_at_call(cone.ctx_for(call_id.func), call_id, &inlinable, &inputs) {
+                any = true;
+            }
+        }
+        if any {
+            changed.extend(callers);
+        }
+    }
+    changed
+}
+
 #[derive(Default)]
 pub struct PartialInline;
 
@@ -416,16 +481,12 @@ impl Pass for PartialInline {
         cone: &mut crate::ConeMut,
         _env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when partial_inline migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
-        let graph = crate::CallGraph::analyze(ctx);
+        let graph = crate::CallGraph::analyze(cone.ctx());
         Ok(
-            crate::ModulePassOutcome::functions(partial_inline_changed_functions(
-                ctx, &targets, &graph,
-            ))
-            .preserving_global::<crate::CallGraphAnalysis>()
-            .preserving_global::<crate::AddressAnalysis>(),
+            crate::ModulePassOutcome::functions(partial_inline_cone(cone, &targets, &graph))
+                .preserving_global::<crate::CallGraphAnalysis>()
+                .preserving_global::<crate::AddressAnalysis>(),
         )
     }
 
@@ -435,16 +496,12 @@ impl Pass for PartialInline {
         _env: &PipelineEnv,
         analyses: &mut crate::AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when partial_inline migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
-        let graph = analyses.global::<crate::CallGraphAnalysis>(ctx);
+        let graph = analyses.global::<crate::CallGraphAnalysis>(cone.ctx());
         Ok(
-            crate::ModulePassOutcome::functions(partial_inline_changed_functions(
-                ctx, &targets, graph,
-            ))
-            .preserving_global::<crate::CallGraphAnalysis>()
-            .preserving_global::<crate::AddressAnalysis>(),
+            crate::ModulePassOutcome::functions(partial_inline_cone(cone, &targets, graph))
+                .preserving_global::<crate::CallGraphAnalysis>()
+                .preserving_global::<crate::AddressAnalysis>(),
         )
     }
 }

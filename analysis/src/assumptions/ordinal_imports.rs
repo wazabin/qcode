@@ -36,9 +36,7 @@ impl Pass for ResolveOrdinals {
         cone: &mut crate::ConeMut,
         env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when ordinal-import resolution migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
         // The per-import DLL is only available from the live binary handle.
         let Some(binary) = env.binary.as_ref() else {
             return Ok(crate::ModulePassOutcome::default());
@@ -50,25 +48,27 @@ impl Pass for ResolveOrdinals {
 
         let mut renamed = Vec::new();
         for &id in &targets {
-            let f = FunctionBody::from_id(ctx, id);
-            if !f.is_external() {
-                continue;
-            }
-            let Some(ordinal) = parse_ordinal(f.name()) else {
-                continue;
+            // Read everything needed off the interface, then drop the read borrow
+            // before taking the cone-checked mutable handle.
+            let resolved = {
+                let f = FunctionBody::from_id(cone.ctx(), id);
+                if !f.is_external() {
+                    None
+                } else if let (Some(ordinal), Some(addr)) = (parse_ordinal(f.name()), f.address()) {
+                    binary
+                        .import_library(addr)
+                        .and_then(|dll| map.resolve(dll, ordinal).map(str::to_owned))
+                        .map(|real| (ordinal, real))
+                } else {
+                    None
+                }
             };
-            let Some(addr) = f.address() else {
-                continue;
-            };
-            let Some(dll) = binary.import_library(addr) else {
-                continue;
-            };
-            let Some(real) = map.resolve(dll, ordinal).map(str::to_owned) else {
+            let Some((ordinal, real)) = resolved else {
                 continue;
             };
             // A duplicate name (another import already carries it) fails the
             // unique rename; skip that one rather than abort the pass.
-            let mut f = FunctionBody::from_id_mut(ctx, id);
+            let mut f = cone.function_mut(id);
             if f.rename(std::borrow::Cow::Owned(real)).is_ok() {
                 // Record the by-ordinal origin on the interface so it survives
                 // the rename (and snapshots); the GUI reads it back.

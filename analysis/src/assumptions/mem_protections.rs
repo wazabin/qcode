@@ -36,9 +36,8 @@ impl Pass for MemoryProtections {
         cone: &mut crate::ConeMut,
         _env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when establish_memory_protections migrates.
-        let ctx = cone.bypass_cone_unmigrated_hatch();
-        establish_memory_protections(ctx);
+        // Marking protections authoritative is a cone-free global write.
+        cone.mark_protections_known();
         Ok(crate::ModulePassOutcome::module()
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>()

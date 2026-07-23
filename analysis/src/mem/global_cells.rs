@@ -78,13 +78,12 @@ impl Pass for PromoteGlobalCells {
         cone: &mut crate::ConeMut,
         env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when promote_global_cells migrates.
+        let ctx_readonly = cone.ctx();
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
         let fun_ids: Vec<FunctionId> = targets
             .iter()
             .copied()
-            .filter(|&id| !FunctionBody::from_id(ctx, id).is_external())
+            .filter(|&id| !FunctionBody::from_id(ctx_readonly, id).is_external())
             .collect();
 
         // Phase 1: whole-program syntactic write-set — addresses that appear as
@@ -92,10 +91,11 @@ impl Pass for PromoteGlobalCells {
         // computed stores are intentionally excluded.)
         let mut written: HashSet<u64> = HashSet::default();
         for &fid in &fun_ids {
-            for block in FunctionBody::from_id(ctx, fid).blocks() {
+            for block in FunctionBody::from_id(ctx_readonly, fid).blocks() {
                 for insn in block.iter() {
                     if let Mnemonic::Store(s) = insn.mnemonic()
-                        && let Some((addr, _)) = const_ram_access(ctx, fid, s.ptr, s.space, s.size)
+                        && let Some((addr, _)) =
+                            const_ram_access(ctx_readonly, fid, s.ptr, s.space, s.size)
                     {
                         written.insert(addr);
                     }
@@ -110,14 +110,15 @@ impl Pass for PromoteGlobalCells {
         let mut folds: HashMap<FunctionId, Vec<(qcode::value::insn::InstructionId, u64, usize)>> =
             HashMap::default();
         for &fid in &fun_ids {
-            for block in FunctionBody::from_id(ctx, fid).blocks() {
+            for block in FunctionBody::from_id(ctx_readonly, fid).blocks() {
                 for insn in block.iter() {
                     let (ptr, space, size) = match insn.mnemonic() {
                         Mnemonic::Load(l) => (l.ptr, l.space, l.size),
                         Mnemonic::Store(s) => (s.ptr, s.space, s.size),
                         _ => continue,
                     };
-                    let Some((addr, data_size)) = const_ram_access(ctx, fid, ptr, space, size)
+                    let Some((addr, data_size)) =
+                        const_ram_access(ctx_readonly, fid, ptr, space, size)
                     else {
                         continue;
                     };
@@ -151,15 +152,18 @@ impl Pass for PromoteGlobalCells {
                     let Some(value) = binary.read_uint(addr, size) else {
                         continue;
                     };
-                    if !ctx.assume_true(Proposition::ImmutableMemory {
+                    // The `ImmutableMemory` truth is a cone-free shared write; the
+                    // load rewrite below is a body edit of `fid` through `ctx_for`.
+                    if !cone.assume_true(Proposition::ImmutableMemory {
                         addr,
                         size: size as u8,
                     }) {
                         continue;
                     }
-                    let konst = ctx.get_const(value, size).id();
-                    ctx.replace_all_uses_with(ValueId::Instruction(load_id), konst);
-                    ctx.remove_instruction(load_id);
+                    let ctx_mut = cone.ctx_for(fid);
+                    let konst = ctx_mut.get_const(value, size).id();
+                    ctx_mut.replace_all_uses_with(ValueId::Instruction(load_id), konst);
+                    ctx_mut.remove_instruction(load_id);
                     changed.insert(fid);
                 }
             }

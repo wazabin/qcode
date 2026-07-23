@@ -155,12 +155,9 @@ impl Pass for RetailApply {
         cone: &mut crate::ConeMut,
         _env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when retail_apply migrates.
-        let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
         let mut changed = FxHashSet::default();
-        for &fid in &targets {
-            if retail_function(ctx, fid) {
+        for fid in cone.cone_functions() {
+            if retail_function(cone.ctx_for(fid), fid) {
                 changed.insert(fid);
             }
         }

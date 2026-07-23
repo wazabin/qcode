@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use qcode::{
     assumption::Proposition,
     context::{Context, TargetOs},
-    types::{AggregateField, TypeId},
+    types::{AggregateField, TypeId, TypeManager},
     value::{ValueId, Varnode, VarnodeId},
 };
 
@@ -44,7 +44,7 @@ fn baked_structs() -> Vec<HStruct> {
 /// Registers every struct from `teb.h` as a nominal qcode struct and returns the
 /// name → [`TypeId`] map. Declaration order in the header guarantees a pointee
 /// struct is registered before any struct that points at it.
-pub fn register_teb_structs(ctx: &mut Context) -> HashMap<String, TypeId> {
+pub fn register_teb_structs(types: &mut TypeManager) -> HashMap<String, TypeId> {
     let mut by_name: HashMap<String, TypeId> = HashMap::new();
     for s in baked_structs() {
         let fields = s
@@ -52,23 +52,18 @@ pub fn register_teb_structs(ctx: &mut Context) -> HashMap<String, TypeId> {
             .iter()
             .map(|f| {
                 let type_id = match &f.kind {
-                    HFieldKind::Int { size } => ctx.shared.types.get_or_make_int(*size),
+                    HFieldKind::Int { size } => types.get_or_make_int(*size),
                     HFieldKind::StructPtr { pointee, width } => {
                         let pointee_ty = *by_name.get(pointee).unwrap_or_else(|| {
                             panic!("pointee struct {pointee} not yet registered")
                         });
-                        ctx.shared
-                            .types
-                            .get_or_make_struct_pointer(*width, pointee_ty)
+                        types.get_or_make_struct_pointer(*width, pointee_ty)
                     }
                 };
                 AggregateField::new_at(f.name.clone(), type_id, f.offset)
             })
             .collect();
-        let id = ctx
-            .shared
-            .types
-            .get_or_make_struct(s.name.clone(), s.size, fields);
+        let id = types.get_or_make_struct(s.name.clone(), s.size, fields);
         by_name.insert(s.name, id);
     }
     by_name
@@ -82,17 +77,18 @@ fn ptr_width(bitness: u8) -> usize {
 /// Types the `fs_offset` register varnode as a global `PtrTo<TEB>` (using the
 /// `teb.h` layout) and records the [`Proposition::WindowsTeb`] assumption.
 /// Returns `false` if the header defines no `TEB` struct.
-pub fn seed_teb_register(ctx: &mut Context, fs_offset: VarnodeId, bitness: u8) -> bool {
-    let structs = register_teb_structs(ctx);
+pub fn seed_teb_register(cone: &mut crate::ConeMut, fs_offset: VarnodeId, bitness: u8) -> bool {
+    // Type interning, the varnode-type override, and the `WindowsTeb` truth are
+    // all cone-free shared-state writes.
+    let structs = register_teb_structs(cone.types_mut());
     let Some(&teb) = structs.get("TEB") else {
         return false;
     };
-    let teb_ptr = ctx
-        .shared
-        .types
+    let teb_ptr = cone
+        .types_mut()
         .get_or_make_struct_pointer(ptr_width(bitness), teb);
-    ctx.set_varnode_type(fs_offset, teb_ptr);
-    ctx.assume_true(Proposition::WindowsTeb { bitness });
+    cone.set_varnode_type(fs_offset, teb_ptr);
+    cone.assume_true(Proposition::WindowsTeb { bitness });
     true
 }
 
@@ -131,24 +127,23 @@ impl Pass for WindowsTebSeed {
         cone: &mut crate::ConeMut,
         env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when windows_teb_seed migrates.
-        let ctx = cone.bypass_cone_unmigrated_hatch();
         if env.cfg.os != TargetOs::Windows || env.cfg.bitness != 32 {
             return Ok(crate::ModulePassOutcome::default());
         }
-        let Some(fs) = register_varnode(ctx, "FS_OFFSET") else {
+        let Some(fs) = register_varnode(cone.ctx(), "FS_OFFSET") else {
             return Ok(crate::ModulePassOutcome::default());
         };
         // The override is global; if it's already a pointer, nothing to do.
-        if ctx
+        if cone
+            .ctx()
             .stored_type_of(ValueId::Varnode(fs))
-            .and_then(|t| ctx.shared.types.pointee_of(t))
+            .and_then(|t| cone.ctx().shared.types.pointee_of(t))
             .is_some()
         {
             return Ok(crate::ModulePassOutcome::default());
         }
         Ok(
-            crate::ModulePassOutcome::module_if(seed_teb_register(ctx, fs, 32))
+            crate::ModulePassOutcome::module_if(seed_teb_register(cone, fs, 32))
                 .preserving_global::<crate::CallGraphAnalysis>()
                 .preserving_global::<crate::AddressAnalysis>(),
         )
@@ -172,7 +167,7 @@ mod tests {
     #[test]
     fn parses_teb_header_layout() {
         let mut ctx = Context::new();
-        let structs = register_teb_structs(&mut ctx);
+        let structs = register_teb_structs(&mut ctx.shared.types);
 
         let peb = structs["PEB"];
         let (_, being_debugged) = ctx
@@ -216,7 +211,11 @@ mod tests {
             "
         );
 
-        assert!(seed_teb_register(&mut ctx, fs, 32));
+        assert!(seed_teb_register(
+            &mut crate::ConeMut::full(&mut ctx),
+            fs,
+            32
+        ));
         // The register now reads as a TEB pointer everywhere.
         let ty = ctx.type_of(ValueId::Varnode(fs));
         assert!(ctx.shared.types.pointee_of(ty).is_some());

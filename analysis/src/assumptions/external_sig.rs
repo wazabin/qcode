@@ -105,21 +105,30 @@ impl Pass for ExternalSigs {
         cone: &mut crate::ConeMut,
         env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when external-signature stamping migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
         if !abi_is_known(&env.cfg.abi) {
             return Ok(crate::ModulePassOutcome::default());
         }
         let affected: Vec<FunctionId> = targets
             .iter()
             .copied()
-            .filter(|&id| FunctionBody::from_id(ctx, id).is_external())
+            .filter(|&id| FunctionBody::from_id(cone.ctx(), id).is_external())
             .collect();
-        let sel = selection_for(ctx, env);
+        // Whole-program read for planning; each stamp is a single-function
+        // interface write confined to `id`, so it goes through the cone.
+        let sel = selection_for(cone.ctx(), env);
         let ptr_width = ptr_width(env);
         let stack_only = env.cfg.bitness == 32;
-        apply_external_signatures(ctx, &affected, &env.cfg.abi, &sel, ptr_width, stack_only);
+        for id in affected.iter().copied() {
+            apply_external_signature(
+                cone.ctx_for(id),
+                id,
+                &env.cfg.abi,
+                &sel,
+                ptr_width,
+                stack_only,
+            );
+        }
         Ok(crate::ModulePassOutcome::functions(affected)
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>())
@@ -457,6 +466,19 @@ pub fn apply_external_signature(
     }
 }
 
+fn apply_external_signatures(
+    ctx: &mut Context,
+    ids: &[FunctionId],
+    abi: &CallingConvention,
+    sel: &Selection,
+    ptr_width: usize,
+    stack_only: bool,
+) {
+    for id in ids.iter().copied() {
+        apply_external_signature(ctx, id, abi, sel, ptr_width, stack_only);
+    }
+}
+
 /// Whether `abi` carries enough of a convention to resolve external callees: it
 /// either passes integer arguments in registers (x64 System V) or, for a
 /// stack-only convention (x86 stdcall/cdecl), at least names its caller-saved
@@ -487,19 +509,6 @@ pub fn apply_all_external_signatures(ctx: &mut Context, abi: &CallingConvention,
 /// The pointer width (in bits) the selection was built for.
 fn sel_bits(sel: &Selection) -> u8 {
     sel.target().bits
-}
-
-fn apply_external_signatures(
-    ctx: &mut Context,
-    ids: &[FunctionId],
-    abi: &CallingConvention,
-    sel: &Selection,
-    ptr_width: usize,
-    stack_only: bool,
-) {
-    for id in ids.iter().copied() {
-        apply_external_signature(ctx, id, abi, sel, ptr_width, stack_only);
-    }
 }
 
 #[cfg(test)]

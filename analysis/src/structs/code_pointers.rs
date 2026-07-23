@@ -39,16 +39,14 @@ impl Pass for InferCodePointers {
         cone: &mut crate::ConeMut,
         _env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when infer_code_pointers migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
         // Collect every indirect-call target, qualified to a context ValueId.
         let mut targets_ptrs: Vec<ValueId> = Vec::new();
         for &fid in &targets {
-            if FunctionBody::from_id(ctx, fid).is_external() {
+            if FunctionBody::from_id(cone.ctx(), fid).is_external() {
                 continue;
             }
-            for block in FunctionBody::from_id(ctx, fid).blocks() {
+            for block in FunctionBody::from_id(cone.ctx(), fid).blocks() {
                 for insn in block.iter() {
                     if let Mnemonic::CallInd(ci) = insn.mnemonic() {
                         targets_ptrs.push(ci.ptr.qualify(fid));
@@ -61,23 +59,27 @@ impl Pass for InferCodePointers {
         for ptr in targets_ptrs {
             // Already a code pointer? Idempotent no-op.
             if matches!(
-                ctx.shared.types.get(ctx.type_of(ptr)).repr(),
+                cone.ctx().shared.types.get(cone.ctx().type_of(ptr)).repr(),
                 TypeRepr::CodePointer { .. }
             ) {
                 continue;
             }
-            let size = ctx.shared.types.size_of(ctx.type_of(ptr));
+            let size = cone.ctx().shared.types.size_of(cone.ctx().type_of(ptr));
             if size == 0 {
                 continue;
             }
-            let code_ptr = ctx.shared.types.get_or_make_code_pointer(size);
+            let code_ptr = cone.ctx().shared.types.get_or_make_code_pointer(size);
             match ptr {
                 ValueId::BlockParam(pid) => {
-                    ctx.block_param_mut(pid).type_id = code_ptr;
+                    let block_func = pid.func;
+                    cone.ctx_for(block_func).block_param_mut(pid).type_id = code_ptr;
                     changed = true;
                 }
                 ValueId::Varnode(vn) => {
-                    ctx.set_varnode_type(vn, code_ptr);
+                    // Varnode types are program-global — a cone-free shared write,
+                    // not a per-function body edit, so it goes through the dedicated
+                    // accessor rather than borrowing some function's `ctx_for`.
+                    cone.set_varnode_type(vn, code_ptr);
                     changed = true;
                 }
                 // Instruction results / literals carry derived or intrinsic

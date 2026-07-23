@@ -24,7 +24,6 @@
 
 use qcode::{
     assumption::{AssumedCallEffect, Proposition},
-    context::Context,
     pass_scope,
     value::VarnodeId,
 };
@@ -70,17 +69,16 @@ fn convention_effect(env: &PipelineEnv) -> AssumedCallEffect {
 /// and cache the convention's effect on the context. Returns `true` if the
 /// truth-map entry was newly recorded this call (the cached effect is refreshed
 /// unconditionally so it is present whenever the hypothesis is active).
-pub fn assume_calling_convention(ctx: &mut Context, env: &PipelineEnv) -> bool {
+pub fn assume_calling_convention(cone: &mut crate::ConeMut, env: &PipelineEnv) -> bool {
     let _scope = pass_scope::enter("assume_calling_convention");
     if !env.cfg.assume_calling_convention {
         return false;
     }
-    ctx.set_assumed_call_convention(Some(convention_effect(env)));
-    // `assume_true` is idempotent (returns `true` only for a fresh record or an
-    // existing same-polarity entry); a pass outcome must report only an actual
-    // truth-map mutation as changed, so gate on the entry not existing yet.
-    let novel = ctx.truth(Proposition::AssumeCallingConvention).is_none()
-        && ctx.assume_true(Proposition::AssumeCallingConvention);
+    cone.set_assumed_call_convention(Some(convention_effect(env)));
+    // `assume_true_if_new` reports only an actual truth-map mutation as changed
+    // (`assume_true` is idempotent and returns `true` for an existing same-polarity
+    // entry too), which is what a pass outcome must gate on.
+    let novel = cone.assume_true_if_new(Proposition::AssumeCallingConvention);
     if novel {
         qcode::pass_log!(
             debug,
@@ -108,9 +106,7 @@ impl Pass for AssumeCallingConvention {
         cone: &mut crate::ConeMut,
         env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when assume_calling_convention migrates.
-        let ctx = cone.bypass_cone_unmigrated_hatch();
-        let changed = assume_calling_convention(ctx, env);
+        let changed = assume_calling_convention(cone, env);
         // The hypothesis refines only mem2reg/alias register clobbering; it adds
         // no CFG/address structure, so both cached global analyses survive.
         Ok(crate::ModulePassOutcome::module_if(changed)
@@ -165,7 +161,10 @@ mod tests {
             assume_calling_convention: false,
         };
         let env = PipelineEnv::from_parts(cfg, tc.r3);
-        assert!(!assume_calling_convention(&mut tc.ctx, &env));
+        assert!(!assume_calling_convention(
+            &mut crate::ConeMut::full(&mut tc.ctx),
+            &env
+        ));
         assert_eq!(tc.ctx.truth(Proposition::AssumeCallingConvention), None);
         assert!(tc.ctx.assumed_call_convention().is_none());
     }
@@ -193,7 +192,10 @@ mod tests {
         let flag = tc.r0_byte3;
         let env = env_with_abi(&tc, abi, sp, vec![flag.into()]);
 
-        assert!(assume_calling_convention(&mut tc.ctx, &env));
+        assert!(assume_calling_convention(
+            &mut crate::ConeMut::full(&mut tc.ctx),
+            &env
+        ));
         assert_eq!(
             tc.ctx
                 .truth(Proposition::AssumeCallingConvention)
@@ -201,7 +203,10 @@ mod tests {
             Some(true)
         );
         // Idempotent: repeating an accepted assumption reports no change.
-        assert!(!assume_calling_convention(&mut tc.ctx, &env));
+        assert!(!assume_calling_convention(
+            &mut crate::ConeMut::full(&mut tc.ctx),
+            &env
+        ));
 
         let eff = tc.ctx.assumed_call_convention().expect("effect installed");
         // reads = widest arg-register view (r0, not r0_lo32); sp excluded.

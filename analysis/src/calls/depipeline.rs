@@ -305,6 +305,9 @@ pub(crate) fn depipeline(ctx: &mut Context) -> bool {
     !depipeline_changed_functions(ctx, &targets).is_empty()
 }
 
+// Only the `#[cfg(test)]` `depipeline` helper drives this now; the module pass
+// inlines the same per-function loop through the cone handle.
+#[cfg(test)]
 fn depipeline_changed_functions(
     ctx: &mut Context,
     targets: &[FunctionId],
@@ -338,13 +341,19 @@ impl Pass for Depipeline {
         cone: &mut crate::ConeMut,
         _env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when depipeline migrates.
-        let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
-        Ok(
-            crate::ModulePassOutcome::functions(depipeline_changed_functions(ctx, &targets))
-                .preserving_global::<crate::AddressAnalysis>(),
-        )
+        let mut changed = rustc_hash::FxHashSet::default();
+        for fid in cone.cone_functions() {
+            let Some(root) = FunctionBody::from_id(cone.ctx(), fid).root().map(|b| b.id) else {
+                continue;
+            };
+            let dom = compute_dominators(&FunctionBody::from_id(cone.ctx(), fid), root);
+            while let Some(p) = find_pipelined(cone.ctx(), fid, &dom) {
+                apply(cone.ctx_for(fid), fid, &p);
+                changed.insert(fid);
+            }
+        }
+        Ok(crate::ModulePassOutcome::functions(changed)
+            .preserving_global::<crate::AddressAnalysis>())
     }
 }
 

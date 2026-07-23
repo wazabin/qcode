@@ -15,8 +15,11 @@
 //! [`BodyMut`]: qcode::value::util::body_mut::BodyMut
 
 use qcode::{
+    assumption::{AssumedCallEffect, Proposition},
     context::Context,
-    value::{FunctionBody, FunctionId, FunctionMutRef},
+    discovery::Discovery,
+    types::{TypeId, TypeManager},
+    value::{FunctionBody, FunctionId, FunctionMutRef, VarnodeId},
 };
 use rustc_hash::FxHashSet;
 
@@ -103,6 +106,70 @@ impl<'ctx, 'str> ConeMut<'ctx, 'str> {
         }
     }
 
+    // --- Cone-free shared-state accessors ------------------------------------
+    //
+    // These reach state the cone does *not* gate: module-scoped shared truths,
+    // discovery queueing, minting, global memory protections, global varnode
+    // types, the calling-convention cache. Ruling 4 makes the four module-scoped
+    // propositions force whole-program replay, so no per-function gate applies to
+    // them; interning a type or queueing a discovery is likewise not a
+    // per-function write. Each delegates to `Context` and, crucially, never hands
+    // a pass a `&mut Context` through which it could reach an out-of-cone body.
+
+    /// Assume `prop` true (see [`Context::assume_true`]). Returns whether it was
+    /// newly recorded or already held with the same polarity.
+    pub fn assume_true(&mut self, prop: Proposition) -> bool {
+        self.ctx.assume_true(prop)
+    }
+
+    /// Assume `prop` true only if no truth for it exists yet, returning whether
+    /// this call actually mutated the truth map. A pass outcome must report only
+    /// a real mutation as changed, so this is the reporting-correct variant of
+    /// [`assume_true`](Self::assume_true).
+    pub fn assume_true_if_new(&mut self, prop: Proposition) -> bool {
+        self.ctx.truth(prop).is_none() && self.ctx.assume_true(prop)
+    }
+
+    /// Cache the assumed calling-convention effect for indirect/unresolved calls
+    /// (see [`Context::set_assumed_call_convention`]).
+    pub fn set_assumed_call_convention(&mut self, effect: Option<AssumedCallEffect>) {
+        self.ctx.set_assumed_call_convention(effect);
+    }
+
+    /// Mark the binary's per-segment memory protections authoritative (see
+    /// [`Context::mark_protections_known`]). Program-global, cone-free.
+    pub fn mark_protections_known(&mut self) {
+        self.ctx.mark_protections_known();
+    }
+
+    /// Set a *global* varnode's type (see [`Context::set_varnode_type`]). Varnode
+    /// types live in shared state, not in any function body, so this is cone-free.
+    pub fn set_varnode_type(&mut self, varnode: VarnodeId, type_id: TypeId) {
+        self.ctx.set_varnode_type(varnode, type_id);
+    }
+
+    /// Queue a discovered code address for the lifter (see [`Context::discover`]).
+    /// Returns whether the discovery was newly added.
+    pub fn discover(&mut self, discovery: Discovery) -> bool {
+        self.ctx.discover(discovery)
+    }
+
+    /// Record a synthetic call-graph edge `caller → callee_addr`. Returns whether
+    /// it was newly added. Edge bookkeeping lives in shared state, not a body.
+    pub fn add_synthetic_callee(&mut self, caller: FunctionId, callee_addr: u64) -> bool {
+        self.ctx
+            .shared
+            .values
+            .add_synthetic_callee(caller, callee_addr)
+    }
+
+    /// The program-global type registry, mutable — the cone-free minting surface.
+    /// Interning/looking-up a type is shared-state work, not a per-function write,
+    /// so it is not gated.
+    pub fn types_mut(&mut self) -> &mut TypeManager {
+        &mut self.ctx.shared.types
+    }
+
     /// Cone-checked mutable access to `f`'s published interface (the effect /
     /// purity / signature setters). Panics if `f` is out of cone.
     pub fn function_mut(&mut self, f: FunctionId) -> FunctionMutRef<'str, '_> {
@@ -116,6 +183,16 @@ impl<'ctx, 'str> ConeMut<'ctx, 'str> {
     /// `Context`-inherent (instruction replacement, pure-body inlining), which a
     /// `FunctionMutRef` cannot express. The assert is the tripwire a step-5 slice
     /// trips when a pass reaches out of its cone.
+    ///
+    /// **Trusted, not checked, beyond `f`.** The returned `&mut Context` is the
+    /// *whole* module: the cone gate only asserts `f`'s membership, so a caller
+    /// that writes some *other* function through this handle is neither caught nor
+    /// stopped. Every current caller confines its *writes* to `f`'s body (reads of
+    /// other functions — e.g. `partial_inline` cloning a callee's expression into
+    /// its caller — are always sound). Narrowing the return type so out-of-`f`
+    /// writes become unrepresentable is the big-pass wave's problem; do not rely
+    /// on this method for global/shared writes — those have dedicated cone-free
+    /// accessors above.
     pub fn ctx_for(&mut self, f: FunctionId) -> &mut Context<'str> {
         self.assert_in_cone(f);
         self.ctx

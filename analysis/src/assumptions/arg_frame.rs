@@ -82,11 +82,12 @@ fn eligible(
 /// eligible function. Returns how many were assumed this round.
 pub fn assume_args_disjoint_caller_frame(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> usize {
     let targets = ctx.function_ids();
-    assume_args_disjoint_caller_frame_changed_functions(ctx, sp_reg, &targets).len()
+    let mut cone = crate::ConeMut::full(ctx);
+    assume_args_disjoint_caller_frame_changed_functions(&mut cone, sp_reg, &targets).len()
 }
 
 fn assume_args_disjoint_caller_frame_changed_functions(
-    ctx: &mut Context,
+    cone: &mut crate::ConeMut,
     sp_reg: Option<VarnodeId>,
     targets: &[FunctionId],
 ) -> rustc_hash::FxHashSet<FunctionId> {
@@ -94,15 +95,17 @@ fn assume_args_disjoint_caller_frame_changed_functions(
     let Some(sp_reg) = sp_reg else {
         return rustc_hash::FxHashSet::default();
     };
-    let taken = address_taken_set(ctx);
+    let taken = address_taken_set(cone.ctx());
     let mut changed = rustc_hash::FxHashSet::default();
     for fid in targets.iter().copied() {
-        if eligible(ctx, fid, sp_reg, &taken) {
-            let first = assume_true_if_new(ctx, Proposition::ArgsDisjointFromCallerFrame(fid));
+        // Read (eligibility) then write (shared truth map) are sequenced so the
+        // read borrow is released before the cone-free `assume_true_if_new`.
+        if eligible(cone.ctx(), fid, sp_reg, &taken) {
+            let first = cone.assume_true_if_new(Proposition::ArgsDisjointFromCallerFrame(fid));
             // Same eligibility and consumer (the memory-forwarding alias rule), so
             // record the loaded-pointer-vs-slot assumption here too — it unblocks
             // forwarding the spilled buffer-pointer reload argpromote depends on.
-            let second = assume_true_if_new(ctx, Proposition::LoadedPointerDisjointFromSlot(fid));
+            let second = cone.assume_true_if_new(Proposition::LoadedPointerDisjointFromSlot(fid));
             if first || second {
                 changed.insert(fid);
             }
@@ -114,16 +117,6 @@ fn assume_args_disjoint_caller_frame_changed_functions(
         changed.len()
     );
     changed
-}
-
-/// Record a true assumption only when the proposition has no truth yet.
-///
-/// [`Context::assume_true`] returns `true` for both a new assumption and an
-/// existing truth with the same polarity. That is useful to callers asking
-/// whether an assumption is accepted, but a pass outcome must report only an
-/// actual truth-map mutation as changed.
-fn assume_true_if_new(ctx: &mut Context, prop: Proposition) -> bool {
-    ctx.truth(prop).is_none() && ctx.assume_true(prop)
 }
 
 /// *Verify* pass — prove every assumed `ArgsDisjointFromCallerFrame` true or
@@ -342,11 +335,9 @@ impl Pass for AssumeArgFrame {
         cone: &mut crate::ConeMut,
         env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when assume_arg_frame migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
         Ok(crate::ModulePassOutcome::functions(
-            assume_args_disjoint_caller_frame_changed_functions(ctx, env.sp_varnode, &targets),
+            assume_args_disjoint_caller_frame_changed_functions(cone, env.sp_varnode, &targets),
         )
         .preserving_global::<crate::CallGraphAnalysis>()
         .preserving_global::<crate::AddressAnalysis>())

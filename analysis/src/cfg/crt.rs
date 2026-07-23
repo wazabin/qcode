@@ -29,10 +29,8 @@ impl Pass for DiscoverLibcMain {
         cone: &mut crate::ConeMut,
         env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when discover_libc_main migrates.
-        let ctx = cone.bypass_cone_unmigrated_hatch();
         Ok(
-            crate::ModulePassOutcome::module_if(discover_libc_main(ctx, env))
+            crate::ModulePassOutcome::module_if(discover_libc_main(cone, env))
                 .preserving_global::<crate::AddressAnalysis>(),
         )
     }
@@ -40,8 +38,8 @@ impl Pass for DiscoverLibcMain {
 
 crate::register_module_pass!(DiscoverLibcMain);
 
-pub fn discover_libc_main(ctx: &mut Context, env: &PipelineEnv) -> bool {
-    let Some(entry) = ctx.primary_entrypoint() else {
+pub fn discover_libc_main(cone: &mut crate::ConeMut, env: &PipelineEnv) -> bool {
+    let Some(entry) = cone.ctx().primary_entrypoint() else {
         return false;
     };
 
@@ -57,9 +55,9 @@ pub fn discover_libc_main(ctx: &mut Context, env: &PipelineEnv) -> bool {
         return false;
     }
 
-    let addresses = AddressIndex::analyze(ctx);
+    let addresses = AddressIndex::analyze(cone.ctx());
     let Some((main, source_addr)) =
-        find_libc_main_arg(ctx, &addresses, entry, main_reg, pointer_width)
+        find_libc_main_arg(cone.ctx(), &addresses, entry, main_reg, pointer_width)
     else {
         return false;
     };
@@ -71,16 +69,19 @@ pub fn discover_libc_main(ctx: &mut Context, env: &PipelineEnv) -> bool {
     // `entry → main` call-graph edge synthetically so the call graph links them.
     // Keyed by address, this is independent of whether we (below) or the symbol
     // table materialize `main`, and it is idempotent across analyze rounds.
+    // Synthetic edges and discoveries are cone-free shared-state writes.
     if let Some(entry_id) = addresses.function_at(entry) {
-        changed |= ctx.shared.values.add_synthetic_callee(entry_id, main);
+        changed |= cone.add_synthetic_callee(entry_id, main);
     }
 
     // Materialize and name `main` only if nothing lives there yet: a function may
     // already exist at `main` (a prior round's discovery) or the name `main` may
     // be taken (e.g. from the symbol table), in which case naming ours `main`
     // would collide on the unique-name invariant.
-    if addresses.function_at(main).is_none() && FunctionBody::from_name(ctx, "main").is_none() {
-        changed |= ctx.discover(
+    if addresses.function_at(main).is_none()
+        && FunctionBody::from_name(cone.ctx(), "main").is_none()
+    {
+        changed |= cone.discover(
             Discovery::function(main)
                 .with_function_reason(FunctionDiscoveryReason::CrtMain)
                 .with_name(Some("main".to_string()))
