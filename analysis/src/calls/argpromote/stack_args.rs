@@ -67,19 +67,17 @@ impl Pass for PromoteStackArgs {
         cone: &mut crate::ConeMut,
         env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when promote_stack_args migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
         let Some(sp_reg) = env.sp_varnode else {
             return Ok(crate::ModulePassOutcome::default());
         };
-        let graph = crate::CallGraph::analyze(ctx);
+        let graph = crate::CallGraph::analyze(cone.ctx());
 
         // Only functions whose call interface is positional (`pure_reg`) — the
         // ones whose direct callers pass `@SP` as an argument we can key on.
         let mut changed = rustc_hash::FxHashSet::default();
         for &fid in &targets {
-            let f = FunctionBody::from_id(ctx, fid);
+            let f = FunctionBody::from_id(cone.ctx(), fid);
             if f.is_external() || !f.is_reg_materialized() {
                 continue;
             }
@@ -91,11 +89,11 @@ impl Pass for PromoteStackArgs {
             // is created, destroyed, or re-keyed. (Rebuilding the graph inside
             // `append_entry_param` per promoted slot was quadratic in module
             // size and dominated the pass on real binaries.)
-            let sites = crate::calls::direct_call_sites(ctx, &graph, fid);
-            if has_implicit_direct_site(ctx, &sites) {
+            let sites = crate::calls::direct_call_sites(cone.ctx(), &graph, fid);
+            if has_implicit_direct_site(cone.ctx(), &sites) {
                 continue;
             }
-            if promote_one(ctx, fid, sp_reg, &sites) {
+            if promote_one(cone, fid, sp_reg, &sites) {
                 changed.insert(fid);
                 // `append_entry_param` also rewrites every direct caller (new
                 // binding load + extra `Call` arg), so those callers are dirtied
@@ -149,25 +147,25 @@ fn has_implicit_direct_site(ctx: &Context, sites: &[InstructionId]) -> bool {
 }
 
 fn promote_one(
-    ctx: &mut Context,
+    cone: &mut crate::ConeMut,
     fid: FunctionId,
     sp_reg: VarnodeId,
     sites: &[InstructionId],
 ) -> bool {
-    let Some(sp_param) = incoming_sp_param(ModuleView::new(ctx), fid, sp_reg) else {
+    let Some(sp_param) = incoming_sp_param(ModuleView::new(cone.ctx()), fid, sp_reg) else {
         return false;
     };
-    let Some(root) = FunctionBody::from_id(ctx, fid).root().map(|b| b.id) else {
+    let Some(root) = FunctionBody::from_id(cone.ctx(), fid).root().map(|b| b.id) else {
         return false;
     };
-    let numbering = precompute_forms(ModuleView::new(ctx), fid);
-    let ram = ctx.shared.default_space;
+    let numbering = precompute_forms(ModuleView::new(cone.ctx()), fid);
+    let ram = cone.ctx().shared.default_space;
 
     // Distinct incoming caller-frame read slots `(offset > 0, size)` → the loads
     // that read them. Offset 0 is the return-address slot, not an argument.
     let mut slots: HashMap<(i64, usize), Vec<qcode::value::insn::InstructionId>> =
         HashMap::default();
-    for block in FunctionBody::from_id(ctx, fid).blocks() {
+    for block in FunctionBody::from_id(cone.ctx(), fid).blocks() {
         for insn in block.iter() {
             let Mnemonic::Load(l) = insn.mnemonic() else {
                 continue;
@@ -176,7 +174,7 @@ fn promote_one(
                 continue;
             }
             let ptr = l.ptr.qualify(insn.id.func);
-            if let Some(off) = frame_offset(ModuleView::new(ctx), &numbering, sp_param, ptr)
+            if let Some(off) = frame_offset(ModuleView::new(cone.ctx()), &numbering, sp_param, ptr)
                 && off > 0
             {
                 slots.entry((off, l.size)).or_default().push(insn.id);
@@ -190,18 +188,31 @@ fn promote_one(
 
     // The positional index of the callee's `@SP` param: every direct caller's
     // `Call.args[sp_index]` is the `@SP` value we key the caller-side load on.
-    let Some(sp_index) = FunctionBody::from_id(ctx, fid)
+    let Some(sp_index) = FunctionBody::from_id(cone.ctx(), fid)
         .root()
         .and_then(|b| b.params().position(|p| p.id() == sp_param))
     else {
         return false;
     };
-    let ram = ctx.shared.default_space;
-    let ptr_width = Space::from_id(&*ctx, ram).addr_size;
+    let ram = cone.ctx().shared.default_space;
+    let ptr_width = Space::from_id(cone.ctx(), ram).addr_size;
 
     // Deterministic order.
     let mut ordered: Vec<((i64, usize), Vec<InstructionId>)> = slots.into_iter().collect();
     ordered.sort_by_key(|((off, size), _)| (*off, *size));
+
+    // Write phase. `append_entry_param_at_sites` threads a binding load + extra
+    // `Call` arg into every direct caller as well as adding the callee's param,
+    // so every function it touches must be in the cone: assert each caller then
+    // the callee (each individually checked), then run the coordinated write
+    // through the callee's whole-context handle. Asserting only now — past every
+    // early bail — keeps a no-op promotion from tripping the gate. `has_implicit
+    // _direct_site` already guaranteed every `site` is a regpure `Call`, so each
+    // is genuinely rewritten.
+    for &site in sites {
+        let _ = cone.ctx_for(site.func);
+    }
+    let ctx = cone.ctx_for(fid);
 
     let mut changed = false;
     for ((off, size), loads) in ordered {
