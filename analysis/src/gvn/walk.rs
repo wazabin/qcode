@@ -113,6 +113,14 @@ impl Editor {
         if with == ValueId::Instruction(insn) {
             return;
         }
+        // `replace_all_uses_with` rewrites every operand of every user recorded in
+        // the reverse use-map, terminator branch arguments included: `args()`
+        // yields them (see `Branch`/`CBranch`), so `push_insn` and
+        // `replace_instruction_mnemonic` register them, and the `users_map`
+        // verifier enforces that the map stays complete. It is the single source of
+        // truth — no post-hoc terminator scan is needed. The old scan re-walked
+        // (and address-sorted) every block on each replace, which dominated GVN on
+        // large functions.
         body.replace_all_uses_with(ValueId::Instruction(insn), with);
         self.redundant.insert(insn);
     }
@@ -553,6 +561,63 @@ mod tests {
             FunctionBody::from_id(&ctx, f).users_of(ValueId::Instruction(x)),
             users_before,
             "its users must be untouched"
+        );
+    }
+
+    /// `Editor::replace` forwards every use through the reverse use-map alone —
+    /// terminator branch arguments included — so a value used *only* as a branch
+    /// argument is rewritten with no separate terminator scan. Guards that removal:
+    /// if `replace_all_uses_with` ever missed branch args, the goto's operand would
+    /// dangle at the now-redundant `%x`.
+    #[test]
+    fn replace_rewrites_a_value_used_only_as_a_branch_argument() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <entry>
+                %x = 0x1000 + 1;
+                goto <join @p=%x>;
+            <join @p:i64>
+                return @p;
+            "
+        );
+        let root = FunctionBody::from_id(&ctx, f).root().unwrap().id;
+        let entry_insns = BasicBlock::from_id(&ctx, root).instruction_ids();
+        let x = entry_insns[0];
+        let goto = *entry_insns.last().unwrap();
+        // %x's sole use is the goto's branch argument — it is reached only through
+        // the reverse use-map's terminator entry.
+        assert_eq!(
+            ctx.bodies[f].users_of(ValueId::Instruction(x)),
+            vec![goto],
+            "%x must be used only by the goto's branch argument",
+        );
+
+        let c = ctx.get_const(0x2000, 8).id();
+        crate::with_body_mut(&mut ctx, f, |body, cx| {
+            let mut ed = Editor::new();
+            ed.replace(body, cx, x, c);
+        });
+
+        // The branch argument now carries the replacement, and %x has no users.
+        let args: Vec<ValueId> = match ctx.get_insn(goto).mnemonic() {
+            qcode::value::insn::Mnemonic::Branch(b) => {
+                b.args.iter().map(|a| a.qualify(goto.func)).collect()
+            }
+            other => panic!("expected a goto terminator, got {other:?}"),
+        };
+        assert_eq!(
+            args,
+            vec![c],
+            "the branch argument must be rewritten to the replacement value",
+        );
+        assert!(
+            FunctionBody::from_id(&ctx, f)
+                .users_of(ValueId::Instruction(x))
+                .is_empty(),
+            "no use of the replaced value may survive",
         );
     }
 
