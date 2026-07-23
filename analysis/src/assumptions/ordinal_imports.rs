@@ -17,10 +17,7 @@
 //! `ordinal_map.toml` maps the DLL/ordinal.
 
 use cabi::OrdinalMap;
-use qcode::{
-    context::Context,
-    value::{FunctionBody, FunctionId, Renameable},
-};
+use qcode::value::{FunctionBody, Renameable};
 
 use crate::{Pass, PipelineEnv};
 
@@ -36,10 +33,12 @@ impl Pass for ResolveOrdinals {
 
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when ordinal-import resolution migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         // The per-import DLL is only available from the live binary handle.
         let Some(binary) = env.binary.as_ref() else {
             return Ok(crate::ModulePassOutcome::default());
@@ -50,7 +49,7 @@ impl Pass for ResolveOrdinals {
         }
 
         let mut renamed = Vec::new();
-        for &id in targets {
+        for &id in &targets {
             let f = FunctionBody::from_id(ctx, id);
             if !f.is_external() {
                 continue;

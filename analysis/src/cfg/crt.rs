@@ -26,10 +26,11 @@ impl Pass for DiscoverLibcMain {
 
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         env: &PipelineEnv,
-        _targets: &[qcode::value::FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when discover_libc_main migrates.
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         Ok(
             crate::ModulePassOutcome::module_if(discover_libc_main(ctx, env))
                 .preserving_global::<crate::AddressAnalysis>(),
@@ -282,7 +283,7 @@ mod tests {
 
         assert!(
             DiscoverLibcMain
-                .run(&mut tc.ctx, &env, &[])
+                .run(&mut crate::ConeMut::full(&mut tc.ctx), &env)
                 .unwrap()
                 .changed()
         );
@@ -327,7 +328,7 @@ mod tests {
 
         assert!(
             DiscoverLibcMain
-                .run(&mut tc.ctx, &env, &[])
+                .run(&mut crate::ConeMut::full(&mut tc.ctx), &env)
                 .unwrap()
                 .changed()
         );
@@ -359,7 +360,7 @@ mod tests {
         // Re-running is idempotent: the edge already exists, so nothing changes.
         assert!(
             !DiscoverLibcMain
-                .run(&mut tc.ctx, &env, &[])
+                .run(&mut crate::ConeMut::full(&mut tc.ctx), &env)
                 .unwrap()
                 .changed()
         );
@@ -408,7 +409,7 @@ mod tests {
 
         assert!(
             DiscoverLibcMain
-                .run(&mut tc.ctx, &env, &[])
+                .run(&mut crate::ConeMut::full(&mut tc.ctx), &env)
                 .unwrap()
                 .changed()
         );

@@ -128,10 +128,11 @@ impl Pass for WindowsTebSeed {
 
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         env: &PipelineEnv,
-        _targets: &[qcode::value::FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when windows_teb_seed migrates.
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         if env.cfg.os != TargetOs::Windows || env.cfg.bitness != 32 {
             return Ok(crate::ModulePassOutcome::default());
         }
@@ -286,7 +287,10 @@ mod tests {
         // Wrong platform: no-op, register stays untyped.
         assert!(
             !WindowsTebSeed
-                .run(&mut ctx, &env_for(TargetOs::Linux, 64), &[])
+                .run(
+                    &mut crate::ConeMut::full(&mut ctx),
+                    &env_for(TargetOs::Linux, 64)
+                )
                 .unwrap()
                 .changed()
         );
@@ -296,7 +300,10 @@ mod tests {
         // Windows x86: types the register and is idempotent on a second run.
         assert!(
             WindowsTebSeed
-                .run(&mut ctx, &env_for(TargetOs::Windows, 32), &[])
+                .run(
+                    &mut crate::ConeMut::full(&mut ctx),
+                    &env_for(TargetOs::Windows, 32)
+                )
                 .unwrap()
                 .changed()
         );
@@ -304,7 +311,10 @@ mod tests {
         assert!(ctx.shared.types.pointee_of(t).is_some());
         assert!(
             !WindowsTebSeed
-                .run(&mut ctx, &env_for(TargetOs::Windows, 32), &[])
+                .run(
+                    &mut crate::ConeMut::full(&mut ctx),
+                    &env_for(TargetOs::Windows, 32)
+                )
                 .unwrap()
                 .changed()
         );

@@ -14,6 +14,7 @@
 //! via [`ArchConfig`]. Callers build one with `harbinger::arch::arch_config`.
 
 mod analysis_manager;
+mod cone;
 mod config;
 mod lifter;
 mod module_view;
@@ -47,6 +48,7 @@ pub(crate) fn install_minted_for_test<'str>(
 pub use analysis_manager::{
     AnalysisManager, GlobalAnalysis, LocalAnalysis, LocalAnalysisManager, PreservedAnalyses,
 };
+pub use cone::{Cone, ConeMut};
 pub(crate) use pass::with_body_mut;
 pub use pass::{
     DynFunctionPass, DynPass, FunctionPass, FunctionPassAdapter, ModulePassOutcome, Pass,

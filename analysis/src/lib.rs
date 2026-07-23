@@ -81,7 +81,7 @@ pub use lift::{AddressAnalysis, discover_addresses_in_binary, lift_new_addresses
 pub mod pipeline;
 pub(crate) use pipeline::with_body_mut;
 pub use pipeline::{
-    AnalysisManager, ArchConfig, CallingConvention, ContextSplit, ContextView,
+    AnalysisManager, ArchConfig, CallingConvention, Cone, ConeMut, ContextSplit, ContextView,
     DEFAULT_PIPELINE_TOML, DynFunctionPass, DynPass, FunctionBody, FunctionPass,
     FunctionPassAdapter, GlobalAnalysis, GpReg, LiftOutcome, LiftSummary, LocalAnalysis,
     LocalAnalysisManager, ModulePassOutcome, Outcome, Pass, PassRegistration, Pipeline,

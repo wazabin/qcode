@@ -26,7 +26,7 @@ use qcode::{
     assumption::{AssumedCallEffect, Proposition},
     context::Context,
     pass_scope,
-    value::{FunctionId, VarnodeId},
+    value::VarnodeId,
 };
 
 use crate::{Pass, PipelineEnv};
@@ -105,10 +105,11 @@ impl Pass for AssumeCallingConvention {
     }
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         env: &PipelineEnv,
-        _targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when assume_calling_convention migrates.
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         let changed = assume_calling_convention(ctx, env);
         // The hypothesis refines only mem2reg/alias register clobbering; it adds
         // no CFG/address structure, so both cached global analyses survive.

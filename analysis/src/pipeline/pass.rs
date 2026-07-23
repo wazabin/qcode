@@ -37,7 +37,7 @@ use qcode::{
 use rustc_hash::FxHashSet;
 
 use super::{
-    AnalysisManager, ArchConfig, CallingConvention, ContextSplit, ContextView,
+    AnalysisManager, ArchConfig, CallingConvention, ConeMut, ContextSplit, ContextView,
     LocalAnalysisManager, Outcome, PreservedAnalyses,
 };
 use crate::structure::Program;
@@ -714,23 +714,20 @@ impl ModulePassOutcome {
 pub trait Pass: Default {
     const NAME: &'static str;
     fn description(&self) -> &'static str;
-    fn run(
-        &self,
-        ctx: &mut Context,
-        env: &PipelineEnv,
-        targets: &[FunctionId],
-    ) -> Result<ModulePassOutcome, String>;
+    /// Run over the module through a [`ConeMut`]: read the whole program, write
+    /// only the cone (which subsumes the old `targets` slice — iterate
+    /// [`ConeMut::cone_functions`]).
+    fn run(&self, cone: &mut ConeMut, env: &PipelineEnv) -> Result<ModulePassOutcome, String>;
 
     /// Analysis-aware entry point. Existing passes use [`Pass::run`]; consumers
     /// of cached global or local analyses override this method.
     fn run_with_analyses(
         &self,
-        ctx: &mut Context,
+        cone: &mut ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
         _analyses: &mut AnalysisManager,
     ) -> Result<ModulePassOutcome, String> {
-        self.run(ctx, env, targets)
+        self.run(cone, env)
     }
 }
 
@@ -738,17 +735,11 @@ pub trait Pass: Default {
 pub trait DynPass {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
-    fn run(
-        &self,
-        ctx: &mut Context,
-        env: &PipelineEnv,
-        targets: &[FunctionId],
-    ) -> Result<ModulePassOutcome, String>;
+    fn run(&self, cone: &mut ConeMut, env: &PipelineEnv) -> Result<ModulePassOutcome, String>;
     fn run_with_analyses(
         &self,
-        ctx: &mut Context,
+        cone: &mut ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
         analyses: &mut AnalysisManager,
     ) -> Result<ModulePassOutcome, String>;
     /// If this module pass is a `module(<fn_pass>)` adapter, the wrapped
@@ -769,26 +760,20 @@ impl<T: Pass> DynPass for T {
     fn description(&self) -> &'static str {
         Pass::description(self)
     }
-    fn run(
-        &self,
-        ctx: &mut Context,
-        env: &PipelineEnv,
-        targets: &[FunctionId],
-    ) -> Result<ModulePassOutcome, String> {
-        Pass::run(self, ctx, env, targets)
+    fn run(&self, cone: &mut ConeMut, env: &PipelineEnv) -> Result<ModulePassOutcome, String> {
+        Pass::run(self, cone, env)
     }
     fn run_with_analyses(
         &self,
-        ctx: &mut Context,
+        cone: &mut ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
         analyses: &mut AnalysisManager,
     ) -> Result<ModulePassOutcome, String> {
         #[cfg(test)]
-        let call_graph_before = call_graph_snapshot(ctx);
+        let call_graph_before = call_graph_snapshot(cone.ctx());
         #[cfg(test)]
-        let addresses_before = address_snapshot(ctx);
-        let outcome = Pass::run_with_analyses(self, ctx, env, targets, analyses)?;
+        let addresses_before = address_snapshot(cone.ctx());
+        let outcome = Pass::run_with_analyses(self, cone, env, analyses)?;
         #[cfg(test)]
         if outcome
             .preserved_analyses()
@@ -796,7 +781,7 @@ impl<T: Pass> DynPass for T {
         {
             assert_eq!(
                 call_graph_before,
-                call_graph_snapshot(ctx),
+                call_graph_snapshot(cone.ctx()),
                 "{} reported preserving CallGraphAnalysis but changed its result",
                 T::NAME,
             );
@@ -808,7 +793,7 @@ impl<T: Pass> DynPass for T {
         {
             assert_eq!(
                 addresses_before,
-                address_snapshot(ctx),
+                address_snapshot(cone.ctx()),
                 "{} reported preserving AddressAnalysis but changed its result",
                 T::NAME,
             );
@@ -949,22 +934,20 @@ impl DynPass for ModuleFnAdapter {
     fn description(&self) -> &'static str {
         self.inner.description()
     }
-    fn run(
-        &self,
-        ctx: &mut Context,
-        env: &PipelineEnv,
-        targets: &[FunctionId],
-    ) -> Result<ModulePassOutcome, String> {
-        self.run_with_analyses(ctx, env, targets, &mut AnalysisManager::default())
+    fn run(&self, cone: &mut ConeMut, env: &PipelineEnv) -> Result<ModulePassOutcome, String> {
+        self.run_with_analyses(cone, env, &mut AnalysisManager::default())
     }
     fn run_with_analyses(
         &self,
-        ctx: &mut Context,
+        cone: &mut ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
         analyses: &mut AnalysisManager,
     ) -> Result<ModulePassOutcome, String> {
-        super::config::run_standalone_module_fn(ctx, env, self.inner.as_ref(), targets, analyses)
+        // Infrastructure adapter: the cone subsumes `targets`, and the standalone
+        // worklist bridge needs the raw `&mut Context` for its split/barrier dance.
+        let targets = cone.cone_functions();
+        let ctx = cone.ctx_mut();
+        super::config::run_standalone_module_fn(ctx, env, self.inner.as_ref(), &targets, analyses)
     }
     fn as_module_fn(&self) -> Option<&dyn DynFunctionPass> {
         Some(&*self.inner)

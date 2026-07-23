@@ -33,10 +33,11 @@ impl Pass for MemoryProtections {
     }
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         _env: &PipelineEnv,
-        _targets: &[qcode::value::FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when establish_memory_protections migrates.
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         establish_memory_protections(ctx);
         Ok(crate::ModulePassOutcome::module()
             .preserving_global::<crate::CallGraphAnalysis>()

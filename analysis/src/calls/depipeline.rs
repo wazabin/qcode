@@ -335,12 +335,14 @@ impl Pass for Depipeline {
     }
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         _env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when depipeline migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         Ok(
-            crate::ModulePassOutcome::functions(depipeline_changed_functions(ctx, targets))
+            crate::ModulePassOutcome::functions(depipeline_changed_functions(ctx, &targets))
                 .preserving_global::<crate::AddressAnalysis>(),
         )
     }

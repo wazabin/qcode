@@ -75,10 +75,12 @@ impl Pass for PromoteGlobalCells {
 
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when promote_global_cells migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         let fun_ids: Vec<FunctionId> = targets
             .iter()
             .copied()

@@ -13,9 +13,8 @@
 //! `discover_code`), which this pass does **not** yet do.
 
 use qcode::{
-    context::Context,
     types::TypeRepr,
-    value::{FunctionBody, FunctionId, ValueId, insn::Mnemonic},
+    value::{FunctionBody, ValueId, insn::Mnemonic},
 };
 
 use crate::{Pass, PipelineEnv};
@@ -37,13 +36,15 @@ impl Pass for InferCodePointers {
 
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         _env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when infer_code_pointers migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         // Collect every indirect-call target, qualified to a context ValueId.
         let mut targets_ptrs: Vec<ValueId> = Vec::new();
-        for &fid in targets {
+        for &fid in &targets {
             if FunctionBody::from_id(ctx, fid).is_external() {
                 continue;
             }
@@ -113,8 +114,9 @@ mod tests {
         );
 
         let env = PipelineEnv::headless(&ctx);
-        let ids = ctx.function_ids();
-        let out = InferCodePointers.run(&mut ctx, &env, &ids).unwrap();
+        let out = InferCodePointers
+            .run(&mut crate::ConeMut::full(&mut ctx), &env)
+            .unwrap();
         assert!(out.changed(), "pass should retype the called param");
 
         let root = FunctionBody::from_id(&ctx, f).root().unwrap().id;

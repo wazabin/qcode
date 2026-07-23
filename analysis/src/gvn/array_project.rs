@@ -63,19 +63,19 @@ impl crate::Pass for ArrayProject {
 
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         _env: &crate::PipelineEnv,
-        targets: &[qcode::value::FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
-        let targets: rustc_hash::FxHashSet<_> = targets.iter().copied().collect();
-        let snapshot = module_instruction_snapshot(ctx)
+        // The instruction snapshot is a whole-program read; the per-instruction
+        // rewrites are cone-checked body edits routed through `cone.ctx_for`.
+        let snapshot = module_instruction_snapshot(cone.ctx())
             .into_iter()
-            .filter(|id| targets.contains(&id.func))
+            .filter(|id| cone.contains(id.func))
             .collect::<Vec<_>>();
         let mut changed = rustc_hash::FxHashSet::default();
         for insn_id in snapshot {
-            let ic = module_insn(ctx, insn_id);
-            if self.rewrite(ctx, &ic) {
+            let ic = module_insn(cone.ctx(), insn_id);
+            if self.rewrite(cone.ctx_for(insn_id.func), &ic) {
                 changed.insert(insn_id.func);
             }
         }
@@ -365,8 +365,8 @@ mod tests {
     fn run_array_project(tc: &mut TestContext) {
         let env = crate::PipelineEnv::headless(&tc.ctx);
         loop {
-            let targets = tc.ctx.function_ids();
-            if !crate::Pass::run(&super::ArrayProject, &mut tc.ctx, &env, &targets)
+            let mut cone = crate::ConeMut::full(&mut tc.ctx);
+            if !crate::Pass::run(&super::ArrayProject, &mut cone, &env)
                 .unwrap()
                 .changed()
             {

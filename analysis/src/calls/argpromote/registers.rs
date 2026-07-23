@@ -785,15 +785,17 @@ impl Pass for ArgPromoteMaterialize {
     }
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when argpromote-registers migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         let graph = CallGraph::analyze(ctx);
         Ok(crate::ModulePassOutcome::functions(materialize_functions(
             ctx,
             &graph,
-            targets,
+            &targets,
             env.sp_varnode,
         ))
         .preserving_global::<CallGraphAnalysis>()
@@ -802,16 +804,18 @@ impl Pass for ArgPromoteMaterialize {
 
     fn run_with_analyses(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
         analyses: &mut AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when argpromote-registers migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         let graph = analyses.global::<CallGraphAnalysis>(ctx);
         Ok(crate::ModulePassOutcome::functions(materialize_functions(
             ctx,
             graph,
-            targets,
+            &targets,
             env.sp_varnode,
         ))
         .preserving_global::<CallGraphAnalysis>()
@@ -834,15 +838,17 @@ impl Pass for ArgPromoteRegpureCalls {
     }
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when argpromote-registers migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         let graph = CallGraph::analyze(ctx);
         Ok(crate::ModulePassOutcome::functions(regpure_all_sites(
             ctx,
             &graph,
-            targets,
+            &targets,
             env.sp_varnode,
         ))
         .preserving_global::<CallGraphAnalysis>()
@@ -851,16 +857,18 @@ impl Pass for ArgPromoteRegpureCalls {
 
     fn run_with_analyses(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
         analyses: &mut AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when argpromote-registers migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         let graph = analyses.global::<CallGraphAnalysis>(ctx);
         Ok(crate::ModulePassOutcome::functions(regpure_all_sites(
             ctx,
             graph,
-            targets,
+            &targets,
             env.sp_varnode,
         ))
         .preserving_global::<CallGraphAnalysis>()

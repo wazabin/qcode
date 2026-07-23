@@ -102,10 +102,12 @@ impl Pass for ExternalSigs {
 
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when external-signature stamping migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         if !abi_is_known(&env.cfg.abi) {
             return Ok(crate::ModulePassOutcome::default());
         }

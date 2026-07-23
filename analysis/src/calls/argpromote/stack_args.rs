@@ -64,10 +64,12 @@ impl Pass for PromoteStackArgs {
 
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when promote_stack_args migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         let Some(sp_reg) = env.sp_varnode else {
             return Ok(crate::ModulePassOutcome::default());
         };
@@ -76,7 +78,7 @@ impl Pass for PromoteStackArgs {
         // Only functions whose call interface is positional (`pure_reg`) — the
         // ones whose direct callers pass `@SP` as an argument we can key on.
         let mut changed = rustc_hash::FxHashSet::default();
-        for &fid in targets {
+        for &fid in &targets {
             let f = FunctionBody::from_id(ctx, fid);
             if f.is_external() || !f.is_reg_materialized() {
                 continue;

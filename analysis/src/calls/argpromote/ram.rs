@@ -1718,15 +1718,17 @@ impl Pass for ArgPromote {
     }
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when argpromote (RAM) migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         let sp_reg = ctx.shared.registers.get(&env.cfg.stack_pointer).copied();
         let graph = crate::CallGraph::analyze(ctx);
         Ok(
             crate::ModulePassOutcome::functions(argpromote_changed_functions_with_sp(
-                ctx, sp_reg, targets, &graph,
+                ctx, sp_reg, &targets, &graph,
             ))
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>(),
@@ -1735,16 +1737,18 @@ impl Pass for ArgPromote {
 
     fn run_with_analyses(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
         analyses: &mut crate::AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when argpromote (RAM) migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         let sp_reg = ctx.shared.registers.get(&env.cfg.stack_pointer).copied();
         let graph = analyses.global::<crate::CallGraphAnalysis>(ctx);
         Ok(
             crate::ModulePassOutcome::functions(argpromote_changed_functions_with_sp(
-                ctx, sp_reg, targets, graph,
+                ctx, sp_reg, &targets, graph,
             ))
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>(),

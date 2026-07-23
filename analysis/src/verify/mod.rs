@@ -188,10 +188,12 @@ impl Pass for Verify {
     }
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         _env: &PipelineEnv,
-        _targets: &[qcode::value::FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when verify migrates (read-only; a cone-checked
+        // read surface would suffice).
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         let violations = verify(ctx);
         if violations.is_empty() {
             Ok(crate::ModulePassOutcome::default())

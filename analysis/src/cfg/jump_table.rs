@@ -107,15 +107,17 @@ impl Pass for HandleJumpTables {
     /// non-ignored function, matching a `scope = "function"` stage's eligibility.
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when handle_jump_tables migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         let mut addresses = AddressIndex::analyze(ctx);
         self.run_indexed(
             ctx,
             env.binary.as_deref(),
-            targets,
+            &targets,
             &mut addresses,
             &env.obligations,
         )
@@ -123,16 +125,18 @@ impl Pass for HandleJumpTables {
 
     fn run_with_analyses(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
         analyses: &mut crate::AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when handle_jump_tables migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         let mut addresses = analyses.take_global::<crate::AddressAnalysis>(ctx);
         let result = self.run_indexed(
             ctx,
             env.binary.as_deref(),
-            targets,
+            &targets,
             &mut addresses,
             &env.obligations,
         );

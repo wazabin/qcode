@@ -735,6 +735,25 @@ struct ModuleStageOutcome {
     module_changed: bool,
 }
 
+/// The cone-gated write handle a module pass runs with this iteration. The cone
+/// carries exactly the stage's `round_targets`: on the first iteration (and after
+/// a module-wide change) that is every function — an inert [`Cone::Full`] — and on
+/// a narrowed fixpoint iteration it is the exact changed set, preserving the
+/// existing per-iteration target narrowing the driver has always done. `Cone::Full`
+/// becomes non-trivially restrictive only when the incremental driver (step 5)
+/// computes a partial cone.
+fn cone_from_round_targets<'a, 'str>(
+    ctx: &'a mut Context<'str>,
+    round_targets: &[FunctionId],
+) -> super::ConeMut<'a, 'str> {
+    if round_targets.len() == ctx.interfaces.len() {
+        super::ConeMut::full(ctx)
+    } else {
+        let set: HashSet<FunctionId> = round_targets.iter().copied().collect();
+        super::ConeMut::new(ctx, super::Cone::Set(set))
+    }
+}
+
 /// Run a whole-program stage; if `repeat_until` is set, loop the stage (OR-ing
 /// the passes' change flags) until nothing changes or the iteration cap is hit.
 #[allow(clippy::too_many_arguments)]
@@ -794,7 +813,13 @@ fn run_module_stage(
                         progress,
                     )?)
                 } else {
-                    p.run_with_analyses(ctx, env, &round_targets, analyses)
+                    // A genuine module pass sees the module through a cone-gated
+                    // write handle carrying this iteration's `round_targets` (all
+                    // functions on the first/module-changed iteration, the exact
+                    // changed set on a narrowed one). The handle subsumes the old
+                    // `round_targets` slice via `ConeMut::cone_functions`.
+                    let mut cone = cone_from_round_targets(ctx, &round_targets);
+                    p.run_with_analyses(&mut cone, env, analyses)
                         .map_err(|e| format!("{}: {e}", p.name()))?
                 };
                 if outcome.type_requests.is_empty() {
@@ -1037,9 +1062,14 @@ fn run_lifting_module_stage(
                     super::pass::ModulePassOutcome::module_if(summary.changed())
                         .preserving_global::<crate::AddressAnalysis>()
                 }
-                _ => p
-                    .run_with_analyses(ctx, env, &round_targets, analyses)
-                    .map_err(|e| format!("{}: {e}", p.name()))?,
+                _ => {
+                    // Cone-gated write handle carrying this iteration's
+                    // `round_targets`; subsumes the old slice via
+                    // `ConeMut::cone_functions`.
+                    let mut cone = cone_from_round_targets(ctx, &round_targets);
+                    p.run_with_analyses(&mut cone, env, analyses)
+                        .map_err(|e| format!("{}: {e}", p.name()))?
+                }
             };
             let pass_changed = outcome.changed();
             if pass_changed {
@@ -2192,21 +2222,19 @@ mod tests {
 
         fn run(
             &self,
-            _ctx: &mut Context,
+            cone: &mut crate::ConeMut,
             _env: &PipelineEnv,
-            targets: &[FunctionId],
         ) -> Result<crate::ModulePassOutcome, String> {
-            Ok(self.invoke(targets))
+            Ok(self.invoke(&cone.cone_functions()))
         }
 
         fn run_with_analyses(
             &self,
-            _ctx: &mut Context,
+            cone: &mut crate::ConeMut,
             _env: &PipelineEnv,
-            targets: &[FunctionId],
             _analyses: &mut AnalysisManager,
         ) -> Result<crate::ModulePassOutcome, String> {
-            Ok(self.invoke(targets))
+            Ok(self.invoke(&cone.cone_functions()))
         }
     }
 

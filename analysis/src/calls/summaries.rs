@@ -399,10 +399,12 @@ impl Pass for Summaries {
     }
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when summaries migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         let Some(stack_ptr) = env.sp_varnode else {
             return Ok(crate::ModulePassOutcome::default());
         };

@@ -81,22 +81,33 @@ impl EffectChannel for PureChannel {
     }
 }
 
-fn mark_pure_functions_targeted(ctx: &mut Context, targets: &[FunctionId]) -> bool {
+/// Solve the purity summary and collect the `targets` that are newly provably
+/// pure (not already pure, reg-materialized, non-external, and unable to reach
+/// themselves). Read-only: the caller stamps `is_pure` on the returned set.
+fn newly_pure_functions(
+    ctx: &Context,
+    targets: impl IntoIterator<Item = FunctionId>,
+) -> Vec<FunctionId> {
     let graph = crate::CallGraph::analyze(ctx);
     let summaries = solve_summaries(ctx, &graph, &PureChannel);
-    let mut changed = false;
-    for fid in targets.iter().copied() {
-        let f = FunctionBody::from_id(ctx, fid);
-        if f.is_pure() || !f.is_reg_materialized() || f.is_external() {
-            continue;
-        }
-        let pure = matches!(summaries.get(fid), Ok(reachable) if !reachable.contains(&fid));
-        if pure {
-            FunctionBody::from_id_mut(ctx, fid).set_is_pure(true);
-            changed = true;
-        }
+    targets
+        .into_iter()
+        .filter(|&fid| {
+            let f = FunctionBody::from_id(ctx, fid);
+            !f.is_pure()
+                && f.is_reg_materialized()
+                && !f.is_external()
+                && matches!(summaries.get(fid), Ok(reachable) if !reachable.contains(&fid))
+        })
+        .collect()
+}
+
+fn mark_pure_functions_targeted(ctx: &mut Context, targets: &[FunctionId]) -> bool {
+    let to_mark = newly_pure_functions(ctx, targets.iter().copied());
+    for &fid in &to_mark {
+        FunctionBody::from_id_mut(ctx, fid).set_is_pure(true);
     }
-    changed
+    !to_mark.is_empty()
 }
 
 /// Whether `fid`'s body computes its returned values as a deterministic function
@@ -185,27 +196,19 @@ impl Pass for MarkPure {
     }
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         _env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
-        let before: rustc_hash::FxHashSet<_> = ctx
-            .functions()
-            .filter(|f| f.is_pure())
-            .map(|f| f.id)
-            .collect();
-        mark_pure_functions_targeted(ctx, targets);
-        Ok(crate::ModulePassOutcome::functions(
-            targets
-                .iter()
-                .copied()
-                .map(|id| FunctionBody::from_id(ctx, id))
-                .filter(|f| f.is_pure() && !before.contains(&f.id))
-                .map(|f| f.id),
-        )
-        .preserving_global::<crate::CallGraphAnalysis>()
-        .preserving_global::<crate::AddressAnalysis>()
-        .preserving_local::<crate::AliasAnalysis>())
+        // Whole-program purity solve reads `&Context`; the `is_pure` stamp writes
+        // through the cone-checked interface setter.
+        let to_mark = newly_pure_functions(cone.ctx(), cone.cone_functions());
+        for &fid in &to_mark {
+            cone.function_mut(fid).set_is_pure(true);
+        }
+        Ok(crate::ModulePassOutcome::functions(to_mark)
+            .preserving_global::<crate::CallGraphAnalysis>()
+            .preserving_global::<crate::AddressAnalysis>()
+            .preserving_local::<crate::AliasAnalysis>())
     }
 }
 

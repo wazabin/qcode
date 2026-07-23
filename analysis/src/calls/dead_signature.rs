@@ -359,14 +359,16 @@ impl Pass for DeadSignature {
     }
     fn run(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         _env: &PipelineEnv,
-        targets: &[FunctionId],
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when dead_signature migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         let graph = CallGraph::analyze(ctx);
         Ok(
             crate::ModulePassOutcome::functions(dead_signature_changed_functions(
-                ctx, targets, &graph,
+                ctx, &targets, &graph,
             ))
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>(),
@@ -375,15 +377,17 @@ impl Pass for DeadSignature {
 
     fn run_with_analyses(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         _env: &PipelineEnv,
-        targets: &[FunctionId],
         analyses: &mut crate::AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
+        // CONE-HATCH: remove when dead_signature migrates.
+        let targets = cone.cone_functions();
+        let ctx = cone.bypass_cone_unmigrated_hatch();
         let graph = analyses.global::<crate::CallGraphAnalysis>(ctx);
         Ok(
             crate::ModulePassOutcome::functions(dead_signature_changed_functions(
-                ctx, targets, graph,
+                ctx, &targets, graph,
             ))
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>(),

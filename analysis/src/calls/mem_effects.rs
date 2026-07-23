@@ -38,16 +38,21 @@ pub fn set_all_written_spaces(ctx: &mut Context) {
     set_written_spaces_targeted_with_sp(ctx, &targets, None);
 }
 
-fn set_written_spaces_targeted_with_sp(
-    ctx: &mut Context,
-    targets: &[FunctionId],
+/// Solve the whole-program RAM summary and compute the memory-channel stamp for
+/// each `target` whose value would change. Read-only: the whole-program solve and
+/// the change comparison both run against `&Context`. The caller stamps the
+/// returned updates (through the cone-checked interface setter on the module path,
+/// or `from_id_mut` on the whole-`Context` path).
+fn written_space_updates(
+    ctx: &Context,
+    targets: impl IntoIterator<Item = FunctionId>,
     sp: Option<qcode::value::VarnodeId>,
-) -> rustc_hash::FxHashSet<FunctionId> {
+) -> Vec<(FunctionId, qcode::value::MemoryChannelState)> {
     let graph = crate::CallGraph::analyze(ctx);
     let summaries = super::argpromote::ram_summary_solve(ctx, &graph, sp);
 
-    let mut changed_functions = rustc_hash::FxHashSet::default();
-    for &id in targets {
+    let mut updates = Vec::new();
+    for id in targets {
         let (summary, precise) = match summaries.get(id) {
             // ⊤: neither component is expressible.
             Err(_) => (None, None),
@@ -77,8 +82,21 @@ fn set_written_spaces_targeted_with_sp(
             precise,
         };
         if FunctionBody::from_id(ctx, id).effects().memory != new_memory {
-            changed_functions.insert(id);
+            updates.push((id, new_memory));
         }
+    }
+    updates
+}
+
+fn set_written_spaces_targeted_with_sp(
+    ctx: &mut Context,
+    targets: &[FunctionId],
+    sp: Option<qcode::value::VarnodeId>,
+) -> rustc_hash::FxHashSet<FunctionId> {
+    let updates = written_space_updates(ctx, targets.iter().copied(), sp);
+    let changed_functions: rustc_hash::FxHashSet<FunctionId> =
+        updates.iter().map(|(id, _)| *id).collect();
+    for (id, new_memory) in updates {
         FunctionBody::from_id_mut(ctx, id).set_memory_effects(new_memory);
     }
     changed_functions
@@ -98,11 +116,17 @@ impl Pass for SeedWrittenSpaces {
     }
     fn run(
         &self,
-        ctx: &mut Context,
-        _env: &PipelineEnv,
-        targets: &[FunctionId],
+        cone: &mut crate::ConeMut,
+        env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        let changed = set_written_spaces_targeted_with_sp(ctx, targets, _env.sp_varnode);
+        // Whole-program solve reads through `&Context`; stamping iterates the cone
+        // and writes through the cone-checked interface setter.
+        let updates = written_space_updates(cone.ctx(), cone.cone_functions(), env.sp_varnode);
+        let changed: rustc_hash::FxHashSet<FunctionId> =
+            updates.iter().map(|(id, _)| *id).collect();
+        for (id, new_memory) in updates {
+            cone.function_mut(id).set_memory_effects(new_memory);
+        }
         Ok(crate::ModulePassOutcome::functions(changed)
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>())
@@ -341,6 +365,61 @@ fn callee:
         assert!(
             out.contains("load(ram:12"),
             "without the assumption the loop-carried wide load must remain opaque, got:\n{out}"
+        );
+    }
+
+    /// Non-vacuity of the cone-gated write handle: running `seed_written_spaces`
+    /// under a partial `Cone::Set` stamps the in-cone function's memory channel
+    /// but leaves the out-of-cone function's channel exactly at its unstamped
+    /// default — the cone restricts the stamping loop, not just the iteration.
+    #[test]
+    fn partial_cone_stamps_only_in_cone_functions() {
+        use qcode_macro::qcode;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn writer_a:
+            <a @p:i64>
+                store(ram:8, i64 @p <- i64 0x1);
+                return at i64 0;
+            fn writer_b:
+            <b @p:i64>
+                store(ram:8, i64 @p <- i64 0x1);
+                return at i64 0;
+            "
+        );
+
+        let default_mem = qcode::value::MemoryChannelState::default();
+        // Both functions start unstamped.
+        assert_eq!(
+            FunctionBody::from_id(&ctx, writer_a).effects().memory,
+            default_mem
+        );
+        assert_eq!(
+            FunctionBody::from_id(&ctx, writer_b).effects().memory,
+            default_mem
+        );
+
+        // Run under a cone that excludes `writer_b`.
+        let env = crate::PipelineEnv::headless(&ctx);
+        let set: rustc_hash::FxHashSet<FunctionId> = [writer_a].into_iter().collect();
+        {
+            let mut cone = crate::ConeMut::new(&mut ctx, crate::Cone::Set(set));
+            crate::Pass::run(&SeedWrittenSpaces, &mut cone, &env).unwrap();
+        }
+
+        // `writer_a` (in cone) was stamped; `writer_b` (out of cone) is untouched.
+        assert_ne!(
+            FunctionBody::from_id(&ctx, writer_a).effects().memory,
+            default_mem,
+            "in-cone function must be stamped"
+        );
+        assert_eq!(
+            FunctionBody::from_id(&ctx, writer_b).effects().memory,
+            default_mem,
+            "out-of-cone function's memory effects must be untouched"
         );
     }
 }
