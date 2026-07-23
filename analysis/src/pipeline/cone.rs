@@ -49,13 +49,13 @@ impl Cone {
 /// The only handle a module [`Pass`](super::Pass) receives: a `&mut Context`
 /// wrapped so that writes are gated on the [`Cone`] while reads stay free.
 ///
-/// It never hands `&mut Context` to a pass. Interface stamping and body edits go
-/// through the cone-checked accessors ([`function_mut`](Self::function_mut),
-/// [`ctx_for`](Self::ctx_for)); reads go through [`ctx`](Self::ctx). Free
-/// operations that the cone does not gate (minting, discovery queueing, shared
-/// truth/proposition writes — ruling 4's module-scoped propositions already force
-/// whole-program replay) are reached through the same read/`ctx_for` surface as a
-/// pass migrates.
+/// It never hands an unrestricted `&mut Context` to a pass. Interface stamping
+/// and body edits go through the cone-checked accessors
+/// ([`function_mut`](Self::function_mut), [`ctx_for`](Self::ctx_for)); reads go
+/// through [`ctx`](Self::ctx). Free operations that the cone does not gate
+/// (minting, discovery queueing, shared truth/proposition writes — ruling 4's
+/// module-scoped propositions already force whole-program replay) are reached
+/// through the dedicated cone-free accessors below.
 pub struct ConeMut<'ctx, 'str> {
     ctx: &'ctx mut Context<'str>,
     cone: Cone,
@@ -178,21 +178,34 @@ impl<'ctx, 'str> ConeMut<'ctx, 'str> {
     }
 
     /// Cone-checked whole-`Context` mutation surface for a body edit on `f`.
-    /// Panics if `f` is out of cone; the caller must confine its edits to `f`'s
-    /// body. This is the migrated-pass surface for transforms whose verbs are
-    /// `Context`-inherent (instruction replacement, pure-body inlining), which a
-    /// `FunctionMutRef` cannot express. The assert is the tripwire a step-5 slice
-    /// trips when a pass reaches out of its cone.
+    /// Panics if `f` is out of cone. This is *the* migrated-pass surface for
+    /// transforms whose verbs are `Context`-inherent (instruction replacement,
+    /// pure-body inlining, call-site rewrites), which a `FunctionMutRef` cannot
+    /// express. The assert is the tripwire a step-5 slice trips when a pass
+    /// reaches out of its cone.
     ///
-    /// **Trusted, not checked, beyond `f`.** The returned `&mut Context` is the
-    /// *whole* module: the cone gate only asserts `f`'s membership, so a caller
-    /// that writes some *other* function through this handle is neither caught nor
-    /// stopped. Every current caller confines its *writes* to `f`'s body (reads of
-    /// other functions — e.g. `partial_inline` cloning a callee's expression into
-    /// its caller — are always sound). Narrowing the return type so out-of-`f`
-    /// writes become unrepresentable is the big-pass wave's problem; do not rely
-    /// on this method for global/shared writes — those have dedicated cone-free
-    /// accessors above.
+    /// # Contract
+    ///
+    /// This is a **trusted single-function write surface**. The gate *checks* one
+    /// thing — that `f` is in the cone — and then *trusts* the caller on
+    /// everything else:
+    ///
+    /// * **Writes must stay within `f`'s body.** The returned handle is the whole
+    ///   module, so a write to some *other* function's body is neither caught nor
+    ///   stopped; it is a caller bug. A coordinated multi-function edit (e.g. a
+    ///   callee interface plus its callers' call sites) is expressed as a sequence
+    ///   of `ctx_for` calls, one per owning function, each individually asserted
+    ///   before its write — never one `ctx_for` standing in for several functions.
+    /// * **Reads of any function are always fine.** Cloning a callee's expression
+    ///   into its caller, scanning the whole module — reads are never cone-gated.
+    /// * **Shared and global writes do not belong here.** Truths/propositions,
+    ///   discovery queueing, type interning, calling-convention caches and other
+    ///   program-global state have dedicated cone-free accessors above; route them
+    ///   there, not through this handle.
+    ///
+    /// Narrowing the return type so out-of-`f` writes become structurally
+    /// unrepresentable is a future refactor; until then the single-function
+    /// contract is a discipline the caller upholds, not one the type enforces.
     pub fn ctx_for(&mut self, f: FunctionId) -> &mut Context<'str> {
         self.assert_in_cone(f);
         self.ctx
@@ -203,14 +216,6 @@ impl<'ctx, 'str> ConeMut<'ctx, 'str> {
             self.cone.contains(f),
             "a module pass may not write function {f:?}: it is outside the pass's cone"
         );
-    }
-
-    /// **Temporary** unrestricted `&mut Context` for module passes not yet
-    /// migrated to the cone-checked surface. Scheduled for deletion within the
-    /// incremental-invalidation round: the round is not done while any call site
-    /// remains. Every use is tagged `// CONE-HATCH: remove when <pass> migrates`.
-    pub fn bypass_cone_unmigrated_hatch(&mut self) -> &mut Context<'str> {
-        self.ctx
     }
 
     /// Raw `&mut Context` for pipeline **infrastructure** only (the driver and the
