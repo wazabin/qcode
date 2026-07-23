@@ -1465,15 +1465,22 @@ impl<'str> Mem2Reg<'_, 'str> {
                         unreachable!("is_register_var only matches varnodes");
                     };
                     let existing = slots.get(index).and_then(|slot| *slot);
-                    let value = existing
-                        .filter(|&value| self.is_load_from_var(value, var, edge.source_block))
-                        .unwrap_or_else(|| {
-                            self.load_register_before_branch(
-                                edge.source_block,
-                                edge.branch_insn,
-                                vn_id,
-                            )
-                        });
+                    // Reuse the argument already wired into this var's own edge
+                    // slot rather than re-materializing a register load. The
+                    // existing argument is the committed edge value for `var` read
+                    // from this block's terminator during the top-down rename, so
+                    // by SSA well-formedness it already dominates the branch, and a
+                    // `Clobbered`/`None` frame means no managed reaching definition
+                    // supersedes it — it is still `var`'s value here. Emitting a
+                    // fresh `load(register:n, SUB)` instead is what let GVN rewrite
+                    // it into an equivalent slice (`load(EBP)` -> `%rbp[0:4]`) and
+                    // mem2reg re-materialize it, oscillating the promote stage
+                    // until the fixpoint tracer tripped — the dominant cost of
+                    // `as -Os`. Only a genuinely new param (no existing argument)
+                    // needs a materialized reload.
+                    let value = existing.unwrap_or_else(|| {
+                        self.load_register_before_branch(edge.source_block, edge.branch_insn, vn_id)
+                    });
                     (value, None)
                 }
                 Some(FrameEntry::Clobbered) | None => panic!(
@@ -1526,25 +1533,6 @@ impl<'str> Mem2Reg<'_, 'str> {
         builder
             .push_load::<false>(ValueId::Varnode(vn_id), size, space)
             .id()
-    }
-
-    /// Whether `value` is a `Load` of `var` that already sits in `block` — the
-    /// shape produced by a prior run's [`Self::load_register_before_branch`]. The
-    /// block check ensures we only reuse a reload that actually dominates the
-    /// branch we are wiring; a load from `var` living elsewhere must not be
-    /// silently adopted as the edge argument.
-    fn is_load_from_var(&self, value: ValueId, var: ValueId, block: BlockId) -> bool {
-        let ValueId::Instruction(insn_id) = value else {
-            return false;
-        };
-        let insn = self.read().insn_ref(insn_id);
-        if insn.parent().map(|b| b.id) != Some(block) {
-            return false;
-        }
-        matches!(
-            insn.mnemonic(),
-            Mnemonic::Load(Load { ptr, .. }) if ptr.qualify(insn_id.func) == var
-        )
     }
 
     fn remove_promoted_stores(
