@@ -164,8 +164,13 @@ fn cross_base_disjoint<'ctx, 'str: 'ctx>(
 
 #[derive(Clone, Default)]
 pub(super) struct MemForward {
-    /// Per-byte forwarding, keyed by base identity and a signed byte offset.
-    byte_map: HashMap<(Base, i64), Cell>,
+    /// Per-byte forwarding, grouped by base identity: each base maps a signed
+    /// byte offset to the [`Cell`] holding it. Grouping (rather than a flat
+    /// `(Base, i64)` key) lets the pruning walks evaluate their per-*base*
+    /// predicate — [`cross_base_disjoint`], the call-clobber classification —
+    /// once per base instead of once per byte. An inner map is never left
+    /// empty: a prune that empties one drops the base entry with it.
+    byte_map: HashMap<Base, HashMap<i64, Cell>>,
 }
 
 impl MemForward {
@@ -182,9 +187,10 @@ impl MemForward {
         numbering: &Numbering,
     ) {
         let (base, start) = locate(host, load.ptr.qualify(func), load.space, aliases, numbering);
+        let cells = self.byte_map.entry(base).or_default();
         for (i, off) in (start..start + load.size as i64).enumerate() {
-            self.byte_map.insert(
-                (base, off),
+            cells.insert(
+                off,
                 Cell {
                     src: value,
                     src_off: i,
@@ -196,9 +202,10 @@ impl MemForward {
     /// Group bytes `start..end` of `base` into maximal single-source segments,
     /// or `None` if any byte is unmapped (coverage gap — not forwardable).
     fn segments(&self, base: Base, start: i64, end: i64) -> Option<Vec<Segment>> {
+        let cells = self.byte_map.get(&base)?;
         let mut segments: Vec<Segment> = Vec::new();
         for off in start..end {
-            let cell = self.byte_map.get(&(base, off)).copied()?;
+            let cell = cells.get(&off).copied()?;
             let load_off = (off - start) as usize;
             match segments.last_mut() {
                 // Extend the run when it continues the same source contiguously.
@@ -241,33 +248,39 @@ impl MemForward {
         );
         let end = start + store.size as i64;
 
-        self.byte_map.retain(|&(cb, _), _| {
+        // A store invalidates every co-base cell it may overlap. `cross_base_disjoint`
+        // depends only on the two bases, so it is evaluated once per base here rather
+        // than once per byte.
+        self.byte_map.retain(|&cb, _| {
             cb == base || cross_base_disjoint(cx.body_view(body), aliases, store_ptr, base, cb)
         });
 
-        for off in start..end {
-            self.byte_map.remove(&(base, off));
-        }
         let covered = ValueRef::from_view(cx.body_view(body), store_src)
             .size()
             .min(store.size);
+        let zero = (covered < store.size).then(|| {
+            cx.body_view(body)
+                .shared()
+                .get_const(0, store.size - covered)
+        });
+
+        let cells = self.byte_map.entry(base).or_default();
+        for off in start..end {
+            cells.remove(&off);
+        }
         for (i, off) in (start..start + covered as i64).enumerate() {
-            self.byte_map.insert(
-                (base, off),
+            cells.insert(
+                off,
                 Cell {
                     src: store_src,
                     src_off: i,
                 },
             );
         }
-        if covered < store.size {
-            let zero = cx
-                .body_view(body)
-                .shared()
-                .get_const(0, store.size - covered);
+        if let Some(zero) = zero {
             for (i, off) in (start + covered as i64..end).enumerate() {
-                self.byte_map.insert(
-                    (base, off),
+                cells.insert(
+                    off,
                     Cell {
                         src: zero,
                         src_off: i,
@@ -511,7 +524,7 @@ impl MemForward {
                             CallClobbers::Regs(map.outputs.clone())
                         }
                         qcode::value::RegisterChannelState::Solved(sets) => {
-                            CallClobbers::Regs(sets.stores.clone())
+                            CallClobbers::Regs(sets.writes.clone())
                         }
                         qcode::value::RegisterChannelState::Top
                         | qcode::value::RegisterChannelState::Unsolved => {
@@ -590,7 +603,7 @@ impl MemForward {
             a.is_own_frame_local(bv) && escaping.iter().all(|&p| a.provably_disjoint(host, p, bv))
         };
 
-        self.byte_map.retain(|&(base, off), _| {
+        self.byte_map.retain(|&base, cells| {
             let space = base.space();
             if !is_reg(space) {
                 // A body-local scratch space is normally owned by the caller and
@@ -623,7 +636,10 @@ impl MemForward {
                                         .is_some_and(|(sp, ..)| sp == space)
                                 })
                         }
-                        Base::Pinned(_) => !pinned_ram_clobbered(space, off),
+                        Base::Pinned(_) => {
+                            cells.retain(|&off, _| !pinned_ram_clobbered(space, off));
+                            !cells.is_empty()
+                        }
                     };
                 }
                 // A direct callee with a witnessed write-set that excludes this
@@ -645,19 +661,27 @@ impl MemForward {
                 // escaped into the callee, which may then store through it.
                 return match base {
                     Base::Symbolic(_, bv) => own_frame_survives(bv),
-                    Base::Pinned(_) => !pinned_ram_clobbered(space, off),
+                    Base::Pinned(_) => {
+                        cells.retain(|&off, _| !pinned_ram_clobbered(space, off));
+                        !cells.is_empty()
+                    }
                 };
             }
             // Register cells: drop those the call clobbers.
             match base {
                 Base::Pinned(_) => match &clobbers {
                     CallClobbers::AllRegisters => false,
-                    CallClobbers::Regs(regs) => !regs.iter().any(|&r| {
-                        let vn = Varnode::from_id(host.shared(), r);
-                        vn.space().id == space
-                            && vn.address() <= off
-                            && off < vn.address() + vn.size() as i64
-                    }),
+                    CallClobbers::Regs(regs) => {
+                        cells.retain(|&off, _| {
+                            !regs.iter().any(|&r| {
+                                let vn = Varnode::from_id(host.shared(), r);
+                                vn.space().id == space
+                                    && vn.address() <= off
+                                    && off < vn.address() + vn.size() as i64
+                            })
+                        });
+                        !cells.is_empty()
+                    }
                 },
                 Base::Symbolic(_, bv) => match &clobbers {
                     CallClobbers::AllRegisters => false,
@@ -839,16 +863,24 @@ impl MemForward {
             })
             .collect();
 
-        self.byte_map.retain(|&(base, off), _| {
-            !store_locs.iter().any(|&(sb, s, size, rep)| {
-                if sb == base {
-                    // Same base: overwritten only on the bytes it covers.
-                    s <= off && off < s + size
-                } else {
-                    // Other base: may overwrite unless provably disjoint.
-                    !cross_base_disjoint(host, aliases, rep, sb, base)
-                }
-            })
+        self.byte_map.retain(|&base, cells| {
+            // An other-base store we cannot prove disjoint clobbers every offset of
+            // this base (its overwritten bytes are unknown here), so it drops the
+            // whole base. `cross_base_disjoint` is offset-independent — evaluated
+            // once per base rather than once per byte.
+            let clobbered_wholesale = store_locs.iter().any(|&(sb, _, _, rep)| {
+                sb != base && !cross_base_disjoint(host, aliases, rep, sb, base)
+            });
+            if clobbered_wholesale {
+                return false;
+            }
+            // Same-base stores overwrite only the bytes they cover.
+            cells.retain(|&off, _| {
+                !store_locs
+                    .iter()
+                    .any(|&(sb, s, size, _)| sb == base && s <= off && off < s + size)
+            });
+            !cells.is_empty()
         });
     }
 
@@ -856,6 +888,42 @@ impl MemForward {
     /// dominator-tree entry, whose dominance claims are invalid).
     pub(super) fn clear(&mut self) {
         self.byte_map.clear();
+    }
+}
+
+#[cfg(test)]
+impl MemForward {
+    /// Insert a single forwarded byte (test-only; production code inserts through
+    /// the per-base entry directly).
+    fn insert_cell(&mut self, base: Base, off: i64, cell: Cell) {
+        self.byte_map.entry(base).or_default().insert(off, cell);
+    }
+
+    /// The cell at `(base, off)`, if any.
+    fn cell(&self, base: Base, off: i64) -> Option<Cell> {
+        self.byte_map.get(&base)?.get(&off).copied()
+    }
+
+    /// Whether a cell at `(base, off)` is present.
+    fn contains_cell(&self, base: Base, off: i64) -> bool {
+        self.byte_map
+            .get(&base)
+            .is_some_and(|m| m.contains_key(&off))
+    }
+
+    /// Total number of forwarded bytes across every base.
+    fn cell_count(&self) -> usize {
+        self.byte_map.values().map(|m| m.len()).sum()
+    }
+
+    /// Remove the cell at `(base, off)`, dropping the base if it empties.
+    fn remove_cell(&mut self, base: Base, off: i64) {
+        if let Some(m) = self.byte_map.get_mut(&base) {
+            m.remove(&off);
+            if m.is_empty() {
+                self.byte_map.remove(&base);
+            }
+        }
     }
 }
 
@@ -1001,11 +1069,9 @@ mod tests {
         let src = ValueId::Varnode(tc.r1);
         let mut mf = MemForward::default();
         // bytes 0,1 = src[0],src[1]  (contiguous) ; byte 2 = src[3] (jump)
-        mf.byte_map.insert((base, start), Cell { src, src_off: 0 });
-        mf.byte_map
-            .insert((base, start + 1), Cell { src, src_off: 1 });
-        mf.byte_map
-            .insert((base, start + 2), Cell { src, src_off: 3 });
+        mf.insert_cell(base, start, Cell { src, src_off: 0 });
+        mf.insert_cell(base, start + 1, Cell { src, src_off: 1 });
+        mf.insert_cell(base, start + 2, Cell { src, src_off: 3 });
 
         let segs = mf.segments(base, start, start + 3).expect("fully covered");
         assert_eq!(segs.len(), 2, "discontiguous src_off splits the run");
@@ -1013,7 +1079,7 @@ mod tests {
         assert_eq!((segs[1].load_off, segs[1].size, segs[1].src_off), (2, 1, 3));
 
         // A hole makes the load unforwardable.
-        mf.byte_map.remove(&(base, start + 1));
+        mf.remove_cell(base, start + 1);
         assert!(mf.segments(base, start, start + 3).is_none());
     }
 
@@ -1038,9 +1104,13 @@ mod tests {
             mf.record_store(body, cx, fid, &byte_store, Some(&aliases), &nb);
         });
 
-        assert_eq!(mf.byte_map[&(base, start)].src, byte, "byte 0 overwritten");
         assert_eq!(
-            mf.byte_map[&(base, start + 1)].src,
+            mf.cell(base, start).unwrap().src,
+            byte,
+            "byte 0 overwritten"
+        );
+        assert_eq!(
+            mf.cell(base, start + 1).unwrap().src,
             wide,
             "byte 1 still from the wide store"
         );
@@ -1059,10 +1129,8 @@ mod tests {
         let r1_start = r1_start as i64;
         let src = ValueId::Varnode(tc.r2);
         let mut mf = MemForward::default();
-        mf.byte_map
-            .insert((base, r0_start), Cell { src, src_off: 0 });
-        mf.byte_map
-            .insert((base, r1_start), Cell { src, src_off: 0 });
+        mf.insert_cell(base, r0_start, Cell { src, src_off: 0 });
+        mf.insert_cell(base, r1_start, Cell { src, src_off: 0 });
 
         // Simulate a call clobbering only r0 by retaining via the same predicate.
         let regs = [tc.r0_lo32];
@@ -1070,19 +1138,24 @@ mod tests {
             sp.shared()
                 .is_some_and(|sp| matches!(Space::from_id(&tc.ctx, sp).ty, SpaceType::Register))
         };
-        mf.byte_map.retain(|&(b, off), _| {
+        mf.byte_map.retain(|&b, cells| {
             let sp = b.space();
             if !is_reg(sp) {
                 return true;
             }
-            !regs.iter().any(|&r| {
-                let vn = Varnode::from_id(&tc.ctx, r);
-                vn.space().id == sp && vn.address() <= off && off < vn.address() + vn.size() as i64
-            })
+            cells.retain(|&off, _| {
+                !regs.iter().any(|&r| {
+                    let vn = Varnode::from_id(&tc.ctx, r);
+                    vn.space().id == sp
+                        && vn.address() <= off
+                        && off < vn.address() + vn.size() as i64
+                })
+            });
+            !cells.is_empty()
         });
 
-        assert!(!mf.byte_map.contains_key(&(base, r0_start)), "r0 dropped");
-        assert!(mf.byte_map.contains_key(&(base, r1_start)), "r1 kept");
+        assert!(!mf.contains_cell(base, r0_start), "r0 dropped");
+        assert!(mf.contains_cell(base, r1_start), "r1 kept");
     }
 
     /// PROTOTYPE (realigned-frame): a spill into a realigned own-frame slot
@@ -1145,8 +1218,9 @@ mod tests {
         // A plain caller-frame `@SP - 4` cell, for contrast: its base is the `@SP`
         // param (classified CallerFrame), so it is not own-frame-private.
         let caller_slot = Base::Symbolic(ram.into(), sp);
-        mf.byte_map.insert(
-            (caller_slot, -4),
+        mf.insert_cell(
+            caller_slot,
+            -4,
             Cell {
                 src: val,
                 src_off: 0,
@@ -1155,18 +1229,18 @@ mod tests {
 
         let realigned = Base::Symbolic(ram.into(), aligned);
         assert!(
-            mf.byte_map.contains_key(&(realigned, -0x78)),
+            mf.contains_cell(realigned, -0x78),
             "spill recorded at the realigned own-frame base"
         );
 
         mf.prune_clobbered_by_call(qcode::value::ModuleView::new(&tc.ctx), root, Some(&aliases));
 
         assert!(
-            mf.byte_map.contains_key(&(realigned, -0x78)),
+            mf.contains_cell(realigned, -0x78),
             "realigned own-frame spill survives the call (callee got no frame pointer)"
         );
         assert!(
-            !mf.byte_map.contains_key(&(caller_slot, -4)),
+            !mf.contains_cell(caller_slot, -4),
             "a caller-frame @SP slot is still dropped across the call"
         );
     }
@@ -1195,17 +1269,17 @@ mod tests {
             mf.record_store(body, cx, fid, &store, Some(&aliases), &Numbering::default());
         });
 
-        assert_eq!(mf.byte_map.len(), 4, "all four written bytes are defined");
-        assert_eq!(mf.byte_map[&(base, start)].src, narrow);
-        assert_eq!(mf.byte_map[&(base, start + 1)].src, narrow);
+        assert_eq!(mf.cell_count(), 4, "all four written bytes are defined");
+        assert_eq!(mf.cell(base, start).unwrap().src, narrow);
+        assert_eq!(mf.cell(base, start + 1).unwrap().src, narrow);
         // Upper bytes resolve to a zero constant.
-        let upper = mf.byte_map[&(base, start + 2)].src;
+        let upper = mf.cell(base, start + 2).unwrap().src;
         assert_eq!(
             literal_of(&tc.ctx, upper),
             Some(0),
             "upper bytes zero-extend"
         );
-        assert_eq!(mf.byte_map[&(base, start + 3)].src, upper);
+        assert_eq!(mf.cell(base, start + 3).unwrap().src, upper);
     }
 
     fn literal_of(ctx: &Context, v: ValueId) -> Option<u64> {
@@ -1266,17 +1340,17 @@ mod tests {
         let src = ValueId::Varnode(tc.r2);
 
         let mut mf = MemForward::default();
-        mf.byte_map.insert((symbolic, 0), Cell { src, src_off: 0 });
-        mf.byte_map.insert((pinned, 0x40), Cell { src, src_off: 0 });
+        mf.insert_cell(symbolic, 0, Cell { src, src_off: 0 });
+        mf.insert_cell(pinned, 0x40, Cell { src, src_off: 0 });
 
         mf.prune_clobbered_by_call(qcode::value::ModuleView::new(&tc.ctx), block, None);
 
         assert!(
-            !mf.byte_map.contains_key(&(symbolic, 0)),
+            !mf.contains_cell(symbolic, 0),
             "a call drops symbolic RAM cells"
         );
         assert!(
-            mf.byte_map.contains_key(&(pinned, 0x40)),
+            mf.contains_cell(pinned, 0x40),
             "a pinned RAM cell survives a call"
         );
     }
@@ -1297,8 +1371,8 @@ mod tests {
         // irrelevant to this RAM-forwarding test.
         FunctionBody::from_id_mut(&mut tc.ctx, callee).set_register_effects(
             qcode::value::RegisterChannelState::Solved(qcode::value::RegisterEffectSets {
-                loads: vec![],
-                stores: vec![],
+                reads: vec![],
+                writes: vec![],
             }),
         );
         if readonly {
@@ -1349,13 +1423,13 @@ mod tests {
         let pinned = Base::Pinned(ram.into());
         let src = ValueId::Varnode(tc.r2);
         let mut mf = MemForward::default();
-        mf.byte_map.insert((pinned, 0x40), Cell { src, src_off: 0 });
+        mf.insert_cell(pinned, 0x40, Cell { src, src_off: 0 });
         mf.prune_clobbered_by_call(
             qcode::value::ModuleView::new(&tc.ctx),
             block,
             Some(&aliases),
         );
-        mf.byte_map.contains_key(&(pinned, 0x40))
+        mf.contains_cell(pinned, 0x40)
     }
 
     /// A call argument flowing into a `readonly` callee param cannot be written
@@ -1429,18 +1503,17 @@ mod tests {
         let src = ValueId::Varnode(tc.r2);
 
         let mut mf = MemForward::default();
-        mf.byte_map.insert((ram_cell, 0), Cell { src, src_off: 0 });
-        mf.byte_map
-            .insert((caller_scratch_cell, 0), Cell { src, src_off: 0 });
+        mf.insert_cell(ram_cell, 0, Cell { src, src_off: 0 });
+        mf.insert_cell(caller_scratch_cell, 0, Cell { src, src_off: 0 });
 
         mf.prune_clobbered_by_call(qcode::value::ModuleView::new(&tc.ctx), block, None);
 
         assert!(
-            mf.byte_map.contains_key(&(ram_cell, 0)),
+            mf.contains_cell(ram_cell, 0),
             "a RAM cell survives a call to a callee that writes only scratch"
         );
         assert!(
-            mf.byte_map.contains_key(&(caller_scratch_cell, 0)),
+            mf.contains_cell(caller_scratch_cell, 0),
             "a callee that writes nothing cannot clobber its caller's body-local scratch"
         );
     }
@@ -1507,13 +1580,13 @@ mod tests {
         let cell = Base::Pinned(shadow);
         let src = ValueId::Varnode(tc.r2);
         let mut mf = MemForward::default();
-        mf.byte_map.insert((cell, 0), Cell { src, src_off: 0 });
+        mf.insert_cell(cell, 0, Cell { src, src_off: 0 });
         mf.prune_clobbered_by_call(
             qcode::value::ModuleView::new(&tc.ctx),
             block,
             Some(&aliases),
         );
-        mf.byte_map.contains_key(&(cell, 0))
+        mf.contains_cell(cell, 0)
     }
 
     #[test]
