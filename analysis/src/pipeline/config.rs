@@ -1293,11 +1293,22 @@ fn hash_id_normalized(hasher: &mut impl std::hash::Hasher, rendered: &str) {
     let mut ordinals: HashMap<&str, u32> = HashMap::default();
     let mut rest = rendered;
 
-    while let Some((at, prefix)) = ID_BEARING_ATOMS
-        .iter()
-        .filter_map(|p| rest.find(p).map(|i| (i, *p)))
-        .min_by_key(|&(i, _)| i)
-    {
+    // Every id-bearing atom starts with `%` or `@`. Scan once for the next such
+    // sigil rather than re-running a full `str::find` per prefix per iteration:
+    // a body carries many `%tmp` atoms and (usually) zero `@param`, so the old
+    // two-prefix `min_by_key` search re-scanned the whole tail for the absent
+    // prefix on every atom — quadratic in body length. The byte stream fed to
+    // `hasher` is identical; only the scan cost changes.
+    while let Some(sigil) = rest.find(['%', '@']) {
+        let candidate = &rest[sigil..];
+        let Some(&prefix) = ID_BEARING_ATOMS.iter().find(|p| candidate.starts_with(*p)) else {
+            // A `%`/`@` that begins no id-bearing atom (a register, a named
+            // value): pass it through and resume scanning after it.
+            hasher.write(&rest.as_bytes()[..sigil + 1]);
+            rest = &rest[sigil + 1..];
+            continue;
+        };
+        let at = sigil;
         let after = &rest[at + prefix.len()..];
         let digits = after
             .find(|c: char| !c.is_ascii_hexdigit())
@@ -2141,6 +2152,95 @@ mod tests {
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
+
+    /// The pre-optimization two-prefix `min_by_key` scan, kept verbatim as an
+    /// oracle so the single-pass rewrite is checked to feed `hasher` a
+    /// byte-identical stream on every representative render.
+    fn old_hash_id_normalized(hasher: &mut impl std::hash::Hasher, rendered: &str) {
+        let mut ordinals: HashMap<&str, u32> = HashMap::default();
+        let mut rest = rendered;
+        while let Some((at, prefix)) = ID_BEARING_ATOMS
+            .iter()
+            .filter_map(|p| rest.find(p).map(|i| (i, *p)))
+            .min_by_key(|&(i, _)| i)
+        {
+            let after = &rest[at + prefix.len()..];
+            let digits = after
+                .find(|c: char| !c.is_ascii_hexdigit())
+                .unwrap_or(after.len());
+            let ends_identifier = after[digits..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+            if digits == 0 || !ends_identifier {
+                hasher.write(&rest.as_bytes()[..at + prefix.len()]);
+                rest = after;
+                continue;
+            }
+            hasher.write(&rest.as_bytes()[..at]);
+            let next = ordinals.len() as u32;
+            let ordinal = *ordinals
+                .entry(&rest[at..at + prefix.len() + digits])
+                .or_insert(next);
+            hasher.write(prefix.as_bytes());
+            hasher.write(&ordinal.to_le_bytes());
+            rest = &after[digits..];
+        }
+        hasher.write(rest.as_bytes());
+    }
+
+    fn norm_hash(f: fn(&mut std::collections::hash_map::DefaultHasher, &str), s: &str) -> u64 {
+        use std::hash::Hasher;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        f(&mut h, s);
+        h.finish()
+    }
+
+    #[test]
+    fn hash_id_normalized_matches_reference_oracle() {
+        // A spread of the shapes a rendered body actually presents: many `%tmp`
+        // with no `@param` (the quadratic case the rewrite targets), interleaved
+        // sigils, named lookalikes that must pass through, non-atom `%`/`@`, and
+        // ids that do/don't end the identifier.
+        let cases = [
+            "",
+            "no sigils here at all",
+            "%tmp1a = add %tmp2b, %tmp3c",
+            "@param0: %tmp1 %tmp2 %tmp1 %tmp2 %tmp1",
+            "%tmpfoo is named; %tmp10 is an id; %tmp is bare",
+            "reg %rax and %eax then %tmp7f",
+            "stray @ and % then %tmp0 and @param9",
+            "%tmp1_ trailing underscore keeps it a name",
+            "mix @paramz %tmpg %tmp1 @param0 %tmp1 @param0",
+            "%tmpF %tmpf %tmpFF %tmpff",
+        ];
+        for c in cases {
+            assert_eq!(
+                norm_hash(hash_id_normalized, c),
+                norm_hash(old_hash_id_normalized, c),
+                "rewrite diverged from oracle on {c:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn hash_id_normalized_is_alpha_equivalent_but_name_sensitive() {
+        // Same structure, different arena ids -> same hash (churn tolerance).
+        assert_eq!(
+            norm_hash(hash_id_normalized, "%tmp1 = add %tmp2, %tmp3"),
+            norm_hash(hash_id_normalized, "%tmpa = add %tmpb, %tmpc"),
+        );
+        // Distinct structure (an operand reused vs not) -> distinct hash.
+        assert_ne!(
+            norm_hash(hash_id_normalized, "%tmp1 = add %tmp2, %tmp2"),
+            norm_hash(hash_id_normalized, "%tmp1 = add %tmp2, %tmp3"),
+        );
+        // A named value that merely starts with the prefix is not normalized.
+        assert_ne!(
+            norm_hash(hash_id_normalized, "%tmpfoo"),
+            norm_hash(hash_id_normalized, "%tmpbar"),
+        );
+    }
 
     static MODULE_ADAPTER_ACTIVE: AtomicUsize = AtomicUsize::new(0);
     static MODULE_ADAPTER_MAX_ACTIVE: AtomicUsize = AtomicUsize::new(0);
