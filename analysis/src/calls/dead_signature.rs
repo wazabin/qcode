@@ -596,6 +596,108 @@ mod tests {
         );
     }
 
+    /// With more than one caller, dropping a dead register input trims the root
+    /// param, shrinks the materialized `inputs` map in lockstep, and removes the
+    /// dead argument at *every* call site — the map is per-callee (updated once),
+    /// the arguments per-site (updated for each). Guards the interface-desync the
+    /// `materialized_interface` verifier catches.
+    #[test]
+    fn drops_unread_argument_across_multiple_callers() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (vr0, vr1) = (tc.r0, tc.r1);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry @r0:i64 @r1:i64>
+                    return at i64 0;
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+
+            fn h:
+                <h_entry>
+                    goto <h_call>;
+                <h_call>
+                    call <f>;
+                <h_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (g, h);
+        // Params are positional: [0]↔r0, [1]↔r1; r0 goes unread.
+        let param_ids: Vec<ValueId> = BasicBlock::from_id(&tc.ctx, entry)
+            .params()
+            .map(|p| p.id())
+            .collect();
+        for (pv, name) in param_ids.iter().zip(["r0", "r1"]) {
+            if let ValueId::BlockParam(pid) = pv {
+                tc.ctx.block_param_mut(*pid).name = Some(std::borrow::Cow::Owned(name.into()));
+            }
+        }
+        let r1_param = param_ids[1];
+        let agg = make_pure_reg_return(
+            &mut tc,
+            f,
+            vec![vr0, vr1],
+            vec![("o0".to_owned(), r1_param)],
+        );
+
+        // Two callers, each passing [a, b]; only b (the r1 arg) should survive.
+        let mut call_sites = Vec::new();
+        for (call_block, cont_block) in [(g_call, g_cont), (h_call, h_cont)] {
+            let a = tc.ctx.get_const(0x10, 8).id();
+            let b = tc.ctx.get_const(0x20, 8).id();
+            let call_id = set_call(&mut tc, call_block, f, vec![a, b]);
+            tc.ctx.add_cfg_edge(call_block, cont_block);
+            Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg);
+            {
+                let reg_space = tc.reg_space;
+                let mut bld = tc.ctx.builder(cont_block);
+                bld.set_insert_point_to_start();
+                let f0 = bld.push_extract(ValueId::Instruction(call_id), 0).id();
+                bld.push_store(f0, ValueId::Varnode(vr0), reg_space);
+            }
+            call_sites.push((call_id, b));
+        }
+
+        assert!(
+            dead_signature(&mut tc.ctx),
+            "the unread r0 arg should be dropped"
+        );
+
+        // Callee: one surviving root param and a map whose inputs shrank to [r1].
+        assert_eq!(
+            BasicBlock::from_id(&tc.ctx, entry).params().count(),
+            1,
+            "the dead root param is removed"
+        );
+        let qcode::value::RegisterChannelState::Materialized(map) =
+            FunctionBody::from_id(&tc.ctx, f).effects().register.clone()
+        else {
+            panic!("f stays materialized");
+        };
+        assert_eq!(
+            map.inputs,
+            vec![vr1],
+            "the dropped input is removed from the interface map in lockstep",
+        );
+
+        // Every caller drops the dead argument, keeping the surviving one.
+        for (call_id, b) in call_sites {
+            assert_eq!(
+                call_args(&tc, call_id),
+                vec![b],
+                "each call site drops the dead arg",
+            );
+        }
+    }
+
     /// A returned field no caller projects is dropped from the callee tuple, and
     /// a surviving higher-index extract is renumbered down.
     #[test]

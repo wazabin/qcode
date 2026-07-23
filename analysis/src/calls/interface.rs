@@ -24,7 +24,8 @@ use std::borrow::Cow;
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, BlockId, BlockParamId, FunctionBody, FunctionId, ValueId,
+        BasicBlock, BlockId, BlockParamId, FunctionBody, FunctionId, RegisterChannelState,
+        RegisterInterfaceMap, ValueId,
         insn::{Call, InstructionId, Mnemonic},
     },
 };
@@ -204,6 +205,30 @@ pub(crate) fn remove_entry_params_at_sites(
         ctx.block_param_mut(BlockParamId::new(root.func, p)).index = i;
     }
     ctx.block_mut(root).params = params;
+
+    // A materialized function's `inputs` map is the leading register prefix of
+    // the root params (`param[i]` binds `inputs[i]`; the RAM channel's by-value
+    // memory params follow). Dropping a register-prefix param must drop its
+    // `inputs` entry in lockstep, or the published interface desyncs from the
+    // params — which the regpure call-site rewrite, the emulator's implicit
+    // convention, and `verify::materialized_interface` all read as authoritative.
+    // Removed indices past the register prefix are memory params and leave the
+    // map untouched.
+    if let RegisterChannelState::Materialized(map) =
+        FunctionBody::from_id(ctx, fid).effects().register.clone()
+    {
+        let inputs: Vec<_> = map
+            .inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &vn)| (!removed.contains(&i)).then_some(vn))
+            .collect();
+        if inputs.len() != map.inputs.len() {
+            FunctionBody::from_id_mut(ctx, fid).set_register_effects(
+                RegisterChannelState::Materialized(RegisterInterfaceMap { inputs, ..map }),
+            );
+        }
+    }
 
     // Drop all matching positional arguments at every direct caller, replacing
     // each call instruction only once.
