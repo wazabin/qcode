@@ -110,12 +110,10 @@ impl Pass for HandleJumpTables {
         cone: &mut crate::ConeMut,
         env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when handle_jump_tables migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
-        let mut addresses = AddressIndex::analyze(ctx);
+        let mut addresses = AddressIndex::analyze(cone.ctx());
         self.run_indexed(
-            ctx,
+            cone,
             env.binary.as_deref(),
             &targets,
             &mut addresses,
@@ -129,12 +127,10 @@ impl Pass for HandleJumpTables {
         env: &PipelineEnv,
         analyses: &mut crate::AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when handle_jump_tables migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
-        let mut addresses = analyses.take_global::<crate::AddressAnalysis>(ctx);
+        let mut addresses = analyses.take_global::<crate::AddressAnalysis>(cone.ctx());
         let result = self.run_indexed(
-            ctx,
+            cone,
             env.binary.as_deref(),
             &targets,
             &mut addresses,
@@ -148,7 +144,7 @@ impl Pass for HandleJumpTables {
 impl HandleJumpTables {
     fn run_indexed(
         &self,
-        ctx: &mut Context,
+        cone: &mut crate::ConeMut,
         binary: Option<&dyn binfmt::BinaryFormat>,
         targets: &[FunctionId],
         addresses: &mut AddressIndex,
@@ -167,13 +163,23 @@ impl HandleJumpTables {
             .iter()
             .copied()
             .filter(|&id| {
-                let f = FunctionBody::from_id(ctx, id);
-                !f.is_external() && !ctx.is_function_ignored(f.address())
+                let f = FunctionBody::from_id(cone.ctx(), id);
+                !f.is_external() && !cone.ctx().is_function_ignored(f.address())
             })
             .collect();
         let mut changed = rustc_hash::FxHashSet::default();
         for fun_id in fun_ids {
-            if Self::resolve_function_indexed(ctx, binary, addresses, fun_id, obligations)? {
+            // Every write is confined to `fun_id`'s body (dispatch/trampoline
+            // blocks); the discovery queueing and `ImmutableMemory` truths the
+            // resolver records are cone-free shared state reached through the same
+            // handle. `ctx_for` asserts `fun_id` (a cone target) is in-cone.
+            if Self::resolve_function_indexed(
+                cone.ctx_for(fun_id),
+                binary,
+                addresses,
+                fun_id,
+                obligations,
+            )? {
                 changed.insert(fun_id);
             }
         }
