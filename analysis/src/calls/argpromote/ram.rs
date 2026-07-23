@@ -129,11 +129,12 @@ pub fn argpromote(ctx: &mut Context) -> bool {
 pub fn argpromote_with_sp(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> bool {
     let targets = ctx.function_ids();
     let graph = crate::CallGraph::analyze(ctx);
-    !argpromote_changed_functions_with_sp(ctx, sp_reg, &targets, &graph).is_empty()
+    let mut cone = crate::ConeMut::full(ctx);
+    !argpromote_changed_functions_with_sp(&mut cone, sp_reg, &targets, &graph).is_empty()
 }
 
 fn argpromote_changed_functions_with_sp(
-    ctx: &mut Context,
+    cone: &mut crate::ConeMut,
     sp_reg: Option<VarnodeId>,
     targets: &[FunctionId],
     graph: &crate::CallGraph,
@@ -144,7 +145,7 @@ fn argpromote_changed_functions_with_sp(
     // (O(instructions)) instead of rescanning the whole program per function. It
     // stays valid across the loop: promotion threads only data values, never adding
     // a `ValueId::Function` operand. See [`super::address_taken_set`].
-    let address_taken = super::address_taken_set(ctx);
+    let address_taken = super::address_taken_set(cone.ctx());
     // A caller may keep a call only to a transitively memory-free callee (see
     // [`function_makes_blocking_call`]). That fact is solved on the effect
     // engine *before* any mutation, so the gate is independent of the visit
@@ -153,7 +154,7 @@ fn argpromote_changed_functions_with_sp(
     // memory-free within this run, so the pre-solved answer stays valid; a
     // freshly promoted callee unblocks its callers on the pipeline's next
     // round, after cleanup drops its shadow accesses, exactly as before.)
-    let ram_summaries = super::ram_summary::solve(ctx, graph, sp_reg);
+    let ram_summaries = super::ram_summary::solve(cone.ctx(), graph, sp_reg);
     // Functions whose complete footprint the shadow path absorbed *this sweep*.
     // Their bodies are already access-free in shared spaces, and their call-site
     // rewrites have landed the footprint as ordinary accesses in each caller's
@@ -164,7 +165,7 @@ fn argpromote_changed_functions_with_sp(
     // Callee-before-caller order kept for the apply side: a promoted callee's
     // call-site rewrites land before its caller is visited. One visit per
     // function (no fixpoint), so an already-promoted body is never re-promoted.
-    let order = callee_first_order(ctx, graph);
+    let order = callee_first_order(cone.ctx(), graph);
     for fid in order {
         if !target_set.contains(&fid) {
             continue;
@@ -173,10 +174,18 @@ fn argpromote_changed_functions_with_sp(
         if callers.iter().any(|id| !target_set.contains(id)) {
             continue;
         }
+        // `try_promote` writes `fid`'s body and rewrites the call site in each
+        // caller. The gate above already confines the callers to `targets` (= the
+        // cone on a narrowed run); assert each caller then the callee in-cone so a
+        // step-5 slice trips a hard tripwire rather than a silent out-of-cone
+        // write.
+        for &c in &callers {
+            let _ = cone.ctx_for(c);
+        }
         // Globals (constant-address real-ram accesses) are materialized by the
         // RAM channel itself inside `try_promote`/`apply` (grow_globals retired).
         let outcome = try_promote(
-            ctx,
+            cone.ctx_for(fid),
             fid,
             sp_reg,
             &address_taken,
@@ -188,13 +197,14 @@ fn argpromote_changed_functions_with_sp(
         // prototyped external's argmem footprint rests on the confinement
         // assumption: record one `ExternalArgmemConfinement(f, e)` per external
         // `e` in `f`'s solved summary flag-set, so a refutation invalidates `f`
-        // (checkpoint+replay). `No` changes nothing, so it registers nothing.
+        // (checkpoint+replay). `No` changes nothing, so it registers nothing. The
+        // truth is cone-free shared state, written through `cone.assume_true`.
         if outcome != Promotion::No
             && let Ok(eff) = ram_summaries.get(fid)
         {
             let externals: Vec<FunctionId> = eff.externals.iter().copied().collect();
             for e in externals {
-                ctx.assume_true(Proposition::ExternalArgmemConfinement(fid, e));
+                cone.assume_true(Proposition::ExternalArgmemConfinement(fid, e));
             }
         }
         match outcome {
@@ -1721,14 +1731,17 @@ impl Pass for ArgPromote {
         cone: &mut crate::ConeMut,
         env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when argpromote (RAM) migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
-        let sp_reg = ctx.shared.registers.get(&env.cfg.stack_pointer).copied();
-        let graph = crate::CallGraph::analyze(ctx);
+        let sp_reg = cone
+            .ctx()
+            .shared
+            .registers
+            .get(&env.cfg.stack_pointer)
+            .copied();
+        let graph = crate::CallGraph::analyze(cone.ctx());
         Ok(
             crate::ModulePassOutcome::functions(argpromote_changed_functions_with_sp(
-                ctx, sp_reg, &targets, &graph,
+                cone, sp_reg, &targets, &graph,
             ))
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>(),
@@ -1741,14 +1754,17 @@ impl Pass for ArgPromote {
         env: &PipelineEnv,
         analyses: &mut crate::AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
-        // CONE-HATCH: remove when argpromote (RAM) migrates.
         let targets = cone.cone_functions();
-        let ctx = cone.bypass_cone_unmigrated_hatch();
-        let sp_reg = ctx.shared.registers.get(&env.cfg.stack_pointer).copied();
-        let graph = analyses.global::<crate::CallGraphAnalysis>(ctx);
+        let sp_reg = cone
+            .ctx()
+            .shared
+            .registers
+            .get(&env.cfg.stack_pointer)
+            .copied();
+        let graph = analyses.global::<crate::CallGraphAnalysis>(cone.ctx());
         Ok(
             crate::ModulePassOutcome::functions(argpromote_changed_functions_with_sp(
-                ctx, sp_reg, &targets, graph,
+                cone, sp_reg, &targets, graph,
             ))
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>(),
