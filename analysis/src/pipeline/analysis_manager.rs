@@ -281,19 +281,33 @@ mod tests {
         assert_eq!(*analyses.global::<CountingGlobal>(&ctx), 2);
     }
 
+    // Its own counter + analysis type: sharing `CountingGlobal` with
+    // `global_cache_obeys_preservation` made the two tests race on the shared
+    // static under the parallel `cargo test` harness (both reset it).
+    static TAKE_PUT_BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+    struct TakePutGlobal;
+
+    impl GlobalAnalysis for TakePutGlobal {
+        type Result = usize;
+
+        fn analyze(_ctx: &Context<'_>) -> Self::Result {
+            TAKE_PUT_BUILDS.fetch_add(1, Ordering::SeqCst) + 1
+        }
+    }
+
     #[test]
     fn global_analysis_can_be_taken_updated_and_returned() {
-        GLOBAL_BUILDS.store(0, Ordering::SeqCst);
         let ctx = Context::new();
         let mut analyses = AnalysisManager::default();
 
-        let mut value = analyses.take_global::<CountingGlobal>(&ctx);
+        let mut value = analyses.take_global::<TakePutGlobal>(&ctx);
         assert_eq!(value, 1);
         value = 42;
-        analyses.put_global::<CountingGlobal>(value);
+        analyses.put_global::<TakePutGlobal>(value);
 
-        assert_eq!(*analyses.global::<CountingGlobal>(&ctx), 42);
-        assert_eq!(GLOBAL_BUILDS.load(Ordering::SeqCst), 1);
+        assert_eq!(*analyses.global::<TakePutGlobal>(&ctx), 42);
+        assert_eq!(TAKE_PUT_BUILDS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
