@@ -1,6 +1,6 @@
 use jstd::graph::analysis::compute_dominators;
 use qcode::context::Context;
-use qcode::space::SpaceType;
+use qcode::space::{LocalMemorySpaceId, SpaceType};
 #[cfg(test)]
 use qcode::value::block::BlockRef;
 use qcode::value::{
@@ -326,6 +326,10 @@ struct InsertedBlockParams {
     /// The caller must drop these from the rename set so their loads/stores are
     /// left in place.
     excluded: HashSet<ValueId>,
+    /// Register vars live-in to the root (or joining at it): `run()` gives each a
+    /// single consolidated `load(V)` at root index 0 instead of a root param, in
+    /// the order params would have been minted (canonical).
+    root_lowered: Vec<ValueId>,
 }
 
 /// How the call terminating a block clobbers register vars, classified once per
@@ -443,8 +447,8 @@ fn classify_call_reg_effect<'a, 'str: 'a>(
                 // Solved but unmaterialized: the transitive load/store sets are
                 // known precisely even though call sites still bind implicitly.
                 qcode::value::RegisterChannelState::Solved(sets) => CallRegEffect::Exact {
-                    reads: sets.loads.clone(),
-                    writes: sets.stores.clone(),
+                    reads: sets.reads.clone(),
+                    writes: sets.writes.clone(),
                 },
                 // ⊤ / not yet solved: reads and writes everything (unless the
                 // AssumeCallingConvention hypothesis refines this).
@@ -724,6 +728,11 @@ struct RenameState<'a> {
     /// defines these instead of clobbering them.
     sliced: &'a HashSet<ValueId>,
     register_clobbers: HashMap<ValueId, Vec<ValueId>>,
+    /// Root-lowered register vars mapped to their consolidated entry `load(V)`
+    /// value at root index 0. A branch back into the root inserts an edge store
+    /// for each var whose carried value differs from the entry value, so the
+    /// re-executed entry load reads the right register cell.
+    root_entry_loads: HashMap<ValueId, ValueId>,
     visited: HashSet<BlockId>,
     frames: Vec<Frame>,
     consumed_stores: HashSet<InstructionId>,
@@ -738,6 +747,7 @@ impl<'a> RenameState<'a> {
         vars: &'a HashSet<ValueId>,
         sliced: &'a HashSet<ValueId>,
         register_clobbers: HashMap<ValueId, Vec<ValueId>>,
+        root_entry_loads: HashMap<ValueId, ValueId>,
         changed: bool,
     ) -> Self {
         Self {
@@ -745,6 +755,7 @@ impl<'a> RenameState<'a> {
             vars,
             sliced,
             register_clobbers,
+            root_entry_loads,
             visited: HashSet::default(),
             frames: vec![Frame::default()],
             consumed_stores: HashSet::default(),
@@ -859,12 +870,14 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
         }
 
         let root_id = self.root_id();
+        let root_param_count = self.read().block_ref(root_id).params().count();
         let dom = compute_dominators(&self.read().function_ref(root_id.func), root_id);
         let frontier = dom.dominator_frontier().clone();
         let InsertedBlockParams {
             by_block: var_params,
             changed,
             excluded,
+            root_lowered,
         } = self.insert_block_params(&vars, &sizes, &sliced, &frontier, &mut live_in_cache);
 
         // Drop vars whose promotion was declined (implicit-edge join); their
@@ -879,10 +892,20 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
             return changed;
         }
 
+        let (root_entry_loads, loads_changed) = self.insert_root_entry_loads(&root_lowered);
+        let changed = changed | loads_changed;
+
         let register_clobbers =
             register_clobber_index(self.read(), self.function_id, &vars, self.aliases);
 
-        let mut state = RenameState::new(&var_params, &vars, &sliced, register_clobbers, changed);
+        let mut state = RenameState::new(
+            &var_params,
+            &vars,
+            &sliced,
+            register_clobbers,
+            root_entry_loads,
+            changed,
+        );
         self.decide_values_start_from(root_id, &mut state);
 
         let RenameState {
@@ -892,8 +915,78 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
             changed,
             ..
         } = state;
+
+        // Invariant: the by-value call interface (root params ↔ `Call.args`) is
+        // argpromote's; root lowering must never have grown or shrunk it.
+        debug_assert_eq!(
+            self.read().block_ref(root_id).params().count(),
+            root_param_count,
+            "mem2reg changed the root param count of {}",
+            self.read().function_ref(self.function_id).name(),
+        );
+
         changed
             | self.remove_promoted_stores(&vars, &consumed_stores, &dead_stores, &preserved_stores)
+    }
+
+    /// Insert (or find) the consolidated entry `load(V)` at the top of the root
+    /// block for each root-lowered register var, returning `var → load value`.
+    ///
+    /// An already-present leading raw load of the var is reused: without that,
+    /// every run would mint a fresh entry load and forward the previous one to
+    /// it, and the promote fixpoint would never converge.
+    fn insert_root_entry_loads(
+        &mut self,
+        root_lowered: &[ValueId],
+    ) -> (HashMap<ValueId, ValueId>, bool) {
+        let mut entry: HashMap<ValueId, ValueId> = HashMap::default();
+        let mut changed = false;
+        if root_lowered.is_empty() {
+            return (entry, changed);
+        }
+        let root = self.root_id();
+
+        let leading: Vec<(InstructionId, ValueId, usize)> = self
+            .read()
+            .block_ref(root)
+            .iter()
+            .map_while(|insn| match insn.mnemonic() {
+                Mnemonic::Load(Load { ptr, size, .. }) => {
+                    Some((insn.id, ptr.qualify(insn.id.func), *size))
+                }
+                _ => None,
+            })
+            .collect();
+        for (insn_id, ptr, size) in leading {
+            if let ValueId::Varnode(vn) = ptr
+                && root_lowered.contains(&ptr)
+                && size == Varnode::from_id(self.read().shared(), vn).size()
+            {
+                entry.entry(ptr).or_insert(ValueId::Instruction(insn_id));
+            }
+        }
+
+        // Insert the missing ones at index 0, in reverse canonical order so the
+        // block reads them in canonical (param-minting) order.
+        for &var in root_lowered.iter().rev() {
+            if entry.contains_key(&var) {
+                continue;
+            }
+            let ValueId::Varnode(vn) = var else {
+                unreachable!("root lowering is register-only");
+            };
+            let (space, size) = {
+                let vn = Varnode::from_id(self.read().shared(), vn);
+                (vn.space().id, vn.size())
+            };
+            let mut host = self.cx.host(self.body);
+            let mut builder = host.builder(root);
+            builder.set_insert_point_to_start();
+            let value = builder.push_load::<false>(var, size, space).id();
+            entry.insert(var, value);
+            changed = true;
+        }
+        (entry, changed)
     }
 
     fn root_id(&self) -> BlockId {
@@ -1271,21 +1364,30 @@ impl<'str> Mem2Reg<'_, 'str> {
         // call argument, i.e. part of the by-value call interface that `argpromote`
         // owns exclusively — mem2reg minting one (for a var live-in to the function)
         // corrupts the `param[i] ↔ Call.args[i]` lockstep argpromote relies on and
-        // crashes it. So drop *every* var that is live-in to the root from the promotion
-        // set: the only thing that would turn such a var into a root param is the
-        // root-param path in `insert_block_params`, and with no live-in var promoted it
-        // never fires (and is asserted away below). These inputs stay as plain loads —
-        // correct (emulation reads the real incoming value); the register interface is
-        // owned by the `argpromote` register passes via `FunctionEffects`, independent
-        // of any mem2reg param. A var written before it is read (RMW / local scratch) is
-        // not live-in and still promotes normally.
+        // crashes it.
+        //
+        // A root-live-in *register* var does not need a root param: `run()` inserts
+        // a single `load(V)` at the top of the root block (the consolidated entry
+        // value) which the renamer's load-becomes-def rule turns into the var's
+        // reaching definition, and edge stores keep the register cell fresh across
+        // any loop back into the root. The register interface stays with the
+        // `argpromote` register passes via `FunctionEffects`; a raw entry load
+        // reads exactly the incoming value, so emulation is unchanged.
+        //
+        // A root-live-in *stack slot* (a read-before-write own-frame offset, i.e.
+        // an incoming caller-frame stack argument) is still dropped: its address
+        // is an SSA expression that need not be materializable at root index 0,
+        // and incoming stack arguments are deliberately left as memory effects
+        // for the RAM channel of argpromote to functionalize.
         let root_id = self.root_id();
         let root_live_in: Vec<ValueId> = vars
             .iter()
             .copied()
             .filter(|&var| {
-                self.live_in_blocks_cached(var, &sliced, live_in_cache)
-                    .contains(&root_id)
+                !self.is_register_var(var)
+                    && self
+                        .live_in_blocks_cached(var, &sliced, live_in_cache)
+                        .contains(&root_id)
             })
             .collect();
         for var in root_live_in {
@@ -1312,6 +1414,7 @@ impl<'str> Mem2Reg<'_, 'str> {
         let mut var_params: BlockParamAssignments = HashMap::default();
         let mut changed = false;
         let mut excluded: HashSet<ValueId> = HashSet::default();
+        let mut root_lowered: Vec<ValueId> = Vec::new();
 
         // `vars` is a `HashSet`, so iterating it directly promotes variables in an
         // order seeded by their value ids' hashes. That order decides block-param
@@ -1337,7 +1440,36 @@ impl<'str> Mem2Reg<'_, 'str> {
 
             let live_in = self.live_in_blocks_cached(var, sliced, live_in_cache);
             let store_blocks = live_in_cache.store_def_blocks(self.read(), var, sliced);
-            let phi_positions = find_phi_insert_positions(frontier, &live_in, &store_blocks);
+            let mut phi_positions = find_phi_insert_positions(frontier, &live_in, &store_blocks);
+
+            // Root lowering: a register var that is live-in to the root (a genuine
+            // function input, e.g. the frame pointer saved by `push rbp`) or whose
+            // phi positions include the root (a loop back through entry) never gets
+            // a root param — a root param is argpromote's call interface. Instead
+            // `run()` inserts a single `load(V)` at root index 0: the renamer's
+            // load-becomes-def rule makes it the reaching definition, and for a
+            // root with predecessors an edge store before each back-branch keeps
+            // the register cell holding the carried value the re-executed entry
+            // load must observe. Those edge stores can only be placed on an
+            // unconditional `Branch` (a store above a `CBranch` would also execute
+            // on the non-root path and corrupt the register's live-out value), so
+            // any other root predecessor declines the var entirely.
+            let root_id = self.root_id();
+            let needs_root_lowering = self.is_register_var(var)
+                && (live_in.contains(&root_id) || phi_positions.contains(&root_id));
+            if needs_root_lowering {
+                if !self.root_preds_are_plain_branches() {
+                    excluded.insert(var);
+                    continue;
+                }
+                phi_positions.remove(&root_id);
+                root_lowered.push(var);
+            } else if phi_positions.contains(&root_id) {
+                // A non-register var (stack slot) joining at the root cannot be
+                // lowered this way; leave its accesses in place.
+                excluded.insert(var);
+                continue;
+            }
 
             // A block param is only meaningful if every incoming edge can supply
             // its argument. Branch/CBranch edges are wired by `merge_branch_args`,
@@ -1367,15 +1499,13 @@ impl<'str> Mem2Reg<'_, 'str> {
                     .insert(var, param_id);
             }
 
-            // mem2reg never produces a root block param: the call interface (root
-            // params ↔ Call.args) is owned exclusively by argpromote. Every var live-in
-            // to the function root was dropped from the promotion set in
-            // `collect_promotable_vars`, so this point is unreachable for a root-live-in
-            // var — a register/stack *input* stays a plain load. (Non-root join params —
-            // phis — are still created above.)
+            // Invariant: no root block param was minted — the root was stripped
+            // from `phi_positions` (root lowering) or the var declined above.
             debug_assert!(
-                !live_in.contains(&self.root_id()),
-                "mem2reg must not promote a root-live-in var ({var:?} in {}): the call \
+                !var_params
+                    .get(&self.root_id())
+                    .is_some_and(|params| params.contains_key(&var)),
+                "mem2reg must not mint a root block param ({var:?} in {}): the call \
                  interface is argpromote's",
                 self.read().function_ref(self.function_id).name(),
             );
@@ -1385,7 +1515,26 @@ impl<'str> Mem2Reg<'_, 'str> {
             by_block: var_params,
             changed,
             excluded,
+            root_lowered,
         }
+    }
+
+    /// True when every predecessor edge into the root ends in an unconditional
+    /// `Branch` — the only terminator a root-lowering edge store can be placed
+    /// above without leaking the store onto a non-root path. Vacuously true for
+    /// a root with no predecessors (the common case).
+    fn root_preds_are_plain_branches(&self) -> bool {
+        let root = self.root_id();
+        self.read().block_ref(root).predecessors().all(|(_, pred)| {
+            matches!(
+                self.read()
+                    .block_ref(pred)
+                    .iter()
+                    .last()
+                    .map(|i| i.mnemonic().clone()),
+                Some(Mnemonic::Branch(_))
+            )
+        })
     }
 
     /// True if `block` has a predecessor reaching it through an edge that cannot
@@ -1517,6 +1666,78 @@ impl<'str> Mem2Reg<'_, 'str> {
             .unwrap_or_else(|| edge.existing_args.to_vec())
     }
 
+    /// A branch back into the root re-executes the root entry loads, so at this
+    /// branch the register cell of each root-lowered var must hold the carried
+    /// value. Insert `store(V, reaching)` before the terminator for every var
+    /// whose reaching value differs from the entry value. A cell no managed
+    /// store wrote on this path (`None` — still the entry value) or that a real
+    /// overlapping store just wrote (`Clobbered`) is already correct.
+    fn store_root_carried_values(
+        &mut self,
+        block: BlockId,
+        branch_insn: InstructionId,
+        state: &mut RenameState<'_>,
+    ) {
+        if state.root_entry_loads.is_empty() {
+            return;
+        }
+        // The trailing run of stores directly before the branch. A reaching
+        // store already inside it (typically a previous run's edge store) means
+        // the cell is already correct at the branch — re-inserting would grow
+        // the block on every promote round and defeat the fixpoint.
+        let trailing: HashSet<InstructionId> = {
+            let ids = self.read().block_ref(block).instruction_ids().to_vec();
+            let branch_pos = ids
+                .iter()
+                .position(|&i| i == branch_insn)
+                .unwrap_or(ids.len());
+            ids[..branch_pos]
+                .iter()
+                .rev()
+                .take_while(|&&i| matches!(self.read().insn_ref(i).mnemonic(), Mnemonic::Store(_)))
+                .copied()
+                .collect()
+        };
+
+        let mut lowered: Vec<(ValueId, ValueId)> = state
+            .root_entry_loads
+            .iter()
+            .map(|(&var, &load)| (var, load))
+            .collect();
+        lowered.sort_unstable_by_key(|&(var, _)| value_id_order_key(var));
+        for (var, entry_value) in lowered {
+            let (value, store_insn) = match decide_variable_value(var, &state.frames) {
+                Some(FrameEntry::Defined(reaching)) => (reaching.value, reaching.store_insn),
+                Some(FrameEntry::Clobbered) | None => continue,
+            };
+            if value == entry_value {
+                continue;
+            }
+            if let Some(id) = store_insn
+                && trailing.contains(&id)
+            {
+                // The reaching store already writes the cell directly before the
+                // branch — reuse it as the edge store. It must then survive even
+                // if a forwarded reload consumed it.
+                state.preserved_stores.insert(id);
+                continue;
+            }
+            let ValueId::Varnode(vn_id) = var else {
+                unreachable!("root lowering is register-only");
+            };
+            let (space, size) = {
+                let vn = Varnode::from_id(self.read().shared(), vn_id);
+                (vn.space().id, vn.size())
+            };
+            let value = self.resize_forwarded_load_value(block, branch_insn, value, size);
+            let mut host = self.cx.host(self.body);
+            let mut builder = host.builder(block);
+            builder.set_insert_point_before(branch_insn);
+            builder.push_store(value, var, space);
+            state.changed = true;
+        }
+    }
+
     fn load_register_before_branch(
         &mut self,
         branch_block: BlockId,
@@ -1554,7 +1775,7 @@ impl<'str> Mem2Reg<'_, 'str> {
         // renaming DFS did not forward away (a successor block it never reached, or
         // a partially promoted var). Removing a store to such a var would strand its
         // load reading an undefined location (the SLEIGH `v0`/`v1` unique-space
-        // leak), so those stores fall back to the consumed/dead guard below.
+        // leak), so those stores must be kept.
         let mut vars_with_surviving_loads: HashSet<ValueId> = HashSet::default();
         // Register loads left *unpromoted* — e.g. a narrow sub-register read (`CL`)
         // declined by `has_overlapping_register_store` because a wider overlapping
@@ -1565,14 +1786,29 @@ impl<'str> Mem2Reg<'_, 'str> {
         // would strand the narrow load as a free register read — a spurious live-in —
         // silently discarding the value the wider store carried.
         let mut unpromoted_register_loads: Vec<ValueId> = Vec::new();
+        // Every other surviving load, with its space. Promoted stack slots are keyed
+        // by SSA pointer value, so the same frame offset reached through a different
+        // pointer expression — typically one derived from an unpromoted
+        // frame-pointer reload (`load(RBP) - K`), which the affine numbering cannot
+        // resolve to a slot yet — is a distinct key the renamer never forwarded.
+        // Deleting the slot's store would strand that load reading uninitialized
+        // memory. Keep any stack-slot store a surviving same-space load `may_alias`;
+        // once a later promote round folds the pointer into the canonical `@SP ± N`
+        // form, the load forwards and the store becomes removable.
+        let mut surviving_loads: Vec<(ValueId, LocalMemorySpaceId)> = Vec::new();
         for &block_id in &block_ids {
             for insn_id in self.read().block_ref(block_id).instruction_ids() {
-                if let Mnemonic::Load(Load { ptr, .. }) = self.read().insn_ref(insn_id).mnemonic() {
+                if let Mnemonic::Load(Load { ptr, space, .. }) =
+                    self.read().insn_ref(insn_id).mnemonic()
+                {
+                    let space = *space;
                     let ptr = ptr.qualify(insn_id.func);
                     if vars.contains(&ptr) {
                         vars_with_surviving_loads.insert(ptr);
                     } else if register_varnode(self.read(), ptr).is_some() {
                         unpromoted_register_loads.push(ptr);
+                    } else {
+                        surviving_loads.push((ptr, space));
                     }
                 }
             }
@@ -1584,11 +1820,20 @@ impl<'str> Mem2Reg<'_, 'str> {
 
             for insn_id in insn_ids {
                 let mnemonic = self.read().insn_ref(insn_id).mnemonic();
-                let Mnemonic::Store(Store { ptr, .. }) = mnemonic else {
+                let Mnemonic::Store(Store { ptr, space, .. }) = mnemonic else {
                     continue;
                 };
+                let space = *space;
                 let ptr = ptr.qualify(insn_id.func);
                 if !vars.contains(&ptr) {
+                    continue;
+                }
+                // The renamer left a load of this var in place — its store must
+                // stay, or the load reads an undefined location. Register vars are
+                // exempt: their surviving loads are clobber reloads reading the
+                // *clobbered* value, and the consumed/dead/preserved bookkeeping
+                // below already decides their stores correctly.
+                if vars_with_surviving_loads.contains(&ptr) && !self.is_register_var(ptr) {
                     continue;
                 }
                 // A wider register store an unpromoted narrow load overlaps is the
@@ -1602,13 +1847,12 @@ impl<'str> Mem2Reg<'_, 'str> {
                 }
                 // For register-space varnodes, preserve live-out stores (callee-save
                 // restores, return values); only consumed or overwritten stores are
-                // safe to drop. Temporary-space varnodes are never live-out, but a
-                // store whose load was not forwarded (the var still has a surviving
-                // load) must be kept under the same guard — dropping it would strand
-                // that load on an undefined temp read. A temp var with no surviving
-                // load is fully promoted, so its remaining stores (e.g. a dead store
-                // the conservative frame analysis did not flag) are safe to remove.
-                // Stack-slot literals keep the unconditional removal.
+                // safe to drop. Temporary-space varnodes are never live-out, and the
+                // surviving-load guard above already kept any store whose load was
+                // not forwarded, so a temp var reaching this point is fully promoted
+                // and its remaining stores (e.g. a dead store the conservative frame
+                // analysis did not flag) are safe to remove. Stack-slot stores are
+                // additionally checked against surviving unresolved loads below.
                 let guarded = if let ValueId::Varnode(vn_id) = ptr {
                     matches!(
                         Varnode::from_id(self.read().shared(), vn_id).space().ty,
@@ -1624,6 +1868,14 @@ impl<'str> Mem2Reg<'_, 'str> {
                     if !removable {
                         continue;
                     }
+                } else if !matches!(ptr, ValueId::Varnode(_))
+                    && surviving_loads.iter().any(|&(load_ptr, load_space)| {
+                        load_space == space && self.aliases.may_alias(self.read(), load_ptr, ptr)
+                    })
+                {
+                    // A stack-slot store a surviving unresolved load may still read
+                    // (see the `surviving_loads` comment above).
+                    continue;
                 }
                 self.body.remove_instruction(insn_id);
                 changed = true;
@@ -1814,13 +2066,27 @@ impl<'str> Mem2Reg<'_, 'str> {
                             (reaching.value, reaching.store_insn)
                         }
                         // No reaching definition. For a register var this means the
-                        // value comes from a clobbering call (or is uninitialized) —
+                        // value is a function input or comes from a clobbering call —
                         // [`live_in_blocks`] treats the call as a def, so no entry
                         // param was created. Leave the load in place to read the live
-                        // register rather than fabricate a value. A non-register var
-                        // (stack slot) must always have a reaching def; missing one is
-                        // a bug, so keep the assertion.
+                        // register rather than fabricate a value, and record its
+                        // result as the var's reaching definition (load-becomes-def):
+                        // the register cell is unchanged until the next store or
+                        // clobber, so later reads on this path see the same value.
+                        // This is what consolidates entry reads onto the root entry
+                        // load and post-call reloads onto the first reload. A
+                        // non-register var (stack slot) must always have a reaching
+                        // def; missing one is a bug, so keep the assertion.
                         Some(FrameEntry::Clobbered) | None if self.is_register_var(ptr) => {
+                            let frame = state.frames.last_mut().unwrap();
+                            frame.insert(
+                                ptr,
+                                FrameEntry::Defined(ReachingValue {
+                                    _defining_block: block,
+                                    value: ValueId::Instruction(insn_id),
+                                    store_insn: None,
+                                }),
+                            );
                             continue;
                         }
                         Some(FrameEntry::Clobbered) | None => panic!(
@@ -1940,6 +2206,9 @@ impl<'str> Mem2Reg<'_, 'str> {
                             }),
                         );
                         state.changed = true;
+                    }
+                    if tgt == self.root_id() {
+                        self.store_root_carried_values(block, insn_id, state);
                     }
                     self.decide_values_start_from(tgt, state);
                 }
@@ -2092,8 +2361,8 @@ mod tests {
             }
             FunctionBody::from_id_mut(ctx, id).set_register_effects(RegisterChannelState::Solved(
                 RegisterEffectSets {
-                    loads: Vec::new(),
-                    stores,
+                    reads: Vec::new(),
+                    writes: stores,
                 },
             ));
         }
@@ -2521,18 +2790,82 @@ mod tests {
     /// literal: the reload forwards from the store and the load disappears.
     #[test]
     fn promotes_canonical_sp_relative_slot() {
-        use crate::stack::canonicalize::canonicalize_sp_slots;
         let mut tc = qcode::testing::TestContext::new();
         let (fun_id, sp, sp_reg) = sp_slot_function(&mut tc);
 
-        canonicalize_sp_slots(&mut tc.ctx, fun_id, sp_reg);
+        let _ = sp_reg;
+        let gvn_changed = crate::gvn::gvn_function(&mut tc.ctx, fun_id, None);
         let aliases = AliasResult::simple_for_function(&tc.ctx, fun_id);
-        let changed = mem2reg_framed(&mut tc.ctx, fun_id, &aliases, Some(sp));
+        let changed = gvn_changed | mem2reg_framed(&mut tc.ctx, fun_id, &aliases, Some(sp));
 
-        assert!(changed, "the @SP-8 slot should be promoted");
+        assert!(
+            changed,
+            "the @SP-8 slot should be promoted:\n{}",
+            FunctionBody::from_id(&tc.ctx, fun_id)
+        );
         assert!(
             !has_load(&tc.ctx, fun_id),
             "the reload should be forwarded from the store:\n{}",
+            FunctionBody::from_id(&tc.ctx, fun_id)
+        );
+    }
+
+    /// A promoted slot's store must survive when the slot is also read through a
+    /// pointer the affine numbering cannot resolve — e.g. one derived from an
+    /// unpromoted frame-pointer reload (`load(reg) - K` where the register holds
+    /// an `@SP`-relative value). The renamer forwards the recognised reload and
+    /// used to then delete the store unconditionally, stranding the unresolved
+    /// load on uninitialized memory (the `pointer_array` frame-pointer
+    /// miscompile: `mov [rbp-0x28], rdi` deleted while `[rbp-0x28]` was still
+    /// read through a raw `load(RBP)`-derived pointer).
+    #[test]
+    fn slot_store_survives_unresolved_aliasing_load() {
+        let mut tc = qcode::testing::TestContext::new();
+        let fp_reg = tc.r1;
+        let reg = tc.reg_space;
+        let ram = tc.ctx.shared.default_space;
+        let (fun_id, sp, _sp_reg) = {
+            // Reuse the @SP-param scaffolding but with our own block body.
+            let sp_reg = tc.r0;
+            let fun_id = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
+            let block = tc.ctx.get_or_make_block(0x1000, fun_id);
+            FunctionBody::from_id_mut(&mut tc.ctx, fun_id)
+                .set_root(block)
+                .unwrap();
+            let pid = BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id;
+            tc.ctx
+                .block_param_mut(pid)
+                .set_origin_id(ValueId::Varnode(sp_reg).localize(pid.func));
+            tc.ctx.block_param_mut(pid).name = Some("RSP".into());
+            (fun_id, ValueId::BlockParam(pid), sp_reg)
+        };
+
+        {
+            let mut b = tc.ctx.builder_at(0x1000);
+            let v = b.shr().get_const(0x1234, 8);
+            let c30 = b.shr().get_const(0x30, 8);
+            let slot = b.push_sub(sp, c30).id();
+            b.push_store(v, slot, ram); // the spill
+            b.push_load::<false>(slot, 8, ram); // recognised reload — forwards
+            // The same address reached through an opaque frame-pointer reload:
+            // `load(fp) - 0x28` cannot be resolved to the slot.
+            let fp = b.push_load::<false>(ValueId::Varnode(fp_reg), 8, reg).id();
+            let c28 = b.shr().get_const(0x28, 8);
+            let alias_ptr = b.push_sub(fp, c28).id();
+            b.push_load::<false>(alias_ptr, 8, ram);
+        }
+
+        let aliases = AliasResult::simple_for_function(&tc.ctx, fun_id);
+        mem2reg_framed(&mut tc.ctx, fun_id, &aliases, Some(sp));
+
+        let has_slot_store = FunctionBody::from_id(&tc.ctx, fun_id).blocks().any(|b| {
+            b.iter()
+                .any(|i| matches!(i.mnemonic(), Mnemonic::Store(s) if s.space == ram))
+        });
+        assert!(
+            has_slot_store,
+            "the spill store must survive: an unresolved load may still read the \
+             slot:\n{}",
             FunctionBody::from_id(&tc.ctx, fun_id)
         );
     }
@@ -2558,8 +2891,6 @@ mod tests {
     /// local is left in memory.
     #[test]
     fn dynamic_sp_indexed_access_disables_promotion() {
-        use crate::stack::canonicalize::canonicalize_sp_slots;
-
         let mut tc = qcode::testing::TestContext::new();
         let sp_reg = tc.r0;
         let ram = tc.ctx.shared.default_space;
@@ -2573,6 +2904,8 @@ mod tests {
             .block_param_mut(pid)
             .set_origin_id(ValueId::Varnode(sp_reg).localize(pid.func));
         let sp = ValueId::BlockParam(pid);
+        let index =
+            ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id);
 
         {
             let mut b = tc.ctx.builder_at(0x1000);
@@ -2581,10 +2914,9 @@ mod tests {
             // A promotable local: store then reload `@SP - 8`.
             let addr_store = b.push_sub(sp, c8).id();
             b.push_store(v, addr_store, ram);
-            let addr_load = b.push_sub(sp, c8).id();
-            let reloaded = b.push_load::<false>(addr_load, 8, ram).id();
-            // A dynamic `@SP + reloaded` access — index is not a constant.
-            let dyn_ptr = b.push_add(sp, reloaded).id();
+            b.push_load::<false>(addr_store, 8, ram);
+            // An independent dynamic `@SP + index` access poisons the frame.
+            let dyn_ptr = b.push_add(sp, index).id();
             b.push_load::<false>(dyn_ptr, 1, ram);
         }
 
@@ -2594,7 +2926,6 @@ mod tests {
             .filter(|i| matches!(i.mnemonic(), Mnemonic::Load(_)))
             .count();
 
-        canonicalize_sp_slots(&mut tc.ctx, fun_id, sp_reg);
         let aliases = AliasResult::simple_for_function(&tc.ctx, fun_id);
         mem2reg_framed(&mut tc.ctx, fun_id, &aliases, Some(sp));
 
@@ -2949,7 +3280,7 @@ mod tests {
         assert!(
             matches!(
                 &FunctionBody::from_id(&tc.ctx, callee).effects().register,
-                qcode::value::RegisterChannelState::Solved(sets) if sets.stores.contains(&r0)
+                qcode::value::RegisterChannelState::Solved(sets) if sets.writes.contains(&r0)
             ),
             "callee must record r0 as call-clobbered"
         );
@@ -3971,6 +4302,294 @@ mod tests {
             entry_has_store,
             "the temp store must be kept while its load survives (no v0/v1 leak)"
         );
+    }
+
+    /// A register that is live-in to the root block through an early upward-exposed
+    /// read (e.g. the caller's frame pointer that `push rbp` saves) but is
+    /// *redefined* inside the function (`mov rbp, rsp`) must still have its
+    /// post-def, cross-block reads promoted to SSA. Dropping the whole register
+    /// (the old per-register root-live-in filter) left the frame-pointer reads
+    /// as raw `load(register)` — opaque to GVN's affine analysis, which kept
+    /// `[rbp - N]` stack slots from folding, the dominant cause of unresolved
+    /// vtable-dispatch indirect calls.
+    ///
+    /// With root lowering, the entry read consolidates onto the root entry load
+    /// and the redefined range promotes normally.
+    #[test]
+    fn root_live_in_register_promotes_its_redefined_cross_block_reads() {
+        use qcode::testing::TestContext;
+
+        let mut tc = TestContext::new();
+        let (rbp, sink, reg) = (tc.r0, tc.r1, tc.reg_space);
+
+        let f = FunctionBody::make(&mut tc.ctx, "framed".into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(0x1000, f);
+        let body = tc.ctx.get_or_make_block(0x1100, f);
+        {
+            let mut fr = FunctionBody::from_id_mut(&mut tc.ctx, f);
+            fr.set_root(root).unwrap();
+            fr.add_block(body);
+        }
+
+        // root: save the incoming RBP (upward-exposed read => RBP live-in to the
+        // root), then redefine RBP := 0x7000 (models `mov rbp, rsp`), branch on.
+        {
+            let mut b = tc.ctx.builder(root);
+            let saved = b.push_load::<false>(ValueId::Varnode(rbp), 8, reg).id();
+            b.push_store(saved, ValueId::Varnode(sink), reg); // consume the save
+            let frame = b.shr().get_const(0x7000u64, 8);
+            b.push_store(frame, ValueId::Varnode(rbp), reg); // mov rbp, rsp
+            b.push_branch(body);
+        }
+        tc.ctx.add_cfg_edge(root, body);
+
+        // body: read RBP (the frame pointer) — must promote to the 0x7000 def,
+        // not stay a raw register load.
+        let frame_read;
+        {
+            let mut b = tc.ctx.builder(body);
+            frame_read = b.push_load::<false>(ValueId::Varnode(rbp), 8, reg).id();
+            b.push_store(frame_read, ValueId::Varnode(sink), reg);
+            let ret = b.shr().get_const(0u64, 8);
+            b.push_return(ret);
+        }
+
+        let aliases = AliasResult::simple_for_function(&tc.ctx, f);
+        mem2reg(&mut tc.ctx, f, &aliases);
+
+        let body_block = BasicBlock::from_id(&tc.ctx, body);
+        let has_raw_rbp_load = body_block.iter().any(|insn| {
+            matches!(
+                insn.mnemonic(),
+                Mnemonic::Load(l) if l.ptr == LocalValueId::Varnode(rbp)
+            )
+        });
+        assert!(
+            !has_raw_rbp_load,
+            "the redefined RBP's cross-block read must promote (block param carrying \
+             the 0x7000 def), not survive as raw load(RBP) dropped by the \
+             root-live-in filter:\n{body_block}"
+        );
+    }
+
+    /// The loads of `var` across the whole function as `(block, index)` pairs.
+    fn loads_of(ctx: &Context, f: FunctionId, var: VarnodeId) -> Vec<(BlockId, usize)> {
+        FunctionBody::from_id(ctx, f)
+            .blocks()
+            .flat_map(|b| {
+                b.iter()
+                    .enumerate()
+                    .filter(|(_, i)| {
+                        matches!(i.mnemonic(), Mnemonic::Load(l)
+                            if l.ptr == LocalValueId::Varnode(var))
+                    })
+                    .map(|(idx, _)| (b.id, idx))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn root_param_count(ctx: &Context, f: FunctionId) -> usize {
+        FunctionBody::from_id(ctx, f)
+            .root()
+            .map(|r| r.params().count())
+            .unwrap_or(0)
+    }
+
+    /// Multiple upward-exposed reads of a root-live-in register — before and on
+    /// sibling paths after an in-function redefinition — consolidate onto ONE
+    /// raw `load(V)` at root index 0 (the first leading load is reused as the
+    /// entry load), and no root block param is minted.
+    #[test]
+    fn root_live_in_register_reads_consolidate_to_one_entry_load() {
+        use qcode::testing::TestContext;
+
+        let mut tc = TestContext::new();
+        let (rbp, sink, reg) = (tc.r0, tc.r1, tc.reg_space);
+
+        let f = FunctionBody::make(&mut tc.ctx, "framed".into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(0x1000, f);
+        let left = tc.ctx.get_or_make_block(0x1100, f);
+        let right = tc.ctx.get_or_make_block(0x1200, f);
+        {
+            let mut fr = FunctionBody::from_id_mut(&mut tc.ctx, f);
+            fr.set_root(root).unwrap();
+            fr.add_block(left);
+            fr.add_block(right);
+        }
+        {
+            let mut b = tc.ctx.builder(root);
+            let save1 = b.push_load::<false>(ValueId::Varnode(rbp), 8, reg).id();
+            b.push_store(save1, ValueId::Varnode(sink), reg);
+            let save2 = b.push_load::<false>(ValueId::Varnode(rbp), 8, reg).id();
+            b.push_store(save2, ValueId::Varnode(sink), reg);
+            let frame = b.shr().get_const(0x7000u64, 8);
+            b.push_store(frame, ValueId::Varnode(rbp), reg); // mov rbp, rsp
+            let cond = b.shr().get_const(1u64, 1);
+            b.push_cbranch(cond, left, right);
+        }
+        for (blk, ret) in [(left, 1u64), (right, 2u64)] {
+            let mut b = tc.ctx.builder(blk);
+            let fp = b.push_load::<false>(ValueId::Varnode(rbp), 8, reg).id();
+            b.push_store(fp, ValueId::Varnode(sink), reg);
+            let r = b.shr().get_const(ret, 8);
+            b.push_return(r);
+        }
+
+        let aliases = AliasResult::simple_for_function(&tc.ctx, f);
+        mem2reg(&mut tc.ctx, f, &aliases);
+
+        let loads = loads_of(&tc.ctx, f, rbp);
+        assert_eq!(
+            loads,
+            vec![(root, 0)],
+            "all entry reads must consolidate onto one load(RBP) at root index \
+             0:\n{}",
+            FunctionBody::from_id(&tc.ctx, f)
+        );
+        assert_eq!(root_param_count(&tc.ctx, f), 0);
+    }
+
+    /// A pure register input (load-only, e.g. `EDI`) consolidates the same way:
+    /// one entry load at root index 0, no root param, sibling-path reads
+    /// forwarded.
+    #[test]
+    fn pure_register_input_consolidates_to_single_entry_load() {
+        use qcode::testing::TestContext;
+
+        let mut tc = TestContext::new();
+        let (edi, sink, reg) = (tc.r0, tc.r1, tc.reg_space);
+
+        let f = FunctionBody::make(&mut tc.ctx, "pure_in".into())
+            .unwrap()
+            .id;
+        let root = tc.ctx.get_or_make_block(0x1000, f);
+        let left = tc.ctx.get_or_make_block(0x1100, f);
+        let right = tc.ctx.get_or_make_block(0x1200, f);
+        {
+            let mut fr = FunctionBody::from_id_mut(&mut tc.ctx, f);
+            fr.set_root(root).unwrap();
+            fr.add_block(left);
+            fr.add_block(right);
+        }
+        {
+            let mut b = tc.ctx.builder(root);
+            let a = b.push_load::<false>(ValueId::Varnode(edi), 8, reg).id();
+            b.push_store(a, ValueId::Varnode(sink), reg);
+            let cond = b.shr().get_const(1u64, 1);
+            b.push_cbranch(cond, left, right);
+        }
+        for (blk, ret) in [(left, 1u64), (right, 2u64)] {
+            let mut b = tc.ctx.builder(blk);
+            let v = b.push_load::<false>(ValueId::Varnode(edi), 8, reg).id();
+            b.push_store(v, ValueId::Varnode(sink), reg);
+            let r = b.shr().get_const(ret, 8);
+            b.push_return(r);
+        }
+
+        let aliases = AliasResult::simple_for_function(&tc.ctx, f);
+        mem2reg(&mut tc.ctx, f, &aliases);
+
+        assert_eq!(
+            loads_of(&tc.ctx, f, edi),
+            vec![(root, 0)],
+            "the pure input must consolidate to a single entry load:\n{}",
+            FunctionBody::from_id(&tc.ctx, f)
+        );
+        assert_eq!(root_param_count(&tc.ctx, f), 0);
+    }
+
+    /// A loop that branches back into the root: the carried register value must
+    /// be stored on the back edge (the re-executed entry load reads the cell),
+    /// and no root param is minted. A second mem2reg run must be a no-op — the
+    /// entry load is reused and the edge store recognised, otherwise the
+    /// promote fixpoint would never converge.
+    #[test]
+    fn loop_back_into_root_stores_carried_value_and_converges() {
+        use qcode::testing::TestContext;
+
+        let mut tc = TestContext::new();
+        let (rbp, sink, reg) = (tc.r0, tc.r1, tc.reg_space);
+
+        let f = FunctionBody::make(&mut tc.ctx, "looped".into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(0x1000, f);
+        let body = tc.ctx.get_or_make_block(0x1100, f);
+        let exit = tc.ctx.get_or_make_block(0x1200, f);
+        {
+            let mut fr = FunctionBody::from_id_mut(&mut tc.ctx, f);
+            fr.set_root(root).unwrap();
+            fr.add_block(body);
+            fr.add_block(exit);
+        }
+        {
+            let mut b = tc.ctx.builder(root);
+            let save = b.push_load::<false>(ValueId::Varnode(rbp), 8, reg).id();
+            b.push_store(save, ValueId::Varnode(sink), reg);
+            let cond = b.shr().get_const(1u64, 1);
+            b.push_cbranch(cond, body, exit);
+        }
+        {
+            let mut b = tc.ctx.builder(body);
+            let carried = b.shr().get_const(0x42u64, 8);
+            b.push_store(carried, ValueId::Varnode(rbp), reg);
+            // A reload that forwards (consuming the store) — the carried value
+            // must then reach the root through the injected edge store.
+            let reload = b.push_load::<false>(ValueId::Varnode(rbp), 8, reg).id();
+            b.push_store(reload, ValueId::Varnode(sink), reg);
+            b.push_branch(root);
+        }
+        tc.ctx.add_cfg_edge(body, root);
+        {
+            let mut b = tc.ctx.builder(exit);
+            let r = b.shr().get_const(0u64, 8);
+            b.push_return(r);
+        }
+
+        let aliases = AliasResult::simple_for_function(&tc.ctx, f);
+        mem2reg(&mut tc.ctx, f, &aliases);
+
+        assert_eq!(
+            loads_of(&tc.ctx, f, rbp),
+            vec![(root, 0)],
+            "entry read consolidates; the body reload forwards:\n{}",
+            FunctionBody::from_id(&tc.ctx, f)
+        );
+        assert_eq!(root_param_count(&tc.ctx, f), 0);
+
+        // The carried value is stored on the back edge, directly before the
+        // terminator.
+        let body_block = BasicBlock::from_id(&tc.ctx, body);
+        let insns: Vec<_> = body_block.iter().map(|i| i.mnemonic().clone()).collect();
+        let rbp_stores: Vec<usize> = insns
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m, Mnemonic::Store(s) if s.ptr == LocalValueId::Varnode(rbp)))
+            .map(|(idx, _)| idx)
+            .collect();
+        assert_eq!(
+            rbp_stores.len(),
+            1,
+            "exactly one store(RBP) must remain in the loop body (the edge \
+             store; the consumed original is removed):\n{body_block}"
+        );
+        assert!(
+            insns[rbp_stores[0] + 1..insns.len() - 1]
+                .iter()
+                .all(|m| matches!(m, Mnemonic::Store(_))),
+            "the edge store must sit in the trailing store run before the back \
+             branch (nothing after it may clobber the cell):\n{body_block}"
+        );
+
+        // Convergence: a second run reuses the entry load and recognises the
+        // edge store — no change.
+        let aliases = AliasResult::simple_for_function(&tc.ctx, f);
+        let changed = mem2reg(&mut tc.ctx, f, &aliases);
+        assert!(
+            !changed,
+            "a second mem2reg run must be a no-op:\n{}",
+            FunctionBody::from_id(&tc.ctx, f)
+        );
+        assert_eq!(loads_of(&tc.ctx, f, rbp), vec![(root, 0)]);
     }
 }
 
