@@ -20,6 +20,10 @@ pub enum FunctionDiscoveryReason {
     CallTarget,
     TailCall,
     UserSeed,
+    /// A constant code-pointer argument passed into a callee parameter that is
+    /// itself called indirectly (`call [@param]`). See the
+    /// `propagate_code_pointer_args` pass.
+    CodePointer,
 }
 
 /// The control-flow edge that exposed a block target.

@@ -22,6 +22,7 @@ description = "Default whole-program lifting, discovery, optimization, and clean
 # Seed the binary's entry points as discovered functions (and load its memory).
 [[stage]]
 name = "discover-binary"
+incremental_once = true
 scope = "module"
 passes = ["discover_addresses_in_binary"]
 
@@ -30,6 +31,7 @@ passes = ["discover_addresses_in_binary"]
 # (every readable byte is r/x) to the real section flags and skips data targets.
 [[stage]]
 name = "memory-protections"
+incremental_once = true
 scope = "module"
 passes = ["memory_protections"]
 
@@ -86,6 +88,8 @@ passes = ["windows_teb_seed"]
 # sound, so no speculative second run).
 [[stage]]
 name = "external-sigs"
+address_discovery = true
+incremental_once = true
 scope = "module"
 passes = ["external_sigs"]
 
@@ -95,6 +99,7 @@ passes = ["external_sigs"]
 # symbolic root to forward onto.
 [[stage]]
 name = "argpromote-registers"
+address_discovery = true
 scope = "module"
 # Pass 2 (materialize) then pass 3 (regpure call sites), back-to-back — the
 # order-independent replacement for the v1 fused rewriter (ARGPROMOTE_REGISTERS_V2.md).
@@ -118,23 +123,20 @@ passes = ["argpromote_materialize", "argpromote_regpure_calls"]
 # register effect-summary fixpoint. Inert (records nothing) unless opted in.
 [[stage]]
 name = "assume-calling-convention"
+address_discovery = true
 scope = "module"
 passes = ["assume_calling_convention"]
 
-# Promote to a fixpoint on the real incoming stack pointer `@SP` (no `@stack_base`
-# round-trip). Each round: `canonicalize_sp_slots` unifies the per-site `@SP ± N`
-# address instructions into one representative per offset; `mem2reg` forwards the
-# entry `store(@SP, RSP)` seed (rewriting `RSP ± N` reads to `@SP ± N`) and
-# promotes local frame slots (offset < 0) to SSA values; `const_fold` reassociates
-# the exposed arithmetic. Convergence takes an extra round versus the literal
-# model: round 1 forwards `RSP → @SP`, round 2 canonicalizes and promotes the now
-# `@SP`-rooted slots. Incoming caller-frame stack arguments (offset >= 0) are left
-# as `load(@SP + offset)` memory reads for the `argpromote` memory channel to
-# functionalize, rather than being minted as stack-input params here.
+# Promote to a fixpoint on the real incoming stack pointer `@SP`. Register
+# effects establish the symbolic stack input; mem2reg and the alias/effect
+# analyses recognize its slots directly, while const-fold reassociates exposed
+# arithmetic. Incoming caller-frame stack arguments remain memory effects for
+# the RAM channel to materialize.
 [[stage]]
 name = "promote"
+address_discovery = true
 scope = "function"
-passes = ["canonicalize_sp_slots", "mem2reg", "const_fold"]
+passes = ["gvn", "mem2reg", "const_fold"]
 repeat_until = "no_change"
 
 # Witness each function's memory-write space set now that `argpromote-registers`
@@ -145,11 +147,13 @@ repeat_until = "no_change"
 # touches its own scratch space, not the real `ram` the spill lives in.
 [[stage]]
 name = "seed-written-spaces"
+address_discovery = true
 scope = "module"
 passes = ["seed_written_spaces"]
 
 [[stage]]
 name = "gvn"
+address_discovery = true
 scope = "function"
 passes = ["gvn"]
 
@@ -169,6 +173,7 @@ passes = ["struct_typing"]
 # discoveries and re-homes resolved target blocks into their owning functions.
 [[stage]]
 name = "jump-tables"
+address_discovery = true
 scope = "module"
 passes = ["handle_jump_tables"]
 
@@ -435,6 +440,7 @@ repeat_until = "no_change"
 # back to the clean lifter on the next round.
 [[stage]]
 name = "discover-crt-main-normalized"
+address_discovery = true
 scope = "module"
 passes = ["discover_libc_main"]
 
@@ -448,6 +454,29 @@ passes = ["discover_libc_main"]
 name = "struct-typing-late"
 scope = "function"
 passes = ["struct_typing"]
+
+# Type the target carrier of an indirect call as a code pointer (shared seed
+# for the code-pointer propagation rules below).
+[[stage]]
+name = "infer-code-pointers"
+scope = "module"
+passes = ["infer_code_pointers"]
+
+# Prototype: seed function discoveries from constant code-pointer arguments
+# passed into callees that call the parameter indirectly (`call [@param]`).
+[[stage]]
+name = "discover-code-pointer-args"
+address_discovery = true
+scope = "module"
+passes = ["propagate_code_pointer_args"]
+
+# Value-set path: seed functions from constant code pointers materialized in
+# code and from the read-only pointer tables (vtables) they reference.
+[[stage]]
+name = "harvest-code-pointers"
+address_discovery = true
+scope = "module"
+passes = ["harvest_code_pointers"]
 
 [[stage]]
 name = "demangle"
