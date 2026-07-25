@@ -2,7 +2,7 @@
 
 use qcode::{
     context::Context,
-    value::{FunctionId, RegisterId, VarnodeId},
+    value::{FunctionId, RegisterId},
 };
 
 use crate::{
