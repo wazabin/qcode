@@ -130,6 +130,13 @@ pub(crate) fn entry_sp_value<'a, 'str: 'a>(
 /// aligned base) through a **non-positive** offset — a *positive* offset before a
 /// mask could round to an address at/above entry `@SP` (the caller's frame), which
 /// must not be classified as a local.
+///
+/// DEBT(sp-normalization): this hand-rolled cascade walk is a special case of
+/// generic masked-value-range reasoning — "what interval can `x & -2^k` occupy
+/// given the interval of `x`" — which would decide the same question for any
+/// base without an `@SP` anchor, a depth limit, or a bespoke non-positive-offset
+/// side condition. The soundness argument above is the range argument, written
+/// out by hand for one register.
 fn is_aligned_sp<'ctx, 'str: 'ctx>(
     host: impl QCodeView<'ctx, 'str>,
     numbering: &Numbering,
@@ -177,7 +184,7 @@ pub(crate) fn frame_class<'ctx, 'str: 'ctx>(
     entry_sp: ValueId,
     v: ValueId,
 ) -> Option<FrameClass> {
-    // An `@SP`/`@stack_base`-relative slot: classify by the sign of its offset.
+    // An `@SP`-relative slot: classify by the sign of its offset.
     if let Some(off) = frame_offset(host, numbering, entry_sp, v) {
         return Some(by_sign(off));
     }

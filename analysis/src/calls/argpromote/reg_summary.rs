@@ -50,6 +50,14 @@ impl RegEffects {
 /// The register [`EffectChannel`]. `sp` is the stack-pointer varnode, needed
 /// only to model the SP reload `argpromote_external` emits for stack-passed
 /// external arguments; without it such externals are ⊤.
+///
+/// DEBT(sp-normalization): this field exists purely to keep the summary in sync
+/// with `registers::rewrite_external_call_regpure`, which emits those SP-relative
+/// loads. The two are coupled by convention, not by construction: change the
+/// lowering and this summary silently under-reports. The generic replacement is
+/// for the lowering to *report* the registers it materialized (an effect delta
+/// on the rewrite) so the channel reads a fact instead of re-deriving one — at
+/// which point the stack pointer needs no named slot here at all.
 pub(crate) struct RegChannel {
     pub(crate) sp: Option<VarnodeId>,
 }

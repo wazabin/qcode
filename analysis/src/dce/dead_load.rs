@@ -601,9 +601,9 @@ fn scan_block_aliased<'a, 'str: 'a>(
             // overwrites it, so a register store preceding the call cannot be proven
             // dead by a later (post-call) covering store. Drop register-space kills
             // at the call boundary; explicit `dead_reg` removals still apply (they
-            // do not depend on `killed`). This keeps the caller's pre-call
-            // stack-pointer decrement (see call_summary::decrement_stack_pointer)
-            // alive so the callee's entry stack pointer is seeded correctly.
+            // do not depend on `killed`). The stack pointer rides along as one of
+            // those registers: a caller's pre-call stack-pointer store stays alive
+            // so the callee's entry stack pointer is seeded correctly.
             Mnemonic::Call(_) | Mnemonic::CallInd(_) => {
                 // Drop register-space kills, and (axiom sweep) private
                 // body-local space kills too: a rebased shadow pointer passed to

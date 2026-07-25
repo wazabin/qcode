@@ -599,6 +599,11 @@ fn rewrite_external_call_regpure(
     // Stack-arg slots (implicit RAM): emitted as standalone SP-relative loads
     // before the call, exactly as `bind_external_args` did. Left in the body
     // (not threaded as regpure operands, which must match `map.inputs` 1:1).
+    //
+    // DEBT(sp-normalization): the SP read these loads perform is mirrored by
+    // hand in `reg_summary::RegChannel::materialized_effects` (the `sp` field
+    // exists only for it). The two sides are coupled by convention — keep them
+    // in step until the lowering reports its own register effects.
     let stack_slots: Vec<(i64, usize)> = FunctionBody::from_id(ctx, callee)
         .extern_interface()
         .map(|iface| {

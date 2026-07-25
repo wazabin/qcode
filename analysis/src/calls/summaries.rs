@@ -82,9 +82,10 @@ fn function_writes_through_stack_arg(
 }
 
 /// The frame-offset context for tracing stack-passed pointers: the affine
-/// numbering plus the entry stack-pointer `base` (the `@SP` param or the bare
-/// stack-pointer varnode) and its width, so a caller-frame slot is recognised in
-/// either the legacy `@stack_base + N` or the `@SP + N` representation.
+/// numbering plus the entry stack-pointer `base` and its width, so a
+/// caller-frame slot is recognised as `@SP + N`. `entry_sp_value` supplies the
+/// base in either of its two shapes (the incoming `@SP` param, or the root
+/// entry `load(SP)`).
 struct FrameCtx {
     numbering: Numbering,
     base: ValueId,
@@ -93,6 +94,10 @@ struct FrameCtx {
 
 impl FrameCtx {
     fn new(ctx: &Context, function_id: FunctionId, stack_ptr: VarnodeId) -> Self {
+        // The bare-varnode fallback can only match a *pre-mem2reg* body, where a
+        // stack pointer is still literally the register operand. Once the
+        // register is lowered, every stack address is rooted at one of
+        // `entry_sp_value`'s two SSA shapes instead.
         let base = entry_sp_value(qcode::value::ModuleView::new(ctx), function_id, stack_ptr)
             .unwrap_or(ValueId::Varnode(stack_ptr));
         Self {

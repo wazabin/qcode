@@ -271,9 +271,9 @@ impl MemoryAccess {
 }
 
 /// A byte range of a stack access, in *frame-offset* coordinates (signed bytes
-/// from the entry stack pointer). Offsets unify the `@SP ± N` and legacy
-/// `@stack_base ± N` representations; overlap is invariant under the constant
-/// shift between an absolute address and its offset.
+/// from the entry stack pointer). Working in offsets rather than absolute
+/// addresses makes overlap invariant under the constant shift between an
+/// address and its offset, whichever `@SP ± N` value the access is built on.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct StackAccessRange {
     start: i64,
@@ -842,6 +842,13 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
     /// dynamically indexed (`@SP + reg`) or realigned (`(@SP & -mask) + k`) stack
     /// pointer that may alias any slot. Only meaningful once the entry stack
     /// pointer is known.
+    ///
+    /// DEBT(sp-normalization): this is stack-pointer-specific reasoning that a
+    /// generic replacement should subsume — value-range analysis on the index
+    /// term plus the ordinary alias oracle would answer "which locations can
+    /// this pointer reach" for *any* base, not just `@SP`. Until then the
+    /// dynamic case poisons the whole function (see `dynamic_stack`), which is
+    /// far coarser than what a register variable gets.
     fn is_dynamic_sp_deref(&self, ptr: ValueId) -> bool {
         self.entry_sp
             .is_some_and(|sp| self.numbering.affine_mentions(ptr, sp))
@@ -1176,6 +1183,13 @@ impl<'str> Mem2Reg<'_, 'str> {
         // unboundedly (`frame_escapes_to_unbounded`, a fact seeded by the driver
         // from the previous checkpoint+replay round): that callee may have written
         // any slot, so none may be promoted across it.
+        //
+        // DEBT(sp-normalization): both are function-wide blanket kills, and both
+        // are asymmetric with how a register variable is treated — one unresolved
+        // register pointer disqualifies that location, not every location. The
+        // generic replacement is per-location alias/value-range reasoning: a
+        // dynamic `@SP + reg` should disqualify the slots its range can reach,
+        // and an escaping frame pointer the slots the callee's footprint covers.
         let mut dynamic_stack = self
             .read()
             .function_ref(self.function_id)
@@ -1349,7 +1363,7 @@ impl<'str> Mem2Reg<'_, 'str> {
             // interprocedural backfill (the former `argpromote_stack`) to reconnect
             // the caller side, and threading the stack pointer through that channel
             // was a recurring source of frame-epilogue correctness bugs. Instead we
-            // leave these slots as plain `load(@stack_base + offset)` memory reads
+            // leave these slots as plain `load(@SP + offset)` memory reads
             // and let the post-lowering memory channel (`calls::argpromote`)
             // functionalize them as ordinary by-value pointer arguments, the same
             // way it handles any other caller-frame dereference. Local frame slots
@@ -2787,8 +2801,8 @@ mod tests {
             .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Load(_))))
     }
 
-    /// A canonical `@SP - N` local slot is promoted just like a `@stack_base`
-    /// literal: the reload forwards from the store and the load disappears.
+    /// A canonical `@SP - N` local slot is promoted: the reload forwards from
+    /// the store and the load disappears.
     #[test]
     fn promotes_canonical_sp_relative_slot() {
         let mut tc = qcode::testing::TestContext::new();
@@ -2871,8 +2885,9 @@ mod tests {
         );
     }
 
-    /// Without the `@SP` parameter the `@SP - N` address is unrecognised (it is
-    /// not a `@stack_base` literal), so the slot is left in memory.
+    /// Without the `@SP` parameter the `@SP - N` address is unrecognised (there
+    /// is no entry stack-pointer value to take offsets from), so the slot is left
+    /// in memory.
     #[test]
     fn sp_relative_slot_not_promoted_without_entry_sp() {
         let mut tc = qcode::testing::TestContext::new();
