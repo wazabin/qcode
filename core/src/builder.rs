@@ -2074,7 +2074,6 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             parent: Some(block),
             name: None,
             origin: None,
-            protected: false,
         });
         self.body.blocks[block].params.push(local);
         local

@@ -65,14 +65,6 @@ pub struct BlockParam<'str> {
     /// lets passes like mem2reg reuse an existing param instead of duplicating it,
     /// even for varnodes that have no `name`.
     pub origin: Option<LocalValueId>,
-
-    /// When `true`, the dead-param sweeps must not collect this param even while
-    /// it has no users. It marks a real input caught mid-transformation — most
-    /// notably the incoming stack pointer between `brighten` (which relabels its
-    /// uses to `@stack_base`) and `lower_stack` (which relabels them back) — so a
-    /// transient zero-user window is not mistaken for a dead argument.
-    #[serde(default)]
-    pub protected: bool,
 }
 
 impl<'str> BlockParam<'str> {
@@ -94,7 +86,6 @@ impl<'str> BlockParam<'str> {
                 parent: Some(block_id.local),
                 name: None,
                 origin: None,
-                protected: false,
             },
         );
         BlockParamMutRef::from_id(ctx, id)
@@ -111,7 +102,6 @@ impl<'str> BlockParam<'str> {
             parent: Some(parent),
             name: None,
             origin: None,
-            protected: false,
         }
     }
 

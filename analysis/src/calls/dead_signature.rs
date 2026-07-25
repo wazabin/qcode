@@ -203,7 +203,7 @@ fn trim_dead_args(
         .enumerate()
         .filter(|(_, p)| {
             let p = BlockParamId::new(root.func, **p);
-            ctx.users(p).is_empty() && !ctx.block_param(p).protected
+            ctx.users(p).is_empty()
         })
         .map(|(i, _)| i)
         .collect();

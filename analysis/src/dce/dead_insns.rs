@@ -186,9 +186,7 @@ fn remove_unused_no_pred_block_params<'a, 'str>(
     let mut changed = false;
     for local in params {
         let param = qcode::value::BlockParamId::new(block_id.func, local);
-        if host_users(cx.body_view(body), ValueId::BlockParam(param)).is_empty()
-            && !cx.body_view(body).block_param(param).protected
-        {
+        if host_users(cx.body_view(body), ValueId::BlockParam(param)).is_empty() {
             body.remove_block_param(param);
             changed = true;
         } else {

@@ -816,7 +816,6 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
                 parent: Some(block_id.local),
                 name: None,
                 origin: None,
-                protected: false,
             },
         );
         self.inner_mut().params.push(id.localize(block_id.func));

@@ -188,10 +188,10 @@ pub(crate) fn remove_dead_block_args_body<'a, 'str>(
 ///   * it is passed, on a `Branch`/`CBranch` edge, into a param that is itself live
 ///     (it is observed indirectly, through the live param it feeds).
 ///
-/// Root (entry) and `protected` params are seeded live: they are the function
-/// interface / pinned, never removed, and they keep their sources alive. The pass
-/// iterates to a fixpoint over the forwarding edges, then drops every param that
-/// stays dead, stripping the matching predecessor argument columns.
+/// Root (entry) params are seeded live: they are the function interface, never
+/// removed, and they keep their sources alive. The pass iterates to a fixpoint
+/// over the forwarding edges, then drops every param that stays dead, stripping
+/// the matching predecessor argument columns.
 ///
 /// Returns whether anything was removed.
 pub fn remove_dead_block_params(
@@ -273,16 +273,11 @@ pub(crate) fn remove_dead_block_params_body<'a, 'str>(
         }
     }
 
-    // Seed root + protected params live, then propagate liveness backwards along
-    // the forwarding edges to a fixpoint: a param feeding a live param is live.
+    // Seed root params live, then propagate liveness backwards along the
+    // forwarding edges to a fixpoint: a param feeding a live param is live.
     if let Some(root) = root {
         for &local in cx.body_view(body).block(root).param_ids() {
             live.insert(BlockParamId::new(root.func, local));
-        }
-    }
-    for &(src, _) in &edges {
-        if cx.body_view(body).block_param(src).protected {
-            live.insert(src);
         }
     }
     loop {
@@ -297,8 +292,8 @@ pub(crate) fn remove_dead_block_params_body<'a, 'str>(
         }
     }
 
-    // Collect dead params per block (protected params are always seeded live, so
-    // they never appear here; root params likewise).
+    // Collect dead params per block (root params are always seeded live, so they
+    // never appear here).
     let mut dead_by_block: rustc_hash::FxHashMap<BlockId, HashSet<usize>> = Default::default();
     for &block in block_ids {
         for (index, &local) in cx
@@ -371,9 +366,6 @@ fn find_congruent_param<'a, 'str: 'a>(
         let params = host.block(block).params.clone();
         for (index, &local) in params.iter().enumerate() {
             let param = BlockParamId::new(block.func, local);
-            if host.block_param(param).protected {
-                continue;
-            }
             if let Some(repl) = congruent_incoming(
                 host,
                 &mut cong,
@@ -471,8 +463,8 @@ fn incoming_args<'a, 'str: 'a>(
     out
 }
 
-/// Scan for the first redundant param: a non-root, non-protected param on a block
-/// with predecessors whose incoming arguments reduce to a single value `repl`.
+/// Scan for the first redundant param: a non-root param on a block with
+/// predecessors whose incoming arguments reduce to a single value `repl`.
 fn find_redundant_param<'a, 'str: 'a>(
     host: impl QCodeView<'a, 'str>,
     block_ids: &[BlockId],
@@ -488,9 +480,6 @@ fn find_redundant_param<'a, 'str: 'a>(
         let params = host.block(block).params.clone();
         for (index, &local) in params.iter().enumerate() {
             let param = BlockParamId::new(block.func, local);
-            if host.block_param(param).protected {
-                continue;
-            }
             if let Some(repl) = unique_incoming(host, block, index, ValueId::BlockParam(param)) {
                 return Some((block, index, param, repl));
             }
