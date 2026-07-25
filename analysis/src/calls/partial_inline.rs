@@ -24,10 +24,17 @@
 //! For output field `i`, with the callee's `pure_reg` invariant that root params
 //! are positionally aligned with every caller's `Call.args`:
 //!
-//! * **Same value at every return.** The field's defining value must be the
-//!   exact same SSA `ValueId` in every `Return`'s write-set tuple (a path
-//!   dependent output cannot be hoisted unconditionally). Checked per field, so
-//!   a divergent field is skipped without blocking the others.
+//! * **Uniform across returns.** The field must compute the *same* value on
+//!   every path — a path-dependent output cannot be hoisted unconditionally.
+//!   Two ways to satisfy it, checked per field so a divergent field is skipped
+//!   without blocking the others:
+//!   * the exact same SSA `ValueId` in every `Return`'s write-set tuple (the
+//!     fast path, and the only shape a single-epilogue function produces); or
+//!   * the same **affine normal form over the callee's input params** at every
+//!     return (see [`affine_uniform`]). A multi-return epilogue mints its own
+//!     `@RSP + 0x8` in each sibling block, so `RSP_out = RSP_in + 8` is uniform
+//!     in value while being three distinct `ValueId`s. The canonically-first
+//!     return's expression is then the representative that gets cloned.
 //! * **Pure-data expression.** Walking the value's def DAG, every interior node
 //!   is a side-effect-free data-op (arithmetic, bitwise, shifts, ext/trunc,
 //!   float converts, flag ops) and every leaf is a literal or a *root* input
@@ -39,6 +46,12 @@
 //!   (`o = p_k`) and constant (`o = 100`) fields are the 0-instruction cases.
 //!
 //! ## Soundness
+//!
+//! The cloned expression is a pure function of the positional inputs *only*:
+//! `collect_expr` admits no leaf but a literal or an input param, and the affine
+//! path additionally requires every term of the shared normal form to be an
+//! input param — so neither uniformity route can smuggle in a load, a varnode,
+//! or a non-input param.
 //!
 //! The expression depends only on the inputs, which are passed by value and
 //! evaluated *before* the call, so recomputing it in the caller's continuation
@@ -135,15 +148,23 @@ fn is_pure_dataop(m: &Mnemonic) -> bool {
     // & effects), Tuple/Extract (aggregate plumbing), PCodeOp (opaque/arch).
 }
 
-/// Every `Return` terminator in `fid`.
+/// Every `Return` terminator in `fid`, in ascending [`InstructionId`] order.
+///
+/// `FunctionBody::iter` walks the block arena in *dense physical* order, which
+/// is explicitly not a semantic order. The sort makes the sequence canonical, so
+/// "the first return" — the affine-uniformity representative
+/// ([`plan_partial_inline`]) — is the same one on every run and the rendered IR
+/// stays byte-identical (the sequential/parallel differential gate).
 fn returns_of(ctx: &Context, fid: FunctionId) -> Vec<InstructionId> {
-    FunctionBody::from_id(ctx, fid)
+    let mut returns: Vec<InstructionId> = FunctionBody::from_id(ctx, fid)
         .iter()
         .filter_map(|b| {
             let last = b.iter().last()?;
             matches!(last.mnemonic(), Mnemonic::Return(_)).then_some(last.id)
         })
-        .collect()
+        .collect();
+    returns.sort_unstable();
+    returns
 }
 
 /// The write-set `Tuple`'s field values at `ret_id`, or `None` if the return
@@ -206,6 +227,49 @@ fn collect_expr(
     }
 }
 
+/// Whether field `i` has the *same affine normal form over the callee's input
+/// params* at every return — the weaker uniformity that lets a multi-return
+/// epilogue inline.
+///
+/// A multi-return function mints its epilogue arithmetic per return block, so
+/// `RSP_out = RSP_in + 8` is a *different* `ValueId` in each sibling block even
+/// though every return computes the identical value. Same-`ValueId` therefore
+/// under-approximates uniformity. GVN's affine machinery already decides the
+/// question exactly: `Numbering::affine_terms` gives the canonical
+/// `constant + Σ coeff·term` decomposition (terms sorted, coefficients merged,
+/// zero coefficients dropped), so two values compute the same function of the
+/// same leaves exactly when their decompositions are equal.
+///
+/// Two conditions, both required:
+///
+/// 1. Every return's field value has an affine view and all of them are equal
+///    (same width, constant, and term list).
+/// 2. Every term in that view is an **inline input param**. This is what makes
+///    the recompute a pure function of the positional arguments: a term that is
+///    a load, a varnode, a non-input (stack-passed or phi) param, or any other
+///    opaque leaf is not reconstructible at the caller, so the field is left on
+///    the return. (Literals need no check — they are folded into `constant` and
+///    the per-term coefficients.)
+///
+/// Purity, leaf-shape and budget are *not* decided here: the representative
+/// expression still goes through [`collect_expr`] unchanged.
+fn affine_uniform(
+    numbering: &crate::gvn::affine::Numbering,
+    per_return: &[Vec<ValueId>],
+    i: usize,
+    inputs: &HashMap<ValueId, usize>,
+) -> bool {
+    let Some(first) = numbering.affine_terms(per_return[0][i]) else {
+        return false;
+    };
+    if !first.2.iter().all(|(term, _)| inputs.contains_key(term)) {
+        return false;
+    }
+    per_return[1..]
+        .iter()
+        .all(|fields| numbering.affine_terms(fields[i]).as_ref() == Some(&first))
+}
+
 /// An inlinable output field: its tuple slot, its (uniform) defining value, and
 /// the post-ordered instruction nodes to clone (empty for identity/const).
 struct Inlinable {
@@ -254,8 +318,8 @@ fn plan_partial_inline(
         return None;
     }
 
-    // The write-set field values, required identical (same SSA value) across
-    // every return. A return without a tuple value bails the whole function.
+    // The write-set field values at each return, in canonical return order.
+    // A return without a tuple value bails the whole function.
     let mut per_return: Vec<Vec<ValueId>> = Vec::with_capacity(returns.len());
     for &ret_id in &returns {
         let fields = return_tuple_fields(ctx, ret_id)?;
@@ -267,12 +331,27 @@ fn plan_partial_inline(
     }
 
     // Classify each field independently.
+    //
+    // The affine views are only needed when a field is *not* the same `ValueId`
+    // everywhere, and computing them walks the whole body — so build them at
+    // most once, lazily.
+    let mut forms: Option<crate::gvn::affine::Numbering> = None;
     let mut inlinable: Vec<Inlinable> = Vec::new();
     for i in 0..n {
+        // The representative expression: the field value at the canonically
+        // first return. When every return agrees on the `ValueId` (the common
+        // single-epilogue case) that is trivially the right choice; otherwise
+        // `affine_uniform` proves the other returns compute the same function of
+        // the same input params, which makes any one of them representative.
         let value = per_return[0][i];
-        // Same value at every return, else the output is path-dependent.
         if per_return.iter().any(|f| f[i] != value) {
-            continue;
+            let numbering = forms.get_or_insert_with(|| {
+                crate::gvn::affine::precompute_forms(qcode::value::ModuleView::new(ctx), fid)
+            });
+            if !affine_uniform(numbering, &per_return, i, &inputs) {
+                // Genuinely path-dependent: cannot be hoisted unconditionally.
+                continue;
+            }
         }
         let mut visited = HashMap::default();
         let mut order = Vec::new();
@@ -1053,6 +1132,185 @@ mod tests {
             return_field_count(&tc, f),
             Some(1),
             "the inlined field is dropped; the impure one remains"
+        );
+    }
+
+    /// Common wiring for the two-return scenarios below: make `f` `pure_reg`,
+    /// give `g`'s call a positional argument, and replay field 0 at the caller.
+    fn wire_two_return(
+        tc: &mut qcode::testing::TestContext,
+        f: FunctionId,
+        g_call: BlockId,
+        g_cont: BlockId,
+    ) -> InstructionId {
+        let (vr0, vr3) = (tc.r0, tc.r3);
+        let agg = make_pure_reg(tc, f, vec![vr0]);
+        let a = tc.ctx.get_const(0x10, 8).id();
+        let call_id = set_call(tc, g_call, f, vec![a]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg);
+        replay_field(tc, g_cont, call_id, 0, vr3);
+        call_id
+    }
+
+    /// A two-return callee whose single output field is `@r0 + 8` on *both*
+    /// paths — two distinct `ValueId`s, as a real multi-return epilogue mints —
+    /// plus a caller that projects it.
+    fn uniform_two_return_scenario() -> (qcode::testing::TestContext, InstructionId, BlockId) {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @r0:i64>
+                    if @r0 goto <rt> else goto <rf>;
+                <rt>
+                    %t = @r0 + i64 8;
+                    %at = (%t);
+                    return at %at;
+                <rf>
+                    %u = @r0 + i64 8;
+                    %af = (%u);
+                    return at %af;
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = g;
+        let call_id = wire_two_return(&mut tc, f, g_call, g_cont);
+        (tc, call_id, g_cont)
+    }
+
+    /// The ruled extension: a field that is a *different* `ValueId` at every
+    /// return but has the same affine normal form over the input params (the
+    /// `RSP_out = RSP_in + 8` shape a multi-return epilogue produces) inlines.
+    #[test]
+    fn multi_return_affine_uniform_field_inlines() {
+        let (mut tc, call_id, g_cont) = uniform_two_return_scenario();
+        assert!(
+            partial_inline(&mut tc.ctx),
+            "both returns compute @r0 + 8, so the field is uniform"
+        );
+        assert_eq!(
+            extracts_of(&tc, g_cont, call_id),
+            0,
+            "the projecting extract is redirected"
+        );
+        assert_eq!(
+            binops_in(&tc, g_cont),
+            1,
+            "one representative expression is recomputed at the caller"
+        );
+    }
+
+    /// A genuinely path-dependent field — different affine forms per return —
+    /// still bails, so the extract survives.
+    #[test]
+    fn multi_return_divergent_affine_form_is_skipped() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @r0:i64>
+                    if @r0 goto <rt> else goto <rf>;
+                <rt>
+                    %t = @r0 + i64 8;
+                    %at = (%t);
+                    return at %at;
+                <rf>
+                    %u = @r0 + i64 16;
+                    %af = (%u);
+                    return at %af;
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = g;
+        let call_id = wire_two_return(&mut tc, f, g_call, g_cont);
+        assert!(
+            !partial_inline(&mut tc.ctx),
+            "@r0 + 8 and @r0 + 16 are not the same value"
+        );
+        assert_eq!(
+            extracts_of(&tc, g_cont, call_id),
+            1,
+            "the path-dependent field keeps its extract"
+        );
+    }
+
+    /// Affine-uniform but built on a leaf that is *not* an input param: both
+    /// returns compute `%l + 8` over the same load, so the normal forms are
+    /// equal, yet a load is not reconstructible from the caller's arguments.
+    #[test]
+    fn affine_uniform_over_non_input_leaf_is_skipped() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (vr0, r2, vr3) = (tc.r0, tc.r2, tc.r3);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @r0:i64>
+                    %l = load(register:8, {r2});
+                    if @r0 goto <rt> else goto <rf>;
+                <rt>
+                    %t = %l + i64 8;
+                    %at = (%t);
+                    return at %at;
+                <rf>
+                    %u = %l + i64 8;
+                    %af = (%u);
+                    return at %af;
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (g, r2);
+        let agg = make_pure_reg(&mut tc, f, vec![vr0]);
+        let a = tc.ctx.get_const(0x10, 8).id();
+        let call_id = set_call(&mut tc, g_call, f, vec![a]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg);
+        replay_field(&mut tc, g_cont, call_id, 0, vr3);
+
+        assert!(
+            !partial_inline(&mut tc.ctx),
+            "a load leaf is not an inline input, however uniform the form"
+        );
+        assert_eq!(extracts_of(&tc, g_cont, call_id), 1);
+    }
+
+    /// The pass must be deterministic: the same input IR must render identically
+    /// after two independent runs. (The rendered-IR comparison is exactly what
+    /// the sequential/parallel differential gate does.)
+    #[test]
+    fn affine_uniform_inline_is_deterministic() {
+        let (mut first, _, _) = uniform_two_return_scenario();
+        let (mut second, _, _) = uniform_two_return_scenario();
+        assert!(partial_inline(&mut first.ctx));
+        assert!(partial_inline(&mut second.ctx));
+        assert_eq!(
+            first.ctx.to_string(),
+            second.ctx.to_string(),
+            "partial_inline must render byte-identical IR across runs"
         );
     }
 }
