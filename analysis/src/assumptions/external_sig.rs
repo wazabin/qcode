@@ -26,7 +26,7 @@
 //! once an external callee has a signature, the argument-producing passes can
 //! produce real arguments at its call sites.
 
-use cabi::{CFunctionProto, CType, Config, Selection};
+use cabi::{CFunctionProto, CParam, CType, Config, Selection};
 use qcode::{
     context::Context,
     value::{
@@ -406,6 +406,92 @@ fn glibc_alias_base(name: &str) -> Option<&str> {
         .find_map(|prefix| name.strip_prefix(prefix))
 }
 
+/// The register-channel interface map for a callee whose argument registers are
+/// `inputs` and whose ABI return register(s) are `outputs`, under `abi`.
+///
+/// Returns-first ordering: the return register(s) lead the output pack and the
+/// convention's caller-saved (volatile) set follows as a clobber tail (poison at
+/// a rewritten site). Growing the outputs to include the clobbers is what lets a
+/// materialized caller's return pack cover them (bug-2-external). Both the
+/// prototyped path and the ABI fallback go through here, so the two agree on the
+/// clobber set by construction.
+fn register_interface_map(
+    inputs: Vec<VarnodeId>,
+    outputs: &[VarnodeId],
+    abi: &CallingConvention,
+) -> RegisterInterfaceMap {
+    let mut pack_outputs: Vec<VarnodeId> = outputs.to_vec();
+    for &clobber in &abi.caller_saved {
+        if !pack_outputs.contains(&clobber) {
+            pack_outputs.push(clobber);
+        }
+    }
+    RegisterInterfaceMap {
+        inputs,
+        returns: outputs.len(),
+        outputs: pack_outputs,
+    }
+}
+
+/// The synthetic "unknown signature" prototype for an external with no C
+/// declaration: every argument-passing register of `abi` is a parameter and the
+/// return is an integer. Fed through [`map_prototype`] exactly like a real
+/// prototype, so the fallback interface is derived from the calling-convention
+/// model alone — no architecture is hardcoded.
+fn abi_unknown_proto(abi: &CallingConvention) -> CFunctionProto {
+    let param = |ty| CParam { name: None, ty };
+    let params = abi
+        .int_args
+        .iter()
+        .map(|_| {
+            param(CType::Integer {
+                bytes: 8,
+                signed: false,
+            })
+        })
+        .chain(
+            abi.sse_args
+                .iter()
+                .map(|_| param(CType::Float { bytes: 8 })),
+        )
+        .collect();
+    CFunctionProto {
+        name: "".into(),
+        return_type: CType::Integer {
+            bytes: 8,
+            signed: true,
+        },
+        params,
+        variadic: false,
+        header: None,
+    }
+}
+
+/// Ruling: **"obeys the platform ABI" is a sound assumption for an arbitrary
+/// unprototyped external symbol.** So an external the prototype table cannot
+/// name is not ⊤ for the register channel — it is materialized from the calling
+/// convention alone: its inputs are *every* argument-passing register and its
+/// outputs are the return register(s) ∪ *every* caller-saved register. Both
+/// halves over-approximate: a real callee reads a prefix of the argument
+/// registers and clobbers a subset of the volatile ones.
+///
+/// This runs only when `sel` has no prototype for the symbol (a real prototype
+/// always wins, and is strictly more precise).
+///
+/// Unlike the prototyped path this stamps *only* the register channel: with no
+/// prototype there is nothing to say about parameter attributes, pointer argmem
+/// kinds, or stack slots, so those stay absent and the RAM channel keeps
+/// treating the callee conservatively.
+fn apply_abi_fallback_signature(ctx: &mut Context, fun_id: FunctionId, abi: &CallingConvention) {
+    let proto = abi_unknown_proto(abi);
+    let Some((inputs, outputs, ..)) = map_prototype(&proto, abi) else {
+        return;
+    };
+    let reg_map = register_interface_map(inputs, &outputs, abi);
+    FunctionBody::from_id_mut(ctx, fun_id)
+        .set_register_effects(RegisterChannelState::Materialized(reg_map));
+}
+
 /// Assign a signature and call interface to `fun_id` if it is a known external
 /// function present in `sel`.
 pub fn apply_external_signature(
@@ -426,15 +512,20 @@ pub fn apply_external_signature(
     // symbol is the part before the first `@`.
     let raw = FunctionBody::from_id(ctx, fun_id).name().to_string();
     let name = raw.split('@').next().unwrap_or(&raw);
-    // Precise prototype first, then the mechanical glibc alias spelling
-    // (`__isoc23_sscanf` → `sscanf`).
+    // Precise prototype first; then the mechanical glibc alias spelling
+    // (`__isoc23_sscanf` → `sscanf`); then, with nothing declared for the
+    // symbol at all, the ABI-only fallback.
     let proto = sel
         .lookup(name)
         .or_else(|| glibc_alias_base(name).and_then(|base| sel.lookup(base)));
     let Some(proto) = proto else {
+        apply_abi_fallback_signature(ctx, fun_id, abi);
         return;
     };
     let Some((inputs, outputs, param_attrs, mut argmem_kinds)) = map_prototype(proto, abi) else {
+        // An unmappable prototype (by-value aggregate) tells us nothing precise,
+        // but the callee still obeys the ABI.
+        apply_abi_fallback_signature(ctx, fun_id, abi);
         return;
     };
     // Ruling 1b: distinguish write-only destination pointers (memset/memcpy dest
@@ -448,25 +539,11 @@ pub fn apply_external_signature(
 
     // The register-channel interface mapping (argpromote v2, ruling 6a): this
     // materialized external's inputs are its argument registers and its outputs
-    // are its return register(s) ∪ the ABI caller-saved clobber set. Growing the
-    // outputs to include the clobbers is what lets a materialized caller's return
-    // pack cover them (bug-2-external). No varargs check — a prototyped variadic
-    // external materializes like any other. This is the single source of truth:
-    // `reg_summary::external_leaf` reads it, and pass 2 never grows an external
-    // branch.
-    let mut pack_outputs: Vec<VarnodeId> = outputs.clone();
-    for &clobber in &abi.caller_saved {
-        if !pack_outputs.contains(&clobber) {
-            pack_outputs.push(clobber);
-        }
-    }
-    let reg_map = RegisterInterfaceMap {
-        inputs: inputs.clone(),
-        // Returns-first ordering: the ABI return register(s) lead, the
-        // caller-saved clobber tail follows (poison at a rewritten site).
-        returns: outputs.len(),
-        outputs: pack_outputs,
-    };
+    // are its return register(s) ∪ the ABI caller-saved clobber set. No varargs
+    // check — a prototyped variadic external materializes like any other. This is
+    // the single source of truth: `reg_summary::external_leaf` reads it, and
+    // pass 2 never grows an external branch.
+    let reg_map = register_interface_map(inputs.clone(), &outputs, abi);
 
     let mut f = FunctionBody::from_id_mut(ctx, fun_id);
     f.set_param_attrs(param_attrs);
@@ -662,6 +739,76 @@ mod tests {
         let f = external(&mut tc, "definitely_not_a_libc_function_xyz");
         apply(&mut tc.ctx, f, &abi, &host_sel());
         assert!(FunctionBody::from_id(&tc.ctx, f).signature().is_none());
+    }
+
+    /// Ruling 1: an external with no prototype at all is *not* ⊤ — it is
+    /// materialized from the calling convention alone, over-approximating on
+    /// both sides: every argument register is an input, and the return register
+    /// ∪ every caller-saved register is an output.
+    #[test]
+    fn prototypeless_external_falls_back_to_the_abi_interface() {
+        use qcode::value::RegisterChannelState;
+        let mut tc = TestContext::new();
+        let abi = toy_abi(&tc); // int_args = [r0, r1], sse_args = [r2], ret/clobber = r3
+        let f = external(&mut tc, "definitely_not_a_libc_function_xyz");
+        apply(&mut tc.ctx, f, &abi, &host_sel());
+        let func = FunctionBody::from_id(&tc.ctx, f);
+        let RegisterChannelState::Materialized(map) = &func.effects().register else {
+            panic!("a prototype-less external must still be stamped Materialized");
+        };
+        assert_eq!(
+            map.inputs,
+            vec![tc.r0, tc.r1, tc.r2],
+            "every argument-passing register of the convention is an input"
+        );
+        assert_eq!(map.returns, 1, "the ABI return register leads the pack");
+        assert_eq!(map.outputs, vec![tc.r3], "return ∪ caller-saved, deduped");
+        // No prototype means nothing precise to say about memory or slots.
+        assert!(func.argmem().is_none());
+        assert!(func.extern_interface().is_none());
+    }
+
+    /// The ABI fallback and the prototyped path agree on the clobber set: both
+    /// build their output pack through `register_interface_map`, so a
+    /// prototype-less external's outputs are a superset of a prototyped one's.
+    #[test]
+    fn fallback_and_prototyped_paths_agree_on_clobbers() {
+        use qcode::value::RegisterChannelState;
+        let mut tc = TestContext::new();
+        let abi = toy_abi(&tc);
+        let known = external_at(&mut tc, "memcpy", 0x9000);
+        let unknown = external_at(&mut tc, "definitely_not_a_libc_function_xyz", 0x9100);
+        apply(&mut tc.ctx, known, &abi, &host_sel());
+        apply(&mut tc.ctx, unknown, &abi, &host_sel());
+        let outputs = |f| match &FunctionBody::from_id(&tc.ctx, f).effects().register {
+            RegisterChannelState::Materialized(map) => map.outputs.clone(),
+            other => panic!("expected Materialized, got {other:?}"),
+        };
+        for clobber in &abi.caller_saved {
+            assert!(outputs(known).contains(clobber));
+            assert!(outputs(unknown).contains(clobber));
+        }
+    }
+
+    /// A real prototype always wins over the ABI fallback: `memcpy` keeps its
+    /// two-register interface rather than claiming every argument register.
+    #[test]
+    fn a_real_prototype_beats_the_abi_fallback() {
+        use qcode::value::RegisterChannelState;
+        let mut tc = TestContext::new();
+        let abi = toy_abi(&tc);
+        let f = external(&mut tc, "memcpy");
+        apply(&mut tc.ctx, f, &abi, &host_sel());
+        let RegisterChannelState::Materialized(map) =
+            &FunctionBody::from_id(&tc.ctx, f).effects().register
+        else {
+            panic!("prototyped external must be Materialized");
+        };
+        assert_eq!(
+            map.inputs,
+            vec![tc.r0, tc.r1],
+            "the prototype's two register args, not the whole convention"
+        );
     }
 
     /// Ruling 2: the mechanical glibc aliases resolve to the unprefixed
