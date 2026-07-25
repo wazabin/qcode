@@ -564,8 +564,8 @@ impl EffectChannel for RamChannel {
                     // shadow (the frame stays real for the ABI), so its value is
                     // identical before and after promotion. It carries no new
                     // info to callers, so we neither ⊤ the summary nor push it
-                    // outward. A *write* mutates an incoming arg slot — still
-                    // promote_stack_args territory, not expressible here yet.
+                    // outward. A *write* mutates an incoming arg slot, which this
+                    // summary cannot express yet.
                     if is_store {
                         precise_top = true;
                     }
