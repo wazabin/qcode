@@ -385,6 +385,27 @@ fn argmem_kind(ty: &CType) -> ArgMemKind {
     }
 }
 
+/// Mechanical glibc symbol aliases: a versioned re-spelling of a standard libc
+/// function that has *the same C signature* as the unprefixed name but that no
+/// header declares under the prefixed spelling. `<stdio.h>` declares `sscanf`;
+/// the compiler emits a call to `__isoc23_sscanf` (glibc's C23-conformant
+/// scanf family) or `__isoc99_sscanf` (the C99 one), and the prototype table —
+/// built from headers — has no entry for either. Stripping the prefix at lookup
+/// recovers the real, precise prototype.
+///
+/// Deliberately narrow: only families where the alias is the *same function
+/// under a different symbol version*, so the signature is identical by
+/// construction. The `__*_chk` fortified family is NOT here — `__memcpy_chk`
+/// takes an extra `size_t destlen` parameter, so it is a different signature.
+const GLIBC_ALIAS_PREFIXES: &[&str] = &["__isoc23_", "__isoc99_"];
+
+/// The unprefixed libc name behind a mechanical glibc alias, if `name` is one.
+fn glibc_alias_base(name: &str) -> Option<&str> {
+    GLIBC_ALIAS_PREFIXES
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))
+}
+
 /// Assign a signature and call interface to `fun_id` if it is a known external
 /// function present in `sel`.
 pub fn apply_external_signature(
@@ -405,7 +426,12 @@ pub fn apply_external_signature(
     // symbol is the part before the first `@`.
     let raw = FunctionBody::from_id(ctx, fun_id).name().to_string();
     let name = raw.split('@').next().unwrap_or(&raw);
-    let Some(proto) = sel.lookup(name) else {
+    // Precise prototype first, then the mechanical glibc alias spelling
+    // (`__isoc23_sscanf` → `sscanf`).
+    let proto = sel
+        .lookup(name)
+        .or_else(|| glibc_alias_base(name).and_then(|base| sel.lookup(base)));
+    let Some(proto) = proto else {
         return;
     };
     let Some((inputs, outputs, param_attrs, mut argmem_kinds)) = map_prototype(proto, abi) else {
@@ -537,7 +563,13 @@ mod tests {
     }
 
     fn external(tc: &mut TestContext, name: &str) -> FunctionId {
-        FunctionBody::make_external(&mut tc.ctx, 0x9000, Some(name.to_string().into())).id
+        external_at(tc, name, 0x9000)
+    }
+
+    /// Externals must have distinct addresses, so tests that make several of them
+    /// place each at its own slot.
+    fn external_at(tc: &mut TestContext, name: &str, addr: u64) -> FunctionId {
+        FunctionBody::make_external(&mut tc.ctx, addr, Some(name.to_string().into())).id
     }
 
     /// The host target the embedded libc table was extracted for.
@@ -630,6 +662,46 @@ mod tests {
         let f = external(&mut tc, "definitely_not_a_libc_function_xyz");
         apply(&mut tc.ctx, f, &abi, &host_sel());
         assert!(FunctionBody::from_id(&tc.ctx, f).signature().is_none());
+    }
+
+    /// Ruling 2: the mechanical glibc aliases resolve to the unprefixed
+    /// prototype, so they get the *precise* interface rather than the fallback.
+    #[test]
+    fn glibc_isoc_aliases_resolve_to_the_unprefixed_prototype() {
+        use qcode::value::RegisterChannelState;
+        let mut tc = TestContext::new();
+        let abi = toy_abi(&tc);
+        // strtol(const char *nptr, char **endptr, int base): three INTEGER args,
+        // two of which fit the toy ABI's GP registers.
+        let plain = external_at(&mut tc, "strtol", 0x9000);
+        let aliased = external_at(&mut tc, "__isoc23_strtol", 0x9100);
+        let c99 = external_at(&mut tc, "__isoc99_scanf", 0x9200);
+        let scanf = external_at(&mut tc, "scanf", 0x9300);
+        for f in [plain, aliased, c99, scanf] {
+            apply(&mut tc.ctx, f, &abi, &host_sel());
+        }
+        let iface = |f| match &FunctionBody::from_id(&tc.ctx, f).effects().register {
+            RegisterChannelState::Materialized(map) => map.clone(),
+            other => panic!("expected Materialized, got {other:?}"),
+        };
+        assert_eq!(iface(aliased), iface(plain), "__isoc23_strtol == strtol");
+        assert_eq!(iface(c99), iface(scanf), "__isoc99_scanf == scanf");
+        // And the aliased form carries the prototype's argmem, not the fallback's
+        // absence of one.
+        assert!(
+            FunctionBody::from_id(&tc.ctx, aliased).argmem().is_some(),
+            "the alias must pick up the real prototype's argmem summary"
+        );
+    }
+
+    /// The alias strip is not a general prefix strip: `__memcpy_chk` takes an
+    /// extra `destlen` parameter, so it must NOT borrow `memcpy`'s prototype.
+    #[test]
+    fn only_the_listed_alias_families_are_normalized() {
+        assert_eq!(glibc_alias_base("__isoc23_strtol"), Some("strtol"));
+        assert_eq!(glibc_alias_base("__isoc99_sscanf"), Some("sscanf"));
+        assert_eq!(glibc_alias_base("__memcpy_chk"), None);
+        assert_eq!(glibc_alias_base("strtol"), None);
     }
 
     #[test]
