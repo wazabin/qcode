@@ -20,25 +20,26 @@ use crate::gvn::affine::{Numbering, precompute_forms};
 use crate::sequence::{
     AddressRelation, MemoryAccess, SequenceRegion, collect_regions_for_base, relate_address,
 };
-use crate::stack::frame::{FrameClass, frame_class, incoming_sp_param};
+use crate::stack::frame::{FrameClass, entry_sp_value, frame_class};
 use crate::{Pass, PipelineEnv};
 
 use super::arg_index_of;
 
 /// Recognises this function's own stack-frame locals (`@SP`-rooted slots below the
 /// entry stack pointer). Inert when there is no stack-pointer register or no
-/// incoming `@SP` param, in which case [`OwnFrame::is_local`] is always `false`.
+/// resolvable entry stack-pointer value, in which case [`OwnFrame::is_local`] is
+/// always `false`.
 pub(super) struct OwnFrame {
-    sp_param: Option<ValueId>,
+    entry_sp: Option<ValueId>,
     numbering: Numbering,
 }
 
 impl OwnFrame {
     pub(super) fn new(ctx: &Context, fid: FunctionId, sp_reg: Option<VarnodeId>) -> Self {
-        let sp_param =
-            sp_reg.and_then(|r| incoming_sp_param(qcode::value::ModuleView::new(ctx), fid, r));
+        let entry_sp =
+            sp_reg.and_then(|r| entry_sp_value(qcode::value::ModuleView::new(ctx), fid, r));
         Self {
-            sp_param,
+            entry_sp,
             numbering: precompute_forms(qcode::value::ModuleView::new(ctx), fid),
         }
     }
@@ -46,7 +47,7 @@ impl OwnFrame {
     /// Whether `addr` points into this function's own frame (classified
     /// [`FrameClass::Local`]).
     pub(super) fn is_local(&self, ctx: &Context, addr: ValueId) -> bool {
-        self.sp_param.is_some_and(|sp| {
+        self.entry_sp.is_some_and(|sp| {
             frame_class(
                 qcode::value::ModuleView::new(ctx),
                 &self.numbering,
@@ -62,9 +63,9 @@ impl OwnFrame {
         &self.numbering
     }
 
-    /// The incoming `@SP` param this frame is rooted at, if recognised.
-    pub(super) fn sp_param(&self) -> Option<ValueId> {
-        self.sp_param
+    /// The entry stack-pointer value this frame is rooted at, if recognised.
+    pub(super) fn entry_sp(&self) -> Option<ValueId> {
+        self.entry_sp
     }
 
     /// The stable slot key of an own-frame local: `addr`'s constant offset from
@@ -72,7 +73,7 @@ impl OwnFrame {
     /// non-locals *and* for realigned-base locals (`@SP & -mask` has no stable
     /// `@SP`-relative offset, so such a slot can never license a read).
     pub(super) fn local_offset(&self, ctx: &Context, addr: ValueId) -> Option<i64> {
-        let sp = self.sp_param?;
+        let sp = self.entry_sp?;
         let off = crate::stack::frame::frame_offset(
             qcode::value::ModuleView::new(ctx),
             &self.numbering,
@@ -85,7 +86,7 @@ impl OwnFrame {
     /// Whether `addr` is any `@SP`-rooted frame slot — an own-frame local or a
     /// caller-frame slot (`@SP + k`, `k ≥ 0`).
     pub(super) fn is_frame_slot(&self, ctx: &Context, addr: ValueId) -> bool {
-        self.sp_param.is_some_and(|sp| {
+        self.entry_sp.is_some_and(|sp| {
             matches!(
                 frame_class(
                     qcode::value::ModuleView::new(ctx),
@@ -102,7 +103,7 @@ impl OwnFrame {
     /// the return address / incoming stack args, established by the caller and
     /// never redirected into the shadow.
     pub(super) fn is_caller_frame_slot(&self, ctx: &Context, addr: ValueId) -> bool {
-        self.sp_param.is_some_and(|sp| {
+        self.entry_sp.is_some_and(|sp| {
             frame_class(
                 qcode::value::ModuleView::new(ctx),
                 &self.numbering,
@@ -1453,8 +1454,8 @@ fn apply(
                     .local_offset(ctx, arg)
                     .expect("admissible call gates on a reconstructible @SP offset");
                 let sp = own_frame
-                    .sp_param()
-                    .expect("an own-frame local implies a recognised @SP param");
+                    .entry_sp()
+                    .expect("an own-frame local implies a recognised entry @SP");
                 let new_id = {
                     let mut b = ctx.builder(block);
                     b.set_insert_point_before(call_id);

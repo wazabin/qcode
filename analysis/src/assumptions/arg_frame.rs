@@ -31,7 +31,7 @@ use qcode::{
 };
 
 use crate::gvn::affine::{Numbering, precompute_forms};
-use crate::stack::frame::{FrameClass, frame_class, frame_offset, incoming_sp_param};
+use crate::stack::frame::{FrameClass, entry_sp_value, frame_class, frame_offset};
 use crate::{CallGraph, calls::direct_call_sites};
 
 /// Every function whose address is used as a value (and so may be reached by an
@@ -50,8 +50,8 @@ fn address_taken_set(ctx: &Context) -> HashSet<FunctionId> {
 }
 
 /// A function is eligible for the assumption when it has a body, is not
-/// address-taken (so every caller is a direct call we can vet), and has an
-/// incoming `@SP` param.
+/// address-taken (so every caller is a direct call we can vet), and has a
+/// resolvable entry stack pointer (either shape — see `entry_sp_value`).
 ///
 /// We deliberately do **not** require a non-`@SP` pointer param to already exist.
 /// The *make* pass runs before the pipeline, and the incoming pointer params this
@@ -59,7 +59,7 @@ fn address_taken_set(ctx: &Context) -> HashSet<FunctionId> {
 /// by the in-pipeline `argpromote` pass. Gating on params present at make-time
 /// would reject exactly the cdecl functions argpromote is about to promote, so the
 /// assumption would never be standing when memory forwarding needs it. Recording
-/// it for every `@SP`-param function is harmless for those that never gain a
+/// it for every `@SP`-rooted function is harmless for those that never gain a
 /// pointer param — the frame-freshness alias rule only consults it when querying an
 /// input-derived pointer.
 fn eligible(
@@ -75,7 +75,7 @@ fn eligible(
     if taken.contains(&fid) {
         return false;
     }
-    incoming_sp_param(qcode::value::ModuleView::new(ctx), fid, sp_reg).is_some()
+    entry_sp_value(qcode::value::ModuleView::new(ctx), fid, sp_reg).is_some()
 }
 
 /// *Make* pass — assume [`Proposition::ArgsDisjointFromCallerFrame`] for every
@@ -135,8 +135,9 @@ pub fn verify_args_disjoint_caller_frame(ctx: &mut Context, sp_reg: Option<Varno
     if assumed.is_empty() {
         return 0;
     }
-    // Cache each caller's `(@SP param, affine numbering)` — `None` if it has no
-    // incoming `@SP` param (it touched no stack, so it cannot pass a stack address).
+    // Cache each caller's `(entry @SP, affine numbering)` — `None` if it has no
+    // resolvable entry stack pointer (it touched no stack, so it cannot pass a
+    // stack address).
     let mut cache: HashMap<FunctionId, Option<(ValueId, Numbering)>> = HashMap::new();
     let graph = CallGraph::analyze(ctx);
     let mut novel = 0;
@@ -174,8 +175,7 @@ fn args_provably_collide(
     sp_reg: VarnodeId,
     cache: &mut HashMap<FunctionId, Option<(ValueId, Numbering)>>,
 ) -> bool {
-    let Some(callee_sp) = incoming_sp_param(qcode::value::ModuleView::new(ctx), callee, sp_reg)
-    else {
+    let Some(callee_sp) = entry_sp_value(qcode::value::ModuleView::new(ctx), callee, sp_reg) else {
         return false;
     };
     let callee_numbering = precompute_forms(qcode::value::ModuleView::new(ctx), callee);
@@ -187,6 +187,10 @@ fn args_provably_collide(
         .root()
         .map(|r| r.params().map(|p| p.id()).collect())
         .unwrap_or_default();
+    // Only the *param* shape of the entry stack pointer has a positional argument
+    // to place the callee's frame in caller offsets. With a root entry `load(SP)`
+    // there is no such argument, so no collision is provable — and, per this
+    // function's contract, no proof leaves the assumption standing.
     let Some(esp_idx) = params.iter().position(|&p| p == callee_sp) else {
         return false;
     };
@@ -208,7 +212,7 @@ fn args_provably_collide(
             continue;
         };
         let frame = cache.entry(caller).or_insert_with(|| {
-            incoming_sp_param(qcode::value::ModuleView::new(ctx), caller, sp_reg).map(|sp| {
+            entry_sp_value(qcode::value::ModuleView::new(ctx), caller, sp_reg).map(|sp| {
                 (
                     sp,
                     precompute_forms(qcode::value::ModuleView::new(ctx), caller),
@@ -358,7 +362,7 @@ mod tests {
     use super::*;
 
     /// Patch the `idx`-th param of `block` to carry `origin = sp_reg`, so
-    /// `incoming_sp_param` recognizes it as the `@SP` param.
+    /// `entry_sp_value` recognizes it as the `@SP` param.
     fn make_sp_param(tc: &mut TestContext, block: BlockId, idx: usize, sp_reg: VarnodeId) {
         let pv = BasicBlock::from_id(&tc.ctx, block)
             .params()

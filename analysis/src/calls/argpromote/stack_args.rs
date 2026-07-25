@@ -44,7 +44,7 @@ use qcode::{
 
 use crate::calls::interface::append_entry_param_at_sites;
 use crate::gvn::affine::precompute_forms;
-use crate::stack::frame::{frame_offset, incoming_sp_param};
+use crate::stack::frame::{entry_sp_value, frame_offset};
 use crate::{Pass, PipelineEnv};
 
 pub struct PromoteStackArgs;
@@ -152,7 +152,7 @@ fn promote_one(
     sp_reg: VarnodeId,
     sites: &[InstructionId],
 ) -> bool {
-    let Some(sp_param) = incoming_sp_param(ModuleView::new(cone.ctx()), fid, sp_reg) else {
+    let Some(entry_sp) = entry_sp_value(ModuleView::new(cone.ctx()), fid, sp_reg) else {
         return false;
     };
     let Some(root) = FunctionBody::from_id(cone.ctx(), fid).root().map(|b| b.id) else {
@@ -174,7 +174,7 @@ fn promote_one(
                 continue;
             }
             let ptr = l.ptr.qualify(insn.id.func);
-            if let Some(off) = frame_offset(ModuleView::new(cone.ctx()), &numbering, sp_param, ptr)
+            if let Some(off) = frame_offset(ModuleView::new(cone.ctx()), &numbering, entry_sp, ptr)
                 && off > 0
             {
                 slots.entry((off, l.size)).or_default().push(insn.id);
@@ -188,9 +188,12 @@ fn promote_one(
 
     // The positional index of the callee's `@SP` param: every direct caller's
     // `Call.args[sp_index]` is the `@SP` value we key the caller-side load on.
+    // Only the *param* shape of the entry stack pointer carries an argument slot;
+    // when it is a root entry `load(SP)` the function has no call interface to
+    // thread a stack argument through, and this bails.
     let Some(sp_index) = FunctionBody::from_id(cone.ctx(), fid)
         .root()
-        .and_then(|b| b.params().position(|p| p.id() == sp_param))
+        .and_then(|b| b.params().position(|p| p.id() == entry_sp))
     else {
         return false;
     };

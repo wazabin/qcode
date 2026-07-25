@@ -1,19 +1,21 @@
-//! Frame-relative classification of stack pointers, independent of the
-//! `@stack_base` brighten/lower representation.
+//! Frame-relative classification of stack pointers.
 //!
-//! A stack address appears in up to three shapes across the pipeline:
-//!   * `@stack_base ± k`   — the interned brighten literal (legacy).
-//!   * `@SP ± k`           — affine arithmetic on the incoming stack-pointer
-//!     parameter (`@SP` = the root-block param whose `origin` is the SP register,
-//!     created by `rewrite_callee_registers`).
+//! The stack pointer is a *normal register*: nothing distinguishes it in the IR,
+//! and its entry value is whatever value the two general register-lowering
+//! mechanisms give it (see [`entry_sp_value`]). A stack address is then plain
+//! affine arithmetic on that value:
+//!   * `@SP ± k`           — a fixed frame slot.
 //!   * `(@SP & -mask) ± k` — a frame realigned by `and rsp, -N`.
 //!
-//! [`frame_class`] recognises all three and reports whether a pointer lands in
-//! this function's own locals or in the caller's frame. It is the representation-
+//! [`frame_class`] recognises both and reports whether a pointer lands in this
+//! function's own locals or in the caller's frame. It is the representation-
 //! agnostic replacement for matching `StackAddress` literals directly, and the
 //! foundation for the frame-freshness alias rule.
 
-use qcode::value::{FunctionId, FunctionRef, QCodeView, ValueId, VarnodeId};
+use qcode::value::{
+    FunctionId, FunctionRef, QCodeView, ValueId, Varnode, VarnodeId,
+    insn::{Load, Mnemonic, Store},
+};
 
 use crate::gvn::affine::Numbering;
 
@@ -32,19 +34,88 @@ pub(crate) enum FrameClass {
     CallerFrame,
 }
 
-/// The incoming stack-pointer root parameter of `fid`: the root-block param whose
-/// `origin` is the stack-pointer register `sp_reg`. `None` if the function has no
-/// such param (e.g. it never touched the stack, or registers were not promoted).
-pub(crate) fn incoming_sp_param<'a, 'str: 'a>(
+/// The value that holds `fid`'s **entry stack pointer** — `@SP`, the root of every
+/// frame-relative judgement in the crate. This is the single seam every consumer
+/// resolves it through; there is no distinguished "SP concept" beyond it.
+///
+/// The stack pointer is lowered like any other register, and the two general
+/// register-lowering mechanisms give it two possible shapes:
+///
+/// 1. **A root block param** whose `origin` is `sp_reg` — the by-value interface
+///    input `argpromote`'s register channel materializes for a `pure_reg`
+///    function (`param[i] ↔ Call.args[i]`), seeded at entry with
+///    `store(SP, param)`. Preferred when present: every read of the register has
+///    been rewritten onto it.
+/// 2. **The root entry `load(SP)`** — `mem2reg`'s root lowering for a register
+///    live-in to the root block (the mechanism used for every non-interface
+///    register). The load reads the register cell before anything in the body
+///    writes it, so it *is* the incoming value.
+///
+/// Shape 2 is accepted only when the root has no predecessors. A root with a back
+/// edge re-executes its entry load, and mem2reg stores the loop-carried value into
+/// the register cell on that edge, so on re-entry the load no longer reads the
+/// caller's stack pointer.
+///
+/// `None` when neither shape is present (e.g. an external, or a function whose
+/// first register-space write precedes any read of the stack pointer), which
+/// leaves every frame-relative rule inert for that function.
+pub(crate) fn entry_sp_value<'a, 'str: 'a>(
     host: impl qcode::value::QCodeView<'a, 'str>,
     fid: FunctionId,
     sp_reg: VarnodeId,
 ) -> Option<ValueId> {
-    FunctionRef::new(host, fid)
-        .root()?
+    let root = FunctionRef::new(host, fid).root()?;
+    if let Some(param) = root
         .params()
         .find(|p| p.origin() == Some(ValueId::Varnode(sp_reg)))
-        .map(|p| p.id())
+    {
+        return Some(param.id());
+    }
+    if root.predecessors().next().is_some() {
+        return None;
+    }
+    let sp = Varnode::from_id(host.shared(), sp_reg);
+    let (sp_space, sp_size) = (sp.space().id, sp.size());
+    for insn in root.iter() {
+        let func = insn.id.func;
+        match insn.mnemonic() {
+            // The entry read of the whole register: this is the incoming value.
+            Mnemonic::Load(Load { space, ptr, size })
+                if *space == sp_space
+                    && ptr.qualify(func) == ValueId::Varnode(sp_reg)
+                    && *size == sp_size =>
+            {
+                return Some(ValueId::Instruction(insn.id));
+            }
+            // Reads of other cells, and writes to any *other* space (a temp spill,
+            // a ram store), leave the register file untouched.
+            Mnemonic::Load(_) => {}
+            Mnemonic::Store(Store { space, .. }) if *space != sp_space => {}
+            // Pure value computation: no memory effect at all.
+            Mnemonic::Binop(_)
+            | Mnemonic::Unop(_)
+            | Mnemonic::Range(_)
+            | Mnemonic::Zext(_)
+            | Mnemonic::Sext(_)
+            | Mnemonic::IntToFloat(_)
+            | Mnemonic::FloatToFloat(_)
+            | Mnemonic::FloatToInt(_)
+            | Mnemonic::IsFloatNaN(_)
+            | Mnemonic::PopCount(_)
+            | Mnemonic::LzCount(_)
+            | Mnemonic::Carry(_)
+            | Mnemonic::SCarry(_)
+            | Mnemonic::SBorrow(_)
+            | Mnemonic::Intrinsic(_)
+            | Mnemonic::Tuple(_)
+            | Mnemonic::Extract(_)
+            | Mnemonic::Gep(_) => {}
+            // Anything else (a register-space store, a call, an opaque p-code op,
+            // a terminator) may have already written the stack-pointer cell.
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Whether `base` is a power-of-two stack realignment of the incoming stack
@@ -62,7 +133,7 @@ pub(crate) fn incoming_sp_param<'a, 'str: 'a>(
 fn is_aligned_sp<'ctx, 'str: 'ctx>(
     host: impl QCodeView<'ctx, 'str>,
     numbering: &Numbering,
-    sp_param: ValueId,
+    entry_sp: ValueId,
     base: ValueId,
     depth: u32,
 ) -> bool {
@@ -77,7 +148,7 @@ fn is_aligned_sp<'ctx, 'str: 'ctx>(
     if off > 0 {
         return false;
     }
-    inner == sp_param || is_aligned_sp(host, numbering, sp_param, inner, depth - 1)
+    inner == entry_sp || is_aligned_sp(host, numbering, entry_sp, inner, depth - 1)
 }
 
 /// The signed byte offset of `v` from the entry stack pointer `@SP`, when `v` is
@@ -89,31 +160,31 @@ fn is_aligned_sp<'ctx, 'str: 'ctx>(
 pub(crate) fn frame_offset<'ctx, 'str: 'ctx>(
     host: impl QCodeView<'ctx, 'str>,
     numbering: &Numbering,
-    sp_param: ValueId,
+    entry_sp: ValueId,
     v: ValueId,
 ) -> Option<i64> {
     // Affine `@SP ± k` (the bare param decomposes to itself at offset 0).
     let (base, off) = numbering.base_offset(host, v).unwrap_or((v, 0));
-    (base == sp_param).then_some(off)
+    (base == entry_sp).then_some(off)
 }
 
 /// Classify pointer `v` against the frame whose incoming stack pointer is
-/// `sp_param`, decomposing `@SP ± k` through `numbering`. Returns `None` when `v`
+/// `entry_sp`, decomposing `@SP ± k` through `numbering`. Returns `None` when `v`
 /// is not stack-pointer-rooted.
 pub(crate) fn frame_class<'ctx, 'str: 'ctx>(
     host: impl QCodeView<'ctx, 'str>,
     numbering: &Numbering,
-    sp_param: ValueId,
+    entry_sp: ValueId,
     v: ValueId,
 ) -> Option<FrameClass> {
     // An `@SP`/`@stack_base`-relative slot: classify by the sign of its offset.
-    if let Some(off) = frame_offset(host, numbering, sp_param, v) {
+    if let Some(off) = frame_offset(host, numbering, entry_sp, v) {
         return Some(by_sign(off));
     }
     // A realigned frame base (`@SP & -mask`, possibly cascaded): everything offset
     // from it is a local — incoming args never flow through the alignment mask.
     let (base, _) = numbering.base_offset(host, v).unwrap_or((v, 0));
-    is_aligned_sp(host, numbering, sp_param, base, ALIGN_CASCADE_LIMIT).then_some(FrameClass::Local)
+    is_aligned_sp(host, numbering, entry_sp, base, ALIGN_CASCADE_LIMIT).then_some(FrameClass::Local)
 }
 
 /// Below the entry stack pointer (`off < 0`) is an own-frame local; the
@@ -132,13 +203,13 @@ mod tests {
     use super::*;
     use qcode::{
         testing::TestContext,
-        value::{BasicBlock, FunctionBody},
+        value::{BasicBlock, FunctionBody, Value},
     };
 
     use crate::gvn::affine::precompute_forms;
 
     /// Build a single-block function whose root has an `@SP` param (origin = a
-    /// register varnode). Returns `(fid, sp_param, sp_reg)`.
+    /// register varnode). Returns `(fid, entry_sp, sp_reg)`.
     fn sp_function(tc: &mut TestContext) -> (FunctionId, ValueId, VarnodeId) {
         let sp_reg = tc.r0; // stand-in stack-pointer register varnode
         let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
@@ -155,18 +226,104 @@ mod tests {
         (fid, ValueId::BlockParam(pid), sp_reg)
     }
 
+    /// Build a param-less single-block function — the shape of a function whose
+    /// registers were never lifted into a call interface. Returns `(fid, root)`.
+    fn bare_function(tc: &mut TestContext) -> (FunctionId, qcode::value::BlockId) {
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(0x1000, fid);
+        let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
+        f.set_root(root).unwrap();
+        f.add_block(root);
+        (fid, root)
+    }
+
     #[test]
-    fn incoming_sp_param_found_by_origin() {
+    fn entry_sp_value_found_by_origin() {
         let mut tc = TestContext::new();
         let (fid, sp, sp_reg) = sp_function(&mut tc);
         assert_eq!(
-            incoming_sp_param(qcode::value::ModuleView::new(&tc.ctx), fid, sp_reg),
+            entry_sp_value(qcode::value::ModuleView::new(&tc.ctx), fid, sp_reg),
             Some(sp)
         );
         // A different register is not the SP param.
         assert_eq!(
-            incoming_sp_param(qcode::value::ModuleView::new(&tc.ctx), fid, tc.r1),
+            entry_sp_value(qcode::value::ModuleView::new(&tc.ctx), fid, tc.r1),
             None
+        );
+    }
+
+    /// Shape 2: no interface param, so the entry stack pointer is the root entry
+    /// `load(SP)` mem2reg's root lowering leaves at the top of the block. Reads of
+    /// other registers and writes to other spaces before it are transparent.
+    #[test]
+    fn entry_sp_value_found_as_root_entry_load() {
+        let mut tc = TestContext::new();
+        let (fid, root) = bare_function(&mut tc);
+        let (sp_reg, reg_space, ram) = (tc.r0, tc.reg_space, tc.ctx.shared.default_space);
+
+        let sp_load = {
+            let mut b = tc.ctx.builder(root);
+            // A read of another register, and a spill of it into ram: neither can
+            // have written the stack-pointer cell.
+            let other = b
+                .push_load::<false>(ValueId::Varnode(tc.r1), 8, reg_space)
+                .id();
+            let addr = b.shr().get_const(0x4000, 8);
+            b.push_store(other, addr, ram);
+            b.push_load::<false>(ValueId::Varnode(sp_reg), 8, reg_space)
+                .id()
+        };
+
+        assert_eq!(
+            entry_sp_value(qcode::value::ModuleView::new(&tc.ctx), fid, sp_reg),
+            Some(sp_load),
+        );
+    }
+
+    /// A read of the stack pointer *after* something wrote register space is not
+    /// the incoming value — the write may have covered the stack-pointer cell.
+    #[test]
+    fn entry_sp_value_rejects_load_after_a_register_write() {
+        let mut tc = TestContext::new();
+        let (fid, root) = bare_function(&mut tc);
+        let (sp_reg, reg_space) = (tc.r0, tc.reg_space);
+
+        {
+            let mut b = tc.ctx.builder(root);
+            let zero = b.shr().get_const(0, 8);
+            b.push_store(zero, ValueId::Varnode(sp_reg), reg_space);
+            b.push_load::<false>(ValueId::Varnode(sp_reg), 8, reg_space);
+        }
+
+        assert_eq!(
+            entry_sp_value(qcode::value::ModuleView::new(&tc.ctx), fid, sp_reg),
+            None,
+        );
+    }
+
+    /// A root with a predecessor re-executes its entry load, reading whatever the
+    /// back edge left in the register cell — not the caller's stack pointer.
+    #[test]
+    fn entry_sp_value_rejects_root_entry_load_under_a_back_edge() {
+        let mut tc = TestContext::new();
+        let (fid, root) = bare_function(&mut tc);
+        let (sp_reg, reg_space) = (tc.r0, tc.reg_space);
+
+        let body = tc.ctx.get_or_make_block(0x2000, fid);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).add_block(body);
+        {
+            let mut b = tc.ctx.builder(root);
+            b.push_load::<false>(ValueId::Varnode(sp_reg), 8, reg_space);
+            b.push_branch(body);
+        }
+        {
+            let mut b = tc.ctx.builder(body);
+            b.push_branch(root);
+        }
+
+        assert_eq!(
+            entry_sp_value(qcode::value::ModuleView::new(&tc.ctx), fid, sp_reg),
+            None,
         );
     }
 

@@ -14,28 +14,29 @@ use std::borrow::Cow;
 use crate::AliasResult;
 use crate::gvn::affine::{Numbering, precompute_forms};
 use crate::pipeline::{ContextView, Outcome};
-use crate::stack::frame::{frame_offset, incoming_sp_param};
+use crate::stack::frame::{entry_sp_value, frame_offset};
 
 /// Returns `true` if any variables were promoted.
 pub fn mem2reg(ctx: &mut Context, function_id: FunctionId, aliases: &AliasResult) -> bool {
     mem2reg_framed(ctx, function_id, aliases, None)
 }
 
-/// [`mem2reg`] with the incoming stack-pointer parameter (`@SP`) supplied, so
-/// canonical `@SP ± N` stack slots are recognised alongside legacy `@stack_base`
-/// literals. `sp_param` is `None` when the caller has no stack-pointer context
-/// (most unit tests), leaving only the literal path active.
+/// [`mem2reg`] with the function's entry stack-pointer value (`@SP`) supplied —
+/// whatever [`entry_sp_value`](crate::stack::frame::entry_sp_value) resolved it
+/// to — so `@SP ± N` stack slots are recognised as slots. `entry_sp` is `None`
+/// when the caller has no stack-pointer context (most unit tests), leaving slot
+/// recognition off.
 pub fn mem2reg_framed(
     ctx: &mut Context,
     function_id: FunctionId,
     aliases: &AliasResult,
-    sp_param: Option<ValueId>,
+    entry_sp: Option<ValueId>,
 ) -> bool {
     // Bridge onto the concrete function-pass core: check the function out and run
     // `mem2reg_host` over `(&mut FunctionBody, ContextView)`. Callers pass their
     // own alias oracle, so the view's env is unread.
     crate::with_body_mut(ctx, function_id, |body, cx| {
-        mem2reg_host(body, cx, function_id, aliases, sp_param)
+        mem2reg_host(body, cx, function_id, aliases, entry_sp)
     })
 }
 
@@ -49,9 +50,9 @@ pub fn mem2reg_host<'ctx, 'str>(
     cx: ContextView<'ctx, 'str>,
     function_id: FunctionId,
     aliases: &AliasResult,
-    sp_param: Option<ValueId>,
+    entry_sp: Option<ValueId>,
 ) -> bool {
-    Mem2Reg::new(body, cx, function_id, aliases, sp_param).run()
+    Mem2Reg::new(body, cx, function_id, aliases, entry_sp).run()
 }
 
 /// A total, hash-independent order over `ValueId`, used to canonicalize the order
@@ -82,7 +83,7 @@ pub(crate) fn has_dynamic_stack_pointer_deref(
     function_id: FunctionId,
     stack_ptr: VarnodeId,
 ) -> bool {
-    let Some(sp) = incoming_sp_param(qcode::value::ModuleView::new(ctx), function_id, stack_ptr)
+    let Some(sp) = entry_sp_value(qcode::value::ModuleView::new(ctx), function_id, stack_ptr)
     else {
         return false;
     };
@@ -792,9 +793,10 @@ struct Mem2Reg<'ctx, 'str> {
     /// Affine decomposition of every value, used to resolve `@SP ± N` slot
     /// offsets. Position-independent, computed once up front.
     numbering: Numbering,
-    /// The incoming stack-pointer parameter, when known. Slots are `@SP ± N`
-    /// relative to it; `None` falls back to `@stack_base`-literal recognition.
-    sp_param: Option<ValueId>,
+    /// The function's entry stack-pointer value, when known (see
+    /// [`entry_sp_value`](crate::stack::frame::entry_sp_value)). Slots are
+    /// `@SP ± N` relative to it; `None` disables slot recognition.
+    entry_sp: Option<ValueId>,
 }
 
 impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
@@ -803,7 +805,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
         cx: ContextView<'ctx, 'str>,
         function_id: FunctionId,
         aliases: &'ctx AliasResult,
-        sp_param: Option<ValueId>,
+        entry_sp: Option<ValueId>,
     ) -> Self {
         let root_id = cx
             .body_view(body)
@@ -818,7 +820,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
             root_id,
             aliases,
             numbering,
-            sp_param,
+            entry_sp,
         }
     }
 
@@ -829,20 +831,19 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
     }
 
     /// The signed byte offset of stack-slot pointer `ptr` from the entry stack
-    /// pointer `@SP` — the canonical slot key. `None` when there is no incoming
-    /// stack-pointer param or `ptr` is not an `@SP ± N` slot.
+    /// pointer `@SP` — the canonical slot key. `None` when the entry stack
+    /// pointer is unknown or `ptr` is not an `@SP ± N` slot.
     fn slot_offset(&self, ptr: ValueId) -> Option<i64> {
-        let sp = self.sp_param?;
+        let sp = self.entry_sp?;
         frame_offset(self.read(), &self.numbering, sp, ptr)
     }
 
     /// Whether `ptr` is `@SP`-derived but *not* a fixed slot offset — a
     /// dynamically indexed (`@SP + reg`) or realigned (`(@SP & -mask) + k`) stack
-    /// pointer that may alias any slot. Only meaningful once the incoming
-    /// stack-pointer param is known; the legacy `@stack_base` path relies on
-    /// [`is_stack_typed`] instead.
+    /// pointer that may alias any slot. Only meaningful once the entry stack
+    /// pointer is known.
     fn is_dynamic_sp_deref(&self, ptr: ValueId) -> bool {
-        self.sp_param
+        self.entry_sp
             .is_some_and(|sp| self.numbering.affine_mentions(ptr, sp))
     }
 
@@ -2754,7 +2755,7 @@ mod tests {
 
     /// Build `store(0x1234, @SP-8); reload(@SP-8)` in one block off an `@SP`
     /// param (origin = `sp_reg`). The two `@SP-8` addresses are distinct `Sub`
-    /// values until canonicalized. Returns `(fun_id, block, sp_param, sp_reg)`.
+    /// values until canonicalized. Returns `(fun_id, block, entry_sp, sp_reg)`.
     fn sp_slot_function(tc: &mut qcode::testing::TestContext) -> (FunctionId, ValueId, VarnodeId) {
         let sp_reg = tc.r0;
         let ram = tc.ctx.shared.default_space;
@@ -2873,7 +2874,7 @@ mod tests {
     /// Without the `@SP` parameter the `@SP - N` address is unrecognised (it is
     /// not a `@stack_base` literal), so the slot is left in memory.
     #[test]
-    fn sp_relative_slot_not_promoted_without_sp_param() {
+    fn sp_relative_slot_not_promoted_without_entry_sp() {
         let mut tc = qcode::testing::TestContext::new();
         let (fun_id, _sp, _sp_reg) = sp_slot_function(&mut tc);
 
@@ -4628,17 +4629,20 @@ impl FunctionPass for Mem2RegPass {
         // they go through the checked-out read host; the shared `RegisterBase` still
         // keys off the module context.
         let sp_reg = shared.registers[&env.cfg.stack_pointer];
-        let (aliases, sp_param) = {
+        let (aliases, entry_sp) = {
             let read = m.body_view(f);
             let aliases = env.alias_base(shared).for_function(read, fun_id);
-            // Resolve `@SP` so canonical `@SP ± N` slots are recognised; `None` when
-            // the function has no incoming stack-pointer param (legacy literal path).
-            let sp_param = incoming_sp_param(read, fun_id, sp_reg);
-            (aliases, sp_param)
+            // Resolve `@SP` so `@SP ± N` slots are recognised. Resolved *before*
+            // the run, against the same IR `Numbering` decomposes: the value every
+            // stack pointer is currently built on. `None` leaves slot recognition
+            // off for this run; a root entry load this run lowers is picked up by
+            // the next one (the `promote` stage repeats to a fixpoint).
+            let entry_sp = entry_sp_value(read, fun_id, sp_reg);
+            (aliases, entry_sp)
         };
 
         Ok(
-            Outcome::changed(mem2reg_host(f, m, fun_id, &aliases, sp_param))
+            Outcome::changed(mem2reg_host(f, m, fun_id, &aliases, entry_sp))
                 .preserving_global::<crate::AddressAnalysis>(),
         )
     }

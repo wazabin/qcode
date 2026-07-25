@@ -12,7 +12,7 @@ use qcode::{
 };
 
 use crate::gvn::affine::{Numbering, precompute_forms};
-use crate::stack::frame::{FrameClass, frame_class, incoming_sp_param};
+use crate::stack::frame::{FrameClass, entry_sp_value, frame_class};
 
 mod provenance;
 mod simple;
@@ -27,10 +27,10 @@ pub(crate) struct FrameInfo {
     /// This function's root (entry) block — a pointer that peels to one of its
     /// params is an *incoming* pointer from the caller.
     root_block: Option<BlockId>,
-    /// The incoming stack-pointer param `@SP`. Excluded from "input-derived": a
+    /// The entry stack-pointer value `@SP`. Excluded from "input-derived": a
     /// pointer rooted at `@SP` is a frame pointer, not a caller-supplied data
     /// pointer, so the rule must not treat `@SP ± k` as an incoming pointer.
-    sp_param: ValueId,
+    entry_sp: ValueId,
     /// Every value classified as an own-frame local (`@SP`-rooted slot below the
     /// entry stack pointer, or a realigned-frame slot) for this function.
     own_frame_locals: HashSet<ValueId>,
@@ -255,8 +255,8 @@ impl AliasResult {
 
     /// Populate the frame-freshness oracle for function `fid`, given the
     /// stack-pointer register varnode `sp_reg` (resolved from the arch config). A
-    /// no-op when `sp_reg` is `None` or the function has no incoming `@SP` param,
-    /// leaving [`AliasResult::provably_disjoint`] inert.
+    /// no-op when `sp_reg` is `None` or the function has no resolvable entry
+    /// stack-pointer value, leaving [`AliasResult::provably_disjoint`] inert.
     pub fn with_frame_freshness<'ctx, 'str: 'ctx>(
         mut self,
         host: impl QCodeView<'ctx, 'str>,
@@ -266,7 +266,7 @@ impl AliasResult {
         let Some(sp_reg) = sp_reg else {
             return self;
         };
-        let Some(sp) = incoming_sp_param(host, fid, sp_reg) else {
+        let Some(sp) = entry_sp_value(host, fid, sp_reg) else {
             return self;
         };
         let numbering = precompute_forms(host, fid);
@@ -294,7 +294,7 @@ impl AliasResult {
         let frame_uncaptured = !frame_is_captured(host, fid, &numbering, sp);
         self.frame = Some(FrameInfo {
             root_block,
-            sp_param: sp,
+            entry_sp: sp,
             own_frame_locals,
             numbering,
             caller_frame_assumed,
@@ -400,7 +400,7 @@ impl FrameInfo {
         use Provenance as P;
         // Stack provenance first: `@SP ± k`, realigned frames, and the bare `@SP`
         // param (offset 0 → caller frame).
-        if let Some(fc) = frame_class(host, &self.numbering, self.sp_param, v) {
+        if let Some(fc) = frame_class(host, &self.numbering, self.entry_sp, v) {
             return match fc {
                 FrameClass::Local => P::OWN_FRAME,
                 FrameClass::CallerFrame => P::CALLER_FRAME,
@@ -421,7 +421,7 @@ impl FrameInfo {
                         P::LOADED
                     }
                     // A non-`@SP` root-block param is a caller-supplied pointer.
-                    _ if v != self.sp_param
+                    _ if v != self.entry_sp
                         && bp.parent().is_some_and(|b| self.root_block == Some(b.id)) =>
                     {
                         P::INPUT

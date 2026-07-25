@@ -22,7 +22,7 @@ use qcode::{
 use crate::{
     gvn::affine::{Numbering, precompute_forms},
     mem::mem2reg::has_dynamic_stack_pointer_deref,
-    stack::frame::{frame_offset, incoming_sp_param},
+    stack::frame::{entry_sp_value, frame_offset},
 };
 
 /// True when `function_id` makes a call that could read a pointer argument
@@ -93,7 +93,7 @@ struct FrameCtx {
 
 impl FrameCtx {
     fn new(ctx: &Context, function_id: FunctionId, stack_ptr: VarnodeId) -> Self {
-        let base = incoming_sp_param(qcode::value::ModuleView::new(ctx), function_id, stack_ptr)
+        let base = entry_sp_value(qcode::value::ModuleView::new(ctx), function_id, stack_ptr)
             .unwrap_or(ValueId::Varnode(stack_ptr));
         Self {
             numbering: precompute_forms(qcode::value::ModuleView::new(ctx), function_id),
@@ -337,8 +337,7 @@ mod tests {
     #[test]
     fn frame_escape_flag_disables_stack_promotion() {
         use crate::mem::mem2reg::mem2reg_framed;
-        use crate::stack::canonicalize::canonicalize_sp_slots;
-        use crate::stack::frame::incoming_sp_param;
+        use crate::stack::frame::entry_sp_value;
 
         // A normally-promotable local (stored then loaded) must stay in memory once
         // the function is flagged as letting a frame pointer escape unboundedly.
@@ -363,8 +362,7 @@ mod tests {
                 let slot = b.push_sub(sp_param, c8).id(); // @SP - 8
                 let v = b.shr().get_const(7u64, 8);
                 b.push_store(v, slot, ram);
-                let slot_reload = b.push_sub(sp_param, c8).id(); // reload @SP - 8
-                let loaded = b.push_load::<false>(slot_reload, 8, ram).id();
+                let loaded = b.push_load::<false>(slot, 8, ram).id();
                 let sink_slot = b.push_sub(sp_param, c16).id(); // @SP - 16
                 b.push_store(loaded, sink_slot, ram);
                 let sink = b.shr().get_const(0u64, 8);
@@ -373,9 +371,7 @@ mod tests {
         };
 
         let promote = |tc: &mut TestContext, fun: FunctionId| {
-            let sp_param =
-                incoming_sp_param(qcode::value::ModuleView::new(&tc.ctx), fun, sp).unwrap();
-            canonicalize_sp_slots(&mut tc.ctx, fun, sp);
+            let sp_param = entry_sp_value(qcode::value::ModuleView::new(&tc.ctx), fun, sp).unwrap();
             let aliases = AliasResult::simple_for_function(&tc.ctx, fun);
             mem2reg_framed(&mut tc.ctx, fun, &aliases, Some(sp_param));
         };

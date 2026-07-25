@@ -255,7 +255,7 @@ impl RamChannel {
         // Any other `@SP`-rooted argument (the return-address slot, an
         // incoming stack arg, a realigned base): not containable, not
         // composable — ⊤.
-        if Some(base) == info.frame.sp_param() {
+        if Some(base) == info.frame.entry_sp() {
             return None;
         }
         // A caller pointer param + const: composes positionally — but only if
