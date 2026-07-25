@@ -394,7 +394,7 @@ fn build_aliases<'ctx, 'str: 'ctx>(
 ) -> Option<AliasResult> {
     let shared = m.shr();
     let env = m.env();
-    let sp_reg = shared.registers.get(&env.cfg.stack_pointer).copied()?;
+    let sp_reg = env.sp_varnode?;
     Some(
         env.alias_base(shared)
             .for_function(host, fun_id)

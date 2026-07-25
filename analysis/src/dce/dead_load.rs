@@ -2292,7 +2292,7 @@ fn frame_aware_aliases<'a, 'str: 'a>(
 ) -> AliasResult {
     let shared = m.shr();
     let env = m.env();
-    let sp_reg = shared.registers.get(&env.cfg.stack_pointer).copied();
+    let sp_reg = env.sp_varnode;
     env.alias_base(shared)
         .for_function(host, fun_id)
         .with_frame_freshness(host, fun_id, sp_reg)

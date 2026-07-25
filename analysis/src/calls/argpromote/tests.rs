@@ -2043,7 +2043,7 @@ mod tests {
         // would prune it.
         assert_eq!(eff.inputs, vec![r0]);
 
-        rewrite_registers(&mut tc.ctx, f, &eff);
+        rewrite_registers(&mut tc.ctx, f, &eff, None);
         assert_eq!(
             register_writeset_len(&tc, f),
             Some(1),
@@ -2072,7 +2072,7 @@ mod tests {
         assert_eq!(eff.inputs, vec![r0]);
         assert_eq!(eff.outputs, vec![r0]);
 
-        rewrite_registers(&mut tc.ctx, f, &eff);
+        rewrite_registers(&mut tc.ctx, f, &eff, None);
         // One by-value input param added, and its seed store is the new entry head.
         assert_eq!(BasicBlock::from_id(&tc.ctx, entry).params().count(), 1);
         let first = BasicBlock::from_id(&tc.ctx, entry).iter().next().unwrap();
@@ -2106,7 +2106,7 @@ mod tests {
             "overlap group collapses to the 8-byte r0"
         );
         let _ = r0_lo32;
-        rewrite_registers(&mut tc.ctx, f, &eff);
+        rewrite_registers(&mut tc.ctx, f, &eff, None);
         assert_eq!(register_writeset_len(&tc, f), Some(1));
     }
 
@@ -2128,7 +2128,7 @@ mod tests {
         );
         let eff = scan_register_effects(&tc.ctx, f).expect("written register");
         assert_eq!(eff.outputs, vec![r0, r1], "both outputs, sorted by address");
-        rewrite_registers(&mut tc.ctx, f, &eff);
+        rewrite_registers(&mut tc.ctx, f, &eff, None);
         assert_eq!(
             register_writeset_len(&tc, f),
             Some(2),
@@ -2189,7 +2189,7 @@ mod tests {
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
         assert!(
-            argpromote_registers(&mut tc.ctx),
+            argpromote_registers(&mut tc.ctx, None),
             "f's register clobber should be promoted"
         );
 
@@ -2253,7 +2253,7 @@ mod tests {
         let call_id = set_call(&mut tc, g_call, f, vec![]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
-        assert!(argpromote_registers(&mut tc.ctx));
+        assert!(argpromote_registers(&mut tc.ctx, None));
 
         // f gained exactly one by-value input param (r0).
         let root = FunctionBody::from_id(&tc.ctx, f).root().unwrap().id;
@@ -2289,7 +2289,7 @@ mod tests {
         );
         let _ = (r0, entry, other);
         let eff = scan_register_effects(&tc.ctx, f).expect("written register");
-        rewrite_registers(&mut tc.ctx, f, &eff);
+        rewrite_registers(&mut tc.ctx, f, &eff, None);
         let with_writeset = FunctionBody::from_id(&tc.ctx, f)
             .iter()
             .filter(|b| {
@@ -2352,7 +2352,7 @@ mod tests {
         };
 
         let original = run(&tc.ctx);
-        assert!(argpromote_registers(&mut tc.ctx));
+        assert!(argpromote_registers(&mut tc.ctx, None));
         let transformed = run(&tc.ctx);
 
         assert_eq!(original, 11, "original: r0 = 10 + 1");
@@ -3656,7 +3656,7 @@ mod tests {
         set_call(&mut tc, c_call, callee, vec![]);
         tc.ctx.add_cfg_edge(c_call, c_cont);
 
-        assert!(argpromote_registers(&mut tc.ctx));
+        assert!(argpromote_registers(&mut tc.ctx, None));
 
         // The callee's read of r0 propagated into the caller's solved interface —
         // it is a by-value input, not a stranded load.
@@ -3709,7 +3709,7 @@ mod tests {
         set_call(&mut tc, c_call, callee, vec![]);
         tc.ctx.add_cfg_edge(c_call, c_cont);
 
-        assert!(argpromote_registers(&mut tc.ctx));
+        assert!(argpromote_registers(&mut tc.ctx, None));
 
         let RegisterChannelState::Materialized(map) = &FunctionBody::from_id(&tc.ctx, grandcaller)
             .effects()
@@ -4035,7 +4035,7 @@ mod tests {
         );
         let _ = (f_entry, g_entry, g_cont);
         set_call(&mut tc, g_entry, f, vec![]);
-        argpromote_registers(&mut tc.ctx);
+        argpromote_registers(&mut tc.ctx, None);
 
         let qcode::value::RegisterChannelState::Solved(sets) =
             FunctionBody::from_id(&tc.ctx, f).effects().register.clone()
@@ -4407,7 +4407,7 @@ mod tests {
         let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("noproto".into())).id;
         let (g, _g_call, _g_cont) = caller_of(&mut tc, ext);
 
-        argpromote_registers(&mut tc.ctx);
+        argpromote_registers(&mut tc.ctx, None);
 
         assert!(
             matches!(

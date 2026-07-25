@@ -61,8 +61,11 @@ fn address_snapshot(ctx: &Context<'_>) -> qcode::address_index::AddressIndex {
 pub struct PipelineEnv {
     /// Register layout / calling convention, built by `harbinger::arch::arch_config`.
     pub cfg: ArchConfig,
-    /// The stack-pointer *varnode* (`cfg.stack_pointer` resolved through
-    /// `ctx.shared.registers`), cached so passes don't re-resolve it each call.
+    /// The stack-pointer *varnode* — **the** handle for "which varnode is SP".
+    /// Resolved once by [`ArchConfig::sp_varnode`] at env construction; passes
+    /// read this and never re-resolve `cfg.stack_pointer` themselves. `None`
+    /// when the context has no such register (hand-written IR), which leaves the
+    /// SP-aware paths inert rather than panicking.
     pub sp_varnode: Option<VarnodeId>,
     /// The loaded binary, shared with the loader when this is a live lift.
     /// Passes read initialized memory (jump-table slots, `.rodata` constants)
@@ -94,7 +97,7 @@ impl PipelineEnv {
         cfg: ArchConfig,
         binary: Option<std::sync::Arc<dyn binfmt::BinaryFormat>>,
     ) -> Self {
-        let sp_varnode = ctx.shared.registers[&cfg.stack_pointer];
+        let sp_varnode = cfg.sp_varnode(ctx);
         let mut env = Self::from_parts(cfg, sp_varnode);
         env.binary = binary;
         env

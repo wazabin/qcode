@@ -182,8 +182,17 @@ impl RegPurityReason {
 /// Solves the whole-program effect-summary fixpoint on every call. A caller
 /// querying many functions in a loop (e.g. the GUI loader) should solve it once
 /// with [`RegPurityGates`] and use [`RegPurityGates::purity`].
-pub fn reg_purity(ctx: &Context, fid: FunctionId) -> Result<(), RegPurityReason> {
-    RegPurityGates::compute(ctx).purity(ctx, fid)
+///
+/// `sp` is the stack-pointer varnode — [`PipelineEnv::sp_varnode`] in the
+/// pipeline, [`ArchConfig::sp_varnode`](crate::ArchConfig::sp_varnode) for a
+/// caller that has no env. `None` (hand-written IR) simply leaves the
+/// stack-pointer-aware part of the register channel inert.
+pub fn reg_purity(
+    ctx: &Context,
+    fid: FunctionId,
+    sp: Option<VarnodeId>,
+) -> Result<(), RegPurityReason> {
+    RegPurityGates::compute(ctx, sp).purity(ctx, fid)
 }
 
 /// The whole-program facts a [`reg_purity`] query consults — the solved effect
@@ -202,24 +211,12 @@ pub struct RegPurityGates {
     address_taken: FxHashSet<FunctionId>,
 }
 
-/// Best-effort stack-pointer varnode for diagnostic queries that have no
-/// [`PipelineEnv`] (the GUI loader): the conventional SP register name per
-/// supported arch. The pass itself always uses `env.sp_varnode`.
-fn guess_sp(ctx: &Context) -> Option<VarnodeId> {
-    ["RSP", "ESP", "SP"].iter().find_map(|sp_name| {
-        ctx.shared.registers.values().copied().find(|&vn| {
-            Varnode::from_id(ctx, vn)
-                .name()
-                .is_some_and(|n| n.eq_ignore_ascii_case(sp_name))
-        })
-    })
-}
-
 impl RegPurityGates {
-    /// Solve the summaries and gating sets for `ctx` once.
-    pub fn compute(ctx: &Context) -> Self {
+    /// Solve the summaries and gating sets for `ctx` once, against the
+    /// stack-pointer varnode `sp` (see [`reg_purity`]).
+    pub fn compute(ctx: &Context, sp: Option<VarnodeId>) -> Self {
         let graph = CallGraph::analyze(ctx);
-        let chan = RegChannel { sp: guess_sp(ctx) };
+        let chan = RegChannel { sp };
         let summaries = solve_summaries(ctx, &graph, &chan);
         let called = called_function_set_from_graph(ctx, &graph);
         let address_taken = super::address_taken_set(ctx);
@@ -737,10 +734,12 @@ pub(crate) fn regpure_all_sites(
 /// Compatibility driver for the unit tests: materialize every eligible function
 /// (pass 2) then flip its direct call sites to regpure (pass 3). Returns `true`
 /// if anything changed.
-pub fn argpromote_registers(ctx: &mut Context) -> bool {
+///
+/// `sp` is the stack-pointer varnode; in the pipeline the two passes below take
+/// theirs from [`PipelineEnv::sp_varnode`].
+pub fn argpromote_registers(ctx: &mut Context, sp: Option<VarnodeId>) -> bool {
     let graph = CallGraph::analyze(ctx);
     let targets = ctx.function_ids();
-    let sp = guess_sp(ctx);
     let mut cone = crate::ConeMut::full(ctx);
     let mut changed = materialize_functions(&mut cone, &graph, &targets, sp);
     let graph = CallGraph::analyze(cone.ctx());
@@ -770,10 +769,14 @@ type InputMeta = (VarnodeId, usize, SpaceId, Option<String>, Option<TypeId>);
 /// regpure (pass 3). The single-function driver the unit tests use to exercise
 /// the register rewrite end to end.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn rewrite_registers(ctx: &mut Context, fid: FunctionId, eff: &RegisterEffects) {
+pub(crate) fn rewrite_registers(
+    ctx: &mut Context,
+    fid: FunctionId,
+    eff: &RegisterEffects,
+    sp: Option<VarnodeId>,
+) {
     materialize_interface(ctx, fid, eff);
     let graph = CallGraph::analyze(ctx);
-    let sp = guess_sp(ctx);
     for site in crate::calls::direct_call_sites(ctx, &graph, fid) {
         rewrite_call_regpure(ctx, site, fid, sp);
     }

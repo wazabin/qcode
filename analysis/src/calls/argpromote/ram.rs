@@ -1733,12 +1733,7 @@ impl Pass for ArgPromote {
         env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
         let targets = cone.cone_functions();
-        let sp_reg = cone
-            .ctx()
-            .shared
-            .registers
-            .get(&env.cfg.stack_pointer)
-            .copied();
+        let sp_reg = env.sp_varnode;
         let graph = crate::CallGraph::analyze(cone.ctx());
         Ok(
             crate::ModulePassOutcome::functions(argpromote_changed_functions_with_sp(
@@ -1756,12 +1751,7 @@ impl Pass for ArgPromote {
         analyses: &mut crate::AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
         let targets = cone.cone_functions();
-        let sp_reg = cone
-            .ctx()
-            .shared
-            .registers
-            .get(&env.cfg.stack_pointer)
-            .copied();
+        let sp_reg = env.sp_varnode;
         let graph = analyses.global::<crate::CallGraphAnalysis>(cone.ctx());
         Ok(
             crate::ModulePassOutcome::functions(argpromote_changed_functions_with_sp(

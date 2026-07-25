@@ -35,19 +35,17 @@ use crate::{Pass, PipelineEnv};
 /// register (integer, widest view, ∪ SSE), `writes` = the caller-saved set ∪
 /// the arch flag registers — an ABI-conforming callee preserves no flags, so
 /// leaving them out would forward pre-call flag values across the call, an
-/// unsoundness *beyond* the hypothesis. The stack pointer is excluded from both
-/// (consistent with the rest of the register channel); the frame pointer is
-/// callee-saved and so never appears in either ABI set to begin with.
+/// unsoundness *beyond* the hypothesis. Neither the stack pointer nor the frame
+/// pointer can appear here: both are callee-saved, so neither is in any ABI
+/// argument list nor in the caller-saved set to begin with.
 fn convention_effect(env: &PipelineEnv) -> AssumedCallEffect {
     let abi = &env.cfg.abi;
-    let excluded = |vn: VarnodeId| Some(vn) == env.sp_varnode;
 
     let mut reads: Vec<VarnodeId> = abi
         .int_args
         .iter()
         .filter_map(|gp| gp.widths.iter().max_by_key(|(w, _)| *w).map(|(_, v)| *v))
         .chain(abi.sse_args.iter().copied())
-        .filter(|&vn| !excluded(vn))
         .collect();
     reads.sort_unstable();
     reads.dedup();
@@ -57,7 +55,6 @@ fn convention_effect(env: &PipelineEnv) -> AssumedCallEffect {
         .iter()
         .copied()
         .chain(env.cfg.dead_flag_regs.iter().filter_map(|v| v.as_varnode()))
-        .filter(|&vn| !excluded(vn))
         .collect();
     writes.sort_unstable();
     writes.dedup();
@@ -170,21 +167,18 @@ mod tests {
     }
 
     #[test]
-    fn installs_effect_and_excludes_sp() {
+    fn installs_effect() {
         let mut tc = TestContext::new();
         let (r0, r0_lo32, r1, r2, sp) = (tc.r0, tc.r0_lo32, tc.r1, tc.r2, tc.r3);
         let abi = CallingConvention {
-            // r0 is an argument register exposed at 4- and 8-byte views; sp is
-            // (wrongly) also listed as an arg register to prove it is filtered.
-            int_args: vec![
-                GpReg {
-                    widths: vec![(4, r0_lo32), (8, r0)],
-                },
-                GpReg {
-                    widths: vec![(8, sp)],
-                },
-            ],
-            caller_saved: vec![r1, r2, sp],
+            // r0 is an argument register exposed at 4- and 8-byte views. The
+            // stack pointer is a normal callee-saved register: a real
+            // `ArchConfig` never lists it as an argument or as caller-saved, so
+            // there is nothing here to filter it out of.
+            int_args: vec![GpReg {
+                widths: vec![(4, r0_lo32), (8, r0)],
+            }],
+            caller_saved: vec![r1, r2],
             ..CallingConvention::default()
         };
         // A (fake) flag register: flags are not in the ABI caller-saved set but
@@ -209,16 +203,18 @@ mod tests {
         ));
 
         let eff = tc.ctx.assumed_call_convention().expect("effect installed");
-        // reads = widest arg-register view (r0, not r0_lo32); sp excluded.
+        // reads = widest arg-register view (r0, not r0_lo32).
         assert!(eff.reads.contains(&r0), "widest arg register present");
         assert!(!eff.reads.contains(&r0_lo32), "narrow view not used");
-        assert!(!eff.reads.contains(&sp), "SP never in the read set");
-        // writes = caller-saved ∪ flag registers, minus sp.
+        // writes = caller-saved ∪ flag registers.
         assert!(eff.writes.contains(&r1) && eff.writes.contains(&r2));
         assert!(
             eff.writes.contains(&flag),
             "flag registers are clobbered by any ABI-conforming callee"
         );
-        assert!(!eff.writes.contains(&sp), "SP never in the write set");
+        // The env's stack pointer is not in either ABI set, so it appears in
+        // neither list — no dedicated exclusion needed.
+        assert_eq!(env.sp_varnode, Some(sp));
+        assert!(!eff.reads.contains(&sp) && !eff.writes.contains(&sp));
     }
 }

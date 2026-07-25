@@ -281,7 +281,7 @@ fn build_gvn_aliases<'ctx, 'str: 'ctx>(
     fun_id: FunctionId,
 ) -> AliasResult {
     let shared = m.shr();
-    let sp_reg = shared.registers.get(&m.env().cfg.stack_pointer).copied();
+    let sp_reg = m.env().sp_varnode;
     m.env()
         .alias_base(shared)
         .for_function(host, fun_id)

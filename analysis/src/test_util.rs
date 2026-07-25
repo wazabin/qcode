@@ -12,6 +12,11 @@ use crate::{
 /// A throwaway [`PipelineEnv`] for passes that don't touch architecture state
 /// (no real stack pointer or ABI). Arch-aware passes should build a real env via
 /// [`PipelineEnv::new`] with a context that has a registered stack pointer.
+///
+/// `sp_varnode` is `None`, matching `stack_pointer` being absent from the test
+/// context's register table: passes read the cached handle, so handing them a
+/// varnode that resolves to nothing would make them chase a non-existent
+/// register.
 pub(crate) fn dummy_env() -> PipelineEnv {
     PipelineEnv::from_parts(
         ArchConfig {
@@ -22,7 +27,7 @@ pub(crate) fn dummy_env() -> PipelineEnv {
             bitness: 64,
             assume_calling_convention: false,
         },
-        VarnodeId::from(0usize),
+        None,
     )
 }
 

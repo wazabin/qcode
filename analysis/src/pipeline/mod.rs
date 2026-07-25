@@ -137,7 +137,10 @@ impl std::error::Error for PipelineError {}
 /// context's pointer width.
 #[derive(Clone)]
 pub struct ArchConfig {
-    /// Stack-pointer register (RSP on x64, ESP on x86), used by brighten-stack.
+    /// Stack-pointer register (RSP on x64, ESP on x86), used to resolve
+    /// [`PipelineEnv::sp_varnode`](crate::PipelineEnv::sp_varnode) — the single
+    /// handle every pass reads. Prefer [`ArchConfig::sp_varnode`] over touching
+    /// this field.
     pub stack_pointer: RegisterId,
     /// Status-flag registers (CF/OF/SF/ZF/PF) treated as dead by dead-store.
     pub dead_flag_regs: Vec<ValueId>,
@@ -157,6 +160,20 @@ pub struct ArchConfig {
     /// the user turns it on. Consulted only by the `assume_calling_convention`
     /// install pass.
     pub assume_calling_convention: bool,
+}
+
+impl ArchConfig {
+    /// Resolve [`Self::stack_pointer`] against `ctx`'s register table — the one
+    /// place a register *identity* becomes an SP varnode handle.
+    ///
+    /// Passes never call this: they read the cached
+    /// [`PipelineEnv::sp_varnode`](crate::PipelineEnv::sp_varnode). It exists for
+    /// env construction and for the few pre-env driver/UI sites that need the
+    /// handle before (or without) a `PipelineEnv`. `None` when the architecture's
+    /// stack-pointer register is not present in `ctx` (hand-written IR).
+    pub fn sp_varnode(&self, ctx: &Context) -> Option<VarnodeId> {
+        ctx.shared.registers.get(&self.stack_pointer).copied()
+    }
 }
 
 /// A general-purpose argument/return register exposed at several byte widths
@@ -584,7 +601,7 @@ fn run_analysis_fixpoint<'s>(
         // `@SP` param it keys on is minted mid-pipeline, so it cannot be assumed
         // here on the raw baseline. It is verified below (and rolled back if a
         // caller is proven to pass a colliding pointer).
-        let sp_reg = ctx.shared.registers.get(&cfg.stack_pointer).copied();
+        let sp_reg = cfg.sp_varnode(&ctx);
         progress(PipelineProgress::AssumptionsRecorded { round, count });
 
         if let Err(e) = pipeline.run(&mut ctx, &env, round, progress) {

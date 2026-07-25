@@ -37,9 +37,9 @@ use crate::value::function::FunctionId;
 ///
 /// `reads` is *all* convention argument registers (integer + SSE) — reads-all-args
 /// keeps pre-call argument setup live, since a variadic-arity callee may consume
-/// any of them — and `writes` is the convention's caller-saved (volatile) set. The
-/// stack- and frame-pointer varnodes are excluded from both, consistent with the
-/// rest of the register channel.
+/// any of them — and `writes` is the convention's caller-saved (volatile) set.
+/// Neither the stack- nor the frame-pointer varnode appears in either list: both
+/// are callee-saved, so no ABI argument list or caller-saved set contains them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AssumedCallEffect {
     /// Argument registers the call is assumed to read.

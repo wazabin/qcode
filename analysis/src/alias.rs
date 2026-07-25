@@ -91,7 +91,7 @@ impl crate::LocalAnalysis for AliasAnalysis {
     ) -> Self::Result {
         let function = body.id();
         let shared = cx.shr();
-        let sp_reg = shared.registers.get(&cx.env().cfg.stack_pointer).copied();
+        let sp_reg = cx.env().sp_varnode;
         cx.env()
             .alias_base(shared)
             .for_function(cx.body_view(body), function)

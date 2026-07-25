@@ -4628,16 +4628,18 @@ impl FunctionPass for Mem2RegPass {
         // The alias oracle and `@SP` resolution both read this function's body, so
         // they go through the checked-out read host; the shared `RegisterBase` still
         // keys off the module context.
-        let sp_reg = shared.registers[&env.cfg.stack_pointer];
+        let sp_reg = env.sp_varnode;
         let (aliases, entry_sp) = {
             let read = m.body_view(f);
             let aliases = env.alias_base(shared).for_function(read, fun_id);
             // Resolve `@SP` so `@SP ± N` slots are recognised. Resolved *before*
             // the run, against the same IR `Numbering` decomposes: the value every
             // stack pointer is currently built on. `None` leaves slot recognition
-            // off for this run; a root entry load this run lowers is picked up by
-            // the next one (the `promote` stage repeats to a fixpoint).
-            let entry_sp = entry_sp_value(read, fun_id, sp_reg);
+            // off for this run — that is also what an env with no stack-pointer
+            // varnode (hand-written IR) yields; a root entry load this run lowers
+            // is picked up by the next one (the `promote` stage repeats to a
+            // fixpoint).
+            let entry_sp = sp_reg.and_then(|sp| entry_sp_value(read, fun_id, sp));
             (aliases, entry_sp)
         };
 
