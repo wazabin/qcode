@@ -205,6 +205,23 @@ fn lower_instruction(ctx: &Context, id: InstructionId, roots: Roots, expand_unkn
             let src = signed_operand(ctx, qualify(s.src), lower(ctx, qualify(s.src), roots));
             cast_if_needed(ctx, qualify(s.src), true, s.size * 8, src)
         }
+        Mnemonic::Tuple(tuple) => {
+            let names = ctx.shared.types.aggregate_fields(insn.type_id());
+            Expr::bare(ExprKind::Aggregate(
+                tuple
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &field)| {
+                        let name = names
+                            .and_then(|fields| fields.get(index))
+                            .map(|field| field.name.clone())
+                            .unwrap_or_else(|| format!("field{index}"));
+                        (name, lower(ctx, qualify(field), roots))
+                    })
+                    .collect(),
+            ))
+        }
         // Not modeled structurally. As an operand (`expand_unknown` false) refer
         // to the SSA temporary by name; as a defining expression expand it to an
         // opaque `opcode(args)` pseudo-call so the assignment is meaningful.

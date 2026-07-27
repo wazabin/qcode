@@ -393,6 +393,11 @@ fn collect_var_leaves<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
                 collect_var_leaves(operand, out);
             }
         }
+        ExprKind::Aggregate(fields) => {
+            for (_, value) in fields {
+                collect_var_leaves(value, out);
+            }
+        }
     }
 }
 
@@ -414,6 +419,11 @@ fn collect_expr_insns(expr: &Expr, out: &mut Vec<InstructionId>) {
         ExprKind::Unknown { operands, .. } => {
             for operand in operands {
                 collect_expr_insns(operand, out);
+            }
+        }
+        ExprKind::Aggregate(fields) => {
+            for (_, value) in fields {
+                collect_expr_insns(value, out);
             }
         }
     }

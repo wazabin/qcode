@@ -41,7 +41,7 @@ pub fn emit_tokens(ctx: &Context, program: &Program) -> Vec<TokenLine> {
     out
 }
 
-/// Builds the `fn name(inputs) -> outputs {` header from the function's
+/// Builds the `fn name(inputs) -> { output types } {` header from the function's
 /// recovered signature. A missing signature (or an empty input/output list)
 /// simply renders empty parentheses / no return arrow.
 fn header_line(ctx: &Context, function_id: FunctionId) -> TokenLine {
@@ -66,7 +66,15 @@ fn header_line(ctx: &Context, function_id: FunctionId) -> TokenLine {
         buf.space();
         buf.punct("->");
         buf.space();
-        emit_regs(ctx, outputs, &mut buf);
+        buf.punct("{");
+        for (i, &id) in outputs.iter().enumerate() {
+            if i > 0 {
+                buf.punct(",");
+                buf.space();
+            }
+            emit_uint_type(Varnode::from_id(ctx, id).size(), &mut buf);
+        }
+        buf.punct("}");
     }
 
     buf.space();
@@ -94,17 +102,6 @@ fn emit_typed_regs(ctx: &Context, regs: &[VarnodeId], buf: &mut LineBuf) {
 
 fn emit_uint_type(size: usize, buf: &mut LineBuf) {
     buf.push(format!("uint{}_t", size * 8), TokenKind::Type);
-}
-
-/// Pushes a comma-separated list of register names (as variables) onto `buf`.
-fn emit_regs(ctx: &Context, regs: &[VarnodeId], buf: &mut LineBuf) {
-    for (i, &id) in regs.iter().enumerate() {
-        if i > 0 {
-            buf.punct(",");
-            buf.space();
-        }
-        buf.push(Varnode::from_id(ctx, id).to_string(), TokenKind::Variable);
-    }
 }
 
 /// Renders `program` as pseudo-C source text (indentation via spaces).
@@ -259,6 +256,9 @@ fn emit_stmt(
                 return;
             }
             let block = Instruction::from_id(ctx, *id).block().map(|b| b.id);
+            if emit_named_return_tuple(ctx, program, *id, indent, roots, out) {
+                return;
+            }
             let mut buf = statement(ctx, *id, roots);
             // The statement's operand expressions were lowered with `Some(roots)`,
             // so `buf.insns` holds every genuinely inlined operand plus any root
@@ -457,6 +457,71 @@ fn emit_stmt(
             out.push(brace_line("}", indent));
         }
     }
+}
+
+/// Emit a functionalized register return as a named brace initializer.
+fn emit_named_return_tuple(
+    ctx: &Context,
+    program: &Program,
+    return_id: InstructionId,
+    indent: usize,
+    roots: &HashSet<InstructionId>,
+    out: &mut Vec<TokenLine>,
+) -> bool {
+    let Mnemonic::Return(ret) = Instruction::from_id(ctx, return_id).mnemonic() else {
+        return false;
+    };
+    let Some(value) = ret.value else {
+        return false;
+    };
+    let ValueId::Instruction(tuple_id) = value.qualify(return_id.func) else {
+        return false;
+    };
+    let Mnemonic::Tuple(tuple) = Instruction::from_id(ctx, tuple_id).mnemonic() else {
+        return false;
+    };
+    let Some(function_id) = program.function else {
+        return false;
+    };
+    let function = FunctionRef::from_id(ctx, function_id);
+    let Some(registers) = function.effects().materialized() else {
+        return false;
+    };
+    let outputs = &registers.outputs[..registers.returns];
+    if outputs.len() != tuple.fields.len() {
+        return false;
+    }
+
+    let mut head = LineBuf::default();
+    head.keyword("return");
+    head.space();
+    head.punct("{");
+    head.note_insn(return_id);
+    out.push(head.into_line(
+        indent,
+        Instruction::from_id(ctx, return_id).block().map(|b| b.id),
+    ));
+
+    for (index, (&output, &field)) in outputs.iter().zip(&tuple.fields).enumerate() {
+        let mut line = LineBuf::default();
+        line.push(
+            Varnode::from_id(ctx, output).to_string(),
+            TokenKind::Variable,
+        );
+        line.punct(":");
+        line.space();
+        lower_expr_rooted(ctx, field.qualify(return_id.func), roots).write_tokens(&mut line);
+        if index + 1 != outputs.len() {
+            line.punct(",");
+        }
+        out.push(line.into_line(indent + 1, None));
+    }
+
+    let mut tail = LineBuf::default();
+    tail.punct("}");
+    tail.punct(";");
+    out.push(tail.into_line(indent, None));
+    true
 }
 
 /// Builds the tokens for a single root instruction rendered as a C statement.

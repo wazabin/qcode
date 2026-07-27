@@ -54,6 +54,8 @@ pub enum ExprKind {
         bits: usize,
         expr: Box<Expr>,
     },
+    /// A named aggregate/pack literal (`{ RAX: x, RDX: y }`).
+    Aggregate(Vec<(String, Expr)>),
     /// A pseudo-call fallback for ops we do not model structurally.
     Unknown { op: String, operands: Vec<Expr> },
 }
@@ -237,6 +239,20 @@ impl Expr {
                 out.space();
                 Self::child_tokens(out, rhs, p, true);
             }
+            ExprKind::Aggregate(fields) => {
+                out.punct("{");
+                for (i, (name, value)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        out.punct(",");
+                        out.space();
+                    }
+                    out.push(name.clone(), TokenKind::Variable);
+                    out.punct(":");
+                    out.space();
+                    value.write_tokens(out);
+                }
+                out.punct("}");
+            }
             ExprKind::Unknown { op, operands } => {
                 out.push_value(op.clone(), TokenKind::Label, self.value);
                 out.punct("(");
@@ -267,7 +283,10 @@ impl Expr {
     /// The precedence of this expression's top-level operator.
     fn precedence(&self) -> u8 {
         match &self.kind {
-            ExprKind::Const(_) | ExprKind::Var(_) | ExprKind::Unknown { .. } => PRIMARY_PREC,
+            ExprKind::Const(_)
+            | ExprKind::Var(_)
+            | ExprKind::Aggregate(_)
+            | ExprKind::Unknown { .. } => PRIMARY_PREC,
             ExprKind::Unary(..) | ExprKind::Deref { .. } | ExprKind::Cast { .. } => UNARY_PREC,
             ExprKind::Binary(op, ..) => op.precedence(),
         }
@@ -381,5 +400,14 @@ mod tests {
         e.write_tokens(&mut buf);
         let token_text: String = buf.tokens.iter().map(|t| t.text.as_str()).collect();
         assert_eq!(e.to_string(), token_text);
+    }
+
+    #[test]
+    fn aggregate_literal_uses_named_brace_syntax() {
+        let aggregate = Expr::bare(ExprKind::Aggregate(vec![
+            ("RAX".into(), Expr::var("a")),
+            ("RDX".into(), Expr::var("b")),
+        ]));
+        assert_eq!(aggregate.to_string(), "{RAX: a, RDX: b}");
     }
 }
