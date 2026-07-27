@@ -22,6 +22,7 @@ pub(crate) fn dummy_env() -> PipelineEnv {
         ArchConfig {
             stack_pointer: RegisterId::from(0usize),
             dead_flag_regs: Vec::new(),
+            killable_registers: Default::default(),
             abi: CallingConvention::default(),
             os: qcode::context::TargetOs::Unknown,
             bitness: 64,

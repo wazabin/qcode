@@ -251,6 +251,7 @@ mod tests {
             ArchConfig {
                 stack_pointer: RegisterId::from(0usize),
                 dead_flag_regs: Vec::new(),
+                killable_registers: Default::default(),
                 abi: CallingConvention::default(),
                 os,
                 bitness,

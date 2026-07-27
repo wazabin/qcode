@@ -47,19 +47,23 @@ use crate::{CallGraph, Pass, PipelineEnv, calls::interface::remove_entry_params_
 /// only guards against an unforeseen non-terminating rewrite.
 const MAX_ITERS: usize = 100_000;
 
-/// Trim dead args and dead returned fields from every `pure_reg` function,
-/// rewriting all direct call sites. Returns `true` if anything changed.
-pub fn dead_signature(ctx: &mut Context) -> bool {
+/// Trim dead architecture-approved args and returned fields from every
+/// `pure_reg` function, rewriting all direct call sites.
+pub fn dead_signature(
+    ctx: &mut Context,
+    killable_registers: &HashSet<qcode::value::VarnodeId>,
+) -> bool {
     let targets = ctx.function_ids();
     let graph = CallGraph::analyze(ctx);
     let mut cone = crate::ConeMut::full(ctx);
-    !dead_signature_changed_functions(&mut cone, &targets, &graph).is_empty()
+    !dead_signature_changed_functions(&mut cone, &targets, &graph, killable_registers).is_empty()
 }
 
 fn dead_signature_changed_functions(
     cone: &mut crate::ConeMut,
     targets: &[FunctionId],
     graph: &CallGraph,
+    killable: &HashSet<qcode::value::VarnodeId>,
 ) -> HashSet<FunctionId> {
     let mut changed = HashSet::default();
     let target_set: HashSet<_> = targets.iter().copied().collect();
@@ -102,8 +106,8 @@ fn dead_signature_changed_functions(
         let ctx = cone.ctx_for(fid);
 
         let mut touched: HashSet<FunctionId> = HashSet::default();
-        let arg_changed = trim_dead_args(ctx, fid, &call_index, &mut touched);
-        let ret_changed = trim_dead_return_fields(ctx, fid, &call_index, &mut touched);
+        let arg_changed = trim_dead_args(ctx, fid, &call_index, killable, &mut touched);
+        let ret_changed = trim_dead_return_fields(ctx, fid, &call_index, killable, &mut touched);
 
         if arg_changed || ret_changed {
             touched.insert(fid);
@@ -191,17 +195,26 @@ fn trim_dead_args(
     ctx: &mut Context,
     fid: FunctionId,
     call_index: &HashMap<FunctionId, Vec<InstructionId>>,
+    killable: &HashSet<qcode::value::VarnodeId>,
     touched: &mut HashSet<FunctionId>,
 ) -> bool {
     let Some(root) = FunctionBody::from_id(ctx, fid).root().map(|b| b.id) else {
         return false;
     };
 
+    let inputs = FunctionBody::from_id(ctx, fid)
+        .effects()
+        .materialized()
+        .map(|map| map.inputs.clone())
+        .unwrap_or_default();
     let params = ctx.block(root).params.clone();
     let dead: Vec<usize> = params
         .iter()
         .enumerate()
-        .filter(|(_, p)| {
+        .filter(|(i, p)| {
+            if !inputs.get(*i).is_some_and(|reg| killable.contains(reg)) {
+                return false;
+            }
             let p = BlockParamId::new(root.func, **p);
             ctx.users(p).is_empty()
         })
@@ -234,6 +247,7 @@ fn trim_dead_return_fields(
     ctx: &mut Context,
     fid: FunctionId,
     call_index: &HashMap<FunctionId, Vec<InstructionId>>,
+    killable: &HashSet<qcode::value::VarnodeId>,
     touched: &mut HashSet<FunctionId>,
 ) -> bool {
     let call_sites = direct_call_sites(ctx, fid, call_index);
@@ -251,6 +265,16 @@ fn trim_dead_return_fields(
     };
     let n = fields.len();
     if n == 0 {
+        return false;
+    }
+    let Some(map) = FunctionBody::from_id(ctx, fid)
+        .effects()
+        .materialized()
+        .cloned()
+    else {
+        return false;
+    };
+    if map.returns != n || map.outputs.len() < n {
         return false;
     }
 
@@ -272,6 +296,11 @@ fn trim_dead_return_fields(
                     return false;
                 }
             }
+        }
+    }
+    for (i, &output) in map.outputs[..n].iter().enumerate() {
+        if !killable.contains(&output) {
+            live[i] = true;
         }
     }
 
@@ -355,6 +384,16 @@ fn trim_dead_return_fields(
         }
     }
 
+    let mut outputs: Vec<_> = kept.iter().map(|&i| map.outputs[i]).collect();
+    outputs.extend_from_slice(&map.outputs[n..]);
+    FunctionBody::from_id_mut(ctx, fid).set_register_effects(
+        qcode::value::RegisterChannelState::Materialized(qcode::value::RegisterInterfaceMap {
+            inputs: map.inputs,
+            outputs,
+            returns: kept.len(),
+        }),
+    );
+
     true
 }
 
@@ -369,13 +408,16 @@ impl Pass for DeadSignature {
     fn run(
         &self,
         cone: &mut crate::ConeMut,
-        _env: &PipelineEnv,
+        env: &PipelineEnv,
     ) -> Result<crate::ModulePassOutcome, String> {
         let targets = cone.cone_functions();
         let graph = CallGraph::analyze(cone.ctx());
         Ok(
             crate::ModulePassOutcome::functions(dead_signature_changed_functions(
-                cone, &targets, &graph,
+                cone,
+                &targets,
+                &graph,
+                &env.cfg.killable_registers,
             ))
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>(),
@@ -385,14 +427,17 @@ impl Pass for DeadSignature {
     fn run_with_analyses(
         &self,
         cone: &mut crate::ConeMut,
-        _env: &PipelineEnv,
+        env: &PipelineEnv,
         analyses: &mut crate::AnalysisManager,
     ) -> Result<crate::ModulePassOutcome, String> {
         let targets = cone.cone_functions();
         let graph = analyses.global::<crate::CallGraphAnalysis>(cone.ctx());
         Ok(
             crate::ModulePassOutcome::functions(dead_signature_changed_functions(
-                cone, &targets, graph,
+                cone,
+                &targets,
+                graph,
+                &env.cfg.killable_registers,
             ))
             .preserving_global::<crate::CallGraphAnalysis>()
             .preserving_global::<crate::AddressAnalysis>(),
@@ -454,6 +499,7 @@ mod tests {
         else {
             unreachable!()
         };
+        let field_count = fields.len();
         let return_fields = fields
             .iter()
             .map(|(name, value)| AggregateField::new(name.clone(), tc.ctx.type_of(*value)))
@@ -479,11 +525,28 @@ mod tests {
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_register_effects(
             qcode::value::RegisterChannelState::Materialized(qcode::value::RegisterInterfaceMap {
                 inputs,
-                outputs: vec![],
-                returns: 0,
+                outputs: [tc.r0, tc.r1, tc.r2, tc.r3][..field_count].to_vec(),
+                returns: field_count,
             }),
         );
         return_type
+    }
+
+    fn killable(tc: &qcode::testing::TestContext) -> HashSet<VarnodeId> {
+        [
+            tc.r0,
+            tc.r1,
+            tc.r2,
+            tc.r3,
+            tc.r0_lo32,
+            tc.r0_lo16,
+            tc.r0_byte0,
+            tc.r0_byte1,
+            tc.r0_byte2,
+            tc.r0_byte3,
+        ]
+        .into_iter()
+        .collect()
     }
 
     /// Field count of `fid`'s single return write-set tuple, or `None` if the
@@ -570,8 +633,9 @@ mod tests {
             bld.push_store(f0, ValueId::Varnode(vr0), reg_space);
         }
 
+        let killable = killable(&tc);
         assert!(
-            dead_signature(&mut tc.ctx),
+            dead_signature(&mut tc.ctx, &killable),
             "the unread r0 arg should be dropped"
         );
 
@@ -666,8 +730,9 @@ mod tests {
             call_sites.push((call_id, b));
         }
 
+        let killable = killable(&tc);
         assert!(
-            dead_signature(&mut tc.ctx),
+            dead_signature(&mut tc.ctx, &killable),
             "the unread r0 arg should be dropped"
         );
 
@@ -744,8 +809,9 @@ mod tests {
             id
         };
 
+        let killable = killable(&tc);
         assert!(
-            dead_signature(&mut tc.ctx),
+            dead_signature(&mut tc.ctx, &killable),
             "field 0 is unprojected and should be trimmed"
         );
 
@@ -799,11 +865,46 @@ mod tests {
         Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg);
         // No extract: nothing projects the result.
 
-        assert!(dead_signature(&mut tc.ctx));
+        let killable = killable(&tc);
+        assert!(dead_signature(&mut tc.ctx, &killable));
         assert_eq!(
             return_field_count(&tc, f),
             None,
             "an entirely-unused return drops its value"
+        );
+    }
+
+    #[test]
+    fn preserves_unused_non_killable_return() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry>
+                    return at i64 0;
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (g, entry);
+        let c0 = tc.ctx.get_const(7, 8).id();
+        let agg = make_pure_reg_return(&mut tc, f, vec![], vec![("o0".to_owned(), c0)]);
+        let call_id = set_call(&mut tc, g_call, f, vec![]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg);
+
+        assert!(!dead_signature(&mut tc.ctx, &HashSet::default()));
+        assert_eq!(
+            return_field_count(&tc, f),
+            Some(1),
+            "an unused general-purpose return is outside architecture policy"
         );
     }
 
@@ -836,8 +937,9 @@ mod tests {
         let call_id = set_call(&mut tc, g_call, f, vec![a, b]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
+        let killable = killable(&tc);
         assert!(
-            !dead_signature(&mut tc.ctx),
+            !dead_signature(&mut tc.ctx, &killable),
             "non-pure-reg functions are skipped"
         );
         assert_eq!(call_args(&tc, call_id).len(), 2, "no argument is dropped");

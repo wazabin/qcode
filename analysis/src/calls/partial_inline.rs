@@ -672,6 +672,7 @@ mod tests {
         inputs: Vec<VarnodeId>,
     ) -> TypeId {
         let mut agg = None;
+        let mut field_count = 0;
         for ret_id in returns_of(&tc.ctx, fid) {
             let block = tc.ctx.get_insn(ret_id).parent().map(|b| b.id).unwrap();
             let tuple_id = BasicBlock::from_id(&tc.ctx, block)
@@ -679,6 +680,10 @@ mod tests {
                 .find(|i| matches!(i.mnemonic(), Mnemonic::Tuple(_)))
                 .unwrap()
                 .id;
+            let Mnemonic::Tuple(tuple) = tc.ctx.get_insn(tuple_id).mnemonic() else {
+                unreachable!()
+            };
+            field_count = tuple.fields.len();
             let Mnemonic::Return(r) = tc.ctx.get_insn(ret_id).mnemonic().clone() else {
                 unreachable!()
             };
@@ -694,8 +699,8 @@ mod tests {
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_register_effects(
             qcode::value::RegisterChannelState::Materialized(qcode::value::RegisterInterfaceMap {
                 inputs,
-                outputs: vec![],
-                returns: 0,
+                outputs: [tc.r0, tc.r1, tc.r2, tc.r3][..field_count].to_vec(),
+                returns: field_count,
             }),
         );
         agg.unwrap()
@@ -1127,7 +1132,11 @@ mod tests {
         replay_field(&mut tc, g_cont, call_id, 1, vr1); // %l   -> impure, stays
 
         assert!(partial_inline(&mut tc.ctx));
-        assert!(super::super::dead_signature::dead_signature(&mut tc.ctx));
+        let killable = [tc.r0].into_iter().collect();
+        assert!(super::super::dead_signature::dead_signature(
+            &mut tc.ctx,
+            &killable
+        ));
         assert_eq!(
             return_field_count(&tc, f),
             Some(1),

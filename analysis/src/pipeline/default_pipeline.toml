@@ -294,13 +294,21 @@ name = "argpromote-cleanup"
 scope = "function"
 passes = ["dead_store", "dce"]
 
-# Recompute cheap callee outputs at their callers. This is deliberately not
-# paired with `dead_signature`: partial inlining expands code in callers but
-# must preserve the original function body and functional signature.
+# Recompute cheap callee outputs at their callers. Partial inlining expands code
+# in callers but preserves the original function body.
 [[stage]]
 name = "partial-inline"
 scope = "module"
 passes = ["partial_inline"]
+repeat_until = "no_change"
+
+# Remove unused machine-state slots only when the architecture marks their
+# registers killable (x86/x64 flags, stack/frame pointers, and instruction
+# pointer). General-purpose arguments and returns remain in the signature.
+[[stage]]
+name = "dead-signature"
+scope = "module"
+passes = ["dead_signature"]
 repeat_until = "no_change"
 
 # Forward the `argpromote` shadow seed-store/load pairs (by-value arguments stored

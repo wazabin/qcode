@@ -129,6 +129,7 @@ mod tests {
         let cfg = ArchConfig {
             stack_pointer: qcode::value::RegisterId::from(0usize),
             dead_flag_regs,
+            killable_registers: Default::default(),
             abi,
             os: qcode::context::TargetOs::Unknown,
             bitness: 64,
@@ -152,6 +153,7 @@ mod tests {
         let cfg = ArchConfig {
             stack_pointer: qcode::value::RegisterId::from(0usize),
             dead_flag_regs: Vec::new(),
+            killable_registers: Default::default(),
             abi,
             os: qcode::context::TargetOs::Unknown,
             bitness: 64,

@@ -145,6 +145,12 @@ pub struct ArchConfig {
     pub stack_pointer: RegisterId,
     /// Status-flag registers (CF/OF/SF/ZF/PF) treated as dead by dead-store.
     pub dead_flag_regs: Vec<ValueId>,
+    /// Registers whose unused functional-signature slots may be removed.
+    ///
+    /// This is architecture policy rather than a generic DCE decision. For the
+    /// x86 families it contains the status flags, stack/frame pointers, and
+    /// instruction pointer.
+    pub killable_registers: rustc_hash::FxHashSet<VarnodeId>,
     /// Calling-convention argument/return register layout, used to give known
     /// external (libc) functions signatures. Empty for unsupported arches.
     pub abi: CallingConvention,
