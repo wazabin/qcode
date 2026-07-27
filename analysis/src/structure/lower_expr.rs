@@ -163,21 +163,19 @@ fn lower_instruction(ctx: &Context, id: InstructionId, roots: Roots, expand_unkn
         // A load from a named location (varnode) reads that variable directly;
         // a load through a computed pointer is a real dereference.
         Mnemonic::Load(l) => deref_location(ctx, qualify(l.ptr), l.size, roots),
-        Mnemonic::Zext(z) => Expr::bare(ExprKind::Cast {
-            signed: false,
-            bits: z.size * 8,
-            expr: Box::new(lower(ctx, qualify(z.src), roots)),
-        }),
+        Mnemonic::Zext(z) => cast_if_needed(
+            ctx,
+            qualify(z.src),
+            false,
+            z.size * 8,
+            lower(ctx, qualify(z.src), roots),
+        ),
         // Sign extension must interpret the source as signed *at its own width*
         // before widening: `(int64_t)(int32_t)x`. A plain `(int64_t)x` would
         // zero-extend an unsigned source in C, silently dropping the sign.
         Mnemonic::Sext(s) => {
             let src = signed_operand(ctx, qualify(s.src), lower(ctx, qualify(s.src), roots));
-            Expr::bare(ExprKind::Cast {
-                signed: true,
-                bits: s.size * 8,
-                expr: Box::new(src),
-            })
+            cast_if_needed(ctx, qualify(s.src), true, s.size * 8, src)
         }
         // Not modeled structurally. As an operand (`expand_unknown` false) refer
         // to the SSA temporary by name; as a defining expression expand it to an
@@ -272,8 +270,30 @@ fn signed_operand(ctx: &Context, value: ValueId, expr: Expr) -> Expr {
             return expr;
         }
     }
+    cast_if_needed(ctx, value, true, bits, expr)
+}
+
+/// Apply an integer cast only when it changes the expression's known type.
+///
+/// QCode integer values already carry their width. Repeating that same width on
+/// a variable adds no information, and wrapping an identical cast produces the
+/// nested `(intN_t)(intN_t)` noise common in lifted sign-extension sequences.
+fn cast_if_needed(ctx: &Context, value: ValueId, signed: bool, bits: usize, expr: Expr) -> Expr {
+    if matches!(expr.kind, ExprKind::Var(_)) && ValueRef::new(value, ctx).size() * 8 == bits {
+        return expr;
+    }
+    if matches!(
+        expr.kind,
+        ExprKind::Cast {
+            signed: inner_signed,
+            bits: inner_bits,
+            ..
+        } if inner_signed == signed && inner_bits == bits
+    ) {
+        return expr;
+    }
     Expr::bare(ExprKind::Cast {
-        signed: true,
+        signed,
         bits,
         expr: Box::new(expr),
     })

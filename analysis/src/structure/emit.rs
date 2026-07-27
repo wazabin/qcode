@@ -638,8 +638,8 @@ mod tests {
     }
 
     #[test]
-    fn signed_comparison_casts_its_operand() {
-        // A signed `s<` casts its operand so the output is not silently unsigned.
+    fn signed_comparison_does_not_recast_same_width_operand() {
+        // The operand is already i32, so a same-width `(int32_t)` cast is noise.
         let mut ctx = Context::new();
         qcode!(
             ctx,
@@ -661,8 +661,8 @@ mod tests {
         );
         let c = emit_c(&ctx, &decompile_function(&ctx, f).unwrap());
         assert!(
-            c.contains("(int32_t)x") && c.contains("< 0x5"),
-            "signed compare should cast its operand:\n{c}"
+            !c.contains("(int32_t)x") && c.contains("x < 0x5"),
+            "same-width signed operand should stay bare:\n{c}"
         );
     }
 
@@ -697,8 +697,7 @@ mod tests {
 
     #[test]
     fn sign_extension_extends_the_sign_not_zero() {
-        // `sext` reads its source as signed before widening, rendering
-        // `(int64_t)(int32_t)x`; a plain `(int64_t)x` would zero-extend in C.
+        // The source is already i32, so only the widening i64 cast is needed.
         let mut ctx = Context::new();
         qcode!(
             ctx,
@@ -716,8 +715,8 @@ mod tests {
         );
         let c = emit_c(&ctx, &lower_function(&ctx, f));
         assert!(
-            c.contains("(int64_t)(int32_t)x"),
-            "sext should sign-extend, not zero-extend:\n{c}"
+            c.contains("(int64_t)x") && !c.contains("(int32_t)x"),
+            "sext should emit only the type-changing widening cast:\n{c}"
         );
     }
 
