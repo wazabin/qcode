@@ -41,6 +41,7 @@ use super::{
     LocalAnalysisManager, Outcome, PreservedAnalyses,
 };
 use crate::RegisterBase;
+use crate::structure::Program;
 
 #[cfg(test)]
 fn call_graph_snapshot(ctx: &Context<'_>) -> Vec<crate::CallEdge> {
@@ -804,12 +805,48 @@ impl<T: Pass> DynPass for T {
     }
 }
 
+/// A read-only IR pass that progressively builds or refines a decompiler AST.
+pub trait DecompilePass: Default {
+    const NAME: &'static str;
+    fn description(&self) -> &'static str;
+    fn run(&self, ctx: &Context, fun_id: FunctionId, program: &mut Program)
+    -> Result<bool, String>;
+}
+
+/// Object-safe dispatch for [`DecompilePass`].
+pub trait DynDecompilePass {
+    fn name(&self) -> &'static str;
+    fn description(&self) -> &'static str;
+    fn run(&self, ctx: &Context, fun_id: FunctionId, program: &mut Program)
+    -> Result<bool, String>;
+}
+
+impl<T: DecompilePass> DynDecompilePass for T {
+    fn name(&self) -> &'static str {
+        T::NAME
+    }
+
+    fn description(&self) -> &'static str {
+        DecompilePass::description(self)
+    }
+
+    fn run(
+        &self,
+        ctx: &Context,
+        fun_id: FunctionId,
+        program: &mut Program,
+    ) -> Result<bool, String> {
+        DecompilePass::run(self, ctx, fun_id, program)
+    }
+}
+
 // ----- registry --------------------------------------------------------------
 
 /// A pass resolved from its TOML name, tagged by which scope it runs in.
 pub enum RegisteredPass {
     Function(Box<dyn DynFunctionPass>),
     Module(Box<dyn DynPass>),
+    Decompile(Box<dyn DynDecompilePass>),
 }
 
 /// One pass's registration, submitted from the pass's own module via
@@ -927,6 +964,20 @@ macro_rules! register_module_pass {
     };
 }
 
+#[macro_export]
+macro_rules! register_decompile_pass {
+    ($ty:ty) => {
+        inventory::submit! {
+            $crate::PassRegistration {
+                name: <$ty as $crate::DecompilePass>::NAME,
+                make: || $crate::RegisteredPass::Decompile(::std::boxed::Box::new(
+                    <$ty as ::core::default::Default>::default(),
+                )),
+            }
+        }
+    };
+}
+
 /// Every registered pass name, sorted, joined for error messages when a pipeline
 /// names an unknown pass.
 pub fn known_pass_names() -> String {
@@ -982,6 +1033,7 @@ mod tests {
             let (name, description) = match &pass {
                 RegisteredPass::Function(p) => (p.name(), p.description()),
                 RegisteredPass::Module(p) => (p.name(), p.description()),
+                RegisteredPass::Decompile(p) => (p.name(), p.description()),
             };
             assert_eq!(name, reg.name, "registration name must match the pass NAME");
             assert!(!description.is_empty(), "{name} has an empty description");

@@ -51,8 +51,9 @@ pub use analysis_manager::{
 pub use cone::{Cone, ConeMut};
 pub(crate) use pass::with_body_mut;
 pub use pass::{
-    DynFunctionPass, DynPass, FunctionPass, FunctionPassAdapter, ModulePassOutcome, Pass,
-    PassRegistration, PipelineEnv, RegisteredPass, known_pass_names, make_pass,
+    DecompilePass, DynDecompilePass, DynFunctionPass, DynPass, FunctionPass, FunctionPassAdapter,
+    ModulePassOutcome, Pass, PassRegistration, PipelineEnv, RegisteredPass, known_pass_names,
+    make_pass,
 };
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};

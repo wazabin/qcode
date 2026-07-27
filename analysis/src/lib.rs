@@ -55,6 +55,9 @@ pub mod sequence;
 
 pub mod reconstruction;
 
+pub mod structure;
+pub use structure::{TokenKind, TokenLine, decompile_function, emit_c, emit_tokens};
+
 pub mod verify;
 pub use verify::{PureRegCallArgsViolation, Verify, verify, verify_ir, verify_pure_reg_call_args};
 
@@ -82,10 +85,10 @@ pub mod pipeline;
 pub(crate) use pipeline::with_body_mut;
 pub use pipeline::{
     AnalysisManager, ArchConfig, CallingConvention, Cone, ConeMut, ContextSplit, ContextView,
-    DEFAULT_PIPELINE_TOML, DynFunctionPass, DynPass, FunctionBody, FunctionPass,
-    FunctionPassAdapter, GlobalAnalysis, GpReg, LiftOutcome, LiftSummary, LocalAnalysis,
-    LocalAnalysisManager, ModulePassOutcome, Outcome, Pass, PassRegistration, Pipeline,
-    PipelineEnv, PipelineServices, PreservedAnalyses, RegisteredPass,
+    DEFAULT_PIPELINE_TOML, DecompilePass, DynDecompilePass, DynFunctionPass, DynPass, FunctionBody,
+    FunctionPass, FunctionPassAdapter, GlobalAnalysis, GpReg, LiftOutcome, LiftSummary,
+    LocalAnalysis, LocalAnalysisManager, ModulePassOutcome, Outcome, Pass, PassRegistration,
+    Pipeline, PipelineEnv, PipelineServices, PreservedAnalyses, RegisteredPass,
     analyze_and_lift_with_progress, analyze_default, analyze_with_pipeline, cabi_abi_target,
     known_pass_names, make_pass,
 };

@@ -676,6 +676,12 @@ fn resolve_function_passes(sc: &StageConfig) -> Result<Vec<Box<dyn DynFunctionPa
                     sc.name
                 ));
             }
+            Some(RegisteredPass::Decompile(_)) => {
+                return Err(format!(
+                    "pass \"{name}\" in stage \"{}\" is a decompilation pass",
+                    sc.name
+                ));
+            }
             None => return Err(unknown_pass(name, &sc.name)),
         }
     }
@@ -690,6 +696,12 @@ fn resolve_module_passes(sc: &StageConfig) -> Result<Vec<Box<dyn DynPass>>, Stri
             Some(RegisteredPass::Function(_)) => {
                 return Err(format!(
                     "pass \"{name}\" in stage \"{}\" is a per-function pass, but the stage is scope=module",
+                    sc.name
+                ));
+            }
+            Some(RegisteredPass::Decompile(_)) => {
+                return Err(format!(
+                    "pass \"{name}\" in stage \"{}\" is a decompilation pass",
                     sc.name
                 ));
             }
