@@ -711,11 +711,9 @@ mod tests {
 
         assert!(argpromote(&mut tc.ctx), "the global write functionalizes");
 
-        // f gained a `glob_9000` param for the lifted constant address, and no
-        // constant-address access remains in *real ram*. (Phase 1 RAM-channel
-        // semantics: the global access is redirected into the private shadow
-        // keeping the literal as its index, rather than rewritten to dereference
-        // the param as the old grow_globals path did.)
+        // A definitely-written global is write-only, so f gains no snapshot
+        // parameter for it. Its constant-address store is still redirected into
+        // private shadow and returned in the write-set.
         let pnames: Vec<String> = FunctionBody::from_id(&tc.ctx, f)
             .root()
             .unwrap()
@@ -723,8 +721,8 @@ mod tests {
             .filter_map(|p| p.name().map(str::to_string))
             .collect();
         assert!(
-            pnames.iter().any(|n| n == "glob_9000"),
-            "glob param added: {pnames:?}"
+            !pnames.iter().any(|n| n == "glob_9000"),
+            "write-only global must not gain a read parameter: {pnames:?}"
         );
         let const_access = FunctionBody::from_id(&tc.ctx, f)
             .iter()
@@ -743,25 +741,10 @@ mod tests {
             "no constant-address access remains in f's real ram"
         );
 
-        // The caller materializes the global at `0x9000`. (Phase 1 value-threading:
-        // the param carries `mem[0x9000]` by value, so the caller loads it for the
-        // input arg and replays the write as `store(ram, 0x9000, value)` — the
-        // address literal is a load/store pointer at the caller, no longer a bare
-        // positional argument.)
-        let refs_addr = FunctionBody::from_id(&tc.ctx, g).iter().any(|b| {
-            b.iter().any(|i| {
-                let ptr = match i.mnemonic() {
-                    Mnemonic::Load(l) => l.ptr,
-                    Mnemonic::Store(s) => s.ptr,
-                    _ => return false,
-                };
-                matches!(
-                    qcode::value::ValueRef::new(ptr.qualify(i.id.func), &tc.ctx),
-                    qcode::value::ValueRef::Literal(l) if l.value() == 0x9000
-                )
-            })
-        });
-        assert!(refs_addr, "caller materializes the global address 0x9000");
+        assert!(
+            caller_load_sizes(&tc, call_id).is_empty(),
+            "write-only global must not make the caller load its incoming value"
+        );
 
         // … and replays the functionalized write-set out of the call result.
         let has_replay = FunctionBody::from_id(&tc.ctx, g).iter().any(|b| {
@@ -1161,6 +1144,212 @@ mod tests {
             .iter()
             .filter(|i| matches!(i.mnemonic(), Mnemonic::Store(_)))
             .count()
+    }
+
+    fn caller_load_sizes(tc: &qcode::testing::TestContext, call_id: InstructionId) -> Vec<usize> {
+        let block = Instruction::from_id(&tc.ctx, call_id)
+            .parent()
+            .expect("call has parent")
+            .id;
+        let mut sizes: Vec<_> = BasicBlock::from_id(&tc.ctx, block)
+            .iter()
+            .filter_map(|insn| match insn.mnemonic() {
+                Mnemonic::Load(load) => Some(load.size),
+                _ => None,
+            })
+            .collect();
+        sizes.sort_unstable();
+        sizes
+    }
+
+    fn precise_fields(
+        tc: &qcode::testing::TestContext,
+        function: FunctionId,
+    ) -> (
+        std::collections::BTreeSet<qcode::value::RamField>,
+        std::collections::BTreeSet<qcode::value::RamField>,
+    ) {
+        let graph = crate::CallGraph::analyze(&tc.ctx);
+        let summaries = super::super::ram_summary::solve(&tc.ctx, &graph, None);
+        let fp = summaries
+            .get(function)
+            .as_ref()
+            .expect("finite RAM summary")
+            .precise
+            .as_ref()
+            .expect("precise RAM footprint");
+        (fp.reads.fields.clone(), fp.writes.fields.clone())
+    }
+
+    #[test]
+    fn write_only_field_materialization_preserves_read_and_write_keys() {
+        use qcode::value::{RamBase, RamField};
+
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @p:i64>
+                    store(ram:4, @p <- i32 7);
+                    return at i64 0;
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (g, f_entry);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            RegisterChannelState::Materialized(qcode::value::RegisterInterfaceMap::default()),
+        );
+        let pointer = tc.ctx.get_const(0x4000, 8).id();
+        let call = set_call(&mut tc, g_call, f, vec![pointer]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert_eq!(
+            precise_fields(&tc, f),
+            (
+                Default::default(),
+                [RamField {
+                    base: RamBase::Param(0),
+                    offset: 0,
+                    size: 4,
+                }]
+                .into_iter()
+                .collect()
+            ),
+            "semantic footprint has one write key and no read key"
+        );
+
+        assert!(argpromote(&mut tc.ctx));
+        assert_eq!(replayed_stores(&tc, call), 1);
+        assert_eq!(
+            caller_load_sizes(&tc, call),
+            Vec::<usize>::new(),
+            "materialization must not invent a read binding for a write-only key"
+        );
+    }
+
+    #[test]
+    fn mixed_width_read_materialization_preserves_both_keys() {
+        use qcode::value::{RamBase, RamField};
+
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @p:i64>
+                    %byte = load(ram:1, @p);
+                    %word = load(ram:4, @p);
+                    return at i64 0;
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (g, f_entry, byte, word);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            RegisterChannelState::Materialized(qcode::value::RegisterInterfaceMap::default()),
+        );
+        let pointer = tc.ctx.get_const(0x4000, 8).id();
+        let call = set_call(&mut tc, g_call, f, vec![pointer]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert_eq!(
+            precise_fields(&tc, f),
+            (
+                [
+                    RamField {
+                        base: RamBase::Param(0),
+                        offset: 0,
+                        size: 1,
+                    },
+                    RamField {
+                        base: RamBase::Param(0),
+                        offset: 0,
+                        size: 4,
+                    },
+                ]
+                .into_iter()
+                .collect(),
+                Default::default()
+            )
+        );
+
+        assert!(argpromote(&mut tc.ctx));
+        assert_eq!(
+            caller_load_sizes(&tc, call),
+            vec![1, 4],
+            "each semantic read key needs its own same-width binding"
+        );
+    }
+
+    #[test]
+    fn mixed_width_write_materialization_preserves_both_keys() {
+        use qcode::value::{RamBase, RamField};
+
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @p:i64>
+                    store(ram:1, @p <- i8 1);
+                    store(ram:4, @p <- i32 2);
+                    return at i64 0;
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (g, f_entry);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            RegisterChannelState::Materialized(qcode::value::RegisterInterfaceMap::default()),
+        );
+        let pointer = tc.ctx.get_const(0x4000, 8).id();
+        let call = set_call(&mut tc, g_call, f, vec![pointer]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert_eq!(
+            precise_fields(&tc, f),
+            (
+                Default::default(),
+                [
+                    RamField {
+                        base: RamBase::Param(0),
+                        offset: 0,
+                        size: 1,
+                    },
+                    RamField {
+                        base: RamBase::Param(0),
+                        offset: 0,
+                        size: 4,
+                    },
+                ]
+                .into_iter()
+                .collect()
+            )
+        );
+
+        assert!(argpromote(&mut tc.ctx));
+        assert_eq!(
+            replayed_stores(&tc, call),
+            2,
+            "each semantic write key needs its own same-width replay"
+        );
     }
 
     /// `void f(int *p, int *q) { *q = 100; *p += 1; }`
@@ -1946,16 +2135,16 @@ mod tests {
     /// requirement.
     #[test]
     fn multi_return_path_dependent_write_is_seeded() {
+        use qcode::value::{RamBase, RamField};
+
         let mut tc = qcode::testing::TestContext::new();
         let _in_p = stack_input(&mut tc, 4, 8);
-        let r0 = tc.r0;
         qcode!(
             tc.ctx,
             "
             fn foo:
-                <foo_entry @stack_10000004:i64>
-                    %c = load(register:1, {r0});
-                    if %c goto <wr> else goto <skip>;
+                <foo_entry @stack_10000004:i64 @cond:i8>
+                    if @cond goto <wr> else goto <skip>;
                 <wr>
                     store(ram:4, @stack_10000004 <- i32 7);
                     return at i64 0;
@@ -1971,16 +2160,29 @@ mod tests {
                     return at i64 0;
             "
         );
-        let _ = (g, r0, wr, skip);
+        let _ = (g, wr, skip);
         FunctionBody::from_id_mut(&mut tc.ctx, foo).set_register_effects(
             qcode::value::RegisterChannelState::Materialized(
                 qcode::value::RegisterInterfaceMap::default(),
             ),
         );
         let a = tc.ctx.get_const(0x4000, 8).id();
-        let call_id = set_call(&mut tc, g_call, foo, vec![a]);
+        let cond = tc.ctx.get_const(1, 1).id();
+        let call_id = set_call(&mut tc, g_call, foo, vec![a, cond]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
+        assert_eq!(
+            precise_fields(&tc, foo),
+            {
+                let key = RamField {
+                    base: RamBase::Param(0),
+                    offset: 0,
+                    size: 4,
+                };
+                ([key].into_iter().collect(), [key].into_iter().collect())
+            },
+            "a conditionally-written location is both a semantic read and write"
+        );
         assert!(
             argpromote(&mut tc.ctx),
             "a path-dependent write is promotable now that write targets are seeded"
@@ -1988,6 +2190,11 @@ mod tests {
         // The caller replays the one surfaced write; on the skip arm the callee
         // returns the seeded initial value, so that replay is a no-op.
         assert_eq!(replayed_stores(&tc, call_id), 1);
+        assert_eq!(
+            caller_load_sizes(&tc, call_id),
+            vec![4],
+            "the conditional write's semantic read must seed exactly one binding"
+        );
         // Idempotent: re-running redirects nothing new (the stores are already in
         // shadow), so the return's write-set is neither rebuilt nor duplicated — a
         // second append would create duplicate `write*` field names and panic.
@@ -2038,10 +2245,10 @@ mod tests {
         let _ = entry;
         let eff = scan_register_effects(&tc.ctx, f).expect("a written register is promotable");
         assert_eq!(eff.outputs, vec![r0]);
-        // The output is over-approximated as an input too (seeded so a no-write
-        // path reads the caller's incoming value); the seed is dead here and DCE
-        // would prune it.
-        assert_eq!(eff.inputs, vec![r0]);
+        assert!(
+            eff.inputs.is_empty(),
+            "materializing a write-only effect must not invent a read"
+        );
 
         rewrite_registers(&mut tc.ctx, f, &eff, None);
         assert_eq!(
@@ -2083,10 +2290,9 @@ mod tests {
         assert_eq!(register_writeset_len(&tc, f), Some(1));
     }
 
-    /// Writes to `r0_lo32` and `r0` overlap; the write-set canonicalizes to the
-    /// coarsest covering register (`r0`), so replay stays order-independent.
+    /// Overlapping registers remain distinct effect and materialization keys.
     #[test]
-    fn register_overlap_canonicalizes_to_coarsest() {
+    fn register_overlap_preserves_exact_keys() {
         let mut tc = qcode::testing::TestContext::new();
         let (r0, r0_lo32) = (tc.r0, tc.r0_lo32);
         qcode!(
@@ -2097,17 +2303,33 @@ mod tests {
                     store(register:4, {r0_lo32} <- i32 2);
                     store(register:8, {r0} <- i64 3);
                     return at i64 0;
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
             "
         );
         let eff = scan_register_effects(&tc.ctx, f).expect("written register");
+        assert_eq!(eff.outputs, vec![r0_lo32, r0]);
+        let call = set_call(&mut tc, g_call, f, vec![]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        assert!(argpromote_registers(&mut tc.ctx, None));
+        assert_eq!(register_writeset_len(&tc, f), Some(2));
+        let RegisterChannelState::Materialized(map) =
+            &FunctionBody::from_id(&tc.ctx, f).effects().register
+        else {
+            panic!("register rewrite must materialize the interface");
+        };
+        assert_eq!(map.outputs, vec![r0_lo32, r0]);
         assert_eq!(
-            eff.outputs,
-            vec![r0],
-            "overlap group collapses to the 8-byte r0"
+            replayed_stores(&tc, call),
+            2,
+            "caller replay must retain one store per overlapping write key"
         );
-        let _ = r0_lo32;
-        rewrite_registers(&mut tc.ctx, f, &eff, None);
-        assert_eq!(register_writeset_len(&tc, f), Some(1));
+        let _ = (entry, g_entry);
     }
 
     /// `r0` (the return register) and `r1` (a clobber) are written. Both ride the
@@ -2359,10 +2581,10 @@ mod tests {
         assert_eq!(transformed, original, "rewrite preserves caller-visible r0");
     }
 
-    /// Two registers that overlap but where neither contains the other (no single
-    /// covering register) leave the function on the conservative path.
+    /// Partial overlaps are also distinct semantic keys; lack of a single
+    /// covering register is not a reason to change or reject the effect set.
     #[test]
-    fn register_partial_overlap_no_cover_bails() {
+    fn register_partial_overlap_preserves_exact_keys() {
         let mut tc = qcode::testing::TestContext::new();
         let r0_lo32 = tc.r0_lo32; // bytes [0, 4)
         // A 4-byte register at offset 2 → bytes [2, 6): overlaps r0_lo32 at [2,4)
@@ -2378,12 +2600,11 @@ mod tests {
                     return at i64 0;
             "
         );
-        let _ = (r0_lo32, mid, entry);
-        assert!(
-            scan_register_effects(&tc.ctx, f).unwrap_err()
-                == RegPurityReason::NonCanonicalRegisters,
-            "partial overlap with no covering register must bail"
-        );
+        let _ = entry;
+        let effects = scan_register_effects(&tc.ctx, f).unwrap();
+        assert_eq!(effects.outputs, vec![r0_lo32, mid]);
+        rewrite_registers(&mut tc.ctx, f, &effects, None);
+        assert_eq!(register_writeset_len(&tc, f), Some(2));
     }
 
     /// `mark_pure_functions` asserts `is_pure` on a `pure_reg` function with a
@@ -4042,8 +4263,8 @@ mod tests {
         else {
             panic!("f reads r1 and writes nothing: solved but not materialized");
         };
-        assert_eq!(sets.loads, vec![r1], "solved read set persisted");
-        assert!(sets.stores.is_empty(), "no register writes");
+        assert_eq!(sets.reads, vec![r1], "solved read set persisted");
+        assert!(sets.writes.is_empty(), "no register writes");
         let _ = g;
     }
 

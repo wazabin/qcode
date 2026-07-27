@@ -169,8 +169,8 @@ fn delta_of_sets<T: std::hash::Hash + Eq>(old: &[T], new: &[T]) -> EffectDelta {
 /// Classify two solved register effect sets componentwise (`loads`, `stores`).
 fn delta_of_register_sets(old: &RegisterEffectSets, new: &RegisterEffectSets) -> EffectDelta {
     EffectDelta::composite([
-        delta_of_sets(&old.loads, &new.loads),
-        delta_of_sets(&old.stores, &new.stores),
+        delta_of_sets(&old.reads, &new.reads),
+        delta_of_sets(&old.writes, &new.writes),
     ])
 }
 
@@ -269,9 +269,12 @@ fn delta_of_btree_sets<T: Ord>(old: &BTreeSet<T>, new: &BTreeSet<T>) -> EffectDe
 /// kinds.
 fn delta_of_footprints(old: &Footprint, new: &Footprint) -> EffectDelta {
     EffectDelta::composite([
-        delta_of_btree_sets(&old.fields, &new.fields),
-        delta_of_btree_sets(&old.regions, &new.regions),
-        delta_of_btree_sets(&old.objects, &new.objects),
+        delta_of_btree_sets(&old.reads.fields, &new.reads.fields),
+        delta_of_btree_sets(&old.reads.regions, &new.reads.regions),
+        delta_of_btree_sets(&old.reads.objects, &new.reads.objects),
+        delta_of_btree_sets(&old.writes.fields, &new.writes.fields),
+        delta_of_btree_sets(&old.writes.regions, &new.writes.regions),
+        delta_of_btree_sets(&old.writes.objects, &new.writes.objects),
     ])
 }
 
@@ -366,10 +369,10 @@ mod tests {
         VarnodeId::from(i)
     }
 
-    fn solved(loads: &[usize], stores: &[usize]) -> RegisterChannelState {
+    fn solved(reads: &[usize], writes: &[usize]) -> RegisterChannelState {
         RegisterChannelState::Solved(RegisterEffectSets {
-            loads: loads.iter().copied().map(vn).collect(),
-            stores: stores.iter().copied().map(vn).collect(),
+            reads: reads.iter().copied().map(vn).collect(),
+            writes: writes.iter().copied().map(vn).collect(),
         })
     }
 
@@ -381,7 +384,10 @@ mod tests {
     /// real production signal (external prototypes' argmem).
     fn fp_objects(bases: &[u32]) -> Footprint {
         Footprint {
-            objects: bases.iter().copied().map(object).collect(),
+            writes: qcode::value::RamLocations {
+                objects: bases.iter().copied().map(object).collect(),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -389,7 +395,6 @@ mod tests {
     fn object(base: u32) -> RamObject {
         RamObject {
             base: RamBase::Param(base),
-            write: true,
         }
     }
 
@@ -398,7 +403,6 @@ mod tests {
             base: RamBase::Param(base),
             offset,
             size: 8,
-            write: true,
         }
     }
 
@@ -407,7 +411,6 @@ mod tests {
             base: RamBase::Param(base),
             lo: 0,
             hi: 32,
-            write: true,
         }
     }
 
@@ -441,9 +444,12 @@ mod tests {
             mem(
                 bounded(&[1]),
                 Some(Footprint {
-                    fields: [field(0, 0)].into_iter().collect(),
-                    regions: [region(0)].into_iter().collect(),
-                    objects: [object(0)].into_iter().collect(),
+                    writes: qcode::value::RamLocations {
+                        fields: [field(0, 0)].into_iter().collect(),
+                        regions: [region(0)].into_iter().collect(),
+                        objects: [object(0)].into_iter().collect(),
+                    },
+                    ..Default::default()
                 }),
             ),
         ];
@@ -784,26 +790,38 @@ mod tests {
     #[test]
     fn footprint_components_compose_independently() {
         let old = Footprint {
-            fields: [field(0, 0), field(0, 8)].into_iter().collect(),
-            regions: Default::default(),
-            objects: [object(1)].into_iter().collect(),
+            writes: qcode::value::RamLocations {
+                fields: [field(0, 0), field(0, 8)].into_iter().collect(),
+                regions: Default::default(),
+                objects: [object(1)].into_iter().collect(),
+            },
+            ..Default::default()
         };
         // fields narrow, objects unchanged.
         let narrower = Footprint {
-            fields: [field(0, 0)].into_iter().collect(),
+            writes: qcode::value::RamLocations {
+                fields: [field(0, 0)].into_iter().collect(),
+                ..old.writes.clone()
+            },
             ..old.clone()
         };
         assert_eq!(delta_of_footprints(&old, &narrower), EffectDelta::Narrowed);
         // fields narrow while objects grow: incomparable.
         let mixed = Footprint {
-            fields: [field(0, 0)].into_iter().collect(),
-            regions: Default::default(),
-            objects: [object(1), object(2)].into_iter().collect(),
+            writes: qcode::value::RamLocations {
+                fields: [field(0, 0)].into_iter().collect(),
+                regions: Default::default(),
+                objects: [object(1), object(2)].into_iter().collect(),
+            },
+            ..Default::default()
         };
         assert_eq!(delta_of_footprints(&old, &mixed), EffectDelta::Incomparable);
         // a regions-only change is visible.
         let with_region = Footprint {
-            regions: [region(0)].into_iter().collect(),
+            writes: qcode::value::RamLocations {
+                regions: [region(0)].into_iter().collect(),
+                ..old.writes.clone()
+            },
             ..old.clone()
         };
         assert_eq!(
@@ -820,11 +838,17 @@ mod tests {
     #[test]
     fn entry_kind_subsumption_is_not_modelled() {
         let object_only = Footprint {
-            objects: [object(0)].into_iter().collect(),
+            writes: qcode::value::RamLocations {
+                objects: [object(0)].into_iter().collect(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let field_only = Footprint {
-            fields: [field(0, 0)].into_iter().collect(),
+            writes: qcode::value::RamLocations {
+                fields: [field(0, 0)].into_iter().collect(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let delta = delta_of_footprints(&object_only, &field_only);
@@ -910,11 +934,17 @@ mod tests {
             Some(fp_objects(&[0])),
             Some(fp_objects(&[0, 1])),
             Some(Footprint {
-                fields: [field(0, 0)].into_iter().collect(),
+                writes: qcode::value::RamLocations {
+                    fields: [field(0, 0)].into_iter().collect(),
+                    ..Default::default()
+                },
                 ..Default::default()
             }),
             Some(Footprint {
-                regions: [region(0)].into_iter().collect(),
+                writes: qcode::value::RamLocations {
+                    regions: [region(0)].into_iter().collect(),
+                    ..Default::default()
+                },
                 ..Default::default()
             }),
         ];

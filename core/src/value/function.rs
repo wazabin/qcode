@@ -8,7 +8,7 @@ use std::{
 };
 
 mod footprint;
-pub use footprint::{Footprint, RamBase, RamField, RamObject, RamRegion};
+pub use footprint::{Footprint, RamBase, RamField, RamLocations, RamObject, RamRegion};
 
 mod signature;
 pub use signature::{
@@ -134,7 +134,7 @@ pub enum RegisterChannelState {
     /// Solved to a finite effect set but the interface is not yet materialized
     /// (no by-value params / return pack added). Call sites still bind
     /// implicitly, but the solved read/write register sets are precise: a call
-    /// to this function reads at most `loads` and writes at most `stores`.
+    /// to this function reads at most `reads` and writes at most `writes`.
     Solved(RegisterEffectSets),
     /// Materialized: the function carries by-value register params and a return
     /// pack, and this mapping records which register each interface slot binds.
@@ -215,9 +215,11 @@ pub enum WrittenSpacesState {
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RegisterEffectSets {
     /// Registers a call may read (sorted).
-    pub loads: Vec<VarnodeId>,
+    #[serde(alias = "loads")]
+    pub reads: Vec<VarnodeId>,
     /// Registers a call may write (sorted).
-    pub stores: Vec<VarnodeId>,
+    #[serde(alias = "stores")]
+    pub writes: Vec<VarnodeId>,
 }
 
 /// The ordered, machine-readable register interface of a *materialized*

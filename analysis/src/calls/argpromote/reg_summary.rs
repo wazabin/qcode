@@ -13,25 +13,30 @@
 
 use qcode::{
     context::Context,
-    value::{ExternSlot, FunctionBody, FunctionId, Varnode, VarnodeId, insn::Mnemonic},
+    value::{
+        BasicBlock, BlockId, ExternSlot, FunctionBody, FunctionId, RegisterChannelState,
+        RegisterInterfaceMap, Varnode, VarnodeId, insn::Mnemonic,
+    },
 };
 use rustc_hash::FxHashSet;
 
-use crate::calls::CallEdge;
+use crate::calls::{
+    CallEdge,
+    effect_engine::{Summary, TopCause},
+};
 
 use super::{
-    registers::{RegPurityReason, RegisterEffects, canonicalize_to_coarsest, is_register},
+    registers::{RegPurityReason, RegisterEffects, is_register},
     summary::EffectChannel,
 };
 
 /// The register channel's effect element: registers this function (or its
-/// callees, once joined) may read / may write. Raw varnode sets — overlap
-/// canonicalization happens once, in [`finalize_register_effects`], after the
-/// fixpoint has finished growing them.
+/// callees, once joined) may read / may write. Raw varnode sets are retained
+/// exactly through materialization, including overlapping register keys.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct RegEffects {
-    pub(crate) loads: FxHashSet<VarnodeId>,
-    pub(crate) stores: FxHashSet<VarnodeId>,
+    pub(crate) reads: FxHashSet<VarnodeId>,
+    pub(crate) writes: FxHashSet<VarnodeId>,
 }
 
 impl RegEffects {
@@ -39,11 +44,11 @@ impl RegEffects {
     /// load/store lists, stored on the interface as
     /// [`RegisterChannelState::Solved`](qcode::value::FunctionEffects).
     pub(crate) fn to_sets(&self) -> qcode::value::RegisterEffectSets {
-        let mut loads: Vec<VarnodeId> = self.loads.iter().copied().collect();
-        let mut stores: Vec<VarnodeId> = self.stores.iter().copied().collect();
-        loads.sort_unstable();
-        stores.sort_unstable();
-        qcode::value::RegisterEffectSets { loads, stores }
+        let mut reads: Vec<VarnodeId> = self.reads.iter().copied().collect();
+        let mut writes: Vec<VarnodeId> = self.writes.iter().copied().collect();
+        reads.sort_unstable();
+        writes.sort_unstable();
+        qcode::value::RegisterEffectSets { reads, writes }
     }
 }
 
@@ -62,6 +67,102 @@ pub(crate) struct RegChannel {
     pub(crate) sp: Option<VarnodeId>,
 }
 
+impl RegChannel {
+    fn materialized_effects(
+        &self,
+        ctx: &Context,
+        fid: FunctionId,
+        map: &RegisterInterfaceMap,
+    ) -> RegEffects {
+        let mut eff = RegEffects::default();
+        eff.reads.extend(map.inputs.iter().copied());
+        eff.writes.extend(map.outputs.iter().copied());
+        // A stack-passed argument is materialized at the caller as an SP reload +
+        // a ram load; only the SP read is a register effect (the ram load is the
+        // other channel's business). Register args are already in `map.inputs`.
+        if let Some(iface) = FunctionBody::from_id(ctx, fid).extern_interface()
+            && iface
+                .args
+                .iter()
+                .any(|arg| matches!(arg.slot, ExternSlot::Stack { .. }))
+        {
+            eff.reads.extend(self.sp);
+        }
+        eff
+    }
+}
+
+/// Whether some reachable return preserves the incoming value of `register`.
+///
+/// The search state records whether the current path has already performed a
+/// covering write. Re-visiting a loop in the same state cannot reveal a new
+/// path, so `(block, written)` is a finite traversal even for cyclic CFGs.
+fn has_return_path_without_write(ctx: &Context, fid: FunctionId, register: VarnodeId) -> bool {
+    let Some(root) = FunctionBody::from_id(ctx, fid).root().map(|block| block.id) else {
+        return false;
+    };
+    let target = Varnode::from_id(ctx, register);
+    let target_space = target.space().id;
+    let target_start = target.address();
+    let target_end = target_start + target.size() as i64;
+    let covers = |candidate: VarnodeId| {
+        let candidate = Varnode::from_id(ctx, candidate);
+        let start = candidate.address();
+        candidate.space().id == target_space
+            && start <= target_start
+            && start + candidate.size() as i64 >= target_end
+    };
+
+    let mut pending = vec![(root, false)];
+    let mut seen: FxHashSet<(BlockId, bool)> = FxHashSet::default();
+    while let Some((block_id, mut written)) = pending.pop() {
+        if !seen.insert((block_id, written)) {
+            continue;
+        }
+        let block = BasicBlock::from_id(ctx, block_id);
+        for insn in block.iter() {
+            match insn.mnemonic() {
+                Mnemonic::Store(store)
+                    if matches!(
+                        store.ptr,
+                        qcode::value::LocalValueId::Varnode(vn) if covers(vn)
+                    ) =>
+                {
+                    written = true;
+                }
+                Mnemonic::Return(_) if !written => return true,
+                _ => {}
+            }
+        }
+        pending.extend(
+            block
+                .successors()
+                .map(|(_, successor)| (successor, written)),
+        );
+    }
+    false
+}
+
+/// Converts an out-of-cone function's persisted register state into a fixed
+/// effect-engine leaf. An unsolved state is not safe to reuse and therefore
+/// conservatively becomes ⊤, just like a persisted explicit [`Top`](RegisterChannelState::Top).
+#[allow(dead_code)] // Wired by the incremental cone solver in the next slice.
+pub(crate) fn fixed_summary_from_register_state(
+    channel: &RegChannel,
+    ctx: &Context,
+    fid: FunctionId,
+    state: &RegisterChannelState,
+) -> Summary<RegEffects> {
+    match state {
+        RegisterChannelState::Solved(sets) => Ok(RegEffects {
+            reads: sets.reads.iter().copied().collect(),
+            writes: sets.writes.iter().copied().collect(),
+        }),
+        RegisterChannelState::Materialized(map) => Ok(channel.materialized_effects(ctx, fid, map)),
+        RegisterChannelState::Top | RegisterChannelState::Unsolved => Err(TopCause::Channel),
+    }
+}
+
 impl EffectChannel for RegChannel {
     type Effects = RegEffects;
 
@@ -77,26 +178,36 @@ impl EffectChannel for RegChannel {
                         if let qcode::value::LocalValueId::Varnode(vn) = l.ptr
                             && is_register(ctx, vn)
                         {
-                            eff.loads.insert(vn);
+                            eff.reads.insert(vn);
                         }
                     }
                     Mnemonic::Store(s) => {
                         if let qcode::value::LocalValueId::Varnode(vn) = s.ptr
                             && is_register(ctx, vn)
                         {
-                            eff.stores.insert(vn);
+                            eff.writes.insert(vn);
                         }
                     }
                     _ => {}
                 }
             }
         }
+        // A register that is only conditionally written must preserve its
+        // incoming value on the other return path. That dependency is a
+        // semantic read and is discovered here, before materialization maps
+        // the exact read/write keys to interface slots.
+        let preserved: Vec<_> = eff
+            .writes
+            .iter()
+            .copied()
+            .filter(|&register| has_return_path_without_write(ctx, fid, register))
+            .collect();
+        eff.reads.extend(preserved);
         Some(eff)
     }
 
     fn external_leaf(&self, ctx: &Context, fid: FunctionId) -> Option<RegEffects> {
         let f = FunctionBody::from_id(ctx, fid);
-        let mut eff = RegEffects::default();
         // A prototyped external is materialized by `external_sigs`, which stamps
         // the single source of truth (ruling 6a): `effects = Materialized(map)`
         // with `map.inputs` = argument registers and `map.outputs` = return
@@ -125,23 +236,10 @@ impl EffectChannel for RegChannel {
         // What remains ⊤ here is an external carrying no mapping at all: an
         // architecture with no modelled convention, or a context in which
         // `external_sigs` never ran.
-        let qcode::value::RegisterChannelState::Materialized(map) = &f.effects().register else {
+        let RegisterChannelState::Materialized(map) = &f.effects().register else {
             return None;
         };
-        eff.loads.extend(map.inputs.iter().copied());
-        eff.stores.extend(map.outputs.iter().copied());
-        // A stack-passed argument is materialized at the caller as an SP reload +
-        // a ram load; only the SP read is a register effect (the ram load is the
-        // other channel's business). Register args are already in `map.inputs`.
-        if let Some(iface) = f.extern_interface()
-            && iface
-                .args
-                .iter()
-                .any(|arg| matches!(arg.slot, ExternSlot::Stack { .. }))
-        {
-            eff.loads.extend(self.sp);
-        }
-        Some(eff)
+        Some(self.materialized_effects(ctx, fid, map))
     }
 
     /// A `CallInd` keeps its intrinsic clobbers-all modelling in the promoted
@@ -163,47 +261,35 @@ impl EffectChannel for RegChannel {
         // read/write of a register is a read/write of that same register in
         // every caller.
         Some(RegEffects {
-            loads: callee.loads.clone(),
-            stores: callee.stores.clone(),
+            reads: callee.reads.clone(),
+            writes: callee.writes.clone(),
         })
     }
 
     fn join(&self, into: &mut RegEffects, from: &RegEffects) -> bool {
-        let before = (into.loads.len(), into.stores.len());
-        into.loads.extend(from.loads.iter().copied());
-        into.stores.extend(from.stores.iter().copied());
-        (into.loads.len(), into.stores.len()) != before
+        let before = (into.reads.len(), into.writes.len());
+        into.reads.extend(from.reads.iter().copied());
+        into.writes.extend(from.writes.iter().copied());
+        (into.reads.len(), into.writes.len()) != before
     }
 }
 
 /// Finalize a solved summary into the interface [`RegisterEffects`] the rewrite
-/// consumes: canonicalize stores to the coarsest register per overlap group,
-/// over-approximate every output as an input too (a no-write path reads the
-/// caller's incoming value at the return pack — see `scan_register_effects`),
-/// and fix a deterministic `(address, size)` order shared with the caller
-/// rewrite. Mirrors v1's gating: no stores ⇒ nothing to functionalize; an
-/// overlap group with no single covering register ⇒ not promotable.
+/// consumes: retain every read and write key, then fix a deterministic
+/// `(address, size)` order shared with the caller rewrite.
+///
+/// Materialization assigns interface slots to known effects; it must not add
+/// or remove effects. A path-sensitive dependency on an incoming register must
+/// therefore be discovered as a read before this conversion.
 pub(crate) fn finalize_register_effects(
     ctx: &Context,
     eff: &RegEffects,
 ) -> Result<RegisterEffects, RegPurityReason> {
-    if eff.stores.is_empty() {
+    if eff.writes.is_empty() {
         return Err(RegPurityReason::NoRegisterWrites);
     }
-    let mut stored: Vec<VarnodeId> = eff.stores.iter().copied().collect();
-    stored.sort_unstable();
-    let mut outputs =
-        canonicalize_to_coarsest(ctx, &stored).ok_or(RegPurityReason::NonCanonicalRegisters)?;
-
-    let mut read_set: Vec<VarnodeId> = eff.loads.iter().copied().collect();
-    read_set.sort_unstable();
-    for &o in &outputs {
-        if !read_set.contains(&o) {
-            read_set.push(o);
-        }
-    }
-    let mut inputs =
-        canonicalize_to_coarsest(ctx, &read_set).ok_or(RegPurityReason::NonCanonicalRegisters)?;
+    let mut outputs: Vec<VarnodeId> = eff.writes.iter().copied().collect();
+    let mut inputs: Vec<VarnodeId> = eff.reads.iter().copied().collect();
 
     // Deterministic order shared by callee param creation and the regpure-site
     // argument threading: sort by `(space, address, size)`.
@@ -224,7 +310,7 @@ mod tests {
     use qcode::value::RegisterChannelState;
     use qcode_macro::qcode;
 
-    use super::super::summary::{EffectSummaries, solve_summaries};
+    use super::super::summary::{EffectSummaries, solve_summaries, solve_summaries_with_fixed};
 
     fn solve(tc: &qcode::testing::TestContext) -> EffectSummaries<RegChannel> {
         let graph = CallGraph::analyze(&tc.ctx);
@@ -249,8 +335,8 @@ mod tests {
         let _ = f_entry;
         let s = solve(&tc);
         let eff = s.get(f).as_ref().unwrap();
-        assert!(eff.loads.contains(&r1));
-        assert!(eff.stores.contains(&r0));
+        assert!(eff.reads.contains(&r1));
+        assert!(eff.writes.contains(&r0));
     }
 
     /// A caller's summary is the *union* of its own effects and every callee's
@@ -279,7 +365,7 @@ mod tests {
         let s = solve(&tc);
         let eff = s.get(caller).as_ref().unwrap();
         assert!(
-            eff.stores.contains(&r0) && eff.stores.contains(&r1),
+            eff.writes.contains(&r0) && eff.writes.contains(&r1),
             "caller's write-set unions the callee's clobber (r0) with its own (r1)"
         );
     }
@@ -312,7 +398,7 @@ mod tests {
         for fid in [a, b] {
             let eff = s.get(fid).as_ref().unwrap();
             assert!(
-                eff.stores.contains(&r0) && eff.stores.contains(&r1),
+                eff.writes.contains(&r0) && eff.writes.contains(&r1),
                 "the 2-cycle unions both members' stores into each"
             );
         }
@@ -343,8 +429,8 @@ mod tests {
             .expect("CallInd is empty-effects, not ⊤, for the register channel");
         // Its own `load(register, r0)` is still scanned; the indirect call adds
         // nothing (no stores).
-        assert!(eff.loads.contains(&r0));
-        assert!(eff.stores.is_empty());
+        assert!(eff.reads.contains(&r0));
+        assert!(eff.writes.is_empty());
     }
 
     /// An external carrying *no* interface mapping is ⊤: an empty-effects leaf
@@ -432,26 +518,230 @@ mod tests {
         let s = solve(&tc);
         let eff = s.get(cid).as_ref().unwrap();
         assert!(
-            eff.stores.contains(&r0),
+            eff.writes.contains(&r0),
             "caller must inherit the external's r0 clobber into its write-set"
         );
-        assert!(eff.stores.contains(&r1), "caller keeps its own r1 store");
+        assert!(eff.writes.contains(&r1), "caller keeps its own r1 store");
     }
 
-    /// `finalize_register_effects` canonicalizes an overlapping write group to the
-    /// single coarsest covering register.
+    /// Overlapping register cells remain separate semantic/interface keys.
     #[test]
-    fn finalize_canonicalizes_overlap() {
+    fn finalize_preserves_overlap_keys() {
         let tc = qcode::testing::TestContext::new();
         let (lo32, byte1) = (tc.r0_lo32, tc.r0_byte1);
         let mut eff = RegEffects::default();
-        eff.stores.insert(lo32);
-        eff.stores.insert(byte1);
+        eff.writes.insert(lo32);
+        eff.writes.insert(byte1);
         let iface = finalize_register_effects(&tc.ctx, &eff).unwrap();
-        assert_eq!(
-            iface.outputs,
-            vec![lo32],
-            "byte1 ⊂ lo32, so the group collapses to the coarsest cover"
+        assert_eq!(iface.outputs, vec![lo32, byte1]);
+    }
+
+    #[test]
+    fn persisted_states_convert_to_fixed_summaries_conservatively() {
+        use qcode::value::{RegisterEffectSets, RegisterInterfaceMap};
+
+        let mut tc = qcode::testing::TestContext::new();
+        let fid = FunctionBody::make(&mut tc.ctx, "fixed".into()).unwrap().id;
+        let channel = RegChannel { sp: None };
+        let (r0, r1) = (tc.r0, tc.r1);
+
+        let solved = RegisterChannelState::Solved(RegisterEffectSets {
+            reads: vec![r0],
+            writes: vec![r1],
+        });
+        let effects = fixed_summary_from_register_state(&channel, &tc.ctx, fid, &solved).unwrap();
+        assert_eq!(effects.reads, FxHashSet::from_iter([r0]));
+        assert_eq!(effects.writes, FxHashSet::from_iter([r1]));
+
+        let materialized = RegisterChannelState::Materialized(RegisterInterfaceMap {
+            inputs: vec![r1],
+            outputs: vec![r0],
+            returns: 1,
+        });
+        let effects =
+            fixed_summary_from_register_state(&channel, &tc.ctx, fid, &materialized).unwrap();
+        assert_eq!(effects.reads, FxHashSet::from_iter([r1]));
+        assert_eq!(effects.writes, FxHashSet::from_iter([r0]));
+
+        for state in [RegisterChannelState::Top, RegisterChannelState::Unsolved] {
+            assert_eq!(
+                fixed_summary_from_register_state(&channel, &tc.ctx, fid, &state),
+                Err(TopCause::Channel)
+            );
+        }
+    }
+
+    /// A write-only register stays write-only after materialization, so using a
+    /// materialized function as an out-of-cone fixed leaf agrees with a full
+    /// solve.
+    #[test]
+    fn partial_solve_with_materialized_bodied_leaf_matches_full_solve() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn callee:
+                <callee_entry>
+                    store(register:8, {r0} <- i64 7);
+                    return at i64 0;
+            fn caller:
+                <caller_entry>
+                    call fn callee();
+                <caller_cont>
+                    return at i64 0;
+            "
         );
+        let _ = (callee_entry, caller_entry, caller_cont);
+        let graph = CallGraph::analyze(&tc.ctx);
+        let channel = RegChannel { sp: None };
+        let full = solve_summaries(&tc.ctx, &graph, &channel)
+            .get(caller)
+            .clone();
+
+        let summaries = solve_summaries(&tc.ctx, &graph, &channel);
+        let callee_effects = summaries.get(callee).as_ref().unwrap();
+        let interface = finalize_register_effects(&tc.ctx, callee_effects).unwrap();
+        super::super::registers::materialize_interface(&mut tc.ctx, callee, &interface);
+        let state = FunctionBody::from_id(&tc.ctx, callee)
+            .effects()
+            .register
+            .clone();
+        let RegisterChannelState::Materialized(map) = &state else {
+            panic!("materialization must persist its interface map");
+        };
+        assert!(map.inputs.is_empty(), "write-only r0 must remain unread");
+        assert_eq!(map.outputs, vec![r0]);
+
+        let fixed = [(
+            callee,
+            fixed_summary_from_register_state(&channel, &tc.ctx, callee, &state),
+        )]
+        .into_iter()
+        .collect();
+        let partial = solve_summaries_with_fixed(&tc.ctx, &graph, &channel, &fixed)
+            .get(caller)
+            .clone();
+
+        assert_eq!(
+            partial, full,
+            "partial solving must preserve the exact materialized read/write keys"
+        );
+    }
+
+    #[test]
+    fn overlapping_write_keys_survive_materialization_and_partial_solve() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (wide, narrow) = (tc.r0, tc.r0_lo32);
+        qcode!(
+            tc.ctx,
+            "
+            fn callee:
+                <callee_entry>
+                    store(register:4, {narrow} <- i32 7);
+                    store(register:8, {wide} <- i64 9);
+                    return at i64 0;
+            fn caller:
+                <caller_entry>
+                    call fn callee();
+                <caller_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = (callee_entry, caller_entry, caller_cont);
+        let graph = CallGraph::analyze(&tc.ctx);
+        let channel = RegChannel { sp: None };
+        let summaries = solve_summaries(&tc.ctx, &graph, &channel);
+        let full = summaries.get(caller).clone();
+        let semantic = summaries.get(callee).as_ref().unwrap();
+        assert_eq!(semantic.writes, [wide, narrow].into_iter().collect());
+
+        let interface = finalize_register_effects(&tc.ctx, semantic).unwrap();
+        super::super::registers::materialize_interface(&mut tc.ctx, callee, &interface);
+        let state = FunctionBody::from_id(&tc.ctx, callee)
+            .effects()
+            .register
+            .clone();
+        let RegisterChannelState::Materialized(map) = &state else {
+            panic!("materialization must persist its interface map");
+        };
+        assert_eq!(map.outputs, vec![narrow, wide]);
+        assert_eq!(map.returns, 2, "both keys must have replayable slots");
+
+        let fixed = [(
+            callee,
+            fixed_summary_from_register_state(&channel, &tc.ctx, callee, &state),
+        )]
+        .into_iter()
+        .collect();
+        let partial = solve_summaries_with_fixed(&tc.ctx, &graph, &channel, &fixed)
+            .get(caller)
+            .clone();
+        assert_eq!(partial, full);
+    }
+
+    #[test]
+    fn finalization_preserves_exact_read_write_sets() {
+        let tc = qcode::testing::TestContext::new();
+        let effects = RegEffects {
+            reads: [tc.r1].into_iter().collect(),
+            writes: [tc.r0].into_iter().collect(),
+        };
+
+        let interface = finalize_register_effects(&tc.ctx, &effects).unwrap();
+
+        assert_eq!(interface.inputs, vec![tc.r1]);
+        assert_eq!(interface.outputs, vec![tc.r0]);
+    }
+
+    #[test]
+    fn unconditional_write_does_not_become_a_read() {
+        let tc = qcode::testing::TestContext::new();
+        let effects = RegEffects {
+            reads: FxHashSet::default(),
+            writes: [tc.r0].into_iter().collect(),
+        };
+
+        let interface = finalize_register_effects(&tc.ctx, &effects).unwrap();
+
+        assert!(interface.inputs.is_empty());
+        assert_eq!(interface.outputs, vec![tc.r0]);
+    }
+
+    #[test]
+    fn conditional_write_is_also_a_read_before_materialization() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry @condition:i8>
+                    if @condition goto <written> else goto <preserved>;
+                <written>
+                    store(register:8, {r0} <- i64 7);
+                    return at i64 0;
+                <preserved>
+                    return at i64 0;
+            "
+        );
+        let _ = (entry, written, preserved);
+        let graph = CallGraph::analyze(&tc.ctx);
+        let channel = RegChannel { sp: None };
+        let summaries = solve_summaries(&tc.ctx, &graph, &channel);
+        let effects = summaries.get(f).as_ref().unwrap();
+
+        assert!(effects.reads.contains(&r0));
+        assert!(effects.writes.contains(&r0));
+
+        let interface = finalize_register_effects(&tc.ctx, effects).unwrap();
+        super::super::registers::materialize_interface(&mut tc.ctx, f, &interface);
+        let RegisterChannelState::Materialized(map) =
+            &FunctionBody::from_id(&tc.ctx, f).effects().register
+        else {
+            panic!("materialization must persist its interface map");
+        };
+        assert_eq!(map.inputs, vec![r0]);
+        assert_eq!(map.outputs, vec![r0]);
     }
 }

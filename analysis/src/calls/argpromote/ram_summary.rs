@@ -100,7 +100,8 @@ use jstd::graph::analysis::{DominatorTree, compute_dominators};
 use qcode::{
     context::Context,
     value::{
-        ArgMemKind, BlockId, FunctionBody, FunctionId, ModuleView, ValueId, ValueRef, VarnodeId,
+        ArgMemKind, BlockId, FunctionBody, FunctionId, MemoryChannelState, ModuleView, ValueId,
+        ValueRef, VarnodeId, WrittenSpacesState,
         insn::{InstructionId, Mnemonic},
     },
 };
@@ -171,6 +172,23 @@ impl RamEffects {
     /// return). This is the blocking-call gate's admission predicate.
     pub(crate) fn outward_invisible(&self) -> bool {
         self.precise.as_ref().is_some_and(Footprint::invisible)
+    }
+}
+
+/// Rebuild the fixed effect-engine leaf for an out-of-cone function from its
+/// persisted memory summary. Provenance assumptions are scheduling metadata,
+/// not part of [`MemoryChannelState`], so the fixed leaf starts with no pending
+/// external-confinement provenance.
+#[allow(dead_code)] // Wired by the incremental cone solver in the next slice.
+pub(crate) fn fixed_effects_from_memory_state(state: &MemoryChannelState) -> RamEffects {
+    let written = match &state.coarse {
+        WrittenSpacesState::Bounded(spaces) => Some(spaces.iter().copied().collect()),
+        WrittenSpacesState::Unstamped | WrittenSpacesState::Unbounded => None,
+    };
+    RamEffects {
+        precise: state.precise.clone(),
+        written,
+        externals: FxHashSet::default(),
     }
 }
 
@@ -313,12 +331,16 @@ impl RamChannel {
                 if let AddressRelation::Const(off) =
                     relate_address(ctx, numbering, param, access.ptr, access.block)
                 {
-                    eff.fields.insert(RamField {
+                    let field = RamField {
                         base: RamBase::Param(idx),
                         offset: off,
                         size: access.size,
-                        write: access.is_store,
-                    });
+                    };
+                    if access.is_store {
+                        eff.writes.fields.insert(field);
+                    } else {
+                        eff.reads.fields.insert(field);
+                    }
                     claimed.insert(access.id);
                 }
             }
@@ -326,12 +348,35 @@ impl RamChannel {
             for ru in &region_set.regions {
                 let lo = i64::try_from(ru.region.base_off).ok()?;
                 let hi = lo.checked_add(i64::try_from(ru.region.byte_len()).ok()?)?;
-                eff.regions.insert(RamRegion {
+                let region = RamRegion {
                     base: RamBase::Param(idx),
                     lo,
                     hi,
-                    write: ru.region.has_write,
+                };
+                if ru.region.has_write {
+                    eff.writes.regions.insert(region);
+                }
+                let has_read = ru.accesses.iter().any(|id| {
+                    outward
+                        .iter()
+                        .any(|access| access.id == *id && !access.is_store)
                 });
+                let store_blocks: FxHashSet<_> = ru
+                    .accesses
+                    .iter()
+                    .filter_map(|id| {
+                        outward
+                            .iter()
+                            .find(|access| access.id == *id && access.is_store)
+                            .map(|access| access.block)
+                    })
+                    .collect();
+                if has_read
+                    || (ru.region.has_write
+                        && !super::ram::definitely_written_on_all_returns(ctx, fid, &store_blocks))
+                {
+                    eff.reads.regions.insert(region);
+                }
                 claimed.extend(ru.accesses.iter().copied());
             }
             // `rejected_accesses` stay unclaimed; the completeness check below
@@ -342,12 +387,16 @@ impl RamChannel {
                 continue;
             }
             if let Some((addr, _)) = global_slot(ctx, fid, lptr, space) {
-                eff.fields.insert(RamField {
+                let field = RamField {
                     base: RamBase::Global(addr),
                     offset: 0,
                     size: access.size,
-                    write: access.is_store,
-                });
+                };
+                if access.is_store {
+                    eff.writes.fields.insert(field);
+                } else {
+                    eff.reads.fields.insert(field);
+                }
                 claimed.insert(access.id);
             }
         }
@@ -355,6 +404,44 @@ impl RamChannel {
         // is not fully expressed — the summary must be ⊤, not a subset.
         if outward.iter().any(|a| !claimed.contains(&a.id)) {
             return None;
+        }
+        // A write that is not guaranteed on every return path must preserve the
+        // incoming value on a skipped path. That preservation is a semantic
+        // read of the same exact location key, not an invented materialization
+        // input. Definitely-written keys remain write-only.
+        let write_fields: Vec<RamField> = eff.writes.fields.iter().copied().collect();
+        for field in write_fields {
+            let mut store_blocks = FxHashSet::default();
+            for (access, &(lptr, space)) in outward.iter().zip(raw) {
+                if !access.is_store || access.size != field.size {
+                    continue;
+                }
+                let matches = match field.base {
+                    RamBase::Param(index) => {
+                        params.get(index as usize).is_some_and(|&(param, _)| {
+                            matches!(
+                                relate_address(
+                                    ctx,
+                                    numbering,
+                                    param,
+                                    access.ptr,
+                                    access.block
+                                ),
+                                AddressRelation::Const(offset) if offset == field.offset
+                            )
+                        })
+                    }
+                    RamBase::Global(address) => global_slot(ctx, fid, lptr, space)
+                        .is_some_and(|(found, _)| found == address && field.offset == 0),
+                    RamBase::Frame(_) | RamBase::Private => false,
+                };
+                if matches {
+                    store_blocks.insert(access.block);
+                }
+            }
+            if !super::ram::definitely_written_on_all_returns(ctx, fid, &store_blocks) {
+                eff.reads.fields.insert(field);
+            }
         }
         if eff.len() > MAX_EFFECT_ENTRIES {
             return None;
@@ -634,7 +721,8 @@ impl EffectChannel for RamChannel {
                 externals: FxHashSet::default(),
             });
         }
-        let mut objects: std::collections::BTreeSet<RamObject> = Default::default();
+        let mut reads = qcode::value::RamLocations::default();
+        let mut writes = qcode::value::RamLocations::default();
         let mut any_write_ptr = false;
         for (i, kind) in argmem.params.iter().enumerate() {
             let base = RamBase::Param(i as u32);
@@ -646,8 +734,8 @@ impl EffectChannel for RamChannel {
                     // sends a frame-local landing to ⊤ in `transfer` (freshness),
                     // so a caller cannot memory-free-fold this through an
                     // uninitialized local.
-                    objects.insert(RamObject { base, write: true });
-                    objects.insert(RamObject { base, write: false });
+                    writes.objects.insert(RamObject { base });
+                    reads.objects.insert(RamObject { base });
                     any_write_ptr = true;
                 }
                 ArgMemKind::OutPtr => {
@@ -655,11 +743,11 @@ impl EffectChannel for RamChannel {
                     // `extern_argmem` table): a pure whole-object write, no read
                     // half — a frame landing is contained (the `memset(&local)`
                     // fold).
-                    objects.insert(RamObject { base, write: true });
+                    writes.objects.insert(RamObject { base });
                     any_write_ptr = true;
                 }
                 ArgMemKind::ConstPtr => {
-                    objects.insert(RamObject { base, write: false });
+                    reads.objects.insert(RamObject { base });
                 }
                 // Filtered out above.
                 ArgMemKind::Opaque => unreachable!(),
@@ -674,10 +762,7 @@ impl EffectChannel for RamChannel {
             Some(std::collections::BTreeSet::new())
         };
         Some(RamEffects {
-            precise: Some(Footprint {
-                objects,
-                ..Footprint::default()
-            }),
+            precise: Some(Footprint { reads, writes }),
             written,
             // An external's own summary describes only its footprint; the
             // confinement flag is minted by the caller that rebases it.
@@ -769,61 +854,78 @@ impl EffectChannel for RamChannel {
                     }
                 })
             };
-            for f in &fp.fields {
-                match rebase(f.base, f.write)? {
-                    None => {}
-                    Some((base, shift)) => {
-                        let offset = f.offset.checked_add(shift)?;
-                        // A frame landing must stay strictly below the caller's
-                        // entry SP — crossing into the return-address slot or the
-                        // caller's caller frame is not containable.
-                        if let RamBase::Frame(t) = base
-                            && t.checked_add(offset)?
-                                .checked_add(i64::try_from(f.size).ok()?)?
-                                > 0
-                        {
-                            return None;
+            for (locations, write) in [(&fp.reads, false), (&fp.writes, true)] {
+                for f in &locations.fields {
+                    match rebase(f.base, write)? {
+                        None => {}
+                        Some((base, shift)) => {
+                            let offset = f.offset.checked_add(shift)?;
+                            // A frame landing must stay strictly below the caller's
+                            // entry SP — crossing into the return-address slot or the
+                            // caller's caller frame is not containable.
+                            if let RamBase::Frame(t) = base
+                                && t.checked_add(offset)?
+                                    .checked_add(i64::try_from(f.size).ok()?)?
+                                    > 0
+                            {
+                                return None;
+                            }
+                            let target = if write {
+                                &mut out.writes
+                            } else {
+                                &mut out.reads
+                            };
+                            target.fields.insert(RamField { base, offset, ..*f });
                         }
-                        out.fields.insert(RamField { base, offset, ..*f });
                     }
                 }
-            }
-            for r in &fp.regions {
-                match rebase(r.base, r.write)? {
-                    None => {}
-                    Some((base, shift)) => {
-                        let lo = r.lo.checked_add(shift)?;
-                        let hi = r.hi.checked_add(shift)?;
-                        if let RamBase::Frame(t) = base
-                            && t.checked_add(hi)? > 0
-                        {
-                            return None;
+                for r in &locations.regions {
+                    match rebase(r.base, write)? {
+                        None => {}
+                        Some((base, shift)) => {
+                            let lo = r.lo.checked_add(shift)?;
+                            let hi = r.hi.checked_add(shift)?;
+                            if let RamBase::Frame(t) = base
+                                && t.checked_add(hi)? > 0
+                            {
+                                return None;
+                            }
+                            let target = if write {
+                                &mut out.writes
+                            } else {
+                                &mut out.reads
+                            };
+                            target.regions.insert(RamRegion { base, lo, hi });
                         }
-                        out.regions.insert(RamRegion { base, lo, hi, ..*r });
                     }
                 }
-            }
-            for o in &fp.objects {
-                // A whole-object entry has no extent, so — unlike fields and
-                // regions — there is NO containment/boundary arithmetic on a
-                // frame landing: a callee's whole-object write into a caller
-                // own-frame local is admitted outright under the confinement
-                // assumption (the external writes only within the addressed
-                // object, and the caller's frame local dies at return). See
-                // stage 4 (`ExternalArgmemConfinement`) in the module docs. A
-                // frame-landing object *read* is still rejected by `rebase`
-                // (freshness), exactly like a field read — which is why a
-                // read-write `MutPtr` external (both objects) goes ⊤ on a frame
-                // landing while a write-only `OutPtr` one (write object only)
-                // is contained.
-                match rebase(o.base, o.write)? {
-                    None => {}
-                    Some((base, _shift)) => {
-                        // A prototyped external's object was folded into the
-                        // caller (any landing base) — the confinement assumption
-                        // is now load-bearing here (rule 2).
-                        ext_object_landed = true;
-                        out.objects.insert(RamObject { base, ..*o });
+                for o in &locations.objects {
+                    // A whole-object entry has no extent, so — unlike fields and
+                    // regions — there is NO containment/boundary arithmetic on a
+                    // frame landing: a callee's whole-object write into a caller
+                    // own-frame local is admitted outright under the confinement
+                    // assumption (the external writes only within the addressed
+                    // object, and the caller's frame local dies at return). See
+                    // stage 4 (`ExternalArgmemConfinement`) in the module docs. A
+                    // frame-landing object *read* is still rejected by `rebase`
+                    // (freshness), exactly like a field read — which is why a
+                    // read-write `MutPtr` external (both objects) goes ⊤ on a frame
+                    // landing while a write-only `OutPtr` one (write object only)
+                    // is contained.
+                    match rebase(o.base, write)? {
+                        None => {}
+                        Some((base, _shift)) => {
+                            // A prototyped external's object was folded into the
+                            // caller (any landing base) — the confinement assumption
+                            // is now load-bearing here (rule 2).
+                            ext_object_landed = true;
+                            let target = if write {
+                                &mut out.writes
+                            } else {
+                                &mut out.reads
+                            };
+                            target.objects.insert(RamObject { base });
+                        }
                     }
                 }
             }
@@ -851,9 +953,12 @@ impl EffectChannel for RamChannel {
         into.precise = match (into.precise.take(), &from.precise) {
             (Some(mut a), Some(b)) => {
                 let before = a.len();
-                a.fields.extend(b.fields.iter().copied());
-                a.regions.extend(b.regions.iter().copied());
-                a.objects.extend(b.objects.iter().copied());
+                a.reads.fields.extend(b.reads.fields.iter().copied());
+                a.reads.regions.extend(b.reads.regions.iter().copied());
+                a.reads.objects.extend(b.reads.objects.iter().copied());
+                a.writes.fields.extend(b.writes.fields.iter().copied());
+                a.writes.regions.extend(b.writes.regions.iter().copied());
+                a.writes.objects.extend(b.writes.objects.iter().copied());
                 grew |= a.len() != before;
                 if a.len() > MAX_EFFECT_ENTRIES {
                     grew = true;
@@ -912,9 +1017,27 @@ pub(crate) fn is_memory_free(summaries: &EffectSummaries<RamChannel>, fid: Funct
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qcode::space::SpaceId;
     use qcode::value::QCodeMut;
     use qcode::value::insn::{Call, CallTag, Callee};
     use qcode_macro::qcode;
+
+    #[test]
+    fn persisted_memory_state_rebuilds_fixed_leaf() {
+        let space = SpaceId::from(3usize);
+        let precise = Footprint::default();
+        let fixed = fixed_effects_from_memory_state(&MemoryChannelState {
+            coarse: WrittenSpacesState::Bounded(vec![space]),
+            precise: Some(precise.clone()),
+        });
+        assert_eq!(fixed.written, Some([space].into_iter().collect()));
+        assert_eq!(fixed.precise, Some(precise));
+        assert!(fixed.externals.is_empty());
+
+        let top = fixed_effects_from_memory_state(&MemoryChannelState::default());
+        assert_eq!(top.written, None);
+        assert_eq!(top.precise, None);
+    }
 
     /// Find the (single) call in `block`, give it positional `args` and the
     /// regpure tag, and resolve it to `target`.
@@ -1175,26 +1298,62 @@ mod tests {
         let s = solve(&tc.ctx, &graph, None);
         let eff = s.get(callee).as_ref().expect("summary is expressible");
         let fp = eff.precise.as_ref().expect("footprint is expressible");
-        let mut fields: Vec<RamField> = fp.fields.iter().copied().collect();
-        fields.sort_by_key(|f| (f.base, f.offset));
         assert_eq!(
-            fields,
-            vec![
-                RamField {
-                    base: RamBase::Param(0),
-                    offset: 0,
-                    size: 4,
-                    write: true
-                },
-                RamField {
-                    base: RamBase::Param(1),
-                    offset: 8,
-                    size: 4,
-                    write: false
-                },
-            ]
+            fp.writes.fields,
+            [RamField {
+                base: RamBase::Param(0),
+                offset: 0,
+                size: 4
+            }]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            fp.reads.fields,
+            [RamField {
+                base: RamBase::Param(1),
+                offset: 8,
+                size: 4
+            }]
+            .into_iter()
+            .collect()
         );
         assert!(!is_memory_free(&s, callee), "a real footprint still blocks");
+    }
+
+    /// The persisted representation keeps direction outside the location key:
+    /// materialization can therefore use these exact keys for its read/write
+    /// bindings without manufacturing a read for an unconditional store.
+    #[test]
+    fn precise_ram_effects_are_separate_location_sets() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn writer:
+                <entry @p:i64>
+                    store(ram:4, @p <- i32 9);
+                    return at i32 0;
+            "
+        );
+        let _ = entry;
+        materialize(&mut tc, writer);
+        let graph = CallGraph::analyze(&tc.ctx);
+        let summaries = solve(&tc.ctx, &graph, None);
+        let fp = summaries
+            .get(writer)
+            .as_ref()
+            .expect("summary")
+            .precise
+            .as_ref()
+            .expect("precise footprint");
+        let key = RamField {
+            base: RamBase::Param(0),
+            offset: 0,
+            size: 4,
+        };
+        assert_eq!(fp.writes.fields, [key].into_iter().collect());
+        assert!(fp.reads.fields.is_empty());
     }
 
     /// Stage 2b transfer: `Param` entries rebase through the actual call
@@ -1247,24 +1406,25 @@ mod tests {
         let s = solve(&tc.ctx, &graph, None);
         let eff = s.get(caller).as_ref().expect("summary is expressible");
         let fp = eff.precise.as_ref().expect("rebase must succeed");
-        let mut fields: Vec<RamField> = fp.fields.iter().copied().collect();
-        fields.sort_by_key(|f| (f.base, f.offset));
         assert_eq!(
-            fields,
-            vec![
-                RamField {
-                    base: RamBase::Param(0),
-                    offset: 0x10,
-                    size: 4,
-                    write: true
-                },
-                RamField {
-                    base: RamBase::Global(0x4000),
-                    offset: 8,
-                    size: 4,
-                    write: false
-                },
-            ]
+            fp.writes.fields,
+            [RamField {
+                base: RamBase::Param(0),
+                offset: 0x10,
+                size: 4
+            }]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            fp.reads.fields,
+            [RamField {
+                base: RamBase::Global(0x4000),
+                offset: 8,
+                size: 4
+            }]
+            .into_iter()
+            .collect()
         );
         assert!(!is_memory_free(&s, caller));
     }
@@ -1296,15 +1456,15 @@ mod tests {
         let s = solve(&tc.ctx, &graph, None);
         let eff = s.get(caller).as_ref().expect("summary is expressible");
         let fp = eff.precise.as_ref().expect("tail rebase must succeed");
-        let fields: Vec<RamField> = fp.fields.iter().copied().collect();
         assert_eq!(
-            fields,
-            vec![RamField {
+            fp.writes.fields,
+            [RamField {
                 base: RamBase::Param(0),
                 offset: 0,
-                size: 8,
-                write: true
-            }],
+                size: 8
+            }]
+            .into_iter()
+            .collect(),
             "the tail callee's Param(0) write rebases onto the caller's Param(0)"
         );
         assert!(!is_memory_free(&s, caller));
@@ -1336,15 +1496,15 @@ mod tests {
         let s = solve(&tc.ctx, &graph, None);
         let eff = s.get(caller).as_ref().expect("summary is expressible");
         let fp = eff.precise.as_ref().expect("apply rebase must succeed");
-        let fields: Vec<RamField> = fp.fields.iter().copied().collect();
         assert_eq!(
-            fields,
-            vec![RamField {
+            fp.writes.fields,
+            [RamField {
                 base: RamBase::Param(0),
                 offset: 0,
-                size: 8,
-                write: true
-            }],
+                size: 8
+            }]
+            .into_iter()
+            .collect(),
             "the applied callee's Param(0) write rebases onto the caller's Param(0)"
         );
         assert!(!is_memory_free(&s, caller));
@@ -1557,22 +1717,22 @@ mod tests {
         let ch = RamChannel::new(Some(sp));
         let callee_eff = RamEffects {
             precise: Some(Footprint {
-                objects: [
-                    RamObject {
-                        base: RamBase::Param(0),
-                        write: true,
-                    },
-                    RamObject {
-                        base: RamBase::Param(1),
-                        write: true,
-                    },
-                    RamObject {
-                        base: RamBase::Param(2),
-                        write: true,
-                    },
-                ]
-                .into_iter()
-                .collect(),
+                writes: qcode::value::RamLocations {
+                    objects: [
+                        RamObject {
+                            base: RamBase::Param(0),
+                        },
+                        RamObject {
+                            base: RamBase::Param(1),
+                        },
+                        RamObject {
+                            base: RamBase::Param(2),
+                        },
+                    ]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                },
                 ..Footprint::default()
             }),
             written: Some(Default::default()),
@@ -1589,22 +1749,19 @@ mod tests {
             .expect("transfer succeeds")
             .precise
             .expect("rebase succeeds");
-        let mut objs: Vec<RamObject> = out.objects.iter().copied().collect();
+        let mut objs: Vec<RamObject> = out.writes.objects.iter().copied().collect();
         objs.sort_by_key(|o| o.base);
         assert_eq!(
             objs,
             vec![
                 RamObject {
-                    base: RamBase::Param(0),
-                    write: true
+                    base: RamBase::Param(0)
                 },
                 RamObject {
-                    base: RamBase::Frame(-0x20),
-                    write: true
+                    base: RamBase::Frame(-0x20)
                 },
                 RamObject {
-                    base: RamBase::Global(0x4000),
-                    write: true
+                    base: RamBase::Global(0x4000)
                 },
             ]
         );
@@ -1651,12 +1808,14 @@ mod tests {
         let ch = RamChannel::new(Some(sp));
         let callee_eff = RamEffects {
             precise: Some(Footprint {
-                objects: [RamObject {
-                    base: RamBase::Param(0),
-                    write: false,
-                }]
-                .into_iter()
-                .collect(),
+                reads: qcode::value::RamLocations {
+                    objects: [RamObject {
+                        base: RamBase::Param(0),
+                    }]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                },
                 ..Footprint::default()
             }),
             written: Some(Default::default()),
@@ -1682,18 +1841,16 @@ mod tests {
     #[test]
     fn invisible_with_frame_write_object() {
         let mut fp = Footprint::default();
-        fp.objects.insert(RamObject {
+        fp.writes.objects.insert(RamObject {
             base: RamBase::Frame(-0x20),
-            write: true,
         });
         assert!(
             fp.invisible(),
             "a Frame-contained object write is outward-invisible"
         );
         let mut real = Footprint::default();
-        real.objects.insert(RamObject {
+        real.writes.objects.insert(RamObject {
             base: RamBase::Param(0),
-            write: true,
         });
         assert!(
             !real.invisible(),
@@ -1824,10 +1981,9 @@ mod tests {
             .as_ref()
             .expect("argmem footprint is expressible");
         assert_eq!(
-            fp.objects.iter().copied().collect::<Vec<_>>(),
+            fp.writes.objects.iter().copied().collect::<Vec<_>>(),
             vec![RamObject {
-                base: RamBase::Param(0),
-                write: true
+                base: RamBase::Param(0)
             }]
         );
         assert!(
@@ -1901,12 +2057,10 @@ mod tests {
             .as_ref()
             .expect("argmem footprint is expressible");
         assert!(
-            fp.objects.contains(&RamObject {
-                base: RamBase::Param(0),
-                write: true,
-            }) && fp.objects.contains(&RamObject {
-                base: RamBase::Param(0),
-                write: false,
+            fp.writes.objects.contains(&RamObject {
+                base: RamBase::Param(0)
+            }) && fp.reads.objects.contains(&RamObject {
+                base: RamBase::Param(0)
             }),
             "a MutPtr dest carries both a write and a read object"
         );
@@ -1964,10 +2118,9 @@ mod tests {
             .as_ref()
             .expect("argmem footprint is expressible");
         assert_eq!(
-            fp.objects.iter().copied().collect::<Vec<_>>(),
+            fp.reads.objects.iter().copied().collect::<Vec<_>>(),
             vec![RamObject {
-                base: RamBase::Param(0),
-                write: false
+                base: RamBase::Param(0)
             }]
         );
         assert!(
@@ -2023,10 +2176,7 @@ mod tests {
             .precise
             .as_ref()
             .expect("empty footprint is expressible");
-        assert!(
-            fp.objects.is_empty(),
-            "no pointer params ⇒ no argmem objects"
-        );
+        assert!(fp.reads.objects.is_empty() && fp.writes.objects.is_empty());
         assert!(
             ext.written.as_ref().is_some_and(|w| w.is_empty()),
             "a pointer-free external writes nothing"
@@ -2061,11 +2211,10 @@ mod tests {
         let mk = |range: std::ops::Range<i64>| {
             let mut fp = Footprint::default();
             for offset in range {
-                fp.fields.insert(RamField {
+                fp.reads.fields.insert(RamField {
                     base: RamBase::Param(0),
                     offset,
                     size: 1,
-                    write: false,
                 });
             }
             RamEffects {
@@ -2350,11 +2499,10 @@ mod tests {
             .as_ref()
             .expect("the reload forwarded to the param — no longer ⊤");
         assert!(
-            fp.fields.contains(&RamField {
+            fp.writes.fields.contains(&RamField {
                 base: RamBase::Param(1),
                 offset: 0,
                 size: 8,
-                write: true,
             }),
             "the callee's Param(0) write composes onto the caller's Param(1) \
              (the spilled `@buf_in`): {fp:?}"

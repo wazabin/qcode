@@ -128,10 +128,31 @@ pub(crate) fn solve_summaries<C: EffectChannel>(
     graph: &CallGraph,
     chan: &C,
 ) -> EffectSummaries<C> {
+    solve_summaries_with_fixed(ctx, graph, chan, &FxHashMap::default())
+}
+
+/// Solve summaries while treating selected functions as fixed interface leaves.
+///
+/// The incremental driver resets the invalidated cone to bottom and supplies
+/// every out-of-cone function here from its persisted
+/// [`FunctionEffects`](qcode::value::FunctionEffects).
+/// Fixed functions are never scanned and their callees are not joined into them;
+/// callers inside the cone consume the supplied summary exactly as they would an
+/// external leaf.
+pub(crate) fn solve_summaries_with_fixed<C: EffectChannel>(
+    ctx: &Context,
+    graph: &CallGraph,
+    chan: &C,
+    fixed: &FxHashMap<FunctionId, Summary<C::Effects>>,
+) -> EffectSummaries<C> {
     let fids: Vec<FunctionId> = ctx.function_ids();
 
     let mut map: FxHashMap<FunctionId, Summary<C::Effects>> = FxHashMap::default();
     for &fid in &fids {
+        if let Some(summary) = fixed.get(&fid) {
+            map.insert(fid, summary.clone());
+            continue;
+        }
         let f = FunctionBody::from_id(ctx, fid);
         let seed = if f.is_external() {
             chan.external_leaf(ctx, fid).ok_or(TopCause::External)
@@ -154,8 +175,12 @@ pub(crate) fn solve_summaries<C: EffectChannel>(
 
     // Monotone worklist: recompute a caller from its callees; requeue its own
     // callers whenever it grows. `in_list` dedupes queue membership.
-    let mut worklist: Vec<FunctionId> = fids.clone();
-    let mut in_list: rustc_hash::FxHashSet<FunctionId> = fids.iter().copied().collect();
+    let mut worklist: Vec<FunctionId> = fids
+        .iter()
+        .copied()
+        .filter(|fid| !fixed.contains_key(fid))
+        .collect();
+    let mut in_list: rustc_hash::FxHashSet<FunctionId> = worklist.iter().copied().collect();
     while let Some(fid) = worklist.pop() {
         in_list.remove(&fid);
         if map[&fid].is_err() {
@@ -193,7 +218,7 @@ pub(crate) fn solve_summaries<C: EffectChannel>(
         }
         if grew {
             for caller in graph.callers(fid) {
-                if in_list.insert(caller) {
+                if !fixed.contains_key(&caller) && in_list.insert(caller) {
                     worklist.push(caller);
                 }
             }

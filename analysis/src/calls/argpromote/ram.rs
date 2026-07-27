@@ -10,8 +10,8 @@ use qcode::{
     space::{LocalMemorySpaceId, MemorySpaceId},
     types::TypeId,
     value::{
-        ArgMemKind, BasicBlock, FunctionBody, FunctionId, TempSpace, TempSpaceId, Value, ValueId,
-        VarnodeId,
+        ArgMemKind, BasicBlock, BlockId, FunctionBody, FunctionId, TempSpace, TempSpaceId, Value,
+        ValueId, VarnodeId,
         insn::{Call, InstructionId, Mnemonic},
     },
 };
@@ -319,6 +319,37 @@ struct ParamInfo {
     region: Option<SequenceRegion>,
 }
 
+/// Whether every entry-to-return path crosses a block containing a store to one
+/// exact location key. Store instructions precede their block terminator, so a
+/// store block is a barrier: traversal need not continue through it.
+pub(super) fn definitely_written_on_all_returns(
+    ctx: &Context,
+    fid: FunctionId,
+    store_blocks: &FxHashSet<BlockId>,
+) -> bool {
+    let function = FunctionBody::from_id(ctx, fid);
+    let Some(root) = function.root().map(|block| block.id) else {
+        return false;
+    };
+    let mut pending = vec![root];
+    let mut visited = FxHashSet::default();
+    while let Some(block) = pending.pop() {
+        if !visited.insert(block) || store_blocks.contains(&block) {
+            continue;
+        }
+        let block_ref = BasicBlock::from_id(ctx, block);
+        if block_ref
+            .iter()
+            .last()
+            .is_some_and(|insn| matches!(insn.mnemonic(), Mnemonic::Return(_)))
+        {
+            return false;
+        }
+        pending.extend(block_ref.successors().map(|(_, successor)| successor));
+    }
+    true
+}
+
 /// A materialized global slot: a constant real-ram address this function accesses.
 /// The RAM channel owns global materialization — a read becomes a by-value input
 /// carrying `mem[addr]` (seeded into the shadow at the literal address), a write
@@ -332,6 +363,11 @@ struct GlobalAccess {
     size: usize,
     /// Whether any access at this slot is a store (rides out in the write-set).
     has_write: bool,
+    /// Whether the semantic effect reads the incoming value: an actual load, or
+    /// a store that is not guaranteed on every return path.
+    has_read: bool,
+    /// Blocks containing stores to this exact `(addr, size)` key.
+    store_blocks: FxHashSet<BlockId>,
     /// The real-ram load/store instructions to redirect into the shadow.
     accesses: Vec<InstructionId>,
 }
@@ -369,6 +405,10 @@ fn collect_globals(ctx: &Context, fid: FunctionId) -> Vec<GlobalAccess> {
                 .find(|g| g.addr == addr && g.size == size)
             {
                 g.has_write |= is_store;
+                g.has_read |= !is_store;
+                if is_store {
+                    g.store_blocks.insert(block.id);
+                }
                 g.accesses.push(insn.id);
             } else {
                 globals.push(GlobalAccess {
@@ -376,9 +416,20 @@ fn collect_globals(ctx: &Context, fid: FunctionId) -> Vec<GlobalAccess> {
                     addr_size,
                     size,
                     has_write: is_store,
+                    has_read: !is_store,
+                    store_blocks: if is_store {
+                        [block.id].into_iter().collect()
+                    } else {
+                        FxHashSet::default()
+                    },
                     accesses: vec![insn.id],
                 });
             }
+        }
+    }
+    for global in &mut globals {
+        if global.has_write && !definitely_written_on_all_returns(ctx, fid, &global.store_blocks) {
+            global.has_read = true;
         }
     }
     globals
@@ -539,6 +590,7 @@ fn try_promote(
     for (param, name) in candidates {
         let info = analyze_param(
             ctx,
+            fid,
             &numbering,
             &accesses_in,
             param,
@@ -1017,6 +1069,7 @@ pub(super) fn function_makes_blocking_call(
 /// is_store, ptr, size); precomputed once and shared across all params.
 fn analyze_param(
     ctx: &Context,
+    fid: FunctionId,
     numbering: &Numbering,
     accesses_in: &[MemoryAccess],
     param: ValueId,
@@ -1026,7 +1079,7 @@ fn analyze_param(
     let mut accesses: Vec<InstructionId> = Vec::new();
     // (offset from base, access width) for each load — one snapshot scalar each.
     let mut read_fields: Vec<ReadField> = Vec::new();
-    let mut write_targets: Vec<(ValueId, usize)> = Vec::new();
+    let mut write_targets: Vec<(ValueId, usize, BlockId, i64)> = Vec::new();
     let mut is_deref = false;
 
     // Record a load at constant byte `offset` of `size` bytes. The width is gated
@@ -1038,11 +1091,12 @@ fn analyze_param(
         if !matches!(size, 1 | 2 | 4 | 8) {
             return false;
         }
-        // Dedup by offset, widening to the largest access there (a narrower load
-        // forwards from the wider seed via base+const matching).
-        if let Some(f) = read_fields.iter_mut().find(|f| f.offset == offset) {
-            f.size = f.size.max(size);
-        } else {
+        // Semantic location keys include width: overlapping reads remain
+        // distinct bindings rather than widening into one invented key.
+        if !read_fields
+            .iter()
+            .any(|f| f.offset == offset && f.size == size)
+        {
             read_fields.push(ReadField { offset, size });
         }
         true
@@ -1058,7 +1112,7 @@ fn analyze_param(
                     // two's-complement at the caller).
                     is_deref = true;
                     accesses.push(access.id);
-                    write_targets.push((access.ptr, access.size));
+                    write_targets.push((access.ptr, access.size, access.block, off));
                 } else if off >= 0 {
                     // Reads become caller-seeded snapshots at `arg + offset`, so only
                     // a non-negative offset is recomputable; a negative-offset read
@@ -1109,15 +1163,34 @@ fn analyze_param(
     // read. (This is the TEB/PEB bug: a wide bounded fs-offset failed to build a
     // region, leaving the `load(teb + idx)` redirected to shadow with no snapshot arg.)
 
-    // Deterministic offset order, shared by callee param creation and caller
+    // A write that may be skipped on a return path semantically reads the
+    // incoming value so the materialized no-write path can replay a no-op.
+    // Definitely-written keys remain genuinely write-only.
+    let mut write_keys: Vec<(ValueId, usize, i64, FxHashSet<BlockId>)> = Vec::new();
+    for &(address, size, block, offset) in &write_targets {
+        if let Some((_, _, _, blocks)) = write_keys
+            .iter_mut()
+            .find(|(a, s, o, _)| *a == address && *s == size && *o == offset)
+        {
+            blocks.insert(block);
+        } else {
+            write_keys.push((address, size, offset, [block].into_iter().collect()));
+        }
+    }
+    for &(_, size, offset, ref blocks) in &write_keys {
+        if offset >= 0 && !definitely_written_on_all_returns(ctx, fid, blocks) {
+            let _ = push_read(offset as u64, size);
+        }
+    }
+    // Deterministic exact-key order, shared by callee param creation and caller
     // argument loads.
-    read_fields.sort_by_key(|f| f.offset);
+    read_fields.sort_by_key(|f| (f.offset, f.size));
 
-    // Dedup write targets by address value.
+    // Dedup write targets by exact address-and-width key.
     let mut deduped: Vec<(ValueId, usize)> = Vec::new();
-    for wt in write_targets {
-        if !deduped.iter().any(|(a, _)| *a == wt.0) {
-            deduped.push(wt);
+    for (address, size, _, _) in write_targets {
+        if !deduped.iter().any(|&(a, s)| a == address && s == size) {
+            deduped.push((address, size));
         }
     }
 
@@ -1203,7 +1276,7 @@ fn apply(
             let base_size = based.map_or(p.base_size, |q| q.base_size);
             if !write_slots
                 .iter()
-                .any(|&(b, _, o, _, _)| b == base && o == offset)
+                .any(|&(b, _, o, s, _)| b == base && o == offset && s == size)
             {
                 write_slots.push((base, base_size, offset, size, based.map(|q| q.arg_idx)));
             }
@@ -1299,25 +1372,6 @@ fn apply(
             });
         }
     }
-    for &(base, base_size, offset, size, _) in &write_slots {
-        if snaps.iter().any(|s| s.base == base && s.offset == offset) {
-            continue;
-        }
-        let Some(q) = promoted.iter().find(|q| q.param == base) else {
-            continue;
-        };
-        snaps.push(Snap {
-            arg_idx: q.arg_idx,
-            base,
-            base_size,
-            offset,
-            size,
-            name: q.name.clone(),
-            type_id: None,
-            tag: "val",
-        });
-    }
-
     // Add one by-value snapshot input per slot (reads and seeded writes alike), in
     // the deterministic `snaps` order so the callee params and caller args stay in
     // lockstep. Each is seeded into the shadow at its `base + offset` so the body's
@@ -1365,7 +1419,7 @@ fn apply(
         );
     }
 
-    // Materialize each global slot (read or written) as one by-value input
+    // Materialize each semantic global read as one by-value input
     // carrying `mem[addr]`, seeded into the shadow at the literal address so the
     // body's (about-to-be-redirected) access forwards from it. Minted *after* the
     // per-param snapshot loop, in deterministic first-seen order, so callee params
@@ -1373,6 +1427,9 @@ fn apply(
     // sites bind the value from it (the emulator reads `mem[addr]`), while the
     // regpure/direct sites in `call_sites` load the value verbatim.
     for g in &globals {
+        if !g.has_read {
+            continue;
+        }
         let (addr, addr_size, size) = (g.addr, g.addr_size, g.size);
         let origin = ctx.get_const(addr, addr_size).id();
         super::add_input(

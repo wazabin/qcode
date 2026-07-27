@@ -40,7 +40,7 @@ pub enum RamBase {
     Private,
 }
 
-/// One scalar effect: `size` bytes at `base + offset`, read or written.
+/// One scalar memory location: `size` bytes at `base + offset`.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -48,11 +48,10 @@ pub struct RamField {
     pub base: RamBase,
     pub offset: i64,
     pub size: usize,
-    pub write: bool,
 }
 
 /// One bounded dynamic-index effect: the half-open byte span
-/// `[base + lo, base + hi)`, read (and written iff `write`).
+/// `[base + lo, base + hi)`.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -60,11 +59,10 @@ pub struct RamRegion {
     pub base: RamBase,
     pub lo: i64,
     pub hi: i64,
-    pub write: bool,
 }
 
-/// One **whole-object** effect: the callee touches the entire (extent-unknown)
-/// object addressed by `base`, read (and written iff `write`). Minted **only**
+/// One **whole-object** location: the entire (extent-unknown) object addressed
+/// by `base`. Minted **only**
 /// from an external prototype's pointer parameters; bodied-function scans never
 /// mint object entries (their footprint is exhaustively classified into
 /// fields/regions). `write == true` models a read+write (possibly in-out)
@@ -74,10 +72,9 @@ pub struct RamRegion {
 )]
 pub struct RamObject {
     pub base: RamBase,
-    pub write: bool,
 }
 
-/// The precise half of a memory summary: the exhaustively classified footprint.
+/// One direction of the exhaustively classified memory footprint.
 ///
 /// The sets are ordered ([`BTreeSet`]) rather than hashed: this value is
 /// persisted and compared across runs, so its iteration and wire order must not
@@ -85,7 +82,7 @@ pub struct RamObject {
 #[derive(
     Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
-pub struct Footprint {
+pub struct RamLocations {
     #[serde(default)]
     pub fields: BTreeSet<RamField>,
     #[serde(default)]
@@ -94,7 +91,7 @@ pub struct Footprint {
     pub objects: BTreeSet<RamObject>,
 }
 
-impl Footprint {
+impl RamLocations {
     /// Total number of entries across all three components.
     pub fn len(&self) -> usize {
         self.fields.len() + self.regions.len() + self.objects.len()
@@ -109,7 +106,7 @@ impl Footprint {
     /// `Frame`/`Private`-contained (writes into the owner's own frame, dead at
     /// return, or into a function-private space). This is the argpromote
     /// blocking-call gate's admission predicate.
-    pub fn invisible(&self) -> bool {
+    pub fn bases_invisible(&self) -> bool {
         self.fields
             .iter()
             .all(|f| matches!(f.base, RamBase::Frame(_) | RamBase::Private))
@@ -117,24 +114,51 @@ impl Footprint {
                 .regions
                 .iter()
                 .all(|r| matches!(r.base, RamBase::Frame(_) | RamBase::Private))
-            && self.objects.iter().all(|o| {
-                if matches!(o.base, RamBase::Private) {
-                    // A private-space landing is fully self-contained (read or
-                    // write): the shadow can neither be observed nor aliased.
-                    return true;
-                }
-                // A `Frame`-based whole-object entry is invisible: a `Frame`
-                // write dies with the owner's frame (contained under the
-                // confinement assumption). A `Frame`-based object *read* must
-                // never exist — the channel's `transfer` sends a frame-landing
-                // read to ⊤ (freshness), same as a field — so it should never
-                // reach this predicate; treat it defensively as not-invisible if
-                // one somehow does.
-                debug_assert!(
-                    o.write || !matches!(o.base, RamBase::Frame(_)),
-                    "a Frame-based object read must have been rejected by transfer"
-                );
-                matches!(o.base, RamBase::Frame(_)) && o.write
-            })
+            && self
+                .objects
+                .iter()
+                .all(|o| matches!(o.base, RamBase::Frame(_) | RamBase::Private))
+    }
+}
+
+/// The precise half of a memory summary. Analysis first computes these sets;
+/// materialization may attach SSA values to the same location keys, but must
+/// never add or remove keys.
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct Footprint {
+    #[serde(default)]
+    pub reads: RamLocations,
+    #[serde(default)]
+    pub writes: RamLocations,
+}
+
+impl Footprint {
+    pub fn len(&self) -> usize {
+        self.reads.len() + self.writes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.reads.is_empty() && self.writes.is_empty()
+    }
+
+    pub fn invisible(&self) -> bool {
+        // Reading the owner's fresh frame is not a valid outward effect.
+        self.reads
+            .fields
+            .iter()
+            .all(|f| matches!(f.base, RamBase::Private))
+            && self
+                .reads
+                .regions
+                .iter()
+                .all(|r| matches!(r.base, RamBase::Private))
+            && self
+                .reads
+                .objects
+                .iter()
+                .all(|o| matches!(o.base, RamBase::Private))
+            && self.writes.bases_invisible()
     }
 }

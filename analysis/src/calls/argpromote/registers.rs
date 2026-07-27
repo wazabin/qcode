@@ -46,80 +46,13 @@ fn access_ptr(_b: &mut qcode::builder::Builder, r: VarnodeId) -> ValueId {
 /// A function's register interface, recovered by [`scan_register_effects`].
 #[derive(Debug)]
 pub(crate) struct RegisterEffects {
-    /// Registers the body loads — each becomes a by-value input parameter
-    /// (over-approximated: a written-first register yields a dead param that
-    /// mem2reg/DCE prune). Sorted by `(address, size)` for a deterministic
-    /// param/argument order shared with the caller rewrite.
+    /// Registers the body reads — each becomes a by-value input parameter.
+    /// Sorted by `(address, size)` for a deterministic param/argument order
+    /// shared with the caller rewrite.
     pub(crate) inputs: Vec<VarnodeId>,
-    /// Registers the body stores, canonicalized to the coarsest register per
-    /// overlap group so the caller's replay is order-independent. Sorted.
+    /// Registers the body writes. Overlapping keys remain distinct and are
+    /// sorted by `(address, size)` so replay order is deterministic.
     pub(crate) outputs: Vec<VarnodeId>,
-}
-
-/// The byte interval `(space, start, end)` a register varnode occupies.
-fn reg_interval(ctx: &Context, vn: VarnodeId) -> (SpaceId, i64, i64) {
-    let v = Varnode::from_id(ctx, vn);
-    let start = v.address();
-    (v.space().id, start, start + v.size() as i64)
-}
-
-/// `true` if two register varnodes occupy overlapping bytes of the same space.
-fn regs_overlap(ctx: &Context, a: VarnodeId, b: VarnodeId) -> bool {
-    let (sa, a0, a1) = reg_interval(ctx, a);
-    let (sb, b0, b1) = reg_interval(ctx, b);
-    sa == sb && a0 < b1 && b0 < a1
-}
-
-/// Collapse a set of register varnodes into the coarsest register per overlap
-/// group. Register files nest (AL ⊂ AX ⊂ EAX ⊂ RAX), so each overlap group has a
-/// unique member whose interval contains the rest; for *outputs*, loading that
-/// register at the return reads the merged final state of every sub-write, and
-/// for *inputs* one seed of it covers every overlapping read. Returns `None` if
-/// some group has no single covering register (partial overlap with no cover) —
-/// that function is left on the conservative path.
-pub(crate) fn canonicalize_to_coarsest(
-    ctx: &Context,
-    regs: &[VarnodeId],
-) -> Option<Vec<VarnodeId>> {
-    // Connected components under `regs_overlap` (tiny N, so O(N²) is fine).
-    let mut group_of: Vec<usize> = (0..regs.len()).collect();
-    for i in 0..regs.len() {
-        for j in (i + 1)..regs.len() {
-            if regs_overlap(ctx, regs[i], regs[j]) {
-                let (gi, gj) = (group_of[i], group_of[j]);
-                if gi != gj {
-                    for g in &mut group_of {
-                        if *g == gj {
-                            *g = gi;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut coarse: Vec<VarnodeId> = Vec::new();
-    for g in 0..regs.len() {
-        let members: Vec<VarnodeId> = (0..regs.len())
-            .filter(|&i| group_of[i] == g)
-            .map(|i| regs[i])
-            .collect();
-        if members.is_empty() {
-            continue; // not a group representative
-        }
-        // The cover must contain every member's interval.
-        let cover = members.iter().copied().find(|&m| {
-            let (_, m0, m1) = reg_interval(ctx, m);
-            members.iter().all(|&o| {
-                let (_, o0, o1) = reg_interval(ctx, o);
-                m0 <= o0 && m1 >= o1
-            })
-        })?;
-        if !coarse.contains(&cover) {
-            coarse.push(cover);
-        }
-    }
-    Some(coarse)
 }
 
 /// Why a function is not register-pure (cannot be functionalized by
@@ -134,8 +67,6 @@ pub enum RegPurityReason {
     AddressTaken,
     /// Writes no registers, so there is nothing to functionalize.
     NoRegisterWrites,
-    /// A register-write overlap group has no single covering register.
-    NonCanonicalRegisters,
     /// No direct callers to thread by-value inputs / replayed outputs through.
     NoCallers,
     /// Contains an unresolved indirect call whose register effects are unknown.
@@ -158,9 +89,6 @@ impl RegPurityReason {
                 "address-taken (reachable by indirect calls this pass can't rewrite)"
             }
             RegPurityReason::NoRegisterWrites => "writes no registers (nothing to functionalize)",
-            RegPurityReason::NonCanonicalRegisters => {
-                "register writes don't canonicalize to a coarsest register"
-            }
             RegPurityReason::NoCallers => "no direct callers to thread inputs/outputs through",
             RegPurityReason::IndirectCall => {
                 "contains an indirect call with unknown register effects"
@@ -342,7 +270,7 @@ pub(crate) fn materialize_functions(
             }
         };
         let Ok(reg_eff) = finalize_register_effects(cone.ctx(), eff) else {
-            // Solved, but no register writes / non-canonical overlap: nothing to
+            // Solved, but no register writes: nothing to
             // materialize. Still a *solved* summary (the RAM gate keys on that);
             // persist the solved sets so call classifiers stay precise.
             cone.function_mut(fid)
