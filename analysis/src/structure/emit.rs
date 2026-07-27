@@ -55,7 +55,7 @@ fn header_line(ctx: &Context, function_id: FunctionId) -> TokenLine {
 
     buf.punct("(");
     if let Some(registers) = registers {
-        emit_regs(ctx, &registers.inputs, &mut buf);
+        emit_typed_regs(ctx, &registers.inputs, &mut buf);
     }
     buf.punct(")");
 
@@ -72,6 +72,28 @@ fn header_line(ctx: &Context, function_id: FunctionId) -> TokenLine {
     buf.space();
     buf.punct("{");
     buf.into_line(0, None)
+}
+
+/// Pushes a comma-separated list of typed register arguments onto `buf`.
+///
+/// Register effects recover each argument's width but not its signedness, so
+/// use the corresponding unsigned fixed-width C type rather than inventing a
+/// signed source-level type.
+fn emit_typed_regs(ctx: &Context, regs: &[VarnodeId], buf: &mut LineBuf) {
+    for (i, &id) in regs.iter().enumerate() {
+        if i > 0 {
+            buf.punct(",");
+            buf.space();
+        }
+        let register = Varnode::from_id(ctx, id);
+        emit_uint_type(register.size(), buf);
+        buf.space();
+        buf.push(register.to_string(), TokenKind::Variable);
+    }
+}
+
+fn emit_uint_type(size: usize, buf: &mut LineBuf) {
+    buf.push(format!("uint{}_t", size * 8), TokenKind::Type);
 }
 
 /// Pushes a comma-separated list of register names (as variables) onto `buf`.
@@ -476,8 +498,11 @@ fn statement(ctx: &Context, id: InstructionId, roots: &HashSet<InstructionId>) -
             call_args(ctx, id.func, &c.args, roots, &mut buf);
             buf.punct(";");
         }
-        // A named value: `name = <defining expression>;`.
+        // An SSA result is defined exactly once, so its assignment is also its
+        // declaration: `uintN_t name = <defining expression>;`.
         _ => {
+            emit_uint_type(insn.size(), &mut buf);
+            buf.space();
             buf.push_value(
                 instruction_name(ctx, id),
                 TokenKind::Variable,
@@ -563,7 +588,62 @@ fn label_of(program: &Program, block: BlockId) -> String {
 mod tests {
     use super::*;
     use crate::structure::{decompile_function, lower_function, tokens::TokenKind};
+    use qcode::value::{FunctionBody, RegisterChannelState, RegisterInterfaceMap};
     use qcode_macro::qcode;
+
+    #[test]
+    fn function_arguments_include_their_recovered_width() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 x;
+            varnode i64 y;
+
+            fn f:
+            <entry>
+                return at i64 0;
+            "
+        );
+        FunctionBody::from_id_mut(&mut ctx, f).set_register_effects(
+            RegisterChannelState::Materialized(RegisterInterfaceMap {
+                inputs: vec![x, y],
+                outputs: vec![],
+                returns: 0,
+            }),
+        );
+
+        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        assert!(
+            c.starts_with("fn f(uint32_t x, uint64_t y)"),
+            "function arguments should carry fixed-width C types:\n{c}"
+        );
+    }
+
+    #[test]
+    fn named_ssa_results_are_declared_with_their_width() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 x;
+            varnode i32 y;
+
+            fn f:
+            <entry>
+                %sum = i32 0x1 + i32 0x2;
+                store(x:4, &x <- %sum);
+                store(y:4, &y <- %sum);
+                return at i64 0;
+            "
+        );
+
+        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        assert!(
+            c.contains("uint32_t sum = 0x1 + 0x2;"),
+            "a named SSA root should be declared at its definition:\n{c}"
+        );
+    }
 
     #[test]
     fn single_use_values_fold_into_a_compound_statement() {
