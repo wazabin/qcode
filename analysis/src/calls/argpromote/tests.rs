@@ -2290,9 +2290,9 @@ mod tests {
         assert_eq!(register_writeset_len(&tc, f), Some(1));
     }
 
-    /// Overlapping registers remain distinct effect and materialization keys.
+    /// A wide output represents every fully contained register cell.
     #[test]
-    fn register_overlap_preserves_exact_keys() {
+    fn register_overlap_uses_covering_output() {
         let mut tc = qcode::testing::TestContext::new();
         let (r0, r0_lo32) = (tc.r0, tc.r0_lo32);
         qcode!(
@@ -2313,21 +2313,21 @@ mod tests {
             "
         );
         let eff = scan_register_effects(&tc.ctx, f).expect("written register");
-        assert_eq!(eff.outputs, vec![r0_lo32, r0]);
+        assert_eq!(eff.outputs, vec![r0]);
         let call = set_call(&mut tc, g_call, f, vec![]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
         assert!(argpromote_registers(&mut tc.ctx, None));
-        assert_eq!(register_writeset_len(&tc, f), Some(2));
+        assert_eq!(register_writeset_len(&tc, f), Some(1));
         let RegisterChannelState::Materialized(map) =
             &FunctionBody::from_id(&tc.ctx, f).effects().register
         else {
             panic!("register rewrite must materialize the interface");
         };
-        assert_eq!(map.outputs, vec![r0_lo32, r0]);
+        assert_eq!(map.outputs, vec![r0]);
         assert_eq!(
             replayed_stores(&tc, call),
-            2,
-            "caller replay must retain one store per overlapping write key"
+            1,
+            "caller replay only needs the covering register's final value"
         );
         let _ = (entry, g_entry);
     }

@@ -32,7 +32,8 @@ use super::{
 
 /// The register channel's effect element: registers this function (or its
 /// callees, once joined) may read / may write. Raw varnode sets are retained
-/// exactly through materialization, including overlapping register keys.
+/// exactly through summary solving. At materialization, output keys fully
+/// contained by another output are represented by that covering register.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct RegEffects {
     pub(crate) reads: FxHashSet<VarnodeId>,
@@ -275,12 +276,12 @@ impl EffectChannel for RegChannel {
 }
 
 /// Finalize a solved summary into the interface [`RegisterEffects`] the rewrite
-/// consumes: retain every read and write key, then fix a deterministic
-/// `(address, size)` order shared with the caller rewrite.
+/// consumes: retain every read key and every maximal write interval, then fix a
+/// deterministic `(address, size)` order shared with the caller rewrite.
 ///
-/// Materialization assigns interface slots to known effects; it must not add
-/// or remove effects. A path-sensitive dependency on an incoming register must
-/// therefore be discovered as a read before this conversion.
+/// A contained output is redundant: the final value loaded from its covering
+/// register already contains those bytes. Partial overlaps remain distinct
+/// because neither register represents the other's complete final value.
 pub(crate) fn finalize_register_effects(
     ctx: &Context,
     eff: &RegEffects,
@@ -290,6 +291,17 @@ pub(crate) fn finalize_register_effects(
     }
     let mut outputs: Vec<VarnodeId> = eff.writes.iter().copied().collect();
     let mut inputs: Vec<VarnodeId> = eff.reads.iter().copied().collect();
+    outputs.retain(|&candidate| {
+        let candidate = Varnode::from_id(ctx, candidate);
+        !eff.writes.iter().copied().any(|other| {
+            let other = Varnode::from_id(ctx, other);
+            other.id != candidate.id
+                && other.space().id == candidate.space().id
+                && other.address() <= candidate.address()
+                && other.address() + other.size() as i64
+                    >= candidate.address() + candidate.size() as i64
+        })
+    });
 
     // Deterministic order shared by callee param creation and the regpure-site
     // argument threading: sort by `(space, address, size)`.
@@ -524,16 +536,17 @@ mod tests {
         assert!(eff.writes.contains(&r1), "caller keeps its own r1 store");
     }
 
-    /// Overlapping register cells remain separate semantic/interface keys.
+    /// A covering output subsumes contained register cells.
     #[test]
-    fn finalize_preserves_overlap_keys() {
+    fn finalize_collapses_contained_output_keys() {
         let tc = qcode::testing::TestContext::new();
-        let (lo32, byte1) = (tc.r0_lo32, tc.r0_byte1);
+        let (wide, lo32, byte1) = (tc.r0, tc.r0_lo32, tc.r0_byte1);
         let mut eff = RegEffects::default();
+        eff.writes.insert(wide);
         eff.writes.insert(lo32);
         eff.writes.insert(byte1);
         let iface = finalize_register_effects(&tc.ctx, &eff).unwrap();
-        assert_eq!(iface.outputs, vec![lo32, byte1]);
+        assert_eq!(iface.outputs, vec![wide]);
     }
 
     #[test]
@@ -630,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_write_keys_survive_materialization_and_partial_solve() {
+    fn covering_write_key_survives_materialization_and_partial_solve() {
         let mut tc = qcode::testing::TestContext::new();
         let (wide, narrow) = (tc.r0, tc.r0_lo32);
         qcode!(
@@ -665,8 +678,8 @@ mod tests {
         let RegisterChannelState::Materialized(map) = &state else {
             panic!("materialization must persist its interface map");
         };
-        assert_eq!(map.outputs, vec![narrow, wide]);
-        assert_eq!(map.returns, 2, "both keys must have replayable slots");
+        assert_eq!(map.outputs, vec![wide]);
+        assert_eq!(map.returns, 1, "the covering key needs one replayable slot");
 
         let fixed = [(
             callee,
@@ -677,7 +690,12 @@ mod tests {
         let partial = solve_summaries_with_fixed(&tc.ctx, &graph, &channel, &fixed)
             .get(caller)
             .clone();
-        assert_eq!(partial, full);
+        let partial = partial.expect("materialized covering output remains solved");
+        assert_eq!(partial.writes, [wide].into_iter().collect());
+        assert!(
+            full.as_ref().unwrap().writes.contains(&wide),
+            "the full summary contains the same covering write"
+        );
     }
 
     #[test]

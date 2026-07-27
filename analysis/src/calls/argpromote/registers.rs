@@ -50,8 +50,9 @@ pub(crate) struct RegisterEffects {
     /// Sorted by `(address, size)` for a deterministic param/argument order
     /// shared with the caller rewrite.
     pub(crate) inputs: Vec<VarnodeId>,
-    /// Registers the body writes. Overlapping keys remain distinct and are
-    /// sorted by `(address, size)` so replay order is deterministic.
+    /// Maximal register cells the body writes. Fully contained cells are
+    /// represented by their covering output; partial overlaps remain distinct.
+    /// Sorted by `(address, size)` so replay order is deterministic.
     pub(crate) outputs: Vec<VarnodeId>,
 }
 
