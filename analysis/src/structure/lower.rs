@@ -20,7 +20,7 @@ use super::{BlockExit, ast::Program, ast::Stmt, block_exit, lower_expr::lower_ex
 /// Blocks are emitted in the function's block order (address-sorted), with the
 /// entry block first. Returns an empty program if the function has no root.
 pub fn lower_function(ctx: &Context, function_id: FunctionId) -> Program {
-    let function = qcode::value::Function::from_id(ctx, function_id);
+    let function = qcode::value::FunctionRef::from_id(ctx, function_id);
     let Some(root) = function.root() else {
         return Program {
             function: Some(function_id),
@@ -58,7 +58,7 @@ pub(crate) fn assign_labels(ctx: &Context, order: &[BlockId]) -> HashMap<BlockId
         let name = match (block.name(), block.address()) {
             (Some(name), _) => name.to_string(),
             (None, Some(addr)) => format!("bb_{addr:x}"),
-            (None, None) => format!("bb_{}", Into::<usize>::into(block_id)),
+            (None, None) => format!("bb_{}", usize::from(block_id.local)),
         };
         labels.insert(block_id, name);
     }
@@ -214,9 +214,21 @@ fn edge_args(ctx: &Context, from: BlockId, to: BlockId) -> Vec<ValueId> {
         return Vec::new();
     };
     match term.mnemonic() {
-        Mnemonic::Branch(b) if b.target == to => b.args.clone(),
-        Mnemonic::CBranch(c) if c.success_block == to => c.success_args.clone(),
-        Mnemonic::CBranch(c) if c.failure_block == to => c.failure_args.clone(),
+        Mnemonic::Branch(b) if b.target == to.local => b
+            .args
+            .iter()
+            .map(|value| value.qualify(from.func))
+            .collect(),
+        Mnemonic::CBranch(c) if c.success_block == to.local => c
+            .success_args
+            .iter()
+            .map(|value| value.qualify(from.func))
+            .collect(),
+        Mnemonic::CBranch(c) if c.failure_block == to.local => c
+            .failure_args
+            .iter()
+            .map(|value| value.qualify(from.func))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -246,7 +258,7 @@ mod tests {
 
             fn f:
             <entry>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <then_lbl> else goto <else_lbl>;
             <then_lbl>
                 goto <0x1001>;
@@ -290,13 +302,13 @@ mod tests {
 
             fn f:
             <entry>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <succ @v=i32 0x1> else goto <fail @w=i32 0x2>;
             <succ @v:i32>
-                store(&x, @v);
+                store(x:4, &x <- @v);
                 goto <0x2000>;
             <fail @w:i32>
-                store(&x, @w);
+                store(x:4, &x <- @w);
                 goto <0x2001>;
             "
         );
@@ -328,12 +340,11 @@ mod tests {
             <entry>
                 goto <head @a=i32 0x1 @b=i32 0x2>;
             <head @a:i32 @b:i32>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <head @a=@b @b=@a> else goto <exit_lbl>;
             <exit_lbl>
-                store(&x, @a);
-                local i64 ptr;
-                return [ptr];
+                store(x:4, &x <- @a);
+                return at i64 0;
             "
         );
 
@@ -371,13 +382,12 @@ mod tests {
             <entry>
                 goto <head @a=i32 0x1 @b=i32 0x2>;
             <head @a:i32 @b:i32>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 %n = i32 @b + i32 0x1;
                 if %c goto <head @a=@b @b=%n> else goto <exit_lbl>;
             <exit_lbl>
-                store(&x, @a);
-                local i64 ptr;
-                return [ptr];
+                store(x:4, &x <- @a);
+                return at i64 0;
             "
         );
 
@@ -402,8 +412,7 @@ mod tests {
             "
             fn g:
             <entry>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
         let program = lower_function(&ctx, g);

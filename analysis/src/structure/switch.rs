@@ -557,30 +557,29 @@ mod tests {
 
             fn f:
             <entry>
-                %x = load(i32, &sel);
+                %x = load(sel:4, &sel);
                 %c1 = i32 %x == i32 0x1;
                 if %c1 goto <case1> else goto <t2>;
             <case1>
-                store(&out, i32 0x10);
+                store(out:4, &out <- i32 0x10);
                 goto <done>;
             <t2>
                 %c2 = i32 %x == i32 0x2;
                 if %c2 goto <case2> else goto <t3>;
             <case2>
-                store(&out, i32 0x20);
+                store(out:4, &out <- i32 0x20);
                 goto <done>;
             <t3>
                 %cm = i32 %x == i32 0xffffffff;
                 if %cm goto <casem> else goto <default_lbl>;
             <casem>
-                store(&out, i32 0xff0);
+                store(out:4, &out <- i32 0xff0);
                 goto <done>;
             <default_lbl>
-                store(&out, i32 0x0);
+                store(out:4, &out <- i32 0x0);
                 goto <done>;
             <done>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 
@@ -606,30 +605,29 @@ mod tests {
 
             fn f:
             <entry>
-                %x = load(i32, &sel);
+                %x = load(sel:4, &sel);
                 %c1 = i32 %x == i32 0x1;
                 if %c1 goto <case1> else goto <t2>;
             <case1>
-                store(&out, i32 0x10);
+                store(out:4, &out <- i32 0x10);
                 goto <done>;
             <t2>
                 %c2 = i32 %x == i32 0x2;
                 if %c2 goto <case2> else goto <t3>;
             <case2>
-                store(&out, i32 0x20);
+                store(out:4, &out <- i32 0x20);
                 goto <done>;
             <t3>
                 %c3 = i32 %x == i32 0x1;
                 if %c3 goto <case3> else goto <default_lbl>;
             <case3>
-                store(&out, i32 0x30);
+                store(out:4, &out <- i32 0x30);
                 goto <done>;
             <default_lbl>
-                store(&out, i32 0x0);
+                store(out:4, &out <- i32 0x0);
                 goto <done>;
             <done>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 
@@ -657,11 +655,11 @@ mod tests {
 
             fn f:
             <entry>
-                %x = load(i32, &sel);
+                %x = load(sel:4, &sel);
                 %c2 = i32 %x == i32 0x2;
                 if %c2 goto <case2> else goto <nav>;
             <case2>
-                store(&out, i32 0x20);
+                store(out:4, &out <- i32 0x20);
                 goto <done>;
             <nav>
                 %lt = i32 %x < i32 0x2;
@@ -670,20 +668,19 @@ mod tests {
                 %c5 = i32 %x == i32 0x5;
                 if %c5 goto <case5> else goto <default_lbl>;
             <case5>
-                store(&out, i32 0x50);
+                store(out:4, &out <- i32 0x50);
                 goto <done>;
             <hi>
                 %c3 = i32 %x == i32 0x3;
                 if %c3 goto <case3> else goto <default_lbl>;
             <case3>
-                store(&out, i32 0x30);
+                store(out:4, &out <- i32 0x30);
                 goto <done>;
             <default_lbl>
-                store(&out, i32 0x0);
+                store(out:4, &out <- i32 0x0);
                 goto <done>;
             <done>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 
@@ -715,33 +712,32 @@ mod tests {
 
             fn f:
             <entry>
-                %g = load(i8, &pre);
+                %g = load(pre:1, &pre);
                 if %g goto <cascade> else goto <default_lbl>;
             <cascade>
-                %x = load(i32, &sel);
+                %x = load(sel:4, &sel);
                 %c1 = i32 %x == i32 0x1;
                 if %c1 goto <case1> else goto <t2>;
             <case1>
-                store(&out, i32 0x10);
+                store(out:4, &out <- i32 0x10);
                 goto <done>;
             <t2>
                 %c2 = i32 %x == i32 0x2;
                 if %c2 goto <case2> else goto <t3>;
             <case2>
-                store(&out, i32 0x20);
+                store(out:4, &out <- i32 0x20);
                 goto <done>;
             <t3>
                 %c3 = i32 %x == i32 0x3;
                 if %c3 goto <case3> else goto <default_lbl>;
             <case3>
-                store(&out, i32 0x30);
+                store(out:4, &out <- i32 0x30);
                 goto <done>;
             <default_lbl>
-                store(&out, i32 0x0);
+                store(out:4, &out <- i32 0x0);
                 goto <done>;
             <done>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 
@@ -765,30 +761,29 @@ mod tests {
 
             fn f:
             <entry>
-                %x = load(i32, &sel);
+                %x = load(sel:4, &sel);
                 %c1 = i32 %x == i32 0x1;
                 if %c1 goto <case1> else goto <t2>;
             <case1>
-                store(&out, i32 0x10);
+                store(out:4, &out <- i32 0x10);
                 goto <done>;
             <t2>
                 %c2 = i32 %x == i32 0x2;
                 if %c2 goto <case2> else goto <t3>;
             <case2>
-                store(&out, i32 0x20);
+                store(out:4, &out <- i32 0x20);
                 goto <done>;
             <t3>
                 %c3 = i32 %x == i32 0x3;
                 if %c3 goto <case3> else goto <default_lbl>;
             <case3>
-                store(&out, i32 0x30);
+                store(out:4, &out <- i32 0x30);
                 goto <done>;
             <default_lbl>
-                store(&out, i32 0x0);
+                store(out:4, &out <- i32 0x0);
                 goto <done>;
             <done>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 
@@ -819,11 +814,11 @@ mod tests {
 
             fn f:
             <entry>
-                %x = load(i32, &sel);
+                %x = load(sel:4, &sel);
                 %c2 = i32 %x == i32 0x2;
                 if %c2 goto <case2> else goto <nav>;
             <case2>
-                store(&out, i32 0x20);
+                store(out:4, &out <- i32 0x20);
                 goto <done>;
             <nav>
                 %lt = i32 %x < i32 0x2;
@@ -832,20 +827,19 @@ mod tests {
                 %c1 = i32 %x == i32 0x1;
                 if %c1 goto <case1> else goto <default_lbl>;
             <case1>
-                store(&out, i32 0x10);
+                store(out:4, &out <- i32 0x10);
                 goto <done>;
             <hi>
                 %c3 = i32 %x == i32 0x3;
                 if %c3 goto <case3> else goto <default_lbl>;
             <case3>
-                store(&out, i32 0x30);
+                store(out:4, &out <- i32 0x30);
                 goto <done>;
             <default_lbl>
-                store(&out, i32 0x0);
+                store(out:4, &out <- i32 0x0);
                 goto <done>;
             <done>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 
@@ -876,24 +870,23 @@ mod tests {
 
             fn f:
             <entry>
-                %x = load(i32, &sel);
+                %x = load(sel:4, &sel);
                 %c1 = i32 %x == i32 0x1;
                 if %c1 goto <case1> else goto <t2>;
             <case1>
-                store(&out, i32 0x10);
+                store(out:4, &out <- i32 0x10);
                 goto <done>;
             <t2>
                 %c2 = i32 %x == i32 0x2;
                 if %c2 goto <case2> else goto <default_lbl>;
             <case2>
-                store(&out, i32 0x20);
+                store(out:4, &out <- i32 0x20);
                 goto <done>;
             <default_lbl>
-                store(&out, i32 0x0);
+                store(out:4, &out <- i32 0x0);
                 goto <done>;
             <done>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 

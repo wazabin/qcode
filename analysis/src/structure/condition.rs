@@ -147,37 +147,35 @@ pub fn block_exit(block: BlockRef<'_, '_>) -> BlockExit {
     match term.mnemonic() {
         Mnemonic::Return(_) => BlockExit::Return,
 
-        Mnemonic::Branch(b) => match unique_edge_to(&block, b.target) {
-            Some(edge) => BlockExit::Goto {
-                edge,
-                target: b.target,
-            },
-            None => unstructured(&block),
-        },
+        Mnemonic::Branch(b) => {
+            let target = BlockId::new(block.id.func, b.target);
+            match unique_edge_to(&block, target) {
+                Some(edge) => BlockExit::Goto { edge, target },
+                None => unstructured(&block),
+            }
+        }
 
         Mnemonic::CBranch(c) => {
             // The invariant is that the two sides are distinct blocks; if they
             // collapse to one, the condition is irrelevant and it is really an
             // unconditional edge.
             if c.success_block == c.failure_block {
-                return match unique_edge_to(&block, c.success_block) {
-                    Some(edge) => BlockExit::Goto {
-                        edge,
-                        target: c.success_block,
-                    },
+                let target = BlockId::new(block.id.func, c.success_block);
+                return match unique_edge_to(&block, target) {
+                    Some(edge) => BlockExit::Goto { edge, target },
                     None => unstructured(&block),
                 };
             }
             match (
-                unique_edge_to(&block, c.success_block),
-                unique_edge_to(&block, c.failure_block),
+                unique_edge_to(&block, BlockId::new(block.id.func, c.success_block)),
+                unique_edge_to(&block, BlockId::new(block.id.func, c.failure_block)),
             ) {
                 (Some(true_edge), Some(false_edge)) => BlockExit::Branch {
-                    condition: c.condition,
+                    condition: c.condition.qualify(block.id.func),
                     true_edge,
-                    true_target: c.success_block,
+                    true_target: BlockId::new(block.id.func, c.success_block),
                     false_edge,
-                    false_target: c.failure_block,
+                    false_target: BlockId::new(block.id.func, c.failure_block),
                 },
                 _ => unstructured(&block),
             }
@@ -227,8 +225,7 @@ mod tests {
             ctx,
             "
             <block>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
         let exit = block_exit(BasicBlock::from_id(&ctx, block));
@@ -267,7 +264,7 @@ mod tests {
             varnode i8 cond;
 
             <block>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <then_lbl> else goto <else_lbl>;
             <then_lbl>
                 goto <0x1001>;

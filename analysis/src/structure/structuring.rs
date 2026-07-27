@@ -178,7 +178,7 @@ fn validate_program(
     program: &Program,
     coverage: bool,
 ) -> Result<(), String> {
-    let function = qcode::value::Function::from_id(ctx, function_id);
+    let function = qcode::value::FunctionRef::from_id(ctx, function_id);
     let Some(root) = function.root() else {
         return Ok(());
     };
@@ -275,7 +275,7 @@ fn structure_regions(ctx: &Context, function_id: FunctionId) -> Program {
 /// [`structure_regions`] with an explicit region-depth limit, so tests can drive
 /// the deep-cascade fallback without materializing thousands of blocks.
 fn structure_regions_limited(ctx: &Context, function_id: FunctionId, max_depth: usize) -> Program {
-    let function = qcode::value::Function::from_id(ctx, function_id);
+    let function = qcode::value::FunctionRef::from_id(ctx, function_id);
     let Some(root) = function.root() else {
         return Program {
             function: Some(function_id),
@@ -292,10 +292,10 @@ fn structure_regions_limited(ctx: &Context, function_id: FunctionId, max_depth: 
     // are correctly treated as region exits.
     let nodes: Vec<BlockId> = reachable(ctx, root_id)
         .into_iter()
-        .filter(|&b| ctx.values.basic_blocks[b].parent == Some(function_id))
+        .filter(|&b| b.func == function_id)
         .collect();
     let node_set: HashSet<BlockId> = nodes.iter().copied().collect();
-    let doms = compute_dominators(ctx, root_id);
+    let doms = compute_dominators(&function, root_id);
 
     // Natural-loop identification. Irreducible or improperly-overlapping loops
     // are out of scope: fall back to the always-correct flat lowering.
@@ -304,7 +304,7 @@ fn structure_regions_limited(ctx: &Context, function_id: FunctionId, max_depth: 
     };
 
     let exit_set = exit_blocks(ctx, &nodes, &node_set);
-    let pdom = compute_postdominators(ctx, &nodes, &node_set, &exit_set);
+    let pdom = compute_postdominators(&function, &nodes, &node_set, &exit_set);
 
     let labels = assign_labels(ctx, &nodes);
     let mut structurer = Structurer {
@@ -573,7 +573,7 @@ impl Structurer<'_, '_> {
     fn immediate_postdom(&self, b: BlockId) -> Option<BlockId> {
         let set = self.pdom.get(&b)?;
         let mut strict: Vec<BlockId> = set.iter().copied().filter(|&x| x != b).collect();
-        strict.sort_unstable_by_key(|&x| Into::<usize>::into(x));
+        strict.sort_unstable_by_key(|&x| usize::from(x.local));
         strict
             .iter()
             .copied()
@@ -675,7 +675,7 @@ fn loop_exit(
     // Most exit edges wins; ties break to the smallest id for determinism.
     counts
         .into_iter()
-        .max_by_key(|&(b, c)| (c, std::cmp::Reverse(Into::<usize>::into(b))))
+        .max_by_key(|&(b, c)| (c, std::cmp::Reverse(usize::from(b.local))))
         .map(|(b, _)| b)
 }
 
@@ -736,7 +736,8 @@ fn prepend(mut head: Vec<Stmt>, tail: Vec<Stmt>) -> Vec<Stmt> {
 
 /// The blocks reachable from `root`, in DFS order.
 fn reachable(ctx: &Context, root: BlockId) -> Vec<BlockId> {
-    jstd::graph::analysis::reachable_from_root(ctx, root)
+    let function = qcode::value::FunctionRef::from_id(ctx, root.func);
+    jstd::graph::analysis::reachable_from_root(&function, root)
 }
 
 /// Blocks with no successor inside the analyzed subgraph (returns and
@@ -791,17 +792,16 @@ mod tests {
 
             fn f:
             <entry>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <then_lbl> else goto <else_lbl>;
             <then_lbl>
-                store(&x, i32 0x1);
+                store(x:4, &x <- i32 0x1);
                 goto <merge>;
             <else_lbl>
-                store(&x, i32 0x2);
+                store(x:4, &x <- i32 0x2);
                 goto <merge>;
             <merge>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 
@@ -838,17 +838,16 @@ mod tests {
 
             fn f:
             <entry>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <then_lbl> else goto <else_lbl>;
             <then_lbl>
-                store(&x, i32 0x1);
+                store(x:4, &x <- i32 0x1);
                 goto <merge>;
             <else_lbl>
-                store(&x, i32 0x2);
+                store(x:4, &x <- i32 0x2);
                 goto <merge>;
             <merge>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 
@@ -875,14 +874,13 @@ mod tests {
 
             fn f:
             <entry>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <then_lbl> else goto <merge>;
             <then_lbl>
-                store(&x, i32 0x1);
+                store(x:4, &x <- i32 0x1);
                 goto <merge>;
             <merge>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 
@@ -915,17 +913,16 @@ mod tests {
 
             fn f:
             <entry>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <then_lbl> else goto <else_lbl>;
             <then_lbl>
-                store(&x, i32 0x1);
+                store(x:4, &x <- i32 0x1);
                 goto <merge>;
             <else_lbl>
-                store(&x, i32 0x2);
+                store(x:4, &x <- i32 0x2);
                 goto <merge>;
             <merge>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 
@@ -950,14 +947,13 @@ mod tests {
             <entry>
                 goto <head>;
             <head>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <body> else goto <exit_lbl>;
             <body>
-                store(&x, i32 0x1);
+                store(x:4, &x <- i32 0x1);
                 goto <head>;
             <exit_lbl>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 
@@ -1002,12 +998,11 @@ mod tests {
             <entry>
                 goto <head>;
             <head>
-                store(&x, i32 0x1);
-                %c = load(i8, &cond);
+                store(x:4, &x <- i32 0x1);
+                %c = load(cond:1, &cond);
                 if %c goto <head> else goto <exit_lbl>;
             <exit_lbl>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 
@@ -1051,13 +1046,13 @@ mod tests {
             <entry>
                 goto <head>;
             <head>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <a> else goto <b>;
             <a>
-                store(&x, i32 0x1);
+                store(x:4, &x <- i32 0x1);
                 goto <head>;
             <b>
-                store(&x, i32 0x2);
+                store(x:4, &x <- i32 0x2);
                 goto <head>;
             "
         );
@@ -1085,16 +1080,15 @@ mod tests {
 
             fn f:
             <entry>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <then_lbl> else goto <else_lbl>;
             <then_lbl>
                 goto <merge @v=i32 0x1>;
             <else_lbl>
                 goto <merge @v=i32 0x2>;
             <merge @v:i32>
-                store(&x, @v);
-                local i64 ptr;
-                return [ptr];
+                store(x:4, &x <- @v);
+                return at i64 0;
             "
         );
 
@@ -1132,9 +1126,8 @@ mod tests {
                 %ni = i32 @i + i32 0x1;
                 goto <head @i=%ni>;
             <exit_lbl>
-                store(&x, @i);
-                local i64 ptr;
-                return [ptr];
+                store(x:4, &x <- @i);
+                return at i64 0;
             "
         );
 
@@ -1166,19 +1159,17 @@ mod tests {
             <entry>
                 goto <head>;
             <head>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <body> else goto <exit1>;
             <body>
-                %e = load(i8, &err);
+                %e = load(err:1, &err);
                 if %e goto <cleanup> else goto <head>;
             <cleanup>
-                store(&x, i32 0xdead);
-                local i64 p1;
-                return [p1];
+                store(x:4, &x <- i32 0xdead);
+                return at i64 0;
             <exit1>
-                store(&x, i32 0xbeef);
-                local i64 p2;
-                return [p2];
+                store(x:4, &x <- i32 0xbeef);
+                return at i64 0;
             "
         );
 
@@ -1210,19 +1201,17 @@ mod tests {
             <entry>
                 goto <head>;
             <head>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <body> else goto <exit1>;
             <body>
-                %e = load(i8, &err);
+                %e = load(err:1, &err);
                 if %e goto <cleanup> else goto <head>;
             <cleanup>
-                store(&x, i32 0xdead);
-                local i64 p1;
-                return [p1];
+                store(x:4, &x <- i32 0xdead);
+                return at i64 0;
             <exit1>
-                store(&x, i32 0xbeef);
-                local i64 p2;
-                return [p2];
+                store(x:4, &x <- i32 0xbeef);
+                return at i64 0;
             "
         );
 
@@ -1261,27 +1250,26 @@ mod tests {
 
             fn f:
             <entry>
-                %x = load(i32, &sel);
+                %x = load(sel:4, &sel);
                 %c1 = i32 %x == i32 0x1;
                 if %c1 goto <case1> else goto <t2>;
             <case1>
-                store(&out, i32 0x10);
+                store(out:4, &out <- i32 0x10);
                 goto <done>;
             <t2>
                 %c2 = i32 %x == i32 0x2;
                 if %c2 goto <case2> else goto <t3>;
             <case2>
-                store(&out, i32 0x20);
+                store(out:4, &out <- i32 0x20);
                 goto <done>;
             <t3>
                 %c3 = i32 %x == i32 0x3;
                 if %c3 goto <case3> else goto <done>;
             <case3>
-                store(&out, i32 0x30);
+                store(out:4, &out <- i32 0x30);
                 goto <done>;
             <done>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 
@@ -1315,17 +1303,16 @@ mod tests {
             <entry>
                 goto <outer>;
             <outer>
-                %oc = load(i8, &outer_c);
+                %oc = load(outer_c:1, &outer_c);
                 if %oc goto <inner> else goto <exit_lbl>;
             <inner>
-                %ic = load(i8, &inner_c);
+                %ic = load(inner_c:1, &inner_c);
                 if %ic goto <inner_body> else goto <outer>;
             <inner_body>
-                store(&x, i32 0x1);
+                store(x:4, &x <- i32 0x1);
                 goto <inner>;
             <exit_lbl>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 

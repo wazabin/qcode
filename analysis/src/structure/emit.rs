@@ -10,8 +10,8 @@ use std::collections::HashSet;
 use qcode::{
     context::Context,
     value::{
-        BlockId, Function, Instruction, InstructionId, Value, ValueId, ValueRef, Varnode,
-        VarnodeId, function::FunctionId, insn::Mnemonic,
+        BlockId, FunctionRef, Instruction, InstructionId, LocalValueId, Value, ValueId, ValueRef,
+        Varnode, VarnodeId, function::FunctionId, insn::Mnemonic,
     },
 };
 
@@ -45,8 +45,8 @@ pub fn emit_tokens(ctx: &Context, program: &Program) -> Vec<TokenLine> {
 /// recovered signature. A missing signature (or an empty input/output list)
 /// simply renders empty parentheses / no return arrow.
 fn header_line(ctx: &Context, function_id: FunctionId) -> TokenLine {
-    let function = Function::from_id(ctx, function_id);
-    let sig = function.signature();
+    let function = FunctionRef::from_id(ctx, function_id);
+    let registers = function.effects().materialized();
 
     let mut buf = LineBuf::default();
     buf.keyword("fn");
@@ -54,14 +54,14 @@ fn header_line(ctx: &Context, function_id: FunctionId) -> TokenLine {
     buf.push(function.name().to_string(), TokenKind::Label);
 
     buf.punct("(");
-    if let Some(inputs) = sig.and_then(|s| s.inputs.as_deref()) {
-        emit_regs(ctx, inputs, &mut buf);
+    if let Some(registers) = registers {
+        emit_regs(ctx, &registers.inputs, &mut buf);
     }
     buf.punct(")");
 
-    if let Some(outputs) = sig
-        .and_then(|s| s.outputs.as_deref())
-        .filter(|o| !o.is_empty())
+    if let Some(outputs) = registers
+        .map(|registers| &registers.outputs[..registers.returns])
+        .filter(|outputs| !outputs.is_empty())
     {
         buf.space();
         buf.punct("->");
@@ -440,36 +440,40 @@ fn emit_stmt(
 /// Builds the tokens for a single root instruction rendered as a C statement.
 fn statement(ctx: &Context, id: InstructionId, roots: &HashSet<InstructionId>) -> LineBuf {
     let insn = Instruction::from_id(ctx, id);
+    let qualify = |value: LocalValueId| value.qualify(id.func);
     let mut buf = LineBuf::default();
     match insn.mnemonic() {
         Mnemonic::Store(s) => {
             // <location> = src;  (a named varnode reads as the variable, a
             // computed address as `*ptr`).
-            deref_location(ctx, s.ptr, s.size, Some(roots)).write_tokens(&mut buf);
+            deref_location(ctx, qualify(s.ptr), s.size, Some(roots)).write_tokens(&mut buf);
             assign(&mut buf);
-            lower_expr_rooted(ctx, s.src, roots).write_tokens(&mut buf);
+            lower_expr_rooted(ctx, qualify(s.src), roots).write_tokens(&mut buf);
             buf.punct(";");
         }
         Mnemonic::Return(r) => {
             buf.keyword("return");
             if let Some(value) = r.value {
                 buf.space();
-                lower_expr_rooted(ctx, value, roots).write_tokens(&mut buf);
+                lower_expr_rooted(ctx, qualify(value), roots).write_tokens(&mut buf);
             }
             buf.punct(";");
         }
         Mnemonic::Call(c) => {
-            let name = Function::from_id(ctx, c.target).name().to_string();
-            buf.push_function(name, TokenKind::Label, Some(c.target));
-            call_args(ctx, &c.args, roots, &mut buf);
+            let target = c.target.real();
+            let name = target
+                .map(|target| FunctionRef::from_id(ctx, target).name().to_string())
+                .unwrap_or_else(|| format!("minted_{}", c.target.minted().unwrap_or_default()));
+            buf.push_function(name, TokenKind::Label, target);
+            call_args(ctx, id.func, &c.args, roots, &mut buf);
             buf.punct(";");
         }
         Mnemonic::CallInd(c) => {
             buf.punct("(");
             buf.push("*", TokenKind::Operator);
-            lower_expr_rooted(ctx, c.ptr, roots).write_tokens(&mut buf);
+            lower_expr_rooted(ctx, qualify(c.ptr), roots).write_tokens(&mut buf);
             buf.punct(")");
-            call_args(ctx, &c.args, roots, &mut buf);
+            call_args(ctx, id.func, &c.args, roots, &mut buf);
             buf.punct(";");
         }
         // A named value: `name = <defining expression>;`.
@@ -487,14 +491,20 @@ fn statement(ctx: &Context, id: InstructionId, roots: &HashSet<InstructionId>) -
     buf
 }
 
-fn call_args(ctx: &Context, args: &[ValueId], roots: &HashSet<InstructionId>, buf: &mut LineBuf) {
+fn call_args(
+    ctx: &Context,
+    function: FunctionId,
+    args: &[LocalValueId],
+    roots: &HashSet<InstructionId>,
+    buf: &mut LineBuf,
+) {
     buf.punct("(");
     for (i, &arg) in args.iter().enumerate() {
         if i > 0 {
             buf.punct(",");
             buf.space();
         }
-        lower_expr_rooted(ctx, arg, roots).write_tokens(buf);
+        lower_expr_rooted(ctx, arg.qualify(function), roots).write_tokens(buf);
     }
     buf.punct(")");
 }
@@ -546,7 +556,7 @@ fn label_of(program: &Program, block: BlockId) -> String {
     program
         .label(block)
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("bb_{}", Into::<usize>::into(block)))
+        .unwrap_or_else(|| format!("bb_{}", usize::from(block.local)))
 }
 
 #[cfg(test)]
@@ -566,11 +576,10 @@ mod tests {
 
             fn f:
             <entry>
-                %a = load(i32, &x);
+                %a = load(x:4, &x);
                 %b = i32 %a + i32 0x1;
-                store(&y, %b);
-                local i64 ptr;
-                return [ptr];
+                store(y:4, &y <- %b);
+                return at i64 0;
             "
         );
 
@@ -602,17 +611,16 @@ mod tests {
 
             fn f:
             <entry>
-                %p = load(i64, &pp);
-                %v = load(i8, %p);
-                %q = load(i64, &qq);
-                store(%q, i8 0x0);
+                %p = load(pp:8, &pp);
+                %v = load(ram:1, %p);
+                %q = load(qq:8, &qq);
+                store(ram:1, %q <- i8 0x0);
                 if %v goto <then_lbl> else goto <merge>;
             <then_lbl>
-                store(&flag, i8 0x1);
+                store(flag:1, &flag <- i8 0x1);
                 goto <merge>;
             <merge>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
         let c = emit_c(&ctx, &decompile_function(&ctx, f).unwrap());
@@ -641,15 +649,14 @@ mod tests {
 
             fn f:
             <entry>
-                %a = load(i32, &x);
+                %a = load(x:4, &x);
                 %c = i32 %a s< i32 0x5;
                 if %c goto <then_lbl> else goto <merge>;
             <then_lbl>
-                store(&y, i32 0x1);
+                store(y:4, &y <- i32 0x1);
                 goto <merge>;
             <merge>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
         let c = emit_c(&ctx, &decompile_function(&ctx, f).unwrap());
@@ -671,15 +678,14 @@ mod tests {
 
             fn f:
             <entry>
-                %a = load(i32, &x);
+                %a = load(x:4, &x);
                 %c = i32 %a < i32 0x5;
                 if %c goto <then_lbl> else goto <merge>;
             <then_lbl>
-                store(&y, i32 0x1);
+                store(y:4, &y <- i32 0x1);
                 goto <merge>;
             <merge>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
         let c = emit_c(&ctx, &decompile_function(&ctx, f).unwrap());
@@ -702,11 +708,10 @@ mod tests {
 
             fn f:
             <entry>
-                %a = load(i32, &x);
+                %a = load(x:4, &x);
                 %w = sext(i64, %a);
-                store(&z, %w);
-                local i64 ptr;
-                return [ptr];
+                store(z:4, &z <- %w);
+                return at i64 0;
             "
         );
         let c = emit_c(&ctx, &lower_function(&ctx, f));
@@ -731,12 +736,11 @@ mod tests {
 
             fn f:
             <entry>
-                %t = load(i32, &x);
-                %u = load(i32, &y);
-                store(&x, %u);
-                store(&y, %t);
-                local i64 ptr;
-                return [ptr];
+                %t = load(x:4, &x);
+                %u = load(y:4, &y);
+                store(x:4, &x <- %u);
+                store(y:4, &y <- %t);
+                return at i64 0;
             "
         );
 
@@ -771,13 +775,12 @@ mod tests {
 
             fn f:
             <entry>
-                %p = load(i64, &pp);
-                %b = load(i8, %p);
-                %q = load(i64, &qq);
-                store(%q, i32 0x0);
-                store(%p, i8 %b);
-                local i64 ptr;
-                return [ptr];
+                %p = load(pp:8, &pp);
+                %b = load(ram:1, %p);
+                %q = load(qq:8, &qq);
+                store(ram:4, %q <- i32 0x0);
+                store(ram:1, %p <- %b);
+                return at i64 0;
             "
         );
 
@@ -802,9 +805,8 @@ mod tests {
             <entry>
                 %sum = i32 0x1 + i32 0x2;
                 %scaled = i32 %sum * i32 0x5;
-                store(&a, %scaled);
-                local i64 ptr;
-                return [ptr];
+                store(a:4, &a <- %scaled);
+                return at i64 0;
             "
         );
 
@@ -832,14 +834,13 @@ mod tests {
 
             fn f:
             <entry>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <then_lbl> else goto <merge>;
             <then_lbl>
-                store(&x, i32 0x1);
+                store(x:4, &x <- i32 0x1);
                 goto <merge>;
             <merge>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 
@@ -865,13 +866,12 @@ mod tests {
 
             fn f:
             <entry>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <body> else goto <exit_lbl>;
             <body>
                 goto <entry>;
             <exit_lbl>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 
@@ -907,11 +907,10 @@ mod tests {
 
             fn f:
             <entry>
-                %a = load(i32, &x);
+                %a = load(x:4, &x);
                 %b = i32 %a + i32 0x1;
-                store(&y, %b);
-                local i64 ptr;
-                return [ptr];
+                store(y:4, &y <- %b);
+                return at i64 0;
             "
         );
 
@@ -958,15 +957,14 @@ mod tests {
 
             fn f:
             <entry>
-                %v = load(i32, &x);
+                %v = load(x:4, &x);
                 %c = i32 %v == i32 0x5;
                 if %c goto <then_lbl> else goto <merge>;
             <then_lbl>
-                store(&y, i32 0x1);
+                store(y:4, &y <- i32 0x1);
                 goto <merge>;
             <merge>
-                local i64 ptr;
-                return [ptr];
+                return at i64 0;
             "
         );
 
@@ -1000,9 +998,8 @@ mod tests {
 
             fn f:
             <entry>
-                store(&y, i32 0x2a);
-                local i64 ptr;
-                return [ptr];
+                store(y:4, &y <- i32 0x2a);
+                return at i64 0;
             "
         );
 

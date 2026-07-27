@@ -12,7 +12,7 @@ use qcode::{
     context::Context,
     value::{
         BlockParam, Instruction, InstructionId, LiteralRef, Value, ValueId, ValueRef, Varnode,
-        insn::{Binop, BoolBinop, FloatBinop, IntBinop, Mnemonic, Unop},
+        insn::{Binop, FloatBinop, IntBinop, Mnemonic, Unop},
     },
 };
 
@@ -101,7 +101,7 @@ pub(crate) fn deref_location(ctx: &Context, ptr: ValueId, size: usize, roots: Ro
 pub(crate) fn instruction_name(ctx: &Context, id: InstructionId) -> String {
     match Instruction::from_id(ctx, id).name() {
         Some(name) => name.to_string(),
-        None => format!("v{}", Into::<usize>::into(id)),
+        None => format!("v{}", usize::from(id.local)),
     }
 }
 
@@ -122,50 +122,57 @@ pub(crate) fn lower_defining_expr(
 
 fn lower_instruction(ctx: &Context, id: InstructionId, roots: Roots, expand_unknown: bool) -> Expr {
     let insn = Instruction::from_id(ctx, id);
+    let qualify = |value: qcode::value::LocalValueId| value.qualify(id.func);
     match insn.mnemonic() {
         Mnemonic::Binop(b) => match map_binop(&b.op) {
             Some(op) => {
-                let mut lhs = lower(ctx, b.lhs, roots);
-                let mut rhs = lower(ctx, b.rhs, roots);
+                let mut lhs = lower(ctx, qualify(b.lhs), roots);
+                let mut rhs = lower(ctx, qualify(b.rhs), roots);
                 // Signed operations (`s<`, `s/`, arithmetic `s>>`) share a C
                 // spelling with their unsigned form, so their operands are cast
                 // to signed — otherwise the bare, untyped variables read unsigned
                 // and two different IR programs would print identically.
                 match signed_operands(&b.op) {
                     SignedOperands::Both => {
-                        lhs = signed_operand(ctx, b.lhs, lhs);
-                        rhs = signed_operand(ctx, b.rhs, rhs);
+                        lhs = signed_operand(ctx, qualify(b.lhs), lhs);
+                        rhs = signed_operand(ctx, qualify(b.rhs), rhs);
                     }
-                    SignedOperands::LhsOnly => lhs = signed_operand(ctx, b.lhs, lhs),
+                    SignedOperands::LhsOnly => lhs = signed_operand(ctx, qualify(b.lhs), lhs),
                     SignedOperands::None => {}
                 }
                 Expr::bare(ExprKind::Binary(op, Box::new(lhs), Box::new(rhs)))
             }
             None => Expr::bare(ExprKind::Unknown {
                 op: insn.opcode().to_string(),
-                operands: vec![lower(ctx, b.lhs, roots), lower(ctx, b.rhs, roots)],
+                operands: vec![
+                    lower(ctx, qualify(b.lhs), roots),
+                    lower(ctx, qualify(b.rhs), roots),
+                ],
             }),
         },
         Mnemonic::Unop(u) => match map_unop(&u.op) {
-            Some(op) => Expr::bare(ExprKind::Unary(op, Box::new(lower(ctx, u.src, roots)))),
+            Some(op) => Expr::bare(ExprKind::Unary(
+                op,
+                Box::new(lower(ctx, qualify(u.src), roots)),
+            )),
             None => Expr::bare(ExprKind::Unknown {
                 op: insn.opcode().to_string(),
-                operands: vec![lower(ctx, u.src, roots)],
+                operands: vec![lower(ctx, qualify(u.src), roots)],
             }),
         },
         // A load from a named location (varnode) reads that variable directly;
         // a load through a computed pointer is a real dereference.
-        Mnemonic::Load(l) => deref_location(ctx, l.ptr, l.size, roots),
+        Mnemonic::Load(l) => deref_location(ctx, qualify(l.ptr), l.size, roots),
         Mnemonic::Zext(z) => Expr::bare(ExprKind::Cast {
             signed: false,
             bits: z.size * 8,
-            expr: Box::new(lower(ctx, z.src, roots)),
+            expr: Box::new(lower(ctx, qualify(z.src), roots)),
         }),
         // Sign extension must interpret the source as signed *at its own width*
         // before widening: `(int64_t)(int32_t)x`. A plain `(int64_t)x` would
         // zero-extend an unsigned source in C, silently dropping the sign.
         Mnemonic::Sext(s) => {
-            let src = signed_operand(ctx, s.src, lower(ctx, s.src, roots));
+            let src = signed_operand(ctx, qualify(s.src), lower(ctx, qualify(s.src), roots));
             Expr::bare(ExprKind::Cast {
                 signed: true,
                 bits: s.size * 8,
@@ -185,7 +192,7 @@ fn lower_instruction(ctx: &Context, id: InstructionId, roots: Roots, expand_unkn
                     .mnemonic()
                     .args()
                     .into_iter()
-                    .map(|v| lower(ctx, v, roots))
+                    .map(|v| lower(ctx, qualify(v), roots))
                     .collect(),
             })
         }
@@ -198,7 +205,6 @@ fn map_unop(op: &Unop) -> Option<UnOp> {
     match op {
         Unop::IntNegate | Unop::FloatNegate => Some(UnOp::Neg),
         Unop::IntNot => Some(UnOp::Not),
-        Unop::BoolNot => Some(UnOp::LNot),
         _ => None,
     }
 }
@@ -206,7 +212,6 @@ fn map_unop(op: &Unop) -> Option<UnOp> {
 fn map_binop(op: &Binop) -> Option<BinOp> {
     match op {
         Binop::Int(i) => map_int_binop(i),
-        Binop::Bool(b) => map_bool_binop(b),
         Binop::Float(fl) => map_float_binop(fl),
         _ => None,
     }
@@ -274,15 +279,6 @@ fn signed_operand(ctx: &Context, value: ValueId, expr: Expr) -> Expr {
     })
 }
 
-fn map_bool_binop(op: &BoolBinop) -> Option<BinOp> {
-    Some(match op {
-        BoolBinop::And => BinOp::LAnd,
-        BoolBinop::Or => BinOp::LOr,
-        BoolBinop::Xor => BinOp::BitXor,
-        _ => return None,
-    })
-}
-
 fn map_float_binop(op: &FloatBinop) -> Option<BinOp> {
     Some(match op {
         FloatBinop::Equal => BinOp::Eq,
@@ -308,10 +304,10 @@ fn name_or(name: Option<&str>, prefix: &str, value: ValueId) -> String {
 fn value_index(value: ValueId) -> usize {
     match value {
         ValueId::Varnode(id) => id.into(),
-        ValueId::BlockParam(id) => id.into(),
-        ValueId::Instruction(id) => id.into(),
+        ValueId::BlockParam(id) => id.local.into(),
+        ValueId::Instruction(id) => id.local.into(),
         ValueId::Literal(id) => id.into(),
-        ValueId::BasicBlock(id) => id.into(),
+        ValueId::BasicBlock(id) => id.local.into(),
         ValueId::Function(id) => id.into(),
         _ => 0,
     }

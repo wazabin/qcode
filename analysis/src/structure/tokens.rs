@@ -156,7 +156,7 @@ impl LineBuf {
         // Order is irrelevant to consumers; dedup so a value used twice on one
         // line is not reported twice.
         self.insns
-            .sort_unstable_by_key(|id| Into::<usize>::into(*id));
+            .sort_unstable_by_key(|id| (usize::from(id.func), usize::from(id.local)));
         self.insns.dedup();
         TokenLine {
             indent,
