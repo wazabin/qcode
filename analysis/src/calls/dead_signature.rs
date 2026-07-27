@@ -47,8 +47,8 @@ use crate::{CallGraph, Pass, PipelineEnv, calls::interface::remove_entry_params_
 /// only guards against an unforeseen non-terminating rewrite.
 const MAX_ITERS: usize = 100_000;
 
-/// Trim dead architecture-approved args and returned fields from every
-/// `pure_reg` function, rewriting all direct call sites.
+/// Trim unused arguments and architecture-approved dead returned fields from
+/// every `pure_reg` function, rewriting all direct call sites.
 pub fn dead_signature(
     ctx: &mut Context,
     killable_registers: &HashSet<qcode::value::VarnodeId>,
@@ -106,7 +106,7 @@ fn dead_signature_changed_functions(
         let ctx = cone.ctx_for(fid);
 
         let mut touched: HashSet<FunctionId> = HashSet::default();
-        let arg_changed = trim_dead_args(ctx, fid, &call_index, killable, &mut touched);
+        let arg_changed = trim_dead_args(ctx, fid, &call_index, &mut touched);
         let ret_changed = trim_dead_return_fields(ctx, fid, &call_index, killable, &mut touched);
 
         if arg_changed || ret_changed {
@@ -195,7 +195,6 @@ fn trim_dead_args(
     ctx: &mut Context,
     fid: FunctionId,
     call_index: &HashMap<FunctionId, Vec<InstructionId>>,
-    killable: &HashSet<qcode::value::VarnodeId>,
     touched: &mut HashSet<FunctionId>,
 ) -> bool {
     let Some(root) = FunctionBody::from_id(ctx, fid).root().map(|b| b.id) else {
@@ -212,7 +211,7 @@ fn trim_dead_args(
         .iter()
         .enumerate()
         .filter(|(i, p)| {
-            if !inputs.get(*i).is_some_and(|reg| killable.contains(reg)) {
+            if inputs.get(*i).is_none() {
                 return false;
             }
             let p = BlockParamId::new(root.func, **p);
@@ -403,7 +402,7 @@ pub struct DeadSignature;
 impl Pass for DeadSignature {
     const NAME: &'static str = "dead_signature";
     fn description(&self) -> &'static str {
-        "Remove dead arguments and dead returned fields from functionalized functions"
+        "Remove unused arguments and architecture-approved dead return effects"
     }
     fn run(
         &self,
@@ -633,10 +632,10 @@ mod tests {
             bld.push_store(f0, ValueId::Varnode(vr0), reg_space);
         }
 
-        let killable = killable(&tc);
+        let killable = HashSet::default();
         assert!(
             dead_signature(&mut tc.ctx, &killable),
-            "the unread r0 arg should be dropped"
+            "unused arguments are removable regardless of return-effect policy"
         );
 
         assert_eq!(
