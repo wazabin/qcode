@@ -17,6 +17,7 @@ use qcode::{
 
 use super::{
     ast::{Program, Stmt},
+    cast::ExprKind,
     lower_expr::{
         deref_location, instruction_declared_signed, instruction_name, lower_condition,
         lower_defining_expr, lower_expr_rooted,
@@ -539,7 +540,21 @@ fn emit_named_return_tuple(
         );
         line.punct(":");
         line.space();
-        lower_expr_rooted(ctx, field.qualify(return_id.func), roots).write_tokens(&mut line);
+        let mut expr = lower_expr_rooted(ctx, field.qualify(return_id.func), roots);
+        let output_bits = Varnode::from_id(ctx, output).size() * 8;
+        if matches!(
+            expr.kind,
+            ExprKind::Cast {
+                bits,
+                ..
+            } if bits == output_bits
+        ) {
+            let ExprKind::Cast { expr: inner, .. } = expr.kind else {
+                unreachable!("matched cast above")
+            };
+            expr = *inner;
+        }
+        expr.write_tokens(&mut line);
         if index + 1 != outputs.len() {
             line.punct(",");
         }
@@ -799,12 +814,81 @@ mod tests {
             "a shared sign-extended value should be declared signed:\n{c}"
         );
         assert!(
-            c.contains("signed_out = (int64_t)d;"),
-            "the signed widening should use the signed declaration directly:\n{c}"
+            c.contains("signed_out = d;"),
+            "C should widen the signed declaration implicitly:\n{c}"
         );
         assert!(
             c.contains("unsigned_out = (uint64_t)(uint32_t)d;"),
             "zero-extension from a signed declaration must preserve the 32-bit pattern:\n{c}"
+        );
+    }
+
+    #[test]
+    fn scalar_ranges_emit_as_fixed_width_casts() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 lhs;
+            varnode i64 rhs;
+            varnode i32 low_out;
+            varnode i32 high_out;
+
+            fn f:
+            <entry>
+                %lhs = load(lhs:8, &lhs);
+                %rhs = load(rhs:8, &rhs);
+                %quotient = i64 %lhs s/ i64 %rhs;
+                %low = %quotient[0:4];
+                %high = %quotient[4:8];
+                store(low_out:4, &low_out <- %low);
+                store(high_out:4, &high_out <- %high);
+                return at i64 0;
+            "
+        );
+
+        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        assert!(
+            c.contains("low_out = (int32_t)")
+                && c.contains("high_out = (uint32_t)")
+                && c.contains(">> 0x20"),
+            "scalar ranges should lower to signed/unsigned casts and shifts:\n{c}"
+        );
+        assert!(
+            !c.contains("range("),
+            "scalar ranges must not leak into emitted C:\n{c}"
+        );
+    }
+
+    #[test]
+    fn named_return_field_omits_its_destination_width_cast() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 EAX;
+            varnode i64 RAX;
+
+            fn f:
+            <entry>
+                %value = load(EAX:4, &EAX);
+                %wide = zext(i64, %value);
+                %result = pack(RAX=%wide);
+                return %result at i64 0;
+            "
+        );
+        FunctionBody::from_id_mut(&mut ctx, f).set_register_effects(
+            RegisterChannelState::Materialized(RegisterInterfaceMap {
+                inputs: vec![EAX],
+                outputs: vec![RAX],
+                returns: 1,
+            }),
+        );
+
+        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        assert!(
+            c.contains("RAX: EAX") && !c.contains("RAX: (uint64_t)"),
+            "the typed return field should provide the widening context:\n{c}"
         );
     }
 
@@ -940,7 +1024,8 @@ mod tests {
 
     #[test]
     fn sign_extension_extends_the_sign_not_zero() {
-        // The source is already i32, so only the widening i64 cast is needed.
+        // The source is already signed i32 and the i64 destination provides the
+        // widening context, so C performs the sign extension implicitly.
         let mut ctx = Context::new();
         qcode!(
             ctx,
@@ -958,8 +1043,8 @@ mod tests {
         );
         let c = emit_c(&ctx, &lower_function(&ctx, f));
         assert!(
-            c.contains("(int64_t)x") && !c.contains("(int32_t)x"),
-            "sext should emit only the type-changing widening cast:\n{c}"
+            c.contains("z = x;") && !c.contains("(int64_t)") && !c.contains("(int32_t)x"),
+            "a direct signed widening should be implicit:\n{c}"
         );
     }
 

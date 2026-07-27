@@ -12,7 +12,7 @@ use qcode::{
     context::Context,
     value::{
         BlockParam, Instruction, InstructionId, LiteralRef, Value, ValueId, ValueRef, Varnode,
-        insn::{Binop, FloatBinop, IntBinop, Mnemonic, Unop},
+        insn::{Binary, Binop, FloatBinop, IntBinop, Mnemonic, Unop},
     },
 };
 
@@ -162,8 +162,8 @@ fn lower_instruction(ctx: &Context, id: InstructionId, roots: Roots, expand_unkn
                 // and two different IR programs would print identically.
                 match signed_operands(&b.op) {
                     SignedOperands::Both => {
-                        lhs = signed_operand(ctx, qualify(b.lhs), lhs);
-                        rhs = signed_operand(ctx, qualify(b.rhs), rhs);
+                        lhs = signed_binop_operand(ctx, qualify(b.lhs), lhs);
+                        rhs = signed_binop_operand(ctx, qualify(b.rhs), rhs);
                     }
                     SignedOperands::LhsOnly => lhs = signed_operand(ctx, qualify(b.lhs), lhs),
                     SignedOperands::None => {}
@@ -204,6 +204,27 @@ fn lower_instruction(ctx: &Context, id: InstructionId, roots: Roots, expand_unkn
         Mnemonic::Sext(s) => {
             let src = signed_operand(ctx, qualify(s.src), lower(ctx, qualify(s.src), roots));
             cast_if_needed(ctx, qualify(s.src), true, s.size * 8, src)
+        }
+        // A scalar byte range is a truncation, optionally after shifting away
+        // lower bytes. Render it with fixed-width C operations rather than
+        // leaking QCode's `range(...)` operation into pseudo-C.
+        Mnemonic::Range(range)
+            if range.size <= 8 && ValueRef::new(qualify(range.src), ctx).size() <= 8 =>
+        {
+            let src = qualify(range.src);
+            let mut expr = lower(ctx, src, roots);
+            if range.start != 0 {
+                expr = Expr::bare(ExprKind::Binary(
+                    BinOp::Shr,
+                    Box::new(unsigned_operand(ctx, src, expr)),
+                    Box::new(Expr::konst((range.start * 8) as u64)),
+                ));
+            }
+            Expr::bare(ExprKind::Cast {
+                signed: range.start == 0 && signed_scalar_result(ctx, src),
+                bits: range.size * 8,
+                expr: Box::new(expr),
+            })
         }
         Mnemonic::Tuple(tuple) => {
             let names = ctx.shared.types.aggregate_fields(insn.type_id());
@@ -318,6 +339,19 @@ fn signed_operand(ctx: &Context, value: ValueId, expr: Expr) -> Expr {
     cast_if_needed(ctx, value, true, bits, expr)
 }
 
+/// Establish signedness for an operand of a signed binary operation.
+///
+/// If lowering has already produced a narrower signed expression, C's usual
+/// arithmetic conversions promote it against the other signed operand. Adding
+/// the IR operation width again would only spell `(int64_t)(int32_t)x`.
+fn signed_binop_operand(ctx: &Context, value: ValueId, expr: Expr) -> Expr {
+    if matches!(expr.kind, ExprKind::Cast { signed: true, .. }) {
+        expr
+    } else {
+        signed_operand(ctx, value, expr)
+    }
+}
+
 /// Interprets `expr` as unsigned at `value`'s own width.
 ///
 /// This matters when a named SSA value was declared signed because its other
@@ -336,6 +370,13 @@ fn unsigned_operand(ctx: &Context, value: ValueId, expr: Expr) -> Expr {
 /// signed interpretation, so declaring the shared temporary signed avoids
 /// repeating casts at every signed use. Unsigned uses still cast explicitly.
 pub(crate) fn instruction_declared_signed(ctx: &Context, id: InstructionId) -> bool {
+    if let Mnemonic::Range(range) = Instruction::from_id(ctx, id).mnemonic()
+        && range.start == 0
+        && signed_scalar_result(ctx, range.src.qualify(id.func))
+    {
+        return true;
+    }
+
     ctx.users(ValueId::Instruction(id)).into_iter().any(|user| {
         let mnemonic = Instruction::from_id(ctx, user).mnemonic();
         let is_value = |local| local == qcode::value::LocalValueId::Instruction(id.local);
@@ -353,6 +394,25 @@ pub(crate) fn instruction_declared_signed(ctx: &Context, id: InstructionId) -> b
     })
 }
 
+/// Whether a scalar-producing instruction has signed integer semantics.
+///
+/// QCode integers otherwise encode only width. A low-word truncation of a
+/// signed division, remainder, shift, or extension retains that signed
+/// interpretation in the emitted C expression.
+fn signed_scalar_result(ctx: &Context, value: ValueId) -> bool {
+    let ValueId::Instruction(id) = value else {
+        return false;
+    };
+    matches!(
+        Instruction::from_id(ctx, id).mnemonic(),
+        Mnemonic::Sext(_)
+            | Mnemonic::Binop(Binary {
+                op: Binop::Int(IntBinop::Sdiv | IntBinop::Srem | IntBinop::SShiftRight),
+                ..
+            })
+    )
+}
+
 /// Apply an integer cast only when it changes the expression's known type.
 ///
 /// QCode integer values already carry their width. Repeating that same width on
@@ -363,10 +423,36 @@ fn cast_if_needed(ctx: &Context, value: ValueId, signed: bool, bits: usize, expr
         ValueId::Instruction(id) => instruction_declared_signed(ctx, id),
         _ => false,
     };
-    if matches!(expr.kind, ExprKind::Var(_))
-        && ValueRef::new(value, ctx).size() * 8 == bits
-        && signed == declared_signed
+    let source_bits = ValueRef::new(value, ctx).size() * 8;
+    let source_is_signed = declared_signed
+        || matches!(
+            expr.kind,
+            ExprKind::Cast {
+                signed: true,
+                bits: inner_bits,
+                ..
+            } if inner_bits == source_bits
+        );
+
+    // C implicitly promotes a signed narrower integer to a signed wider
+    // destination. Once an inner cast/declaration has established signedness,
+    // spelling the widening again only produces `(int64_t)(int32_t)` noise.
+    if signed && bits > source_bits && source_is_signed {
+        return expr;
+    }
+
+    // A signless QCode integer is emitted unsigned by default. Its defining
+    // expression therefore already has the correct same-width C interpretation;
+    // wrapping an unsigned add in `(uint32_t)` before widening is redundant.
+    if !signed
+        && !declared_signed
+        && source_bits == bits
+        && !matches!(expr.kind, ExprKind::Cast { signed: true, .. })
     {
+        return expr;
+    }
+
+    if matches!(expr.kind, ExprKind::Var(_)) && source_bits == bits && signed == declared_signed {
         return expr;
     }
     if matches!(
