@@ -819,12 +819,12 @@ impl MemForward {
         // foreign blocks' stores entirely (they are the callee's concern, walked by
         // its own owner), but keep traversing through them to reach any owned
         // descendant, whose stores this function *does* reason about.
-        let owner = ctx.values.basic_blocks[block_id].parent;
+        let owner = block_id.func;
         let mut body = vec![block_id];
         let mut frontier = vec![block_id];
         while let Some(b) = frontier.pop() {
             for &child in tree.children_of(b) {
-                if ctx.values.basic_blocks[child].parent == owner {
+                if child.func == owner {
                     body.push(child);
                 }
                 frontier.push(child);

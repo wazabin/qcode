@@ -35,7 +35,7 @@ use qcode::{
     context::Context,
     types::AggregateField,
     value::{
-        BlockParamId, FunctionBody, FunctionId, Instruction, ValueId,
+        BlockParamId, FunctionBody, FunctionId, Instruction, QCodeMut, ValueId,
         insn::{Extract, InstructionId, Mnemonic, Return, Tuple},
     },
 };

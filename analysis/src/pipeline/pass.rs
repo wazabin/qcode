@@ -40,7 +40,6 @@ use super::{
     AnalysisManager, ArchConfig, CallingConvention, ConeMut, ContextSplit, ContextView,
     LocalAnalysisManager, Outcome, PreservedAnalyses,
 };
-use crate::structure::Program;
 use crate::RegisterBase;
 
 #[cfg(test)]
@@ -805,80 +804,12 @@ impl<T: Pass> DynPass for T {
     }
 }
 
-/// A decompilation pass: reads the (immutable, already-optimized) qcode IR of one
-/// function and reads/writes the high-level [`Program`] AST, returning `Ok(true)`
-/// if it changed the AST so a stage can loop it to a fixpoint.
-///
-/// This is the third pass scope, distinct from [`FunctionPass`] and [`Pass`],
-/// which both *mutate* the IR. A decompilation pass never touches the IR:
-/// decompilation is a read-only view over qcode that progressively builds and
-/// refines the AST. Region structuring, loop refinement, and the SAILR deopt
-/// transforms (switch-case recovery, tail duplication, …) are all this kind of
-/// pass. Its [`NAME`] is the single source of truth for the pipeline name.
-///
-/// [`NAME`]: DecompilePass::NAME
-pub trait DecompilePass: Default {
-    const NAME: &'static str;
-    fn description(&self) -> &'static str;
-    fn run(&self, ctx: &Context, fun_id: FunctionId, program: &mut Program)
-    -> Result<bool, String>;
-}
-
-/// Object-safe dispatch shim for [`DecompilePass`], mirroring [`DynFunctionPass`].
-pub trait DynDecompilePass {
-    fn name(&self) -> &'static str;
-    fn description(&self) -> &'static str;
-    fn run(&self, ctx: &Context, fun_id: FunctionId, program: &mut Program)
-    -> Result<bool, String>;
-}
-
-impl<T: DecompilePass> DynDecompilePass for T {
-    fn name(&self) -> &'static str {
-        T::NAME
-    }
-    fn description(&self) -> &'static str {
-        DecompilePass::description(self)
-    }
-    fn run(
-        &self,
-        ctx: &Context,
-        fun_id: FunctionId,
-        program: &mut Program,
-    ) -> Result<bool, String> {
-        DecompilePass::run(self, ctx, fun_id, program)
-    }
-    fn run_with_analyses(
-        &self,
-        ctx: &mut Context,
-        env: &PipelineEnv,
-        analyses: &mut AnalysisManager,
-    ) -> Result<ModulePassOutcome, String> {
-        #[cfg(test)]
-        let call_graph_before = call_graph_snapshot(ctx);
-        let outcome = Pass::run_with_analyses(self, ctx, env, analyses)?;
-        #[cfg(test)]
-        if outcome
-            .preserved_analyses()
-            .preserves_global_analysis::<crate::CallGraphAnalysis>()
-        {
-            assert_eq!(
-                call_graph_before,
-                call_graph_snapshot(ctx),
-                "{} reported preserving CallGraphAnalysis but changed its result",
-                T::NAME,
-            );
-        }
-        Ok(outcome)
-    }
-}
-
 // ----- registry --------------------------------------------------------------
 
 /// A pass resolved from its TOML name, tagged by which scope it runs in.
 pub enum RegisteredPass {
     Function(Box<dyn DynFunctionPass>),
     Module(Box<dyn DynPass>),
-    Decompile(Box<dyn DynDecompilePass>),
 }
 
 /// One pass's registration, submitted from the pass's own module via
@@ -996,22 +927,6 @@ macro_rules! register_module_pass {
     };
 }
 
-/// Register a decompilation pass. Like [`register_function_pass!`], but for
-/// AST-scoped passes; reads the name from [`DecompilePass::NAME`].
-#[macro_export]
-macro_rules! register_decompile_pass {
-    ($ty:ty) => {
-        inventory::submit! {
-            $crate::PassRegistration {
-                name: <$ty as $crate::DecompilePass>::NAME,
-                make: || $crate::RegisteredPass::Decompile(::std::boxed::Box::new(
-                    <$ty as ::core::default::Default>::default(),
-                )),
-            }
-        }
-    };
-}
-
 /// Every registered pass name, sorted, joined for error messages when a pipeline
 /// names an unknown pass.
 pub fn known_pass_names() -> String {
@@ -1067,7 +982,6 @@ mod tests {
             let (name, description) = match &pass {
                 RegisteredPass::Function(p) => (p.name(), p.description()),
                 RegisteredPass::Module(p) => (p.name(), p.description()),
-                RegisteredPass::Decompile(p) => (p.name(), p.description()),
             };
             assert_eq!(name, reg.name, "registration name must match the pass NAME");
             assert!(!description.is_empty(), "{name} has an empty description");

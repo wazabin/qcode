@@ -1413,7 +1413,7 @@ impl serde::Serialize for TypeManager {
 impl<'de> serde::Deserialize<'de> for TypeManager {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let reprs = Vec::<TypeRepr>::deserialize(deserializer)?;
-        let manager = TypeManager::new();
+        let mut manager = TypeManager::new();
         for repr in reprs {
             match repr {
                 TypeRepr::Int { size } => {
@@ -1429,6 +1429,11 @@ impl<'de> serde::Deserialize<'de> for TypeManager {
                 // so replaying in order guarantees they already exist here.
                 TypeRepr::Aggregate { fields } => {
                     manager.get_or_make_named_aggregate(fields);
+                }
+                TypeRepr::FunctionReturn { owner, fields } => {
+                    manager
+                        .create_function_return(owner, fields)
+                        .map_err(serde::de::Error::custom)?;
                 }
                 TypeRepr::Struct { name, size, fields } => {
                     manager.get_or_make_struct(name, size, fields);
@@ -1714,59 +1719,5 @@ mod tests {
             return_type
         );
         assert_eq!(restored.size_of(return_type), 4);
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for TypeManager {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let reprs = Vec::<TypeRepr>::deserialize(deserializer)?;
-        let mut manager = TypeManager::new();
-        for repr in reprs {
-            match repr {
-                TypeRepr::Int { size } => {
-                    manager.get_or_make_int(size);
-                }
-                TypeRepr::Bool => {
-                    manager.get_or_make_bool();
-                }
-                TypeRepr::SpaceAddress { size, space } => {
-                    manager.get_or_make_space_address(size, space);
-                }
-                // Field types have lower TypeIds (built before the aggregate),
-                // so replaying in order guarantees they already exist here.
-                TypeRepr::Aggregate { fields } => {
-                    manager.get_or_make_named_aggregate(fields);
-                }
-                TypeRepr::FunctionReturn { owner, fields } => {
-                    manager
-                        .create_function_return(owner, fields)
-                        .map_err(serde::de::Error::custom)?;
-                }
-                TypeRepr::Struct { name, size, fields } => {
-                    manager.get_or_make_struct(name, size, fields);
-                }
-                // The pointee has a lower TypeId (built before the pointer),
-                // so replaying in order guarantees it already exists here.
-                TypeRepr::StructPointer { size, pointee } => {
-                    manager.get_or_make_struct_pointer(size, pointee);
-                }
-                // The element type has a lower TypeId (built before the array),
-                // so replaying in order guarantees it already exists here.
-                TypeRepr::Array { elem, count } => {
-                    manager.get_or_make_array(elem, count);
-                }
-                // The element type has a lower TypeId (built before the list),
-                // so replaying in order guarantees it already exists here.
-                TypeRepr::List { elem, bound } => match bound {
-                    Some(b) => {
-                        manager.get_or_make_list(elem, b);
-                    }
-                    None => {
-                        manager.get_or_make_unbounded_list(elem);
-                    }
-                },
-            }
-        }
-        Ok(manager)
     }
 }

@@ -157,6 +157,7 @@ impl HandleJumpTables {
                 module_changed: false,
                 changed_functions: rustc_hash::FxHashSet::default(),
                 preserved_analyses: crate::PreservedAnalyses::all(),
+                type_requests: Vec::new(),
             });
         };
         let fun_ids: Vec<FunctionId> = targets

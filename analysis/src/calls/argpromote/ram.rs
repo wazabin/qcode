@@ -10,8 +10,8 @@ use qcode::{
     space::{LocalMemorySpaceId, MemorySpaceId},
     types::TypeId,
     value::{
-        ArgMemKind, BasicBlock, BlockId, FunctionBody, FunctionId, TempSpace, TempSpaceId, Value,
-        ValueId, VarnodeId,
+        ArgMemKind, BasicBlock, BlockId, FunctionBody, FunctionId, QCodeMut, TempSpace,
+        TempSpaceId, Value, ValueId, VarnodeId,
         insn::{Call, InstructionId, Mnemonic},
     },
 };
