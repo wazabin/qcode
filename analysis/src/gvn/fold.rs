@@ -428,6 +428,16 @@ pub(super) fn cast_identity<'ctx, 'str: 'ctx>(
             }
             None
         }
+        Mnemonic::Range(range) => {
+            let src = range.src.qualify(func);
+            if let ValueId::Instruction(id) = src
+                && let Mnemonic::Zext(zext) = host.insn_ref(id).mnemonic()
+                && range.start >= value_size(host, zext.src.qualify(id.func))
+            {
+                return Some(host.shared().get_const(0, range.size));
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -1150,6 +1160,44 @@ mod tests {
             ValueId::Instruction(a),
             "zext(i32, i1 v)[0:1] must collapse to v"
         );
+    }
+
+    /// The bytes introduced above a zero-extension's source width are all zero.
+    #[test]
+    fn test_upper_range_of_zext_folds_to_zero() {
+        use crate::gvn::gvn_function;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+                <entry>
+                    varnode i32 A;
+                    varnode i32 B;
+                    %a = load(A:4, &A);
+                    %z = zext(i64, %a);
+                    %upper = %z[4:8];
+                    store(B:4, &B <- %upper);
+                    return at i32 0;
+            "
+        );
+
+        let aliases = AliasResult::simple_for_function(&ctx, f);
+        gvn_function(&mut ctx, f, Some(&aliases));
+
+        let stored = FunctionBody::from_id(&ctx, f)
+            .blocks()
+            .flat_map(|b| b.iter().collect::<Vec<_>>())
+            .find_map(|i| match i.mnemonic() {
+                Mnemonic::Store(s) => Some(s.src.qualify(f)),
+                _ => None,
+            })
+            .expect("a store survives");
+        let ValueId::Literal(zero) = stored else {
+            panic!("upper range should fold to a zero literal, got {stored:?}");
+        };
+        assert_eq!(LiteralRef::from_id(&ctx, zero).value(), 0);
     }
 
     // -----------------------------------------------------------------------
