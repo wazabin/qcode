@@ -19,7 +19,7 @@ use qcode::{
     context::Context,
     discovery::Discovery,
     types::{TypeId, TypeManager},
-    value::{FunctionBody, FunctionId, FunctionMutRef, VarnodeId},
+    value::{FunctionBody, FunctionId, FunctionMutRef, ValueId, VarnodeId},
 };
 use rustc_hash::FxHashSet;
 
@@ -146,6 +146,19 @@ impl<'ctx, 'str> ConeMut<'ctx, 'str> {
     /// types live in shared state, not in any function body, so this is cone-free.
     pub fn set_varnode_type(&mut self, varnode: VarnodeId, type_id: TypeId) {
         self.ctx.set_varnode_type(varnode, type_id);
+    }
+
+    /// Mutably access a program-global varnode.
+    pub fn varnode_mut(
+        &mut self,
+        varnode: VarnodeId,
+    ) -> qcode::value::varnode::VarnodeMutRef<'str, '_> {
+        qcode::value::Varnode::from_id_mut(self.ctx, varnode)
+    }
+
+    /// Intern a literal in program-global storage.
+    pub fn push_literal(&mut self, literal: qcode::value::literal::Literal) -> ValueId {
+        ValueId::Literal(self.ctx.shared.values.push_literal(literal))
     }
 
     /// Queue a discovered code address for the lifter (see [`Context::discover`]).

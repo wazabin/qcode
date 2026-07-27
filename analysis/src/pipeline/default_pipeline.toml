@@ -439,6 +439,11 @@ scope = "module"
 passes = ["dead_signature"]
 repeat_until = "no_change"
 
+[[stage]]
+name = "identify-return-address"
+scope = "module"
+passes = ["identify_return_address"]
+
 # Re-run CRT-main discovery on fully normalized IR. This is required for i386
 # PIE startup, where `_start` computes the stack-passed main pointer through a
 # get-PC thunk and it becomes a literal only after late register/stack

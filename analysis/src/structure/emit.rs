@@ -62,7 +62,7 @@ fn header_line(ctx: &Context, function_id: FunctionId) -> TokenLine {
                     buf.punct(",");
                     buf.space();
                 }
-                emit_typed_param(param, &mut buf);
+                emit_typed_param(ctx, param, &mut buf);
             }
         }
     }
@@ -113,8 +113,15 @@ fn emit_uint_type(size: usize, buf: &mut LineBuf) {
     buf.push(format!("uint{}_t", size * 8), TokenKind::Type);
 }
 
-fn emit_typed_param(param: BlockParamRef<'_, '_>, buf: &mut LineBuf) {
-    emit_uint_type(param.size(), buf);
+fn emit_typed_param(ctx: &Context, param: BlockParamRef<'_, '_>, buf: &mut LineBuf) {
+    if matches!(
+        ctx.shared.types.get(param.type_id()).repr(),
+        qcode::types::TypeRepr::CodePointer { .. }
+    ) {
+        buf.push("code *", TokenKind::Type);
+    } else {
+        emit_uint_type(param.size(), buf);
+    }
     buf.space();
     buf.push(
         param
