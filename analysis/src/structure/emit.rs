@@ -504,7 +504,7 @@ fn statement(ctx: &Context, id: InstructionId, roots: &HashSet<InstructionId>) -
             emit_uint_type(insn.size(), &mut buf);
             buf.space();
             buf.push_value(
-                instruction_name(ctx, id),
+                instruction_name(ctx, id, roots),
                 TokenKind::Variable,
                 Some(ValueId::Instruction(id)),
             );

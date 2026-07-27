@@ -65,7 +65,7 @@ fn lower(ctx: &Context, value: ValueId, roots: Roots) -> Expr {
         }
         ValueId::Instruction(id) => {
             if roots.is_some_and(|r| r.contains(&id)) {
-                Expr::var(instruction_name(ctx, id))
+                Expr::var(instruction_name(ctx, id, roots.expect("checked above")))
             } else {
                 lower_instruction(ctx, id, roots, false)
             }
@@ -98,10 +98,38 @@ pub(crate) fn deref_location(ctx: &Context, ptr: ValueId, size: usize, roots: Ro
 }
 
 /// The display name of an instruction's SSA result.
-pub(crate) fn instruction_name(ctx: &Context, id: InstructionId) -> String {
+///
+/// Explicit IR names are preserved. Anonymous statement roots are densely named
+/// `a` through `z`, then `var26`, `var27`, ... within their function.
+pub(crate) fn instruction_name(
+    ctx: &Context,
+    id: InstructionId,
+    roots: &HashSet<InstructionId>,
+) -> String {
     match Instruction::from_id(ctx, id).name() {
         Some(name) => name.to_string(),
-        None => format!("v{}", usize::from(id.local)),
+        None => {
+            let index = roots
+                .iter()
+                .filter(|&&candidate| {
+                    candidate.func == id.func
+                        && candidate.local < id.local
+                        && Instruction::from_id(ctx, candidate).name().is_none()
+                        && !matches!(
+                            Instruction::from_id(ctx, candidate).mnemonic(),
+                            Mnemonic::Store(_)
+                                | Mnemonic::Return(_)
+                                | Mnemonic::Call(_)
+                                | Mnemonic::CallInd(_)
+                        )
+                })
+                .count();
+            if index < 26 {
+                char::from(b'a' + index as u8).to_string()
+            } else {
+                format!("var{index}")
+            }
+        }
     }
 }
 
