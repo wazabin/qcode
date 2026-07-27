@@ -288,31 +288,19 @@ passes = ["retail_apply", "argpromote"]
 
 # Sweep the instructions the rewrite makes dead (redirected/forwarded loads and
 # stores, now-unused address computations): `dead_store` drops the now-unread
-# stores, `dce` the forwarded loads and dead address math. A leading `dce` (the
-# stage was once `dce, dead_store, dce`) is unnecessary — the only stage between
-# here and the downstream `mark-pure`/`final-canonicalize` sweeps is
-# `dead-signature`, which keys on call signatures rather than dead address math,
-# so anything an up-front `dce` would remove is re-swept later with identical
-# output.
+# stores, `dce` the forwarded loads and dead address math.
 [[stage]]
 name = "argpromote-cleanup"
 scope = "function"
 passes = ["dead_store", "dce"]
 
-# Now that callees are functionalized and the dead replay stores/extracts are
-# swept, simplify the functionalized signatures, rewriting every direct call site.
-# Both passes are module-scoped (they edit call sites across functions) and looped
-# together to a whole-program fixpoint:
-#   * `partial_inline` recomputes a callee's cheap outputs (a small pure
-#     expression of its inputs) at every caller and kills the projecting extract,
-#     leaving the returned field unprojected;
-#   * `dead_signature` then drops arguments no callee reads and returned write-set
-#     fields no caller projects, and DCEs the functions it dirties.
-# A field one pass exposes can feed the other, so they share the loop.
+# Recompute cheap callee outputs at their callers. This is deliberately not
+# paired with `dead_signature`: partial inlining expands code in callers but
+# must preserve the original function body and functional signature.
 [[stage]]
-name = "dead-signature"
+name = "partial-inline"
 scope = "module"
-passes = ["partial_inline", "dead_signature"]
+passes = ["partial_inline"]
 repeat_until = "no_change"
 
 # Forward the `argpromote` shadow seed-store/load pairs (by-value arguments stored
