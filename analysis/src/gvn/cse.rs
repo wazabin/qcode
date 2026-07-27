@@ -813,4 +813,44 @@ mod tests {
             "@A-8 in a block reachable from two orphan entries must not be forwarded"
         );
     }
+
+    #[test]
+    fn cse_rewrites_parameterized_branch_argument_before_removing_duplicate() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i64 SP;
+
+                fn f:
+                    <entry>
+                        %address = &SP - i64 0x8;
+                        %duplicate = &SP - i64 0x8;
+                        goto <join @slot=%duplicate>;
+                    <join @slot:i64>
+                        return at i64 0;
+            "
+        );
+
+        gvn_function(&mut ctx, f, None);
+
+        assert!(
+            !BasicBlock::from_id(&ctx, entry)
+                .instruction_ids()
+                .contains(&duplicate),
+            "CSE must remove the duplicate address expression"
+        );
+        let terminator = BasicBlock::from_id(&ctx, entry)
+            .iter()
+            .last()
+            .expect("entry terminator");
+        let Mnemonic::Branch(branch) = terminator.mnemonic() else {
+            panic!("expected parameterized branch");
+        };
+        assert_eq!(
+            branch.args,
+            vec![ValueId::Instruction(address).localize(f)],
+            "branch argument must be forwarded to the surviving definition"
+        );
+    }
 }
