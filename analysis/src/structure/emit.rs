@@ -18,7 +18,8 @@ use qcode::{
 use super::{
     ast::{Program, Stmt},
     lower_expr::{
-        deref_location, instruction_name, lower_condition, lower_defining_expr, lower_expr_rooted,
+        deref_location, instruction_declared_signed, instruction_name, lower_condition,
+        lower_defining_expr, lower_expr_rooted,
     },
     tokens::{LineBuf, TokenKind, TokenLine},
 };
@@ -594,7 +595,11 @@ fn statement(ctx: &Context, id: InstructionId, roots: &HashSet<InstructionId>) -
         // An SSA result is defined exactly once, so its assignment is also its
         // declaration: `uintN_t name = <defining expression>;`.
         _ => {
-            emit_uint_type(insn.size(), &mut buf);
+            if instruction_declared_signed(ctx, id) {
+                buf.push(format!("int{}_t", insn.size() * 8), TokenKind::Type);
+            } else {
+                emit_uint_type(insn.size(), &mut buf);
+            }
             buf.space();
             buf.push_value(
                 instruction_name(ctx, id, roots),
@@ -763,6 +768,43 @@ mod tests {
         assert!(
             c.contains("uint32_t sum = 0x1 + 0x2;"),
             "a named SSA root should be declared at its definition:\n{c}"
+        );
+    }
+
+    #[test]
+    fn shared_signed_value_keeps_signed_declaration_and_explicit_zero_extension() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 x;
+            varnode i64 signed_out;
+            varnode i64 unsigned_out;
+
+            fn f:
+            <entry>
+                %xv = load(x:4, &x);
+                %d = i32 %xv + i32 0x2;
+                %signed = sext(i64, %d);
+                %unsigned = zext(i64, %d);
+                store(signed_out:8, &signed_out <- %signed);
+                store(unsigned_out:8, &unsigned_out <- %unsigned);
+                return at i64 0;
+            "
+        );
+
+        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        assert!(
+            c.contains("int32_t d = x + 0x2;"),
+            "a shared sign-extended value should be declared signed:\n{c}"
+        );
+        assert!(
+            c.contains("signed_out = (int64_t)d;"),
+            "the signed widening should use the signed declaration directly:\n{c}"
+        );
+        assert!(
+            c.contains("unsigned_out = (uint64_t)(uint32_t)d;"),
+            "zero-extension from a signed declaration must preserve the 32-bit pattern:\n{c}"
         );
     }
 

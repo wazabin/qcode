@@ -196,7 +196,7 @@ fn lower_instruction(ctx: &Context, id: InstructionId, roots: Roots, expand_unkn
             qualify(z.src),
             false,
             z.size * 8,
-            lower(ctx, qualify(z.src), roots),
+            unsigned_operand(ctx, qualify(z.src), lower(ctx, qualify(z.src), roots)),
         ),
         // Sign extension must interpret the source as signed *at its own width*
         // before widening: `(int64_t)(int32_t)x`. A plain `(int64_t)x` would
@@ -318,13 +318,55 @@ fn signed_operand(ctx: &Context, value: ValueId, expr: Expr) -> Expr {
     cast_if_needed(ctx, value, true, bits, expr)
 }
 
+/// Interprets `expr` as unsigned at `value`'s own width.
+///
+/// This matters when a named SSA value was declared signed because its other
+/// uses are signed. Widening it directly with `(uint64_t)d` would sign-extend a
+/// negative `int32_t d`; QCode `zext` instead needs
+/// `(uint64_t)(uint32_t)d`.
+fn unsigned_operand(ctx: &Context, value: ValueId, expr: Expr) -> Expr {
+    let bits = (ValueRef::new(value, ctx).size() * 8).max(8);
+    cast_if_needed(ctx, value, false, bits, expr)
+}
+
+/// Whether a named SSA result should use a signed C declaration.
+///
+/// QCode integer types encode width but not source-level signedness. A value
+/// consumed by a sign-extension or signed integer operation has an observable
+/// signed interpretation, so declaring the shared temporary signed avoids
+/// repeating casts at every signed use. Unsigned uses still cast explicitly.
+pub(crate) fn instruction_declared_signed(ctx: &Context, id: InstructionId) -> bool {
+    ctx.users(ValueId::Instruction(id)).into_iter().any(|user| {
+        let mnemonic = Instruction::from_id(ctx, user).mnemonic();
+        let is_value = |local| local == qcode::value::LocalValueId::Instruction(id.local);
+        match mnemonic {
+            Mnemonic::Sext(ext) => is_value(ext.src),
+            Mnemonic::Binop(binop) => match binop.op {
+                Binop::Int(
+                    IntBinop::SLess | IntBinop::SLessEqual | IntBinop::Sdiv | IntBinop::Srem,
+                ) => is_value(binop.lhs) || is_value(binop.rhs),
+                Binop::Int(IntBinop::SShiftRight) => is_value(binop.lhs),
+                _ => false,
+            },
+            _ => false,
+        }
+    })
+}
+
 /// Apply an integer cast only when it changes the expression's known type.
 ///
 /// QCode integer values already carry their width. Repeating that same width on
 /// a variable adds no information, and wrapping an identical cast produces the
 /// nested `(intN_t)(intN_t)` noise common in lifted sign-extension sequences.
 fn cast_if_needed(ctx: &Context, value: ValueId, signed: bool, bits: usize, expr: Expr) -> Expr {
-    if matches!(expr.kind, ExprKind::Var(_)) && ValueRef::new(value, ctx).size() * 8 == bits {
+    let declared_signed = match value {
+        ValueId::Instruction(id) => instruction_declared_signed(ctx, id),
+        _ => false,
+    };
+    if matches!(expr.kind, ExprKind::Var(_))
+        && ValueRef::new(value, ctx).size() * 8 == bits
+        && signed == declared_signed
+    {
         return expr;
     }
     if matches!(

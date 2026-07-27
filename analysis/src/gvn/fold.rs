@@ -359,7 +359,8 @@ fn try_fold_insn<'ctx, 'str: 'ctx>(
     let func = ic.insn_id.func;
     let folded = constant_folding_with_location(host, func, ic.mnemonic, ic.size, Some(ic))
         .or_else(|| algebraic_identity(host, func, ic.mnemonic, ic.size))
-        .or_else(|| cast_identity(host, func, ic.mnemonic))?;
+        .or_else(|| cast_identity(host, func, ic.mnemonic))
+        .or_else(|| reconstructed_sext_identity(host, func, ic.mnemonic, ic.size))?;
 
     let root_ty = host.type_of(ic.id);
     let folded_ty = host.type_of(folded);
@@ -383,6 +384,109 @@ fn try_fold_insn<'ctx, 'str: 'ctx>(
         .symbolic
         .is_none()
         .then(|| host.shared().get_typed_const(literal.value, root_ty))
+}
+
+/// Collapse a sign-extension reconstructed from its low and high halves.
+///
+/// Register-lane promotion can spell `sext(dst, x)` as:
+///
+/// ```text
+/// zext(dst, x)
+///   | zext(dst, range(sext(dst, x), sizeof(x), sizeof(dst) - sizeof(x)))
+///       * 2^(bits(x))
+/// ```
+///
+/// The two terms are exactly the low and high bytes of the original sign
+/// extension, so retaining the assembly only obscures the canonical `sext`.
+fn reconstructed_sext_identity<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    func: FunctionId,
+    m: &Mnemonic,
+    output_size: usize,
+) -> Option<ValueId> {
+    let &Mnemonic::Binop(Binary {
+        lhs,
+        rhs,
+        op: Binop::Int(IntBinop::Or),
+    }) = m
+    else {
+        return None;
+    };
+    let (lhs, rhs) = (lhs.qualify(func), rhs.qualify(func));
+    reconstructed_sext_terms(host, lhs, rhs, output_size)
+        .or_else(|| reconstructed_sext_terms(host, rhs, lhs, output_size))
+}
+
+fn reconstructed_sext_terms<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    low: ValueId,
+    high: ValueId,
+    output_size: usize,
+) -> Option<ValueId> {
+    let ValueId::Instruction(low_id) = low else {
+        return None;
+    };
+    let Mnemonic::Zext(low_zext) = host.insn_ref(low_id).mnemonic() else {
+        return None;
+    };
+    if low_zext.size != output_size {
+        return None;
+    }
+    let src = low_zext.src.qualify(low_id.func);
+    let src_size = value_size(host, src);
+    if src_size >= output_size || output_size > 8 {
+        return None;
+    }
+
+    let ValueId::Instruction(mul_id) = high else {
+        return None;
+    };
+    let Mnemonic::Binop(Binary {
+        lhs,
+        rhs,
+        op: Binop::Int(IntBinop::Mul),
+    }) = host.insn_ref(mul_id).mnemonic()
+    else {
+        return None;
+    };
+    let (lhs, rhs) = (lhs.qualify(mul_id.func), rhs.qualify(mul_id.func));
+    let scale = 1u64.checked_shl((src_size * 8) as u32)?;
+    let high_zext = if const_value(host.shared(), lhs) == Some(scale) {
+        rhs
+    } else if const_value(host.shared(), rhs) == Some(scale) {
+        lhs
+    } else {
+        return None;
+    };
+
+    let ValueId::Instruction(high_zext_id) = high_zext else {
+        return None;
+    };
+    let Mnemonic::Zext(high_zext) = host.insn_ref(high_zext_id).mnemonic() else {
+        return None;
+    };
+    if high_zext.size != output_size {
+        return None;
+    }
+
+    let ValueId::Instruction(range_id) = high_zext.src.qualify(high_zext_id.func) else {
+        return None;
+    };
+    let Mnemonic::Range(range) = host.insn_ref(range_id).mnemonic() else {
+        return None;
+    };
+    if range.start != src_size || range.size != output_size - src_size {
+        return None;
+    }
+
+    let sext = range.src.qualify(range_id.func);
+    let ValueId::Instruction(sext_id) = sext else {
+        return None;
+    };
+    let Mnemonic::Sext(sext_op) = host.insn_ref(sext_id).mnemonic() else {
+        return None;
+    };
+    (sext_op.size == output_size && sext_op.src.qualify(sext_id.func) == src).then_some(sext)
 }
 
 /// The size in bytes of `v`'s output.
@@ -1198,6 +1302,51 @@ mod tests {
             panic!("upper range should fold to a zero literal, got {stored:?}");
         };
         assert_eq!(LiteralRef::from_id(&ctx, zero).value(), 0);
+    }
+
+    /// Register promotion may rebuild a sign extension by packing its original
+    /// low word beside the extracted upper word. That byte-for-byte assembly is
+    /// the original sext and should return to the canonical operation.
+    #[test]
+    fn reconstructed_sign_extension_folds_to_sext() {
+        use crate::gvn::gvn_function;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+                <entry>
+                    varnode i32 A;
+                    varnode i64 B;
+                    %a = load(A:4, &A);
+                    %signed = sext(i64, %a);
+                    %low = zext(i64, %a);
+                    %upper_word = %signed[4:8];
+                    %upper = zext(i64, %upper_word);
+                    %shifted = %upper * i64 0x100000000;
+                    %packed = %shifted | %low;
+                    store(B:8, &B <- %packed);
+                    return at i32 0;
+            "
+        );
+
+        let aliases = AliasResult::simple_for_function(&ctx, f);
+        gvn_function(&mut ctx, f, Some(&aliases));
+
+        let stored = FunctionBody::from_id(&ctx, f)
+            .blocks()
+            .flat_map(|b| b.iter().collect::<Vec<_>>())
+            .find_map(|i| match i.mnemonic() {
+                Mnemonic::Store(s) => Some(s.src.qualify(f)),
+                _ => None,
+            })
+            .expect("a store survives");
+        assert_eq!(
+            stored,
+            ValueId::Instruction(signed),
+            "the packed low and sign-extension high halves must collapse to sext"
+        );
     }
 
     // -----------------------------------------------------------------------
