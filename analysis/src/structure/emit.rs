@@ -10,8 +10,8 @@ use std::collections::HashSet;
 use qcode::{
     context::Context,
     value::{
-        BlockId, FunctionRef, Instruction, InstructionId, LocalValueId, Value, ValueId, ValueRef,
-        Varnode, VarnodeId, function::FunctionId, insn::Mnemonic,
+        BlockId, BlockParamRef, FunctionRef, Instruction, InstructionId, LocalValueId, Value,
+        ValueId, ValueRef, Varnode, VarnodeId, function::FunctionId, insn::Mnemonic,
     },
 };
 
@@ -56,6 +56,15 @@ fn header_line(ctx: &Context, function_id: FunctionId) -> TokenLine {
     buf.punct("(");
     if let Some(registers) = registers {
         emit_typed_regs(ctx, &registers.inputs, &mut buf);
+        if let Some(root) = function.root() {
+            for (extra_index, param) in root.params().skip(registers.inputs.len()).enumerate() {
+                if !registers.inputs.is_empty() || extra_index > 0 {
+                    buf.punct(",");
+                    buf.space();
+                }
+                emit_typed_param(param, &mut buf);
+            }
+        }
     }
     buf.punct(")");
 
@@ -102,6 +111,18 @@ fn emit_typed_regs(ctx: &Context, regs: &[VarnodeId], buf: &mut LineBuf) {
 
 fn emit_uint_type(size: usize, buf: &mut LineBuf) {
     buf.push(format!("uint{}_t", size * 8), TokenKind::Type);
+}
+
+fn emit_typed_param(param: BlockParamRef<'_, '_>, buf: &mut LineBuf) {
+    emit_uint_type(param.size(), buf);
+    buf.space();
+    buf.push(
+        param
+            .name()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("param{}", usize::from(param.id.local))),
+        TokenKind::Variable,
+    );
 }
 
 /// Renders `program` as pseudo-C source text (indentation via spaces).
@@ -682,6 +703,34 @@ mod tests {
         assert!(
             c.starts_with("fn f(uint32_t x, uint64_t y)"),
             "function arguments should carry fixed-width C types:\n{c}"
+        );
+    }
+
+    #[test]
+    fn function_arguments_include_ram_snapshot_params_after_registers() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 RSP;
+
+            fn f:
+            <entry @rsp:i64 @RSP_val_0:i64>
+                return at @RSP_val_0;
+            "
+        );
+        FunctionBody::from_id_mut(&mut ctx, f).set_register_effects(
+            RegisterChannelState::Materialized(RegisterInterfaceMap {
+                inputs: vec![RSP],
+                outputs: vec![],
+                returns: 0,
+            }),
+        );
+
+        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        assert!(
+            c.starts_with("fn f(uint64_t RSP, uint64_t RSP_val_0)"),
+            "RAM snapshot params should follow the register-input prefix:\n{c}"
         );
     }
 
