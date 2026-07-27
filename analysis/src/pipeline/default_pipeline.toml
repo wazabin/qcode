@@ -429,6 +429,16 @@ scope = "function"
 passes = ["gvn", "dead_store", "dce"]
 repeat_until = "no_change"
 
+# Final forwarding above removes the shadow seed/load pair that temporarily
+# keeps a register base live for a RAM snapshot (for example `RSP` beside the
+# independent `RSP_val_0` return-address parameter). Prune the newly dead,
+# architecture-approved signature slots now that this dependency is gone.
+[[stage]]
+name = "final-dead-signature"
+scope = "module"
+passes = ["dead_signature"]
+repeat_until = "no_change"
+
 # Re-run CRT-main discovery on fully normalized IR. This is required for i386
 # PIE startup, where `_start` computes the stack-passed main pointer through a
 # get-PC thunk and it becomes a literal only after late register/stack

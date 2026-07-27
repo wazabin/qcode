@@ -660,6 +660,69 @@ mod tests {
         );
     }
 
+    /// A promoted caller-frame snapshot is a RAM-channel parameter after the
+    /// register-input prefix. Once cleanup forwards the snapshot directly, the
+    /// stack-register parameter is dead and must be removable without removing
+    /// or reindexing the snapshot as though it were another register input.
+    #[test]
+    fn drops_dead_stack_register_but_keeps_ram_snapshot_param() {
+        let mut tc = qcode::testing::TestContext::new();
+        let rsp_reg = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry @rsp:i64 @rsp_val_0:i64>
+                    return at @rsp_val_0;
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = g;
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(qcode::value::RegisterInterfaceMap {
+                inputs: vec![rsp_reg],
+                outputs: vec![],
+                returns: 0,
+            }),
+        );
+        let stack = tc.ctx.get_const(0x1000, 8).id();
+        let return_address = tc.ctx.get_const(0x4000, 8).id();
+        let call_id = set_call(&mut tc, g_call, f, vec![stack, return_address]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        let killable = [rsp_reg].into_iter().collect();
+        assert!(dead_signature(&mut tc.ctx, &killable));
+
+        let params: Vec<_> = FunctionBody::from_id(&tc.ctx, f)
+            .root()
+            .unwrap()
+            .params()
+            .collect();
+        assert_eq!(params.len(), 1, "only the RAM snapshot should remain");
+        assert_eq!(params[0].name(), Some("rsp_val_0"));
+        assert_eq!(
+            call_args(&tc, call_id),
+            vec![return_address],
+            "the snapshot's positional call argument must remain"
+        );
+        assert!(
+            FunctionBody::from_id(&tc.ctx, f)
+                .effects()
+                .materialized()
+                .unwrap()
+                .inputs
+                .is_empty(),
+            "the stale stack-register effect must be pruned"
+        );
+    }
+
     /// With more than one caller, dropping a dead register input trims the root
     /// param, shrinks the materialized `inputs` map in lockstep, and removes the
     /// dead argument at *every* call site — the map is per-callee (updated once),
