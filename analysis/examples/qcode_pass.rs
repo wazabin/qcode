@@ -133,6 +133,15 @@ fn run() -> Result<(), String> {
                 p.run_with_analyses(&mut cone, &env, &mut analyses)
                     .map_err(|e| format!("pass `{pass}` failed: {e}"))?;
             }
+            // A decompile pass rewrites a structured `Program`, which this filter
+            // never builds — it reads and writes textual IR. Reject by name
+            // rather than silently doing nothing.
+            RegisteredPass::Decompile(_) => {
+                return Err(format!(
+                    "`{pass}` is a decompile pass: it runs over a structured program, \
+                     which this textual-IR filter does not build"
+                ));
+            }
         }
     }
 
