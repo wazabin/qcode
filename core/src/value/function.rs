@@ -189,6 +189,30 @@ pub struct MemoryChannelState {
     /// footprint was persisted still load, conservatively.
     #[serde(default)]
     pub precise: Option<Footprint>,
+
+    /// The materialized memory interface: where each by-value memory input is
+    /// bound from and each write-set output replayed to, once the RAM channel
+    /// has functionalized this function. `None` while the memory channel is not
+    /// materialized (the default and, today, the only state any pass sets).
+    ///
+    /// The memory analogue of
+    /// [`RegisterChannelState::Materialized`](RegisterChannelState::Materialized).
+    /// Unlike the register channel this is a field rather than a lattice state,
+    /// because `coarse` and `precise` are independently ⊤ and materialization is
+    /// orthogonal to both.
+    ///
+    /// `#[serde(default)]` (→ `None`) so snapshots predating the memory
+    /// interface load unchanged.
+    #[serde(default)]
+    pub materialized: Option<MemoryInterfaceMap>,
+}
+
+impl MemoryChannelState {
+    /// The materialized memory interface, if the memory channel has been
+    /// materialized.
+    pub fn materialized(&self) -> Option<&MemoryInterfaceMap> {
+        self.materialized.as_ref()
+    }
 }
 
 /// Owned tri-state of a function's coarse written-space verdict, subsuming the
@@ -244,6 +268,62 @@ pub struct RegisterInterfaceMap {
     /// `returns == outputs.len()`; a prototyped external returns only its ABI
     /// return register(s) and clobbers the caller-saved tail.
     pub returns: usize,
+}
+
+/// Where one materialized interface input is bound from, or one write-set
+/// output replayed to, at a call site that does not pass it explicitly.
+///
+/// This is the memory channel's analogue of [`RegisterInterfaceMap`]'s bare
+/// [`VarnodeId`]: a register input needs no descriptor beyond the register
+/// itself, but a memory input has to say *which address* the caller reads. It
+/// generalizes [`ExternSlot`](super::function::signature::ExternSlot), which
+/// describes the same thing for prototyped externals only.
+///
+/// Deliberately **non-recursive**: a base that must itself be loaded is the
+/// "re-dereference whose address is loaded at runtime" case the RAM channel
+/// already rejects as unmodellable, so `base` is a register or nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum InterfaceSlot {
+    /// A register, `size` bytes — bound by reading the register file.
+    Reg(VarnodeId, usize),
+    /// `mem[base + offset]`, `size` bytes. `base: None` is an absolute address
+    /// (a global); `base: Some(sp)` with a non-negative offset is a caller-frame
+    /// slot (the return address, an incoming stack argument).
+    Deref {
+        base: Option<VarnodeId>,
+        offset: i64,
+        size: usize,
+    },
+}
+
+impl InterfaceSlot {
+    /// The width in bytes of the value this slot binds.
+    pub fn size(&self) -> usize {
+        match *self {
+            InterfaceSlot::Reg(_, size) | InterfaceSlot::Deref { size, .. } => size,
+        }
+    }
+}
+
+/// The ordered, machine-readable *memory* interface of a function whose memory
+/// channel has been materialized: where each by-value memory input parameter is
+/// loaded from, and where each memory write-set output is replayed to.
+///
+/// The memory analogue of [`RegisterInterfaceMap`]. Memory input parameters
+/// follow the register inputs in root-parameter order, so `inputs[i]` describes
+/// root param `register_inputs.len() + i`.
+///
+/// Read by the emulator's implicit binding convention (evaluate each input
+/// slot's address in the *caller's* state at the call, replay each output slot
+/// on return) and by the decompiler.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryInterfaceMap {
+    /// Where each by-value memory input parameter is bound from, in parameter
+    /// order (after the register inputs).
+    pub inputs: Vec<InterfaceSlot>,
+    /// Where each memory write-set output slot is replayed to, in pack order
+    /// (after the register outputs).
+    pub outputs: Vec<InterfaceSlot>,
 }
 
 /// A function *body*: arenas, roster, root, reverse use-def, local names. The
@@ -2242,10 +2322,10 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
             Some(spaces) => WrittenSpacesState::Bounded(spaces),
             None => WrittenSpacesState::Unbounded,
         };
-        // Coarse-only setter: the precise footprint is a separate component of
-        // the same channel and is left exactly as it was.
+        // Coarse-only setter: every other component of the channel is left
+        // exactly as it was.
         let precise = self.interface_mut().effects.memory.precise.take();
-        self.set_memory_effects(MemoryChannelState { coarse, precise });
+        self.set_memory_solved(coarse, precise);
     }
 
     /// Records the C-prototype-derived external call interface on this function.
@@ -2276,8 +2356,33 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
 
     /// Records this function's memory-channel effect state, preserving the
     /// register channel (read-modify-write). See [`FunctionInterface::effects`].
+    ///
+    /// Replaces **every** component of the memory channel. The channel has two
+    /// independent writers — the effect solve owns `coarse`/`precise`, the RAM
+    /// channel's rewrite owns `materialized` — so a caller that computes only
+    /// one writer's components must not build a whole state and pass it here:
+    /// the other writer's field would be silently lost. Use
+    /// [`set_memory_solved`](Self::set_memory_solved) or
+    /// [`set_memory_interface`](Self::set_memory_interface) instead.
     pub fn set_memory_effects(&mut self, memory: MemoryChannelState) {
         self.interface_mut().effects.memory = memory;
+    }
+
+    /// Records the *solved* components of the memory channel — the coarse
+    /// written-space verdict and the precise footprint the same solve derived —
+    /// leaving the materialized interface untouched.
+    ///
+    /// The effect solve does not compute the interface, so it must not clear it.
+    pub fn set_memory_solved(&mut self, coarse: WrittenSpacesState, precise: Option<Footprint>) {
+        let memory = &mut self.interface_mut().effects.memory;
+        memory.coarse = coarse;
+        memory.precise = precise;
+    }
+
+    /// Records the materialized memory interface, leaving the solved components
+    /// untouched. `None` marks the memory channel as not materialized.
+    pub fn set_memory_interface(&mut self, materialized: Option<MemoryInterfaceMap>) {
+        self.interface_mut().effects.memory.materialized = materialized;
     }
 
     /// Marks this function as fully functionalized over *every* side-effect
@@ -2787,5 +2892,70 @@ mod tests {
         assert_eq!(addresses.block_at(0x1000), None);
         assert!(FunctionBody::from_id(&ctx, fn_id).root().is_none());
         assert_ne!(block_id.func, fn_id);
+    }
+}
+
+#[cfg(test)]
+mod memory_interface_tests {
+    use super::*;
+
+    fn slot() -> InterfaceSlot {
+        InterfaceSlot::Deref {
+            base: Some(VarnodeId::from(3usize)),
+            offset: 8,
+            size: 8,
+        }
+    }
+
+    /// The interface survives a round-trip through the snapshot wire format.
+    ///
+    /// Back-compat is *not* tested here and is not provided: the payload is
+    /// bincode under a hard version lock (`session.rs` `FORMAT_VERSION`, bumped
+    /// for this field), so snapshots written before it are rejected outright
+    /// rather than defaulted.
+    #[test]
+    fn memory_interface_round_trips_through_the_wire_format() {
+        let state = MemoryChannelState {
+            materialized: Some(MemoryInterfaceMap {
+                inputs: vec![slot()],
+                outputs: vec![InterfaceSlot::Reg(VarnodeId::from(1usize), 4)],
+            }),
+            ..MemoryChannelState::default()
+        };
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&state, config).expect("encode memory state");
+        let (decoded, _): (MemoryChannelState, _) =
+            bincode::serde::decode_from_slice(&bytes, config).expect("decode memory state");
+        assert_eq!(decoded, state);
+    }
+
+    /// A default (unmaterialized) channel reports no interface.
+    #[test]
+    fn default_memory_state_is_not_materialized() {
+        assert_eq!(MemoryChannelState::default().materialized(), None);
+    }
+
+    /// The coarse-only setter must not disturb the other two components: a
+    /// re-stamp of the written-space set is not a re-materialization.
+    #[test]
+    fn stamping_written_spaces_preserves_the_materialized_interface() {
+        let mut ctx = Context::new();
+        let fid = FunctionBody::make(&mut ctx, "keeps_interface".into())
+            .unwrap()
+            .id;
+        let map = MemoryInterfaceMap {
+            inputs: vec![slot()],
+            outputs: vec![],
+        };
+        let mut body = FunctionBody::from_id_mut(&mut ctx, fid);
+        body.set_memory_effects(MemoryChannelState {
+            materialized: Some(map.clone()),
+            ..MemoryChannelState::default()
+        });
+        body.set_written_spaces(None);
+
+        let effects = FunctionBody::from_id(&ctx, fid).effects().memory.clone();
+        assert_eq!(effects.materialized(), Some(&map));
+        assert_eq!(effects.coarse, WrittenSpacesState::Unbounded);
     }
 }

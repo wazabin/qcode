@@ -47,7 +47,11 @@ fn written_space_updates(
     ctx: &Context,
     targets: impl IntoIterator<Item = FunctionId>,
     sp: Option<qcode::value::VarnodeId>,
-) -> Vec<(FunctionId, qcode::value::MemoryChannelState)> {
+) -> Vec<(
+    FunctionId,
+    qcode::value::WrittenSpacesState,
+    Option<qcode::value::Footprint>,
+)> {
     let graph = crate::CallGraph::analyze(ctx);
     let summaries = super::argpromote::ram_summary_solve(ctx, &graph, sp);
 
@@ -66,23 +70,27 @@ fn written_space_updates(
         // A ⊤ summary now records *stamped unbounded* rather than clearing the
         // stamp, so a fresh mint transitioning Unstamped → Unbounded counts as a
         // change (its callers' bounds may need re-verifying). Change-detection is
-        // a direct equality on the memory channel (Unstamped ≠ Bounded/Unbounded,
-        // Unbounded == Unbounded, Bounded(a) == Bounded(b) iff a == b) — the same
-        // verdict the hand-rolled `WrittenSpaces` match produced.
+        // a direct equality on each solved component (Unstamped ≠
+        // Bounded/Unbounded, Unbounded == Unbounded, Bounded(a) == Bounded(b) iff
+        // a == b) — the same verdict the hand-rolled `WrittenSpaces` match
+        // produced.
         //
         // The precise footprint the same solve derived is stamped alongside the
         // coarse set, so a memory-channel effect delta can compare addresses and
-        // not just space granularity. It has no consumer yet (Milestone 3 step
-        // 3); persisting it is inert.
-        let new_memory = qcode::value::MemoryChannelState {
-            coarse: match &summary {
-                Some(b) => qcode::value::WrittenSpacesState::Bounded(b.clone()),
-                None => qcode::value::WrittenSpacesState::Unbounded,
-            },
-            precise,
+        // not just space granularity.
+        //
+        // Only these two *solved* components are this pass's to write. The
+        // channel's materialized interface belongs to the RAM channel's rewrite,
+        // not to any lattice this solve computes, so it is neither recomputed nor
+        // compared, and the stamp goes through the field-wise
+        // `set_memory_solved` rather than replacing the whole channel.
+        let coarse = match &summary {
+            Some(b) => qcode::value::WrittenSpacesState::Bounded(b.clone()),
+            None => qcode::value::WrittenSpacesState::Unbounded,
         };
-        if FunctionBody::from_id(ctx, id).effects().memory != new_memory {
-            updates.push((id, new_memory));
+        let current = &FunctionBody::from_id(ctx, id).effects().memory;
+        if current.coarse != coarse || current.precise != precise {
+            updates.push((id, coarse, precise));
         }
     }
     updates
@@ -95,9 +103,9 @@ fn set_written_spaces_targeted_with_sp(
 ) -> rustc_hash::FxHashSet<FunctionId> {
     let updates = written_space_updates(ctx, targets.iter().copied(), sp);
     let changed_functions: rustc_hash::FxHashSet<FunctionId> =
-        updates.iter().map(|(id, _)| *id).collect();
-    for (id, new_memory) in updates {
-        FunctionBody::from_id_mut(ctx, id).set_memory_effects(new_memory);
+        updates.iter().map(|(id, ..)| *id).collect();
+    for (id, coarse, precise) in updates {
+        FunctionBody::from_id_mut(ctx, id).set_memory_solved(coarse, precise);
     }
     changed_functions
 }
@@ -123,9 +131,9 @@ impl Pass for SeedWrittenSpaces {
         // and writes through the cone-checked interface setter.
         let updates = written_space_updates(cone.ctx(), cone.cone_functions(), env.sp_varnode);
         let changed: rustc_hash::FxHashSet<FunctionId> =
-            updates.iter().map(|(id, _)| *id).collect();
-        for (id, new_memory) in updates {
-            cone.function_mut(id).set_memory_effects(new_memory);
+            updates.iter().map(|(id, ..)| *id).collect();
+        for (id, coarse, precise) in updates {
+            cone.function_mut(id).set_memory_solved(coarse, precise);
         }
         Ok(crate::ModulePassOutcome::functions(changed)
             .preserving_global::<crate::CallGraphAnalysis>()
@@ -420,6 +428,53 @@ fn callee:
             FunctionBody::from_id(&ctx, writer_b).effects().memory,
             default_mem,
             "out-of-cone function's memory effects must be untouched"
+        );
+    }
+
+    /// The memory channel has two independent writers: this solve owns
+    /// `coarse`/`precise`, the RAM channel's rewrite owns the materialized
+    /// interface. Re-running the solve must not disturb the interface.
+    ///
+    /// Regression: `written_space_updates` used to build a whole
+    /// `MemoryChannelState` and replace the stored one, so a single re-stamp
+    /// silently dropped the interface — a lost update, not an idempotence or
+    /// duplicate-pass failure (it converged, on the wrong value).
+    #[test]
+    fn restamping_written_spaces_preserves_the_materialized_memory_interface() {
+        let mut ctx = Context::new();
+        let fid = FunctionBody::make(&mut ctx, "keeps_memory_interface".into())
+            .unwrap()
+            .id;
+        BasicBlock::make(&mut ctx, fid);
+        let map = qcode::value::MemoryInterfaceMap {
+            inputs: vec![qcode::value::InterfaceSlot::Deref {
+                base: None,
+                offset: 0x1000,
+                size: 4,
+            }],
+            outputs: vec![],
+        };
+        FunctionBody::from_id_mut(&mut ctx, fid).set_memory_interface(Some(map.clone()));
+
+        // Two solves: the first stamps the coarse/precise components, the second
+        // finds them unchanged. Neither may touch the interface.
+        crate::calls::set_all_written_spaces(&mut ctx);
+        assert_eq!(
+            FunctionBody::from_id(&ctx, fid)
+                .effects()
+                .memory
+                .materialized(),
+            Some(&map),
+            "first solve dropped the materialized memory interface"
+        );
+        crate::calls::set_all_written_spaces(&mut ctx);
+        assert_eq!(
+            FunctionBody::from_id(&ctx, fid)
+                .effects()
+                .memory
+                .materialized(),
+            Some(&map),
+            "re-solve dropped the materialized memory interface"
         );
     }
 }

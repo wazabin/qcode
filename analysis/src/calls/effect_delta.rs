@@ -334,6 +334,11 @@ fn precise_delta(old: &Option<Footprint>, new: &Option<Footprint>) -> EffectDelt
 /// [`EffectDelta::composite`] reports that mix as
 /// [`Incomparable`](EffectDelta::Incomparable), which is the correct
 /// conservative verdict.
+/// `materialized` is deliberately **not** part of this comparison: it records
+/// the RAM channel's rewrite of the interface, not a solved lattice value, so it
+/// moves only when a pass functionalizes the function and never as the fixpoint
+/// converges. Folding it in would report a delta for a rewrite that changed no
+/// effect, invalidating callers needlessly.
 pub(crate) fn memory_channel_delta(
     old: &MemoryChannelState,
     new: &MemoryChannelState,
@@ -415,7 +420,11 @@ mod tests {
     }
 
     fn mem(coarse: WrittenSpacesState, precise: Option<Footprint>) -> MemoryChannelState {
-        MemoryChannelState { coarse, precise }
+        MemoryChannelState {
+            coarse,
+            precise,
+            ..MemoryChannelState::default()
+        }
     }
 
     fn effects(register: RegisterChannelState, memory: MemoryChannelState) -> FunctionEffects {

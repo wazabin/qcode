@@ -1029,6 +1029,7 @@ mod tests {
         let fixed = fixed_effects_from_memory_state(&MemoryChannelState {
             coarse: WrittenSpacesState::Bounded(vec![space]),
             precise: Some(precise.clone()),
+            ..MemoryChannelState::default()
         });
         assert_eq!(fixed.written, Some([space].into_iter().collect()));
         assert_eq!(fixed.precise, Some(precise));
