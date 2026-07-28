@@ -34,7 +34,7 @@ pub fn emit_tokens(ctx: &Context, program: &Program) -> Vec<TokenLine> {
     let mut out = Vec::new();
     match program.function {
         Some(function_id) => {
-            out.push(header_line(ctx, function_id));
+            out.push(header_line(ctx, program, function_id));
             emit_stmts(ctx, program, &program.stmts, 1, &roots, &mut out);
             out.push(brace_line("}", 0));
         }
@@ -46,7 +46,7 @@ pub fn emit_tokens(ctx: &Context, program: &Program) -> Vec<TokenLine> {
 /// Builds the `fn name(inputs) -> { output types } {` header from the function's
 /// recovered signature. A missing signature (or an empty input/output list)
 /// simply renders empty parentheses / no return arrow.
-fn header_line(ctx: &Context, function_id: FunctionId) -> TokenLine {
+fn header_line(ctx: &Context, program: &Program, function_id: FunctionId) -> TokenLine {
     let function = FunctionRef::from_id(ctx, function_id);
     let registers = function.effects().materialized();
 
@@ -78,12 +78,22 @@ fn header_line(ctx: &Context, function_id: FunctionId) -> TokenLine {
         buf.punct("->");
         buf.space();
         buf.punct("{");
+        let returned = returned_field_types(ctx, program, outputs.len());
         for (i, &id) in outputs.iter().enumerate() {
             if i > 0 {
                 buf.punct(",");
                 buf.space();
             }
-            emit_uint_type(Varnode::from_id(ctx, id).size(), &mut buf);
+            // Prefer the type of the value actually returned in this slot: the
+            // interface records only a register varnode, which carries a width
+            // but no type, so a returned code pointer would otherwise print as
+            // a plain integer of the same width.
+            match returned.as_ref().and_then(|types| types.get(i).copied()) {
+                Some(type_id) => {
+                    emit_c_type(ctx, type_id, Varnode::from_id(ctx, id).size(), &mut buf)
+                }
+                None => emit_uint_type(Varnode::from_id(ctx, id).size(), &mut buf),
+            }
         }
         buf.punct("}");
     }
@@ -115,16 +125,72 @@ fn emit_uint_type(size: usize, buf: &mut LineBuf) {
     buf.push(format!("uint{}_t", size * 8), TokenKind::Type);
 }
 
-fn emit_typed_param(ctx: &Context, param: BlockParamRef<'_, '_>, buf: &mut LineBuf) {
-    if matches!(
-        ctx.shared.types.get(param.type_id()).repr(),
+/// Whether `type_id` is a code pointer, whose C spelling is `code_t *` rather
+/// than an integer of the same width.
+fn is_code_pointer(ctx: &Context, type_id: qcode::types::TypeId) -> bool {
+    matches!(
+        ctx.shared.types.get(type_id).repr(),
         qcode::types::TypeRepr::CodePointer { .. }
-    ) {
-        buf.push("code *", TokenKind::Type);
+    )
+}
+
+/// Pushes the C spelling of `type_id` with no declarator name, so a pointer
+/// renders as `code_t*`. Falls back to the unsigned type for `size` when the
+/// qcode type carries nothing beyond its width.
+fn emit_c_type(ctx: &Context, type_id: qcode::types::TypeId, size: usize, buf: &mut LineBuf) {
+    if is_code_pointer(ctx, type_id) {
+        buf.push("code_t", TokenKind::Type);
+        buf.punct("*");
+    } else {
+        emit_uint_type(size, buf);
+    }
+}
+
+/// The types of the values the function's return pack actually yields, aligned
+/// with the interface's output slots.
+///
+/// The interface records each output as a register [`VarnodeId`], which carries
+/// a width but no type. The returned values do carry types, so the declared
+/// return type is read off the `Tuple` feeding the `Return`. `None` when the
+/// program has no such return, or when it does not line up with `outputs`.
+fn returned_field_types(
+    ctx: &Context,
+    program: &Program,
+    outputs: usize,
+) -> Option<Vec<qcode::types::TypeId>> {
+    let mut raws = Vec::new();
+    collect_raws(&program.stmts, &mut raws);
+    raws.into_iter().find_map(|return_id| {
+        let Mnemonic::Return(ret) = Instruction::from_id(ctx, return_id).mnemonic() else {
+            return None;
+        };
+        let ValueId::Instruction(tuple_id) = ret.value?.qualify(return_id.func) else {
+            return None;
+        };
+        let Mnemonic::Tuple(tuple) = Instruction::from_id(ctx, tuple_id).mnemonic() else {
+            return None;
+        };
+        (tuple.fields.len() == outputs).then(|| {
+            tuple
+                .fields
+                .iter()
+                .map(|&field| ctx.type_of(field.qualify(return_id.func)))
+                .collect()
+        })
+    })
+}
+
+fn emit_typed_param(ctx: &Context, param: BlockParamRef<'_, '_>, buf: &mut LineBuf) {
+    let code_pointer = is_code_pointer(ctx, param.type_id());
+    if code_pointer {
+        buf.push("code_t", TokenKind::Type);
     } else {
         emit_uint_type(param.size(), buf);
     }
     buf.space();
+    if code_pointer {
+        buf.punct("*");
+    }
     buf.push(
         param
             .name()
