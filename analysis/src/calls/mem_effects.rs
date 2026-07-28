@@ -454,7 +454,7 @@ fn callee:
             .id;
         BasicBlock::make(&mut ctx, fid);
         let map = qcode::value::MemoryInterfaceMap {
-            inputs: vec![qcode::value::InterfaceSlot::Deref {
+            inputs: vec![qcode::value::InterfaceSlot {
                 base: qcode::value::SlotBase::Global(0x1000),
                 offset: 0,
                 size: 4,

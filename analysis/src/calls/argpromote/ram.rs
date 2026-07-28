@@ -720,26 +720,6 @@ fn try_promote(
     }
 }
 
-/// The base a root param at `arg_idx` describes, for a slot rooted at it.
-///
-/// The register channel materializes its inputs into the *leading* root-param
-/// slots, and a param's index is its argument index (see [`arg_index_of`]), so
-/// an index inside `map.inputs` names that register directly.
-///
-/// A param past them is a memory input added by this channel: a base that would
-/// itself have to be bound before it could be dereferenced. That is the
-/// recursive case [`InterfaceSlot`] deliberately cannot express, so it records
-/// [`SlotBase::Unmappable`] — distinct from [`SlotBase::Global`], so a consumer
-/// cannot mistake "we could not describe this" for "absolute address zero".
-fn param_slot_base(ctx: &Context, fid: FunctionId, arg_idx: usize) -> SlotBase {
-    FunctionBody::from_id(ctx, fid)
-        .effects()
-        .register
-        .materialized()
-        .and_then(|map| map.inputs.get(arg_idx).copied())
-        .map_or(SlotBase::Unmappable, SlotBase::Reg)
-}
-
 /// Record where each memory input binds from and each write-set output replays
 /// to, as [`InterfaceSlot`]s on the memory channel.
 ///
@@ -1424,8 +1404,9 @@ fn apply(
     for s in &snaps {
         let (base, base_size, offset, size, arg_idx) =
             (s.base, s.base_size, s.offset, s.size, s.arg_idx);
-        input_slots.push(InterfaceSlot::Deref {
-            base: param_slot_base(ctx, fid, arg_idx),
+        input_slots.push(InterfaceSlot {
+            // The base is the pointer argument the caller already passes.
+            base: SlotBase::Arg(arg_idx),
             offset,
             size,
         });
@@ -1438,7 +1419,7 @@ fn apply(
             Some(name),
             None,
             s.type_id,
-            Some(call_sites),
+            Some(&[]),
             shadow,
             move |b| seed_addr(b, base, base_size, offset),
             move |ctx, call_id, block| {
@@ -1479,8 +1460,8 @@ fn apply(
             continue;
         }
         let (addr, addr_size, size) = (g.addr, g.addr_size, g.size);
-        // A global binds from its absolute address.
-        input_slots.push(InterfaceSlot::Deref {
+        // A global binds from its absolute address, in every caller alike.
+        input_slots.push(InterfaceSlot {
             base: SlotBase::Global(addr),
             offset: 0,
             size,
@@ -1493,7 +1474,7 @@ fn apply(
             Some(format!("glob_{:x}", addr)),
             Some(origin),
             None,
-            Some(call_sites),
+            Some(&[]),
             shadow,
             move |b| b.shr().get_const(addr, addr_size),
             move |ctx, call_id, block| {
@@ -1608,10 +1589,10 @@ fn apply(
     // closure below does.
     let output_slots: Vec<InterfaceSlot> = write_slots
         .iter()
-        .map(|&(_, _, offset, size, arg_idx)| InterfaceSlot::Deref {
+        .map(|&(_, _, offset, size, arg_idx)| InterfaceSlot {
             // No arg index means the base is not a promoted param: the replay
             // falls back to the extracted address, which no slot can describe.
-            base: arg_idx.map_or(SlotBase::Unmappable, |i| param_slot_base(ctx, fid, i)),
+            base: arg_idx.map_or(SlotBase::Unmappable, SlotBase::Arg),
             offset,
             size,
         })
@@ -1622,7 +1603,7 @@ fn apply(
         ctx,
         fid,
         &write_slots,
-        Some(call_sites),
+        Some(&[]),
         true,
         |i, _| {
             vec![
@@ -1661,7 +1642,189 @@ fn apply(
         },
     );
 
+    // Everything above rewrote only the callee (`Some(&[])` at each threading
+    // point). The caller side is driven entirely off the interface recorded
+    // above — the seam that lets the two halves become separate passes.
+    bind_memory_calls(ctx, fid, call_sites);
+
     true
+}
+
+/// Bind `fid`'s materialized memory interface at every site in `call_sites`:
+/// append one positional argument per input slot, then replay each write-set
+/// output into real memory in the call's continuation.
+///
+/// Reads only the recorded [`MemoryInterfaceMap`] and the callee's return
+/// layout — never the promotion's internal state — so it does not depend on when
+/// (or whether) the callee was materialized. That independence is the point: a
+/// materialized callee with no sites simply binds nowhere.
+fn bind_memory_calls(ctx: &mut Context, fid: FunctionId, call_sites: &[InstructionId]) {
+    let Some(map) = FunctionBody::from_id(ctx, fid)
+        .effects()
+        .memory
+        .materialized()
+        .cloned()
+    else {
+        return;
+    };
+    if call_sites.is_empty() {
+        return;
+    }
+    // Args land at the end of `Call.args`, so append in interface order to keep
+    // the memory params in lockstep behind the register ones.
+    for &slot in &map.inputs {
+        crate::calls::interface::append_caller_arg_at_sites(
+            ctx,
+            call_sites,
+            |ctx, call_id, block| slot_value(ctx, call_id, block, slot),
+        );
+    }
+    replay_memory_writes(ctx, fid, &map, call_sites);
+}
+
+/// Replay each write-set output at every call site: extract the `(addr, value)`
+/// pair the callee returned and store it into real memory.
+///
+/// The pair's position is read off the callee's return layout rather than
+/// remembered from the promotion — the memory write-set is the run of fields
+/// named `write*`, appended after whatever the register channel already emitted.
+fn replay_memory_writes(
+    ctx: &mut Context,
+    fid: FunctionId,
+    map: &MemoryInterfaceMap,
+    call_sites: &[InstructionId],
+) {
+    if map.outputs.is_empty() {
+        return;
+    }
+    let Some(return_ty) = ctx.shared.types.function_return(fid) else {
+        return;
+    };
+    let Some(fields) = ctx.shared.types.aggregate_fields(return_ty) else {
+        return;
+    };
+    // The first `write*` field: everything before it belongs to an earlier
+    // channel and is replayed by that channel, not here.
+    let Some(base_len) = fields.iter().position(|f| f.name.starts_with("write")) else {
+        return;
+    };
+    let ram = ctx.shared.default_space;
+
+    for &call_id in call_sites {
+        let Some(call_block) = ctx.get_insn(call_id).parent().map(|b| b.id) else {
+            continue;
+        };
+        let Some(cont) = BasicBlock::from_id(ctx, call_block)
+            .successors()
+            .next()
+            .map(|(_, b)| b)
+        else {
+            continue;
+        };
+        // The call now yields the write-set aggregate. Resized (not set): the
+        // register channel may already have typed the result to its own,
+        // smaller write-set, and we are growing it with the appended fields.
+        qcode::value::Instruction::from_id_mut(ctx, call_id).set_type_resized(return_ty);
+        let result = ValueId::Instruction(call_id);
+        for (i, &slot) in map.outputs.iter().enumerate() {
+            // Each write slot contributes an (addr, value) pair.
+            let (addr_idx, value_idx) = (base_len + 2 * i, base_len + 2 * i + 1);
+            let value = {
+                let mut b = (ctx).builder(cont);
+                b.set_insert_point_to_start();
+                ValueId::Instruction(b.push_extract(result, value_idx).id)
+            };
+            // Prefer the slot's own address — affine in the caller, so the
+            // caller's footprint scan can capture the replayed store, where an
+            // extracted pack address is opaque. Fall back to the extracted
+            // address when the slot cannot name one.
+            let addr = slot_address(ctx, call_id, InsertAt::ContinuationStart(cont), slot)
+                .unwrap_or_else(|| {
+                    let mut b = (ctx).builder(cont);
+                    b.set_insert_point_to_start();
+                    ValueId::Instruction(b.push_extract(result, addr_idx).id)
+                });
+            let mut b = (ctx).builder(cont);
+            b.set_insert_point_to_start();
+            b.push_store(value, addr, ram);
+        }
+    }
+}
+
+/// Build the address `slot` names, in the *caller's* state at `call_id`.
+///
+/// An [`SlotBase::Arg`] base is the argument the site already passes — the
+/// caller holds that pointer as an SSA value, so no reconstruction is needed (or
+/// possible: it is caller-supplied data). `None` when the site does not pass
+/// that argument, or the base names no address at all.
+fn slot_address(
+    ctx: &mut Context,
+    call_id: InstructionId,
+    at: InsertAt,
+    slot: InterfaceSlot,
+) -> Option<ValueId> {
+    let InterfaceSlot { base, offset, .. } = slot;
+    let addr_size = ctx.shared.space(ctx.shared.default_space).addr_size;
+    match base {
+        SlotBase::Unmappable => None,
+        SlotBase::Global(addr) => {
+            let mut b = (ctx).builder(at.block());
+            at.position(&mut b, call_id);
+            Some(
+                b.shr()
+                    .get_const(addr.wrapping_add(offset as u64), addr_size),
+            )
+        }
+        SlotBase::Arg(i) => {
+            let Mnemonic::Call(call) = ctx.get_insn(call_id).mnemonic().clone() else {
+                return None;
+            };
+            let base = call.args.get(i)?.qualify(call_id.func);
+            let base_size = qcode::value::ValueRef::new(base, &*ctx).size();
+            let mut b = (ctx).builder(at.block());
+            at.position(&mut b, call_id);
+            Some(seed_addr(&mut b, base, base_size, offset))
+        }
+    }
+}
+
+/// Where a bind-side value is built: an argument is materialized *before* the
+/// call, a write replay *at the top of its continuation*.
+#[derive(Clone, Copy)]
+enum InsertAt {
+    BeforeCall(BlockId),
+    ContinuationStart(BlockId),
+}
+
+impl InsertAt {
+    /// The block to build in.
+    fn block(self) -> BlockId {
+        match self {
+            InsertAt::BeforeCall(block) | InsertAt::ContinuationStart(block) => block,
+        }
+    }
+
+    /// Position an already-created builder at this insertion point.
+    fn position(self, b: &mut Builder<'_, '_>, call_id: InstructionId) {
+        match self {
+            InsertAt::BeforeCall(_) => b.set_insert_point_before(call_id),
+            InsertAt::ContinuationStart(_) => b.set_insert_point_to_start(),
+        }
+    }
+}
+
+/// Materialize one interface input's value at `call_id`, per its slot.
+fn slot_value(
+    ctx: &mut Context,
+    call_id: InstructionId,
+    block: BlockId,
+    slot: InterfaceSlot,
+) -> Option<ValueId> {
+    let addr = slot_address(ctx, call_id, InsertAt::BeforeCall(block), slot)?;
+    let ram = ctx.shared.default_space;
+    let mut b = (ctx).builder(block);
+    b.set_insert_point_before(call_id);
+    Some(b.push_load::<false>(addr, slot.size, ram).id())
 }
 
 /// Recompute a snapshot/write-slot address `base + offset` for a builder. The

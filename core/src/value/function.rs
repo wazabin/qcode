@@ -279,60 +279,60 @@ pub struct RegisterInterfaceMap {
 /// generalizes [`ExternSlot`](super::function::signature::ExternSlot), which
 /// describes the same thing for prototyped externals only.
 ///
+/// Every slot is `mem[base + offset]` of `size` bytes: a memory input is, by
+/// construction, a dereference. The interface says *where*, in terms the caller
+/// can evaluate — never in terms of the callee's body.
+///
 /// Deliberately **non-recursive**: a base that must itself be loaded is the
 /// "re-dereference whose address is loaded at runtime" case the RAM channel
 /// already rejects as unmodellable — such a base records
 /// [`SlotBase::Unmappable`] rather than being described.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum InterfaceSlot {
-    /// A register, `size` bytes — bound by reading the register file.
-    Reg(VarnodeId, usize),
-    /// `mem[base + offset]`, `size` bytes.
-    Deref {
-        base: SlotBase,
-        offset: i64,
-        size: usize,
-    },
+pub struct InterfaceSlot {
+    pub base: SlotBase,
+    pub offset: i64,
+    pub size: usize,
 }
 
-/// What a [`Deref`](InterfaceSlot::Deref) slot's address is relative to.
+/// What an [`InterfaceSlot`]'s address is relative to.
 ///
-/// The three cases are kept apart deliberately: "absolute address" and "we could
-/// not describe this base" are both address-less, but only the first is
-/// *bindable*. Collapsing them would let a consumer synthesize a load from a
-/// bogus absolute address for a base it never resolved.
+/// Deliberately **register-free**. A materialized function is on its way to
+/// being a pure function of its arguments, and its interface should carry no
+/// notion of a register file: the register channel has already turned every
+/// register input into a by-value argument, so a base that *was* a register is
+/// simply the argument bound to it. The property that matters is that a caller
+/// can express the address — hence the vocabulary is "an argument you pass" or
+/// "an address that is the same everywhere".
+///
+/// The address-less cases are kept apart on purpose: an absolute address and a
+/// base we failed to describe are both address-less, but only the first is
+/// bindable. Collapsing them would let a consumer load from a bogus absolute
+/// address for a base it never resolved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SlotBase {
-    /// Relative to a register's value at the call: `mem[reg + offset]`. A
-    /// stack-pointer base with a non-negative offset is a caller-frame slot (the
-    /// return address, an incoming stack argument).
-    Reg(VarnodeId),
-    /// An absolute address (a global): `mem[addr + offset]`.
+    /// The callee's `i`-th positional argument: `mem[args[i] + offset]`.
+    ///
+    /// Bindable at any site that passes that argument — which is *site*-relative,
+    /// and honestly so: a pointer the caller supplies cannot be reconstructed
+    /// without a caller. A caller-less function is still materialized; it simply
+    /// binds nowhere.
+    Arg(usize),
+    /// An absolute address (a global): `mem[addr + offset]`. Bindable anywhere,
+    /// including at an implicit or indirect site, since the address is the same
+    /// in every caller.
     Global(u64),
-    /// The base could not be expressed — it is itself a memory input, so it
-    /// would have to be bound before it could be dereferenced. **Not bindable**:
-    /// a consumer must refuse such a slot rather than treat it as absolute.
+    /// The base could not be expressed. **Not bindable**: a consumer must refuse
+    /// such a slot rather than treat it as absolute.
     Unmappable,
 }
 
 impl InterfaceSlot {
-    /// The width in bytes of the value this slot binds.
-    pub fn size(&self) -> usize {
-        match *self {
-            InterfaceSlot::Reg(_, size) | InterfaceSlot::Deref { size, .. } => size,
-        }
-    }
-
-    /// Whether a call site can evaluate this slot's address from its own state.
-    /// False for a [`SlotBase::Unmappable`] base.
+    /// Whether this slot's address is expressible at a call site at all.
+    ///
+    /// A [`SlotBase::Arg`] slot additionally needs the site to actually pass
+    /// that argument; this reports only the address-independent half.
     pub fn is_bindable(&self) -> bool {
-        !matches!(
-            self,
-            InterfaceSlot::Deref {
-                base: SlotBase::Unmappable,
-                ..
-            }
-        )
+        !matches!(self.base, SlotBase::Unmappable)
     }
 }
 
@@ -2931,8 +2931,8 @@ mod memory_interface_tests {
     use super::*;
 
     fn slot() -> InterfaceSlot {
-        InterfaceSlot::Deref {
-            base: SlotBase::Reg(VarnodeId::from(3usize)),
+        InterfaceSlot {
+            base: SlotBase::Arg(0),
             offset: 8,
             size: 8,
         }
@@ -2949,7 +2949,11 @@ mod memory_interface_tests {
         let state = MemoryChannelState {
             materialized: Some(MemoryInterfaceMap {
                 inputs: vec![slot()],
-                outputs: vec![InterfaceSlot::Reg(VarnodeId::from(1usize), 4)],
+                outputs: vec![InterfaceSlot {
+                    base: SlotBase::Global(0x2000),
+                    offset: 0,
+                    size: 4,
+                }],
             }),
             ..MemoryChannelState::default()
         };
@@ -2995,12 +2999,12 @@ mod memory_interface_tests {
     /// load from a bogus absolute address for a base it never resolved.
     #[test]
     fn an_unmappable_base_is_distinct_from_a_global_and_is_not_bindable() {
-        let unmappable = InterfaceSlot::Deref {
+        let unmappable = InterfaceSlot {
             base: SlotBase::Unmappable,
             offset: 0,
             size: 8,
         };
-        let global = InterfaceSlot::Deref {
+        let global = InterfaceSlot {
             base: SlotBase::Global(0),
             offset: 0,
             size: 8,
@@ -3008,10 +3012,9 @@ mod memory_interface_tests {
         assert_ne!(unmappable, global);
         assert!(!unmappable.is_bindable());
         assert!(global.is_bindable());
-        assert!(InterfaceSlot::Reg(VarnodeId::from(1usize), 8).is_bindable());
         assert!(
-            InterfaceSlot::Deref {
-                base: SlotBase::Reg(VarnodeId::from(1usize)),
+            InterfaceSlot {
+                base: SlotBase::Arg(0),
                 offset: -8,
                 size: 8,
             }
