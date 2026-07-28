@@ -351,6 +351,7 @@ mod tests {
                 inputs,
                 outputs: vec![],
                 returns: 0,
+                projections: Vec::new(),
             }),
         );
         callee

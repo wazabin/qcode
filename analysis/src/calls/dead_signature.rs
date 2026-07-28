@@ -390,6 +390,7 @@ fn trim_dead_return_fields(
             inputs: map.inputs,
             outputs,
             returns: kept.len(),
+            projections: map.projections,
         }),
     );
 
@@ -526,6 +527,7 @@ mod tests {
                 inputs,
                 outputs: [tc.r0, tc.r1, tc.r2, tc.r3][..field_count].to_vec(),
                 returns: field_count,
+                projections: Vec::new(),
             }),
         );
         return_type
@@ -689,6 +691,7 @@ mod tests {
                 inputs: vec![rsp_reg],
                 outputs: vec![],
                 returns: 0,
+                projections: Vec::new(),
             }),
         );
         let stack = tc.ctx.get_const(0x1000, 8).id();

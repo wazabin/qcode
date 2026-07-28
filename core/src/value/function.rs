@@ -246,6 +246,34 @@ pub struct RegisterEffectSets {
     pub writes: Vec<VarnodeId>,
 }
 
+/// A register whose value on return is *computed* rather than carried in the
+/// return pack: the linked function is this function's **projection** for that
+/// one output — a pure function of its inputs, returning what the register
+/// would have held.
+///
+/// Recording the projection is what lets the register leave both
+/// [`outputs`](RegisterInterfaceMap::outputs) and, once nothing else reads it,
+/// [`inputs`](RegisterInterfaceMap::inputs) without the fact being lost. The
+/// motivating case is the stack pointer: every function "returns" `SP + k`,
+/// which is a true statement about the machine code and no part of what the
+/// function means. Leaving it in the pack put `RSP` in every signature; deleting
+/// it outright would discard a real effect. A projection does neither.
+///
+/// The projection is an ordinary function and says what it reads through its
+/// *own* interface — this record deliberately does not restate the binding, so
+/// there is nothing here to desync from the function it names.
+///
+/// Entries are disjoint from `outputs`: a register is either packed or derived,
+/// never both.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DerivedOutput {
+    /// The register this projection computes.
+    pub register: VarnodeId,
+    /// The projection: a pure function whose return value is `register`'s value
+    /// on return from the parent.
+    pub projection: crate::value::insn::Callee,
+}
+
 /// The ordered, machine-readable register interface of a *materialized*
 /// function: which register each by-value input parameter binds, and which
 /// register each return-pack slot stores back. Slot `i` of `inputs` is the
@@ -255,6 +283,10 @@ pub struct RegisterEffectSets {
 /// implicit (zero-arg) convention read this: implicitly, param `i` is seeded
 /// from `inputs[i]` at entry and pack slot `i` is stored back to `outputs[i]`
 /// on return.
+///
+/// A third category sits alongside those two: a register that is neither an
+/// input nor packed, because it is *derived* — see
+/// [`projections`](Self::projections).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RegisterInterfaceMap {
     /// Register bound by each by-value input parameter, in parameter order.
@@ -268,6 +300,18 @@ pub struct RegisterInterfaceMap {
     /// `returns == outputs.len()`; a prototyped external returns only its ABI
     /// return register(s) and clobbers the caller-saved tail.
     pub returns: usize,
+    /// Registers whose returned value is computed by a linked projection rather
+    /// than carried in the pack (see [`DerivedOutput`]). Unordered and disjoint
+    /// from `outputs`; a consumer that needs such a register's value evaluates
+    /// its projection instead of reading a pack field.
+    ///
+    /// `#[serde(default)]` (→ empty) covers self-describing formats only. A
+    /// `.harbinger` session payload is *positional* bincode under a hard version
+    /// lock with no migration path, so adding this field changed the payload
+    /// layout and required a `harbinger_session::session::FORMAT_VERSION` bump —
+    /// old sessions are rejected, not defaulted.
+    #[serde(default)]
+    pub projections: Vec<DerivedOutput>,
 }
 
 /// Where one materialized interface input is bound from, or one write-set

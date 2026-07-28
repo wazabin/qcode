@@ -789,6 +789,7 @@ mod tests {
                 inputs: vec![x, y],
                 outputs: vec![],
                 returns: 0,
+                projections: Vec::new(),
             }),
         );
 
@@ -817,6 +818,7 @@ mod tests {
                 inputs: vec![RSP],
                 outputs: vec![],
                 returns: 0,
+                projections: Vec::new(),
             }),
         );
 
@@ -948,6 +950,7 @@ mod tests {
                 inputs: vec![EAX],
                 outputs: vec![RAX],
                 returns: 1,
+                projections: Vec::new(),
             }),
         );
 

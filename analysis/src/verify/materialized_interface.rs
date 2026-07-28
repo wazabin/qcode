@@ -46,6 +46,16 @@ fn check_function(ctx: &Context, fid: FunctionId) -> Option<String> {
     let RegisterChannelState::Materialized(map) = &function.effects().register else {
         return None;
     };
+
+    // A register is either packed or derived, never both — a consumer resolving
+    // one must have exactly one place to look, and a register appearing in both
+    // means a pass added a projection without dropping the pack slot it
+    // replaces. Checked ahead of the root-param rules so a bodyless external's
+    // projections are covered too.
+    if let Some(diag) = check_projections(ctx, fid, map) {
+        return Some(diag);
+    }
+
     // A bodyless external has no root block; its `inputs` map *is* the interface
     // and there is nothing to cross-check it against.
     let root = function.root().map(|b| b.id)?;
@@ -77,10 +87,58 @@ fn check_function(ctx: &Context, fid: FunctionId) -> Option<String> {
     ))
 }
 
+/// The [`projections`](qcode::value::RegisterInterfaceMap::projections)
+/// invariants: each derived register is absent from `outputs`, and no register
+/// is derived twice.
+fn check_projections(
+    ctx: &Context,
+    fid: FunctionId,
+    map: &qcode::value::RegisterInterfaceMap,
+) -> Option<String> {
+    if map.projections.is_empty() {
+        return None;
+    }
+    let name = &ctx.interfaces[fid].name;
+
+    if let Some(derived) = map
+        .projections
+        .iter()
+        .find(|d| map.outputs.contains(&d.register))
+    {
+        return Some(format!(
+            "materialized interface desync: `{name}` lists register `{}` as both a return-pack \
+             output and a derived projection; a register is packed or derived, never both",
+            render_varnode(ctx, derived.register),
+        ));
+    }
+
+    let mut seen = rustc_hash::FxHashSet::default();
+    if let Some(derived) = map.projections.iter().find(|d| !seen.insert(d.register)) {
+        return Some(format!(
+            "materialized interface desync: `{name}` derives register `{}` twice; each derived \
+             register has exactly one projection",
+            render_varnode(ctx, derived.register),
+        ));
+    }
+
+    None
+}
+
+/// A varnode's architectural name for a diagnostic, falling back to its label
+/// and then its raw id.
+fn render_varnode(ctx: &Context, id: qcode::value::VarnodeId) -> String {
+    let varnode = Varnode::from_id(ctx, id);
+    match (varnode.name(), varnode.label()) {
+        (Some(name), _) => name.to_string(),
+        (None, Some(label)) => format!("v{label}"),
+        (None, None) => format!("varnode:{id}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qcode::value::RegisterInterfaceMap;
+    use qcode::value::{DerivedOutput, RegisterInterfaceMap, insn::Callee};
 
     /// Losing the root params while the map still declares inputs is reported
     /// against the callee — the case that previously only surfaced, misattributed,
@@ -120,6 +178,101 @@ mod tests {
         assert!(verify_materialized_interfaces(&ctx).is_empty());
     }
 
+    /// A register may be packed or derived, never both. This is the shape a pass
+    /// produces by recording a projection and forgetting to drop the pack slot it
+    /// replaces, which would leave two disagreeing answers for one register.
+    #[test]
+    fn a_register_both_packed_and_derived_is_reported() {
+        let (mut ctx, vn) = fixture();
+        let f = materialized(&mut ctx, "doubled", &[vn], 1);
+        let proj = projection(&mut ctx, "doubled$vn");
+        set_interface(&mut ctx, f, |map| {
+            map.outputs = vec![vn];
+            map.returns = 1;
+            map.projections = vec![DerivedOutput {
+                register: vn,
+                projection: proj,
+            }];
+        });
+
+        let diags = verify_materialized_interfaces(&ctx);
+        assert_eq!(diags.len(), 1, "expected exactly one diagnostic: {diags:?}");
+        assert!(
+            diags[0].contains("`doubled`") && diags[0].contains("packed or derived"),
+            "diagnostic must name the callee and the rule: {}",
+            diags[0],
+        );
+    }
+
+    /// Each derived register has exactly one projection.
+    #[test]
+    fn a_register_derived_twice_is_reported() {
+        let (mut ctx, vn) = fixture();
+        let f = materialized(&mut ctx, "twice", &[vn], 1);
+        let (a, b) = (
+            projection(&mut ctx, "twice$a"),
+            projection(&mut ctx, "twice$b"),
+        );
+        set_interface(&mut ctx, f, |map| {
+            map.projections = vec![
+                DerivedOutput {
+                    register: vn,
+                    projection: a,
+                },
+                DerivedOutput {
+                    register: vn,
+                    projection: b,
+                },
+            ];
+        });
+
+        let diags = verify_materialized_interfaces(&ctx);
+        assert_eq!(diags.len(), 1, "expected exactly one diagnostic: {diags:?}");
+        assert!(
+            diags[0].contains("`twice`") && diags[0].contains("twice"),
+            "diagnostic must name the callee and the rule: {}",
+            diags[0],
+        );
+    }
+
+    /// A register that is derived and *absent* from the pack is the whole point
+    /// of the record — the shape the stack-pointer axis produces — and verifies
+    /// clean. Being an `inputs` entry as well is fine: SP is read and derived.
+    #[test]
+    fn a_derived_register_absent_from_the_pack_verifies_clean() {
+        let (mut ctx, vn) = fixture();
+        let f = materialized(&mut ctx, "derived", &[vn], 1);
+        let proj = projection(&mut ctx, "derived$vn");
+        set_interface(&mut ctx, f, |map| {
+            map.projections = vec![DerivedOutput {
+                register: vn,
+                projection: proj,
+            }];
+        });
+        assert!(verify_materialized_interfaces(&ctx).is_empty());
+    }
+
+    /// Overwrite `f`'s materialized interface map through `edit`.
+    fn set_interface(
+        ctx: &mut Context<'static>,
+        f: FunctionId,
+        edit: impl FnOnce(&mut RegisterInterfaceMap),
+    ) {
+        let RegisterChannelState::Materialized(mut map) =
+            FunctionBody::from_id(ctx, f).effects().register.clone()
+        else {
+            panic!("fixture must be materialized");
+        };
+        edit(&mut map);
+        FunctionBody::from_id_mut(ctx, f)
+            .set_register_effects(RegisterChannelState::Materialized(map));
+    }
+
+    /// A stand-in projection function to link to.
+    fn projection(ctx: &mut Context<'static>, name: &'static str) -> Callee {
+        Callee::Real(FunctionBody::make(ctx, name.into()).unwrap().id)
+    }
+
     fn fixture() -> (Context<'static>, qcode::value::VarnodeId) {
         let mut ctx = Context::new();
         let space = ctx.shared.default_space;
@@ -146,6 +299,7 @@ mod tests {
                 inputs: inputs.to_vec(),
                 outputs: vec![],
                 returns: 0,
+                projections: Vec::new(),
             },
         ));
         f

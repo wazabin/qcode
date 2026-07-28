@@ -1517,6 +1517,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![r0],
                 returns: 0,
+                projections: Vec::new(),
             }),
         );
     }

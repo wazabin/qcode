@@ -428,6 +428,7 @@ fn register_interface_map(
     RegisterInterfaceMap {
         inputs,
         returns: outputs.len(),
+        projections: Vec::new(),
         outputs: pack_outputs,
     }
 }

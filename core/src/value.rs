@@ -95,11 +95,12 @@ pub use bytes::{
     render_bytes_literal,
 };
 pub use function::{
-    ArgMemKind, BodyArenaKindStats, BodyArenaStats, ExternArg, ExternArgmem, ExternInterface,
-    ExternSlot, Footprint, FunctionBody, FunctionEffects, FunctionId, FunctionKind, FunctionMutRef,
-    FunctionRef, InterfaceSlot, MemoryChannelState, MemoryInterfaceMap, ParamAttrs, RamBase,
-    RamField, RamLocations, RamObject, RamRegion, RegisterChannelState, RegisterEffectSets,
-    RegisterInterfaceMap, SlotBase, WrittenSpaces, WrittenSpacesState,
+    ArgMemKind, BodyArenaKindStats, BodyArenaStats, DerivedOutput, ExternArg, ExternArgmem,
+    ExternInterface, ExternSlot, Footprint, FunctionBody, FunctionEffects, FunctionId,
+    FunctionKind, FunctionMutRef, FunctionRef, InterfaceSlot, MemoryChannelState,
+    MemoryInterfaceMap, ParamAttrs, RamBase, RamField, RamLocations, RamObject, RamRegion,
+    RegisterChannelState, RegisterEffectSets, RegisterInterfaceMap, SlotBase, WrittenSpaces,
+    WrittenSpacesState,
 };
 pub use insn::LocalInsnId;
 pub use insn::{Instruction, InstructionId, InstructionRef};

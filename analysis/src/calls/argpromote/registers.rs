@@ -371,6 +371,7 @@ pub(crate) fn materialize_interface(ctx: &mut Context, fid: FunctionId, reg_eff:
             outputs: reg_eff.outputs.clone(),
             // Every pack slot of a bodied function is a real computed value.
             returns: reg_eff.outputs.len(),
+            projections: Vec::new(),
         },
     ));
 }

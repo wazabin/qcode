@@ -751,6 +751,7 @@ mod tests {
                 inputs,
                 outputs: [tc.r0, tc.r1, tc.r2, tc.r3][..field_count].to_vec(),
                 returns: field_count,
+                projections: Vec::new(),
             }),
         );
         agg.unwrap()

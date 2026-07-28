@@ -287,6 +287,7 @@ mod tests {
                 inputs: vec![tc.r1],
                 outputs: vec![tc.r0],
                 returns: 1,
+                projections: Vec::new(),
             }),
         );
         mark_pure_functions(&mut tc.ctx);

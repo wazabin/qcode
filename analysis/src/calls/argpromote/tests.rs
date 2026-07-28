@@ -109,6 +109,7 @@ mod tests {
             inputs: vec![r1],
             outputs: vec![r0],
             returns: 1,
+            projections: Vec::new(),
         };
         FunctionBody::from_id_mut(&mut tc.ctx, f)
             .set_register_effects(RegisterChannelState::Materialized(iface.clone()));
@@ -3980,6 +3981,7 @@ mod tests {
                 inputs: regs.to_vec(),
                 outputs: regs.to_vec(),
                 returns: regs.len(),
+                projections: Vec::new(),
             }),
         );
     }
@@ -4548,6 +4550,7 @@ mod tests {
                 inputs: vec![r1],
                 outputs: vec![r0, r2],
                 returns: 1,
+                projections: Vec::new(),
             }));
         }
         let (_g, g_call, g_cont) = caller_of(&mut tc, ext);
@@ -4653,6 +4656,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![r0],
                 returns: 1,
+                projections: Vec::new(),
             }));
             // One stack-passed argument at [SP+0].
             f.set_extern_interface(ExternInterface {

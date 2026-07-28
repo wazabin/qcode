@@ -487,6 +487,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![r0],
                 returns: 0,
+                projections: Vec::new(),
             }),
         );
 
@@ -570,6 +571,7 @@ mod tests {
             inputs: vec![r1],
             outputs: vec![r0],
             returns: 1,
+            projections: Vec::new(),
         });
         let effects =
             fixed_summary_from_register_state(&channel, &tc.ctx, fid, &materialized).unwrap();
