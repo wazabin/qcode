@@ -1239,15 +1239,16 @@ fn apply(
     sp_reg: Option<VarnodeId>,
     call_sites: &[InstructionId],
 ) -> bool {
-    // With no regpure site to thread, snapshot promotion and written-global
-    // write-set replay have nowhere to land, so they cannot proceed. But a
-    // read-only global still materializes: its param binds from the address-literal
-    // origin at implicit/indirect callers with no positional argument (matching the
-    // retired `grow_globals`). So bail only when there is caller-threading work.
-    if call_sites.is_empty() && (!promoted.is_empty() || globals.iter().any(|g| g.has_write)) {
-        return false;
-    }
-
+    // No bail on an empty site list. The callee rewrite below threads `Some(&[])`
+    // throughout — it touches no caller — and the caller side is driven
+    // afterwards off the recorded interface. A function with no direct sites is
+    // therefore materialized like any other and simply binds nowhere.
+    //
+    // This is what makes the result independent of whether the compiler left the
+    // callee reachable: gcc inlines or folds a callee away at higher `-O`, and
+    // the old fused rewrite then had nothing to thread and abandoned the whole
+    // promotion, so the same source function decompiled differently at different
+    // optimization levels (`ARGPROMOTE_MEMORY_V2.md`).
     let ram = ctx.shared.default_space;
     let default = ctx.shared.space(ram);
     let (word_size, addr_size) = (default.word_size, default.addr_size);
