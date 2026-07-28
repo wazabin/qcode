@@ -5547,4 +5547,60 @@ mod tests {
             map.inputs,
         );
     }
+
+    /// A site that binds every memory input explicitly is retagged `Pure`
+    /// (registers *and* memory explicit); the tag is what makes its arity
+    /// derivable, so `verify_pure_reg_call_args` must accept it.
+    #[test]
+    fn a_fully_bound_site_becomes_pure_and_verifies() {
+        let mut tc = qcode::testing::TestContext::new();
+        let _input = stack_input(&mut tc, 4, 8);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    %v = load(ram:4, @stack_10000004);
+                    store(ram:4, @stack_10000004 <- %v);
+                    return at i64 0;
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = g;
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
+                qcode::value::RegisterInterfaceMap::default(),
+            ),
+        );
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        let call_id = set_call(&mut tc, g_call, f, vec![ptr]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(argpromote(&mut tc.ctx), "the in/out param promotes");
+
+        let tag = match tc.ctx.get_insn(call_id).mnemonic() {
+            qcode::value::insn::Mnemonic::Call(c) => c.tag,
+            other => panic!("expected a call, got {other:?}"),
+        };
+        assert_eq!(
+            tag,
+            qcode::value::insn::CallTag::Pure,
+            "a site binding both channels explicitly must be tagged Pure"
+        );
+        assert!(
+            crate::verify::verify_pure_reg_call_args(&tc.ctx).is_empty(),
+            "tag-derived arity must accept the site it just tagged: {:?}",
+            crate::verify::verify_pure_reg_call_args(&tc.ctx)
+                .iter()
+                .map(|v| v.diagnostic(&tc.ctx))
+                .collect::<Vec<_>>()
+        );
+    }
 }

@@ -1673,14 +1673,46 @@ fn bind_memory_calls(ctx: &mut Context, fid: FunctionId, call_sites: &[Instructi
     }
     // Args land at the end of `Call.args`, so append in interface order to keep
     // the memory params in lockstep behind the register ones.
+    // A site is fully bound only if *every* input slot produced a value there; a
+    // slot that could not be expressed leaves the site short of the interface, so
+    // it must keep binding the memory channel implicitly.
+    let mut bound_everywhere: FxHashSet<InstructionId> = call_sites.iter().copied().collect();
     for &slot in &map.inputs {
+        let mut supplied: FxHashSet<InstructionId> = FxHashSet::default();
         crate::calls::interface::append_caller_arg_at_sites(
             ctx,
             call_sites,
-            |ctx, call_id, block| slot_value(ctx, call_id, block, slot),
+            |ctx, call_id, block| {
+                let value = slot_value(ctx, call_id, block, slot);
+                if value.is_some() {
+                    supplied.insert(call_id);
+                }
+                value
+            },
         );
+        bound_everywhere.retain(|id| supplied.contains(id));
     }
     replay_memory_writes(ctx, fid, &map, call_sites);
+
+    // Now that the memory channel is explicit at these sites, promote their tag:
+    // `RegPure` (registers explicit, memory implicit) becomes `Pure` (both
+    // explicit). This is what makes the site's arity derivable from its tag —
+    // see `verify::pure_reg_call_args`.
+    for call_id in bound_everywhere {
+        let Mnemonic::Call(call) = ctx.get_insn(call_id).mnemonic().clone() else {
+            continue;
+        };
+        if !call.tag.is_regpure() {
+            continue;
+        }
+        ctx.replace_instruction_mnemonic(
+            call_id,
+            Mnemonic::Call(Call {
+                tag: qcode::value::insn::CallTag::Pure,
+                ..call
+            }),
+        );
+    }
 }
 
 /// Replay each write-set output at every call site: extract the `(addr, value)`

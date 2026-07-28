@@ -1,14 +1,20 @@
 //! Verify the materialized-function call-interface invariants (argpromote v2,
 //! `ARGPROMOTE_REGISTERS_V2.md`).
 //!
-//! A materialized function supports two per-call binding conventions, selected
-//! by the call's [`CallTag`](qcode::value::insn::CallTag):
+//! A materialized function binds its two effect channels independently, and the
+//! call's [`CallTag`](qcode::value::insn::CallTag) says which are explicit here:
 //!
-//! * **`regpure`** — inputs are passed explicitly, so `Call.args` must align
-//!   with the callee's root params index-for-index (count and size); and the
-//!   callee must be materialized.
-//! * **non-regpure (`Opaque`)** — implicit binding, so the call carries **zero**
-//!   register arguments (they are bound from the register file at entry).
+//! * **`Opaque`** — both implicit, so the call carries **zero** arguments (each
+//!   is bound from its register or memory slot at entry).
+//! * **`RegPure`** — registers explicit, memory implicit: `Call.args` align 1:1
+//!   with the callee's *register* inputs.
+//! * **`Pure`** — both explicit: `Call.args` align with the register inputs
+//!   followed by the memory inputs.
+//!
+//! Arity therefore comes from the tag, not from counting the callee's root
+//! params. That is what lets a callee carry memory params a given site does not
+//! pass — and so lets the RAM channel materialize a callee whose callers it
+//! never rewrites (`ARGPROMOTE_MEMORY_V2.md`).
 //!
 //! Both are checked per direct call site so a regression crashes loudly under
 //! `QCODE_VERIFY` instead of miscompiling.
@@ -120,8 +126,11 @@ pub(crate) fn verify_pure_reg_call_args_scoped(
     scope: super::Scope<'_>,
 ) -> Vec<PureRegCallArgsViolation> {
     let mut violations = Vec::new();
-    // Per-callee interface, computed lazily: `None` = not materialized (exempt).
-    let mut interfaces: FxHashMap<FunctionId, Option<Vec<usize>>> = FxHashMap::default();
+    // Per-(callee, tag) interface, computed lazily: `None` = not materialized
+    // (exempt). Keyed by tag because the expected arity depends on which channels
+    // the site binds explicitly.
+    let mut interfaces: FxHashMap<(FunctionId, qcode::value::insn::CallTag), Option<Vec<usize>>> =
+        FxHashMap::default();
 
     // Caller side: every direct call issued by an in-scope function.
     for insn in scope.instructions(ctx) {
@@ -171,7 +180,7 @@ pub(crate) fn verify_pure_reg_call_args_scoped(
 fn check_call_site(
     ctx: &Context<'_>,
     insn: &qcode::value::InstructionRef<'_, '_>,
-    interfaces: &mut FxHashMap<FunctionId, Option<Vec<usize>>>,
+    interfaces: &mut FxHashMap<(FunctionId, qcode::value::insn::CallTag), Option<Vec<usize>>>,
     violations: &mut Vec<PureRegCallArgsViolation>,
 ) {
     let qcode::value::insn::Mnemonic::Call(call) = insn.mnemonic() else {
@@ -180,9 +189,11 @@ fn check_call_site(
     let Some(callee) = call.target.real() else {
         return;
     };
+    // Keyed by (callee, tag): the expected arity now depends on which channels
+    // this site binds explicitly, so one callee has one answer per tag.
     let Some(param_sizes) = interfaces
-        .entry(callee)
-        .or_insert_with(|| interface_param_sizes(ctx, callee))
+        .entry((callee, call.tag))
+        .or_insert_with(|| interface_param_sizes(ctx, callee, call.tag))
         .as_ref()
     else {
         return;
@@ -220,26 +231,59 @@ fn check_call_site(
     }
 }
 
-/// The register-passed interface arity/sizes of `callee`, or `None` when it is
-/// not materialized (the rule does not apply).
+/// The interface arity/sizes a site with this `tag` must pass, or `None` when
+/// the callee is not materialized (the rule does not apply).
 ///
-/// A regpure site's args must match the callee's *full* register-passed
-/// interface 1:1. For a bodied callee that interface is its root params —
-/// which the later RAM channel (`argpromote`) grows with by-value memory
-/// params, so it is a superset of the register-only `Materialized` map and
-/// is the authoritative arity. For a bodyless external (no root) the
-/// `Materialized` map is the interface. Both are read from the function's
-/// published state, not from the call's origin.
-fn interface_param_sizes(ctx: &Context<'_>, callee: FunctionId) -> Option<Vec<usize>> {
+/// **Arity is derived from the tag, not from the callee's root params.** The two
+/// channels bind independently, and the tag says which are explicit here:
+///
+/// | tag       | registers | memory   | args                            |
+/// |-----------|-----------|----------|---------------------------------|
+/// | `Opaque`  | implicit  | implicit | none                            |
+/// | `RegPure` | explicit  | implicit | the register inputs             |
+/// | `Pure`    | explicit  | explicit | register ++ memory inputs       |
+///
+/// This is what lets a callee carry memory params that a given site does not
+/// pass. Counting root params instead — the previous rule — made every memory
+/// param a site's obligation, so growing the interface invalidated every call
+/// and callee and callers had to be rewritten together
+/// (`ARGPROMOTE_MEMORY_V2.md`).
+///
+/// The memory inputs are the *trailing* root params — the RAM channel appends
+/// them last — so they are counted off the end. Counting register inputs from
+/// the front would be wrong: a callee may carry params that predate both
+/// channels (a stack-passed pointer the lifter gave it), and those are still the
+/// site's obligation under every tag. A bodyless external has no root, and no
+/// memory interface, so its register map is the whole story.
+fn interface_param_sizes(
+    ctx: &Context<'_>,
+    callee: FunctionId,
+    tag: qcode::value::insn::CallTag,
+) -> Option<Vec<usize>> {
     let function = FunctionBody::from_id(ctx, callee);
     let qcode::value::RegisterChannelState::Materialized(map) = &function.effects().register else {
         return None;
     };
+    let memory = function
+        .effects()
+        .memory
+        .materialized()
+        .map_or(0, |m| m.inputs.len());
     Some(match function.root().map(|b| b.id) {
-        Some(root) => BasicBlock::from_id(ctx, root)
-            .params()
-            .map(|param| param.size())
-            .collect(),
+        Some(root) => {
+            let sizes: Vec<usize> = BasicBlock::from_id(ctx, root)
+                .params()
+                .map(|param| param.size())
+                .collect();
+            // `Pure` binds the memory channel too, so it passes every param;
+            // `RegPure` leaves the trailing memory inputs implicit.
+            let len = if tag.is_pure() {
+                sizes.len()
+            } else {
+                sizes.len().saturating_sub(memory)
+            };
+            sizes.into_iter().take(len).collect()
+        }
         None => map
             .inputs
             .iter()
