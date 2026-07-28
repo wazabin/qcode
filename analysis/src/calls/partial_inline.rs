@@ -296,16 +296,25 @@ fn plan_partial_inline(
 
     // Only the *register* arguments a caller passes positionally in `Call.args`
     // are reconstructible inline inputs. They occupy the leading params (added by
-    // `argpromote_registers` before any stack-passed param), so the number of
-    // such inputs is the `Call.args` length. Every direct call site supplies the
-    // same arg count — `verify_pure_reg_call_args` enforces that each equals the
-    // callee's root param count — so any one site gives it. Params beyond it
-    // (stack-passed arguments, with no `Call.args` slot) are *not* inputs and a
-    // field reading one is left on the return.
-    let n_inputs = match ctx.get_insn(call_sites[0]).mnemonic() {
-        Mnemonic::Call(call) => call.args.len(),
-        _ => 0,
-    };
+    // `argpromote_registers` before any stack-passed param), so their count is
+    // the callee's own `inputs` map length — a property of the function, read off
+    // its interface and never off a caller. Params beyond the prefix (the memory
+    // channel's by-value params) are *not* register inputs, and a field reading
+    // one is left on the return.
+    //
+    // Site arity is *tag-dependent* (see
+    // `verify::pure_reg_call_args::interface_param_sizes`): a `Pure` site also
+    // passes the trailing memory params, a `RegPure` site only this register
+    // prefix, an `Opaque` site nothing at all. Because the prefix leads under
+    // every convention, index `i` names the same param at every
+    // explicitly-binding site — which is what lets one plan apply to sites whose
+    // tags differ. Deriving the count from `call_sites[0]` instead imposed that
+    // one site's convention on all of them, and overran `clone_expr`'s `args`
+    // whenever a later site bound fewer channels.
+    let n_inputs = FunctionBody::from_id(ctx, fid)
+        .effects()
+        .materialized()
+        .map_or(0, |map| map.inputs.len());
     let inputs: HashMap<ValueId, usize> = BasicBlock::from_id(ctx, root)
         .params()
         .take(n_inputs)
@@ -383,6 +392,15 @@ fn apply_inline_at_call(
     let Mnemonic::Call(c) = ctx.get_insn(call_id).mnemonic().clone() else {
         return false;
     };
+    // An `Opaque` site binds implicitly: it passes no positional `args`, so there
+    // is no argument to substitute an input param for, and its outputs land in
+    // the register file rather than an SSA pack, so it has no projecting
+    // `extract` to rewrite either. Bailing states that instead of relying on the
+    // extract scan coming up empty, and is what keeps `clone_expr`'s `args[idx]`
+    // in range by construction.
+    if !c.tag.is_regpure() {
+        return false;
+    }
     let args: Vec<ValueId> = c.args.iter().map(|a| a.qualify(call_id.func)).collect();
     let result = ValueId::Instruction(call_id);
 
@@ -457,8 +475,12 @@ fn clone_references(ctx: &Context, root: ValueId, target: InstructionId) -> bool
 /// Clone `value`'s expression (post-ordered nodes in `order`) into the block of
 /// `extract_id`, just before it, substituting each input param for the call's
 /// positional argument in `args`. Returns the root value of the clone (an
-/// argument or literal directly when `order` is empty). Every input index is
-/// `< n_inputs <= args.len()` by construction, so the `args` index is in range.
+/// argument or literal directly when `order` is empty).
+///
+/// Every input index is `< n_inputs`, the callee's `inputs` map length, and
+/// [`apply_inline_at_call`] admits only explicitly-binding (`RegPure` / `Pure`)
+/// sites, whose `args` open with that same register prefix — so
+/// `n_inputs <= args.len()` and the `args` index is in range by construction.
 fn clone_expr(
     ctx: &mut Context,
     extract_id: InstructionId,
@@ -629,12 +651,40 @@ mod tests {
         assert!(!clone_references(&ctx, ValueId::Instruction(b), c));
     }
 
-    /// Give `block`'s call instruction the target `target` and `args`.
+    /// Give `block`'s call instruction the target `target` and `args`, tagged
+    /// [`CallTag::RegPure`](qcode::value::insn::CallTag::RegPure).
+    ///
+    /// The tag is not decoration: a site passing positional `args` to a
+    /// materialized callee *is* the regpure convention, and the implicit
+    /// (`Opaque`) default these fixtures used to carry is a
+    /// `verify_pure_reg_call_args` rule-2 violation — "a non-regpure call to a
+    /// materialized callee must carry zero args". `partial_inline` now declines
+    /// implicit sites outright (there is no positional argument to substitute an
+    /// input param for), so an untagged fixture no longer models what production
+    /// hands the pass.
     fn set_call(
         tc: &mut qcode::testing::TestContext,
         block: BlockId,
         target: FunctionId,
         args: Vec<ValueId>,
+    ) -> InstructionId {
+        set_call_tagged(
+            tc,
+            block,
+            target,
+            args,
+            qcode::value::insn::CallTag::RegPure,
+        )
+    }
+
+    /// [`set_call`] with an explicit binding-convention tag, for fixtures that
+    /// mix conventions across a callee's sites.
+    fn set_call_tagged(
+        tc: &mut qcode::testing::TestContext,
+        block: BlockId,
+        target: FunctionId,
+        args: Vec<ValueId>,
+        tag: qcode::value::insn::CallTag,
     ) -> InstructionId {
         let call_id = BasicBlock::from_id(&tc.ctx, block)
             .iter()
@@ -650,7 +700,7 @@ mod tests {
                     .map(|arg| arg.localize(call_id.func))
                     .collect(),
                 clobbers: vec![],
-                tag: Default::default(),
+                tag,
             }),
         );
         call_id
@@ -794,6 +844,92 @@ mod tests {
         );
     }
 
+    /// The register-input count is the callee's own, never a call site's.
+    ///
+    /// Site arity is tag-dependent — an `Opaque` site passes nothing, a `RegPure`
+    /// site the register prefix, a `Pure` site the trailing memory params too —
+    /// so reading the count off `call_sites[0]` imposed one site's convention on
+    /// every other. With an implicit site ordered first the count read as zero
+    /// and nothing inlined anywhere; with an explicit site first, indices derived
+    /// from it ran off a shorter `args` at the next site and panicked in
+    /// `clone_expr`.
+    #[test]
+    fn input_count_comes_from_the_interface_not_a_call_site() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (vr0, vr3) = (tc.r0, tc.r3);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @r0:i64>
+                    %sum = @r0 + i64 5;
+                    %agg = (%sum);
+                    return at %agg;
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+
+            fn h:
+                <h_entry>
+                    goto <h_call>;
+                <h_call>
+                    call <f>;
+                <h_cont>
+                    return at i64 0;
+            "
+        );
+        let (_, _) = (g, h);
+        let agg = make_pure_reg(&mut tc, f, vec![vr0]);
+
+        // An implicit site: binds from the register file, so it passes no args
+        // and projects no field.
+        let opaque = set_call_tagged(
+            &mut tc,
+            g_call,
+            f,
+            vec![],
+            qcode::value::insn::CallTag::Opaque,
+        );
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        // An explicit site: one positional argument, one projecting extract.
+        let a = tc.ctx.get_const(0x10, 8).id();
+        let regpure = set_call(&mut tc, h_call, f, vec![a]);
+        tc.ctx.add_cfg_edge(h_call, h_cont);
+        Instruction::from_id_mut(&mut tc.ctx, regpure).set_type(agg);
+        replay_field(&mut tc, h_cont, regpure, 0, vr3);
+
+        // Planning with the implicit site listed *first* must still see the one
+        // register input the interface declares.
+        let graph = crate::CallGraph::analyze(&tc.ctx);
+        let mut sites = crate::calls::direct_call_sites(&tc.ctx, &graph, f);
+        sites.sort_by_key(|&site| site != opaque);
+        let (inlinable, inputs) =
+            plan_partial_inline(&tc.ctx, f, &sites).expect("f's output is cheap");
+        assert_eq!(inputs.len(), 1, "one register input, per the interface");
+        assert_eq!(inlinable.len(), 1, "the single output is inlinable");
+
+        assert!(
+            partial_inline(&mut tc.ctx),
+            "the explicit site inlines despite the implicit one"
+        );
+        assert_eq!(
+            extracts_of(&tc, h_cont, regpure),
+            0,
+            "the explicit site's extract is redirected"
+        );
+        assert_eq!(
+            binops_in(&tc, h_cont),
+            1,
+            "the expr is recomputed once at the explicit caller"
+        );
+    }
+
     /// A callee whose sole output is a `map` over its input array param projects
     /// that map back into every caller: the caller's `extract` of the field is
     /// replaced by `body <$> arg`, the callee's param substituted by the call
@@ -908,10 +1044,15 @@ mod tests {
             "
         );
         let _ = g;
-        let agg = make_pure_reg(&mut tc, f, vec![vr0, vr1]);
-        // The callee has two params but every caller passes a single positional
-        // argument, so only param 0 is a `Call.args`-backed input; param 1 (the
-        // field's value) has no argument slot.
+        // The callee has two params but only param 0 is a *register* input, so
+        // that is all `inputs` records. Param 1 — the field's value — is a
+        // trailing memory param with no `Call.args` slot under the regpure
+        // convention, hence a caller passing the single positional argument
+        // below. Declaring both as register inputs while passing one argument
+        // would be a `verify_pure_reg_call_args` rule-1 arity violation; the
+        // interface, not the site, is what says how many inputs there are.
+        let agg = make_pure_reg(&mut tc, f, vec![vr0]);
+        let _ = vr1;
         let a = tc.ctx.get_const(0x10, 8).id();
         let call_id = set_call(&mut tc, g_call, f, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
