@@ -10,8 +10,8 @@ use qcode::{
     space::{LocalMemorySpaceId, MemorySpaceId},
     types::TypeId,
     value::{
-        ArgMemKind, BasicBlock, BlockId, FunctionBody, FunctionId, QCodeMut, TempSpace,
-        TempSpaceId, Value, ValueId, VarnodeId,
+        ArgMemKind, BasicBlock, BlockId, FunctionBody, FunctionId, InterfaceSlot,
+        MemoryInterfaceMap, QCodeMut, TempSpace, TempSpaceId, Value, ValueId, VarnodeId,
         insn::{Call, InstructionId, Mnemonic},
     },
 };
@@ -720,6 +720,46 @@ fn try_promote(
     }
 }
 
+/// The register a root param at `arg_idx` binds from, if it is one of the
+/// register channel's by-value inputs.
+///
+/// The register channel materializes its inputs into the *leading* root-param
+/// slots, and a param's index is its argument index (see [`arg_index_of`]), so
+/// an index inside `map.inputs` names that register directly. `None` for a param
+/// past them — a RAM param added by this channel, i.e. a base that would itself
+/// have to be bound before it could be dereferenced. That is the recursive case
+/// [`InterfaceSlot`] deliberately cannot express and the shadow path already
+/// rejects, so such a slot is simply not recorded.
+fn param_register(ctx: &Context, fid: FunctionId, arg_idx: usize) -> Option<VarnodeId> {
+    FunctionBody::from_id(ctx, fid)
+        .effects()
+        .register
+        .materialized()?
+        .inputs
+        .get(arg_idx)
+        .copied()
+}
+
+/// Record where each memory input binds from and each write-set output replays
+/// to, as [`InterfaceSlot`]s on the memory channel.
+///
+/// Written in the same order the inputs were added and the outputs appended, so
+/// slot `i` describes the `i`-th memory param / write-set entry. Purely
+/// descriptive: nothing reads it yet (`ARGPROMOTE_MEMORY_V2.md` step 1), and it
+/// is what a later site-independent binding will synthesize caller values from.
+fn record_memory_interface(
+    ctx: &mut Context,
+    fid: FunctionId,
+    inputs: Vec<InterfaceSlot>,
+    outputs: Vec<InterfaceSlot>,
+) {
+    if inputs.is_empty() && outputs.is_empty() {
+        return;
+    }
+    FunctionBody::from_id_mut(ctx, fid)
+        .set_memory_interface(Some(MemoryInterfaceMap { inputs, outputs }));
+}
+
 /// Whether every real-memory (default-space) load/store in `fid` is captured by
 /// `promoted` — i.e. will be redirected into the shadow. Accesses already in a
 /// shadow space (a prior promotion round) are inherently modelled and skipped, so
@@ -1378,9 +1418,17 @@ fn apply(
     // redirected access forwards from it, and loaded at every caller from the same
     // address relocated onto the call argument (the base is an identical by-value
     // param on both sides).
+    // Slots describing where each memory input binds from, in the same order the
+    // inputs are added below.
+    let mut input_slots: Vec<InterfaceSlot> = Vec::new();
     for s in &snaps {
         let (base, base_size, offset, size, arg_idx) =
             (s.base, s.base_size, s.offset, s.size, s.arg_idx);
+        input_slots.push(InterfaceSlot::Deref {
+            base: param_register(ctx, fid, arg_idx),
+            offset,
+            size,
+        });
         let name = format!("{}_{}_{:x}", s.name, s.tag, s.offset);
         let pname = s.name.clone();
         super::add_input(
@@ -1431,6 +1479,12 @@ fn apply(
             continue;
         }
         let (addr, addr_size, size) = (g.addr, g.addr_size, g.size);
+        // A global binds from its absolute address — no base register.
+        input_slots.push(InterfaceSlot::Deref {
+            base: None,
+            offset: addr as i64,
+            size,
+        });
         let origin = ctx.get_const(addr, addr_size).id();
         super::add_input(
             ctx,
@@ -1548,6 +1602,20 @@ fn apply(
     // also let `partial_inline` recompute either half at the caller independently.
     // A read-only promotion has no write slots, so this is a no-op — the returns
     // and result type stay untouched.
+    // Slots describing where each write-set output replays to, in `write_slots`
+    // order. A slot whose base is not a register-bound param records `None` — the
+    // replay then falls back to the extracted address, exactly as the caller-side
+    // closure below does.
+    let output_slots: Vec<InterfaceSlot> = write_slots
+        .iter()
+        .map(|&(_, _, offset, size, arg_idx)| InterfaceSlot::Deref {
+            base: arg_idx.and_then(|i| param_register(ctx, fid, i)),
+            offset,
+            size,
+        })
+        .collect();
+    record_memory_interface(ctx, fid, input_slots, output_slots);
+
     super::append_outputs(
         ctx,
         fid,

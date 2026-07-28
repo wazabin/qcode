@@ -5480,4 +5480,71 @@ mod tests {
             "no external in the cone ⇒ no ExternalArgmemConfinement recorded"
         );
     }
+
+    /// The RAM channel records where each memory input binds from, as an
+    /// `InterfaceSlot` on the memory channel (`ARGPROMOTE_MEMORY_V2.md` step 1).
+    ///
+    /// A global binds from its absolute address, so its slot is a based-`None`
+    /// `Deref` at that address — the same address literal the param's `origin`
+    /// already carries, now in a form a caller can evaluate without the callee.
+    #[test]
+    fn a_promoted_global_read_records_its_absolute_address_slot() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    i32 %v = load(ram:4, i64 0x9000);
+                    store(ram:4, i64 0x9004 <- i32 %v);
+                    return at i64 0;
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return at i64 0;
+            "
+        );
+        let _ = g;
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_register_effects(
+            qcode::value::RegisterChannelState::Materialized(
+                qcode::value::RegisterInterfaceMap::default(),
+            ),
+        );
+        set_call(&mut tc, g_call, f, vec![]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(argpromote(&mut tc.ctx), "the global read functionalizes");
+
+        let memory = FunctionBody::from_id(&tc.ctx, f).effects().memory.clone();
+        let map = memory
+            .materialized()
+            .expect("a promoted function records its memory interface");
+        assert!(
+            map.inputs.contains(&qcode::value::InterfaceSlot::Deref {
+                base: None,
+                offset: 0x9000,
+                size: 4,
+            }),
+            "the read global's input slot is its absolute address: {:?}",
+            map.inputs,
+        );
+        // One slot per memory input parameter: the interface describes exactly the
+        // params the rewrite added, so a caller can bind each without the body.
+        let memory_params = FunctionBody::from_id(&tc.ctx, f)
+            .root()
+            .unwrap()
+            .params()
+            .filter(|p| p.name().is_some_and(|n| n.starts_with("glob_")))
+            .count();
+        assert_eq!(
+            map.inputs.len(),
+            memory_params,
+            "one input slot per memory param: {:?}",
+            map.inputs,
+        );
+    }
 }
