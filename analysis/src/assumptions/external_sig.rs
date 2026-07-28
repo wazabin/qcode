@@ -22,9 +22,8 @@
 //! and the pass is a no-op. Hex lifts / DSL tests opt in via `--assume-libs`
 //! (`TestContext::assume_libs`), which seeds `Context::linked_libraries`.
 //!
-//! Run before [`set_all_function_summaries`](crate::set_all_function_summaries):
-//! once an external callee has a signature, the argument-producing passes can
-//! produce real arguments at its call sites.
+//! Run before the `summaries` pass: once an external callee has a signature,
+//! the argument-producing passes can produce real arguments at its call sites.
 
 use cabi::{CFunctionProto, CParam, CType, Config, Selection};
 use qcode::{

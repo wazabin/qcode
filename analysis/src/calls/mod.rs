@@ -37,13 +37,13 @@ pub use argpromote::{
 pub use call_graph::{CallEdge, CallEdgeId, CallGraph, CallGraphAnalysis, CallKind, CallTarget};
 pub use dead_signature::dead_signature;
 pub use interface::{append_caller_arg, append_entry_param, remove_entry_param};
-pub use mem_effects::set_all_written_spaces;
+#[cfg(test)]
+pub(crate) use mem_effects::set_all_written_spaces;
 pub(crate) use outline::inline_pure_body;
 pub use param_attrs::infer_param_attrs;
 pub use partial_inline::partial_inline;
 pub use projection::{Projection, project_return, return_field};
 pub use stack_facts::{learn_stack_facts, seed_stack_facts};
-pub use summaries::{set_all_function_summaries, set_function_summaries};
 
 /// Incoming sites backed specifically by a real [`Mnemonic::Call`]. The graph's
 /// public `call_sites` query also includes direct-like `Apply`/`Map`/`Scan` and

@@ -12,7 +12,7 @@ pub mod calls;
 pub use calls::{
     CallEdge, CallEdgeId, CallGraph, CallGraphAnalysis, CallKind, CallTarget, append_caller_arg,
     append_entry_param, argpromote, argpromote_registers, learn_stack_facts, remove_entry_param,
-    seed_stack_facts, set_all_function_summaries, set_all_written_spaces, set_function_summaries,
+    seed_stack_facts,
 };
 
 pub mod cfg;

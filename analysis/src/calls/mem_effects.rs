@@ -33,7 +33,13 @@ use qcode::{
 /// callee whether internal or external, so a caller bounded over a prototyped
 /// external no longer trips the "external is unbounded" arm when the external's
 /// derived write-set nests inside the caller's.
-pub fn set_all_written_spaces(ctx: &mut Context) {
+///
+/// Test-only: the pipeline stamps through the cone-checked [`SeedWrittenSpaces`]
+/// pass, which calls [`written_space_updates`] directly. This whole-`Context`
+/// form bypasses the cone, so it is not offered to production code — it exists
+/// for tests that hold the whole context and want a one-call stamp.
+#[cfg(test)]
+pub(crate) fn set_all_written_spaces(ctx: &mut Context) {
     let targets = ctx.function_ids();
     set_written_spaces_targeted_with_sp(ctx, &targets, None);
 }
@@ -96,6 +102,7 @@ fn written_space_updates(
     updates
 }
 
+#[cfg(test)]
 fn set_written_spaces_targeted_with_sp(
     ctx: &mut Context,
     targets: &[FunctionId],

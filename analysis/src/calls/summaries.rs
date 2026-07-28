@@ -249,21 +249,18 @@ fn compute_reads_unbounded_stack(
 /// so it must keep its whole frame in memory (see `mem2reg`'s stack-escape
 /// handling). The register effect/interface channel is owned by the `argpromote`
 /// register passes via `FunctionEffects`, not recomputed here.
-pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_ptr: VarnodeId) {
+/// Test-only: production stamps through the cone-checked [`Summaries`] pass,
+/// which runs the same `compute_reads_unbounded_stack` inference over its cone.
+/// This whole-`Context` form bypasses the cone and exists for tests holding the
+/// whole context.
+#[cfg(test)]
+pub(crate) fn set_function_summaries(
+    ctx: &mut Context,
+    function_id: FunctionId,
+    stack_ptr: VarnodeId,
+) {
     if let Some(reads_unbounded) = compute_reads_unbounded_stack(ctx, function_id, stack_ptr) {
         FunctionBody::from_id_mut(ctx, function_id).set_reads_unbounded_stack(reads_unbounded);
-    }
-}
-
-/// Runs [`set_function_summaries`] over every non-external function.
-pub fn set_all_function_summaries(ctx: &mut Context, stack_ptr: VarnodeId) {
-    let ids: Vec<FunctionId> = ctx
-        .functions()
-        .filter(|f| !f.is_external())
-        .map(|f| f.id)
-        .collect();
-    for id in ids {
-        set_function_summaries(ctx, id, stack_ptr);
     }
 }
 
