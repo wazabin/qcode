@@ -99,7 +99,7 @@ pub use function::{
     ExternSlot, Footprint, FunctionBody, FunctionEffects, FunctionId, FunctionKind, FunctionMutRef,
     FunctionRef, InterfaceSlot, MemoryChannelState, MemoryInterfaceMap, ParamAttrs, RamBase,
     RamField, RamLocations, RamObject, RamRegion, RegisterChannelState, RegisterEffectSets,
-    RegisterInterfaceMap, WrittenSpaces, WrittenSpacesState,
+    RegisterInterfaceMap, SlotBase, WrittenSpaces, WrittenSpacesState,
 };
 pub use insn::LocalInsnId;
 pub use insn::{Instruction, InstructionId, InstructionRef};

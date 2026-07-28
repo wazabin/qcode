@@ -5525,8 +5525,8 @@ mod tests {
             .expect("a promoted function records its memory interface");
         assert!(
             map.inputs.contains(&qcode::value::InterfaceSlot::Deref {
-                base: None,
-                offset: 0x9000,
+                base: qcode::value::SlotBase::Global(0x9000),
+                offset: 0,
                 size: 4,
             }),
             "the read global's input slot is its absolute address: {:?}",

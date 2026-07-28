@@ -281,19 +281,38 @@ pub struct RegisterInterfaceMap {
 ///
 /// Deliberately **non-recursive**: a base that must itself be loaded is the
 /// "re-dereference whose address is loaded at runtime" case the RAM channel
-/// already rejects as unmodellable, so `base` is a register or nothing.
+/// already rejects as unmodellable — such a base records
+/// [`SlotBase::Unmappable`] rather than being described.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum InterfaceSlot {
     /// A register, `size` bytes — bound by reading the register file.
     Reg(VarnodeId, usize),
-    /// `mem[base + offset]`, `size` bytes. `base: None` is an absolute address
-    /// (a global); `base: Some(sp)` with a non-negative offset is a caller-frame
-    /// slot (the return address, an incoming stack argument).
+    /// `mem[base + offset]`, `size` bytes.
     Deref {
-        base: Option<VarnodeId>,
+        base: SlotBase,
         offset: i64,
         size: usize,
     },
+}
+
+/// What a [`Deref`](InterfaceSlot::Deref) slot's address is relative to.
+///
+/// The three cases are kept apart deliberately: "absolute address" and "we could
+/// not describe this base" are both address-less, but only the first is
+/// *bindable*. Collapsing them would let a consumer synthesize a load from a
+/// bogus absolute address for a base it never resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SlotBase {
+    /// Relative to a register's value at the call: `mem[reg + offset]`. A
+    /// stack-pointer base with a non-negative offset is a caller-frame slot (the
+    /// return address, an incoming stack argument).
+    Reg(VarnodeId),
+    /// An absolute address (a global): `mem[addr + offset]`.
+    Global(u64),
+    /// The base could not be expressed — it is itself a memory input, so it
+    /// would have to be bound before it could be dereferenced. **Not bindable**:
+    /// a consumer must refuse such a slot rather than treat it as absolute.
+    Unmappable,
 }
 
 impl InterfaceSlot {
@@ -302,6 +321,18 @@ impl InterfaceSlot {
         match *self {
             InterfaceSlot::Reg(_, size) | InterfaceSlot::Deref { size, .. } => size,
         }
+    }
+
+    /// Whether a call site can evaluate this slot's address from its own state.
+    /// False for a [`SlotBase::Unmappable`] base.
+    pub fn is_bindable(&self) -> bool {
+        !matches!(
+            self,
+            InterfaceSlot::Deref {
+                base: SlotBase::Unmappable,
+                ..
+            }
+        )
     }
 }
 
@@ -2901,7 +2932,7 @@ mod memory_interface_tests {
 
     fn slot() -> InterfaceSlot {
         InterfaceSlot::Deref {
-            base: Some(VarnodeId::from(3usize)),
+            base: SlotBase::Reg(VarnodeId::from(3usize)),
             offset: 8,
             size: 8,
         }
@@ -2957,5 +2988,34 @@ mod memory_interface_tests {
         let effects = FunctionBody::from_id(&ctx, fid).effects().memory.clone();
         assert_eq!(effects.materialized(), Some(&map));
         assert_eq!(effects.coarse, WrittenSpacesState::Unbounded);
+    }
+
+    /// `Unmappable` and `Global` are both address-less bases, but only the
+    /// second is bindable. A consumer that collapsed them would synthesize a
+    /// load from a bogus absolute address for a base it never resolved.
+    #[test]
+    fn an_unmappable_base_is_distinct_from_a_global_and_is_not_bindable() {
+        let unmappable = InterfaceSlot::Deref {
+            base: SlotBase::Unmappable,
+            offset: 0,
+            size: 8,
+        };
+        let global = InterfaceSlot::Deref {
+            base: SlotBase::Global(0),
+            offset: 0,
+            size: 8,
+        };
+        assert_ne!(unmappable, global);
+        assert!(!unmappable.is_bindable());
+        assert!(global.is_bindable());
+        assert!(InterfaceSlot::Reg(VarnodeId::from(1usize), 8).is_bindable());
+        assert!(
+            InterfaceSlot::Deref {
+                base: SlotBase::Reg(VarnodeId::from(1usize)),
+                offset: -8,
+                size: 8,
+            }
+            .is_bindable()
+        );
     }
 }

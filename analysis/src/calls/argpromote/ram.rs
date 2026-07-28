@@ -11,7 +11,7 @@ use qcode::{
     types::TypeId,
     value::{
         ArgMemKind, BasicBlock, BlockId, FunctionBody, FunctionId, InterfaceSlot,
-        MemoryInterfaceMap, QCodeMut, TempSpace, TempSpaceId, Value, ValueId, VarnodeId,
+        MemoryInterfaceMap, QCodeMut, SlotBase, TempSpace, TempSpaceId, Value, ValueId, VarnodeId,
         insn::{Call, InstructionId, Mnemonic},
     },
 };
@@ -720,24 +720,24 @@ fn try_promote(
     }
 }
 
-/// The register a root param at `arg_idx` binds from, if it is one of the
-/// register channel's by-value inputs.
+/// The base a root param at `arg_idx` describes, for a slot rooted at it.
 ///
 /// The register channel materializes its inputs into the *leading* root-param
 /// slots, and a param's index is its argument index (see [`arg_index_of`]), so
-/// an index inside `map.inputs` names that register directly. `None` for a param
-/// past them — a RAM param added by this channel, i.e. a base that would itself
-/// have to be bound before it could be dereferenced. That is the recursive case
-/// [`InterfaceSlot`] deliberately cannot express and the shadow path already
-/// rejects, so such a slot is simply not recorded.
-fn param_register(ctx: &Context, fid: FunctionId, arg_idx: usize) -> Option<VarnodeId> {
+/// an index inside `map.inputs` names that register directly.
+///
+/// A param past them is a memory input added by this channel: a base that would
+/// itself have to be bound before it could be dereferenced. That is the
+/// recursive case [`InterfaceSlot`] deliberately cannot express, so it records
+/// [`SlotBase::Unmappable`] — distinct from [`SlotBase::Global`], so a consumer
+/// cannot mistake "we could not describe this" for "absolute address zero".
+fn param_slot_base(ctx: &Context, fid: FunctionId, arg_idx: usize) -> SlotBase {
     FunctionBody::from_id(ctx, fid)
         .effects()
         .register
-        .materialized()?
-        .inputs
-        .get(arg_idx)
-        .copied()
+        .materialized()
+        .and_then(|map| map.inputs.get(arg_idx).copied())
+        .map_or(SlotBase::Unmappable, SlotBase::Reg)
 }
 
 /// Record where each memory input binds from and each write-set output replays
@@ -1425,7 +1425,7 @@ fn apply(
         let (base, base_size, offset, size, arg_idx) =
             (s.base, s.base_size, s.offset, s.size, s.arg_idx);
         input_slots.push(InterfaceSlot::Deref {
-            base: param_register(ctx, fid, arg_idx),
+            base: param_slot_base(ctx, fid, arg_idx),
             offset,
             size,
         });
@@ -1479,10 +1479,10 @@ fn apply(
             continue;
         }
         let (addr, addr_size, size) = (g.addr, g.addr_size, g.size);
-        // A global binds from its absolute address — no base register.
+        // A global binds from its absolute address.
         input_slots.push(InterfaceSlot::Deref {
-            base: None,
-            offset: addr as i64,
+            base: SlotBase::Global(addr),
+            offset: 0,
             size,
         });
         let origin = ctx.get_const(addr, addr_size).id();
@@ -1609,7 +1609,9 @@ fn apply(
     let output_slots: Vec<InterfaceSlot> = write_slots
         .iter()
         .map(|&(_, _, offset, size, arg_idx)| InterfaceSlot::Deref {
-            base: arg_idx.and_then(|i| param_register(ctx, fid, i)),
+            // No arg index means the base is not a promoted param: the replay
+            // falls back to the extracted address, which no slot can describe.
+            base: arg_idx.map_or(SlotBase::Unmappable, |i| param_slot_base(ctx, fid, i)),
             offset,
             size,
         })
