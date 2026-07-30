@@ -558,12 +558,45 @@ impl LiveInBlocks {
         host: impl QCodeView<'a, 'str>,
         var: ValueId,
         sliced: &HashSet<ValueId>,
+        aliases: &AliasResult,
     ) -> HashSet<BlockId> {
-        if sliced.contains(&var) {
+        let mut blocks = if sliced.contains(&var) {
             self.sliced_seeds(host, var).0
         } else {
             self.store_blocks.get(&var).cloned().unwrap_or_default()
+        };
+
+        // A store to an *overlapping* register — a write to `EAX` while `RAX` is
+        // promoted — redefines part of `var`, so a join below it merges two
+        // different values and needs a parameter. During renaming
+        // `clobber_overlapping_register_vars` drops `var` to `Clobbered` there,
+        // but that only takes effect if a parameter exists to merge into:
+        // without a definition site the block never reaches the dominance
+        // frontier, no parameter is placed, and the wide value stored before the
+        // branch forwards straight past the narrow write. That is how the
+        // diamond `cmov` lowers to loses one of its arms.
+        //
+        // Unlike a store to `var` itself this is a *partial* redefinition, which
+        // is why it belongs here and not in `compute`'s `defined` set: `var` is
+        // still live-in above such a block, since its other bytes survive.
+        if register_varnode(host, var).is_some() {
+            for (&store_ptr, store_blocks) in &self.store_blocks {
+                if store_ptr == var || register_varnode(host, store_ptr).is_none() {
+                    continue;
+                }
+                // A wider store that low-alignedly covers a sliced var is a
+                // *precise* definition, already seeded by `sliced_seeds`.
+                if sliced.contains(&var)
+                    && register_store_low_aligned_contains(host, store_ptr, var)
+                {
+                    continue;
+                }
+                if aliases.may_alias(host, store_ptr, var) {
+                    blocks.extend(store_blocks.iter().copied());
+                }
+            }
         }
+        blocks
     }
 
     /// Memoized live-in block set for `var`.
@@ -1454,7 +1487,8 @@ impl<'str> Mem2Reg<'_, 'str> {
             let var_name = self.block_param_name_for_var(var);
 
             let live_in = self.live_in_blocks_cached(var, sliced, live_in_cache);
-            let store_blocks = live_in_cache.store_def_blocks(self.read(), var, sliced);
+            let store_blocks =
+                live_in_cache.store_def_blocks(self.read(), var, sliced, self.aliases);
             let mut phi_positions = find_phi_insert_positions(frontier, &live_in, &store_blocks);
 
             // Root lowering: a register var that is live-in to the root (a genuine
@@ -2441,8 +2475,12 @@ mod tests {
             &sliced,
             &aliases,
         );
-        let store_blocks =
-            cache.store_def_blocks(qcode::value::ModuleView::new(&ctx), A.into(), &sliced);
+        let store_blocks = cache.store_def_blocks(
+            qcode::value::ModuleView::new(&ctx),
+            A.into(),
+            &sliced,
+            &aliases,
+        );
 
         let result = find_phi_insert_positions(frontier, &live_in, &store_blocks);
 
@@ -2586,8 +2624,14 @@ mod tests {
         ]);
 
         let sliced = HashSet::default();
+        let aliases = AliasResult::simple_for_function(&ctx, test);
         let store_blocks = LiveInBlocks::new(qcode::value::ModuleView::new(&ctx), test)
-            .store_def_blocks(qcode::value::ModuleView::new(&ctx), A.into(), &sliced);
+            .store_def_blocks(
+                qcode::value::ModuleView::new(&ctx),
+                A.into(),
+                &sliced,
+                &aliases,
+            );
         let result = find_phi_insert_positions(&frontier, &live_in, &store_blocks);
 
         assert_eq!(result, HashSet::from_iter([loop_header]));
@@ -2699,8 +2743,12 @@ mod tests {
             &sliced,
             &aliases,
         );
-        let store_blocks =
-            cache.store_def_blocks(qcode::value::ModuleView::new(&ctx), A.into(), &sliced);
+        let store_blocks = cache.store_def_blocks(
+            qcode::value::ModuleView::new(&ctx),
+            A.into(),
+            &sliced,
+            &aliases,
+        );
 
         let result = find_phi_insert_positions(frontier, &live_in, &store_blocks);
 
@@ -3605,6 +3653,71 @@ mod tests {
              (the deferred GVN slice's source) while leaving the byte load dangling as a \
              live-in. Keep the dominating store or slice the byte from the promoted \
              value.\n{entry_block}"
+        );
+    }
+
+    /// The `cmov` shape. `cmovle %edx,%eax` lifts to a diamond whose taken arm
+    /// writes only the low half of the register (`EAX`), while the wide value
+    /// (`RAX`) was stored before the branch. A read of the wide register at the
+    /// join must not forward that pre-branch store: the narrow write on the
+    /// other path redefined its low bytes, so forwarding silently discards the
+    /// conditional move and both arms collapse to the same value.
+    #[test]
+    fn narrow_store_on_one_path_is_not_lost_at_the_join() {
+        use qcode::testing::TestContext;
+
+        let mut tc = TestContext::new();
+        let (r0, r0_lo32, r1, reg) = (tc.r0, tc.r0_lo32, tc.r1, tc.reg_space);
+
+        let f = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000, f);
+        let arm = tc.ctx.get_or_make_block(0x1100, f);
+        let join = tc.ctx.get_or_make_block(0x1200, f);
+        {
+            let mut fb = FunctionBody::from_id_mut(&mut tc.ctx, f);
+            fb.set_root(entry).unwrap();
+            fb.add_block(arm);
+            fb.add_block(join);
+        }
+
+        {
+            let mut b = tc.ctx.builder(entry);
+            let k = b.shr().get_const(0x11u64, 8);
+            b.push_store(k, ValueId::Varnode(r0), reg);
+            let cond = b.shr().get_const(1u64, 1);
+            b.push_cbranch(cond, join, arm);
+        }
+        {
+            let mut b = tc.ctx.builder(arm);
+            let v = b.shr().get_const(0xffff_fffcu64, 4);
+            b.push_store(v, ValueId::Varnode(r0_lo32), reg);
+            b.push_branch(join);
+        }
+        {
+            let mut b = tc.ctx.builder(join);
+            let loaded = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
+            b.push_store(loaded, ValueId::Varnode(r1), reg);
+            let ret = b.shr().get_const(0u64, 8);
+            b.push_return(ret);
+        }
+
+        let aliases = AliasResult::simple_for_function(&tc.ctx, f);
+        mem2reg(&mut tc.ctx, f, &aliases);
+
+        let join_block = BasicBlock::from_id(&tc.ctx, join);
+        let stored = join_block
+            .iter()
+            .find_map(|insn| match insn.mnemonic() {
+                Mnemonic::Store(store) if store.ptr == LocalValueId::Varnode(r1) => Some(store.src),
+                _ => None,
+            })
+            .expect("the join stores its r0 read into r1");
+
+        assert!(
+            !matches!(stored, LocalValueId::Literal(_)),
+            "mem2reg forwarded the pre-branch r0 constant across a narrow store to its \
+             low half on the other path, so the join sees one value where there are \
+             two. Expected a reload or a merged parameter.\n{join_block}"
         );
     }
 
