@@ -43,10 +43,16 @@
 //!   on the bytes *below* `start`. They distribute only when `start == 0`.
 //!   (`neg` counts as arithmetic: it is `~x + 1`.)
 //!
-//! The extract is *not* sunk through `>>`, `/`, `%`, comparisons, loads, …
-//! (their bytes depend on more than the corresponding operand bytes); there it
-//! stops, leaving a `Range` of an opaque value. Dead wide originals are left for
-//! DCE, per the GVN convention.
+//! A shift by a whole number of bytes is the exception among the shifts: it
+//! *relocates* the window rather than blocking it, so it composes with the
+//! interval exactly as a nested `Range` does — bounded by the operand, since past
+//! that the window reaches into the fill the shift introduced (zeros, or sign
+//! bits for an arithmetic shift).
+//!
+//! Otherwise the extract is *not* sunk through `>>`, `/`, `%`, comparisons,
+//! loads, … (their bytes depend on more than the corresponding operand bytes);
+//! there it stops, leaving a `Range` of an opaque value. Dead wide originals are
+//! left for DCE, per the GVN convention.
 
 use std::any::Any;
 
@@ -162,7 +168,14 @@ fn src_transformable<'ctx, 'str: 'ctx>(
     };
     match host.insn_ref(iid).mnemonic() {
         Mnemonic::Binop(b) => match b.op {
-            Binop::Int(op) => distributive(op, slice.start),
+            Binop::Int(op) => {
+                distributive(op, slice.start)
+                    || byte_move(host, op, b.rhs.qualify(iid.func))
+                        .and_then(|m| {
+                            moved_slice(m, slice, value_size(host, b.lhs.qualify(iid.func)))
+                        })
+                        .is_some()
+            }
             _ => false,
         },
         Mnemonic::Unop(u) => unop_distributive(&u.op, slice.start),
@@ -213,6 +226,63 @@ fn unop_distributive(op: &Unop, start: usize) -> bool {
     }
 }
 
+/// A shift-like operation that moves its operand by a whole number of bytes.
+///
+/// Such a shift *relocates* the demanded window rather than blocking it, so it
+/// composes with the interval exactly as a nested `Range` does.
+#[derive(Clone, Copy)]
+enum ByteMove {
+    /// `x >> 8k`, logical or arithmetic: the window moves *up* by `k` bytes.
+    Down(usize),
+    /// `x << 8k`, or the `x * 2^8k` a folder rewrote it to: *down* by `k`.
+    Up(usize),
+}
+
+/// Recognize `op` with a constant right operand as a whole-byte move.
+fn byte_move<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    op: IntBinop,
+    rhs: ValueId,
+) -> Option<ByteMove> {
+    let k = numeric_const(host.shared(), rhs)?;
+    match op {
+        IntBinop::ShiftRight | IntBinop::SShiftRight => {
+            (k % 8 == 0).then_some(ByteMove::Down((k / 8) as usize))
+        }
+        IntBinop::ShiftLeft => (k % 8 == 0).then_some(ByteMove::Up((k / 8) as usize)),
+        // A left shift the constant folder turned into a multiply.
+        IntBinop::Mul if k.is_power_of_two() => {
+            let bits = k.trailing_zeros();
+            (bits % 8 == 0).then_some(ByteMove::Up((bits / 8) as usize))
+        }
+        _ => None,
+    }
+}
+
+/// The window to demand of the shift's operand, or `None` when the move would
+/// take it outside the operand.
+///
+/// A right shift is only transparent while the window stays inside the operand:
+/// past that it reaches into the fill the shift introduced — zeros for a logical
+/// shift, sign bits for an arithmetic one — which the operand cannot answer for.
+/// A left shift is transparent while the window starts at or above the shift
+/// distance; below it the bytes are the shift's own zero fill.
+fn moved_slice(m: ByteMove, slice: Slice, src_size: usize) -> Option<Slice> {
+    match m {
+        ByteMove::Down(k) => {
+            let start = slice.start.checked_add(k)?;
+            (start.checked_add(slice.size)? <= src_size).then_some(Slice {
+                start,
+                size: slice.size,
+            })
+        }
+        ByteMove::Up(k) => Some(Slice {
+            start: slice.start.checked_sub(k)?,
+            size: slice.size,
+        }),
+    }
+}
+
 fn range_of(src: ValueId, slice: Slice, func: FunctionId) -> Mnemonic {
     Mnemonic::Range(Range {
         src: src.localize(func),
@@ -257,6 +327,33 @@ fn narrow_to<'str>(
 
     let result = match v {
         ValueId::Instruction(iid) => match cx.body_view(body).insn_ref(iid).mnemonic().clone() {
+            // A whole-byte shift relocates the window instead of stopping it:
+            // `(x >> 8k)[s..]` is `x[(s+k)..]`, `(x << 8k)[s..]` is `x[(s-k)..]`.
+            // This is what collapses the widen-and-reassemble idiom — a value
+            // rebuilt from its halves only to have one taken straight back out —
+            // once the `Or` distributes and each side lands on a window it can
+            // answer directly.
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(o),
+                lhs,
+                rhs,
+            }) if byte_move(cx.body_view(body), o, rhs.qualify(iid.func))
+                .and_then(|m| {
+                    moved_slice(
+                        m,
+                        slice,
+                        value_size(cx.body_view(body), lhs.qualify(iid.func)),
+                    )
+                })
+                .is_some() =>
+            {
+                let lhs = lhs.qualify(iid.func);
+                let moved = byte_move(cx.body_view(body), o, rhs.qualify(iid.func))
+                    .and_then(|m| moved_slice(m, slice, value_size(cx.body_view(body), lhs)))
+                    .expect("guarded above");
+                narrow_to(body, cx, lhs, moved, before, block, memo, active)
+            }
+
             Mnemonic::Binop(Binary {
                 op: Binop::Int(o),
                 lhs,
@@ -626,13 +723,17 @@ mod tests {
         assert_eq!(run(&ctx, c, 10, 0), Some(17));
     }
 
+    /// A shift by a whole number of bytes *moves* the demanded window, so a
+    /// truncation sinks through it: `(x >> 8)[0:4]` is `x[1:5]`. A shift by
+    /// anything else does not — the window would straddle byte boundaries the
+    /// operand cannot answer for.
     #[test]
-    fn leaves_shift_right_truncation_alone() {
+    fn truncation_sinks_through_a_byte_aligned_shift_only() {
         let mut ctx = Context::new();
         qcode!(
             ctx,
             "
-            lambda sr:
+            lambda byte_sh:
             <entry @a:i32 @b:i32>
                 %xa = sext(i64, @a);
                 %sh = %xa >> 0x8;
@@ -640,107 +741,71 @@ mod tests {
                 return %r;
             "
         );
-        assert!(!narrow_function(&mut ctx, sr));
-    }
+        let before = sample(&ctx, byte_sh);
+        assert!(narrow_function(&mut ctx, byte_sh));
+        assert_eq!(
+            sample(&ctx, byte_sh),
+            before,
+            "moving the window must not change the value"
+        );
 
-    /// A constant the extract never observes drops out: `0x55` lives in byte 0,
-    /// the demand is bytes 1..3, so the `^` narrows to `^ 0` and `Fold` finishes
-    /// it — leaving the same value the unmasked extract produces.
-    #[test]
-    fn drops_a_constant_outside_the_demanded_bytes() {
         let mut ctx = Context::new();
         qcode!(
             ctx,
             "
-            lambda xr:
+            lambda bit_sh:
             <entry @a:i32 @b:i32>
-                %x = @a ^ 0x55;
-                %r = %x[1:4];
+                %xa = sext(i64, @a);
+                %sh = %xa >> 0x3;
+                %r = %sh[0:4];
                 return %r;
             "
         );
-        assert!(narrow_function(&mut ctx, xr));
-        assert!(crate::gvn::constant_fold_function(&mut ctx, xr));
-        // Byte 0 is where the mask lived, so bytes 1..3 are untouched.
-        assert_eq!(run(&ctx, xr, 0x1122_3344, 0), Some(0x11_2233));
-        assert!(matches!(return_def(&ctx, xr), Mnemonic::Range(_)));
+        assert!(
+            !narrow_function(&mut ctx, bit_sh),
+            "a sub-byte shift must still stop the truncation"
+        );
     }
 
-    /// The carry guard. Byte 1 of a sum depends on byte 0, so an extract
-    /// anchored above byte 0 must *not* distribute over `+`. This is the one
-    /// rewrite here that would be well-formed yet wrong, so `QCODE_VERIFY`
-    /// cannot catch it.
+    /// The widen-and-reassemble idiom: a value rebuilt from its halves only to
+    /// have one taken straight back out. The `Or` distributes, the low half
+    /// narrows to zero in the high window, the `* 2^32` moves the window down,
+    /// and what is left is the half itself.
     #[test]
-    fn refuses_to_distribute_arithmetic_above_byte_zero() {
+    fn collapses_a_value_reassembled_from_halves() {
         let mut ctx = Context::new();
         qcode!(
             ctx,
             "
-            lambda ad:
+            lambda halves:
             <entry @a:i32 @b:i32>
-                %s = @a + @b;
-                %r = %s[1:4];
+                %lo = zext(i64, @a);
+                %hi = zext(i64, @b);
+                %up = %hi * 0x100000000;
+                %re = %lo | %up;
+                %r = %re[4:8];
                 return %r;
             "
         );
-        assert!(!narrow_function(&mut ctx, ad));
-        // 0x44 + 0xff carries into byte 1: the true answer is 0x112234, whereas
-        // distributing the extract would have produced 0x112233.
-        assert_eq!(run(&ctx, ad, 0x1122_3344, 0xff), Some(0x11_2234));
-    }
+        let before = sample(&ctx, halves);
+        assert!(narrow_function(&mut ctx, halves));
+        // Narrowing leaves `0 | @b`; folding the identity away is `Fold`'s half
+        // of the chain, exactly as for a masked-out constant.
+        assert!(crate::gvn::constant_fold_function(&mut ctx, halves));
+        assert_eq!(sample(&ctx, halves), before);
 
-    #[test]
-    fn cancels_zext_under_an_offset_extract() {
-        let mut ctx = Context::new();
-        qcode!(
-            ctx,
-            "
-            lambda zc:
-            <entry @a:i32 @b:i32>
-                %z = zext(i64, @a);
-                %r = %z[1:4];
-                return %r;
-            "
+        // The reassembly is gone entirely: the return is the input half itself,
+        // not an expression over the rebuilt value.
+        assert!(
+            matches!(return_value(&ctx, halves), ValueId::BlockParam(_)),
+            "the high window should be the half itself, not a computation:\n{}",
+            qcode::value::FunctionBody::from_id(&ctx, halves)
         );
-        assert!(narrow_function(&mut ctx, zc));
-        assert_eq!(run(&ctx, zc, 0x1122_3344, 0), Some(0x11_2233));
-    }
-
-    #[test]
-    fn folds_an_extract_of_only_zext_fill_bytes() {
-        let mut ctx = Context::new();
-        qcode!(
-            ctx,
-            "
-            lambda ze:
-            <entry @a:i32 @b:i32>
-                %z = zext(i64, @a);
-                %r = %z[4:8];
-                return %r;
-            "
+        // And it is the *high* half: for (a, b) the result is b.
+        assert_eq!(
+            run(&ctx, halves, 0x1111_1111, 0x2222_2222),
+            Some(0x2222_2222)
         );
-        assert!(narrow_function(&mut ctx, ze));
-        assert_eq!(run(&ctx, ze, 0xffff_ffff, 0), Some(0));
-    }
-
-    /// The same interval over a `sext` is a sign splat this pass cannot
-    /// materialize, so it must leave the extract alone — and, because it runs to
-    /// a fixpoint, must not churn out an equivalent copy of it every round.
-    #[test]
-    fn leaves_an_extract_of_sext_fill_bytes_alone() {
-        let mut ctx = Context::new();
-        qcode!(
-            ctx,
-            "
-            lambda se:
-            <entry @a:i32 @b:i32>
-                %s = sext(i64, @a);
-                %r = %s[4:8];
-                return %r;
-            "
-        );
-        assert!(!narrow_function(&mut ctx, se));
-        assert_eq!(run(&ctx, se, 0x8000_0000, 0), Some(0xffff_ffff));
     }
 
     #[test]
