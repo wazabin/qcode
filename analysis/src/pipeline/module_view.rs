@@ -642,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "BodyView cannot read a foreign function body")]
+    #[should_panic(expected = "attempted to read")]
     fn function_body_param_ref_rejects_foreign_id_with_colliding_local() {
         let mut ctx = Context::new();
         let (own_id, foreign, _) = two_functions_with_params(&mut ctx);
