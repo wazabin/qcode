@@ -17,6 +17,13 @@
 //!   callee's return `Tuple`, the call-result aggregate type is rebuilt, and the
 //!   surviving extracts are renumbered through one old→new index map.
 //!
+//!   A function with *no* call sites is trimmed the same way rather than skipped.
+//!   There is no site to prove a field dead, so the architecture's killable set
+//!   decides alone: every killable output goes, everything else stays. This is the
+//!   common shape from `-O1` up, where gcc inlines a callee into its only caller
+//!   but keeps the standalone copy for external linkage — leaving a function whose
+//!   entire clobber set, flags and all, would otherwise survive unexamined.
+//!
 //! ## Scope and soundness
 //!
 //! Only `pure_reg` functions are touched. That flag (set by
@@ -250,13 +257,23 @@ fn trim_dead_return_fields(
     touched: &mut HashSet<FunctionId>,
 ) -> bool {
     let call_sites = direct_call_sites(ctx, fid, call_index);
-    if call_sites.is_empty() {
-        return false;
-    }
 
     // The returned aggregate type (uniform across call sites). A `pure_reg`
     // function always returns the write-set aggregate.
-    let Some(agg_ty) = ctx.stored_type_of(ValueId::Instruction(call_sites[0])) else {
+    //
+    // A function nothing calls has no site to read it off, so fall back to its
+    // own return type. That case is worth handling rather than skipping: with no
+    // call site to project a field, *every* killable output is dead by
+    // definition, so the trim below reduces the interface to exactly what a
+    // conforming caller could still read. It is the common shape at `-O1` and
+    // above, where gcc inlines a callee into its only caller but keeps the
+    // standalone copy for external linkage — leaving a function whose whole
+    // clobber set, flags included, would otherwise survive unexamined.
+    let agg_ty = match call_sites.first() {
+        Some(&site) => ctx.stored_type_of(ValueId::Instruction(site)),
+        None => ctx.shared.types.function_return(fid),
+    };
+    let Some(agg_ty) = agg_ty else {
         return false;
     };
     let Some(fields) = ctx.shared.types.aggregate_fields(agg_ty).map(<[_]>::to_vec) else {
@@ -665,6 +682,87 @@ mod tests {
     /// register-input prefix. Once cleanup forwards the snapshot directly, the
     /// stack-register parameter is dead and must be removable without removing
     /// or reindexing the snapshot as though it were another register input.
+    /// A function nothing calls still has an interface, and no call site can
+    /// prove any of it dead. Trim it against the ABI instead: every killable
+    /// output goes, everything a conforming caller could still read stays.
+    ///
+    /// This is the shape gcc leaves at `-O1` and above — a callee inlined into
+    /// its only caller but kept for external linkage — where the whole clobber
+    /// set would otherwise survive unexamined.
+    #[test]
+    fn trims_an_uncalled_function_against_the_abi() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry>
+                    return at i64 0;
+            "
+        );
+
+        let kept = tc.ctx.get_const(0xaa, 8).id();
+        let dropped = tc.ctx.get_const(0xbb, 8).id();
+        // outputs are [r0, r1] positionally; only r1 is killable below.
+        make_pure_reg_return(
+            &mut tc,
+            f,
+            vec![],
+            vec![("keep".into(), kept), ("kill".into(), dropped)],
+        );
+        assert_eq!(return_field_count(&tc, f), Some(2));
+
+        let killable = [tc.r1].into_iter().collect();
+        assert!(
+            dead_signature(&mut tc.ctx, &killable),
+            "an uncalled function's killable outputs should be trimmed"
+        );
+
+        assert_eq!(
+            return_field_count(&tc, f),
+            Some(1),
+            "only the killable field should have been dropped"
+        );
+        let map = FunctionBody::from_id(&tc.ctx, f)
+            .effects()
+            .materialized()
+            .expect("still materialized")
+            .clone();
+        assert_eq!(map.returns, 1);
+        assert_eq!(
+            map.outputs,
+            vec![tc.r0],
+            "the surviving output is the kept one"
+        );
+    }
+
+    /// The complement: with nothing killable, an uncalled function keeps its
+    /// whole interface rather than being stripped for having no observers.
+    #[test]
+    fn an_uncalled_function_keeps_non_killable_outputs() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry>
+                    return at i64 0;
+            "
+        );
+
+        let a = tc.ctx.get_const(0xaa, 8).id();
+        let b = tc.ctx.get_const(0xbb, 8).id();
+        make_pure_reg_return(&mut tc, f, vec![], vec![("a".into(), a), ("b".into(), b)]);
+
+        let killable = HashSet::default();
+        dead_signature(&mut tc.ctx, &killable);
+        assert_eq!(
+            return_field_count(&tc, f),
+            Some(2),
+            "no call sites is not a licence to drop observable outputs"
+        );
+    }
+
     #[test]
     fn drops_dead_stack_register_but_keeps_ram_snapshot_param() {
         let mut tc = qcode::testing::TestContext::new();
