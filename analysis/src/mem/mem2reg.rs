@@ -1587,10 +1587,14 @@ impl<'str> Mem2Reg<'_, 'str> {
     }
 
     /// True if `block` has a predecessor reaching it through an edge that cannot
-    /// carry block-param arguments. Only `Branch`/`CBranch` terminators wire args
-    /// (via [`merge_branch_args`](Self::merge_branch_args)); a `Call`/`CallInd`
-    /// fall-through or a `BranchInd` jump-table edge is a bare CFG edge. A
+    /// carry block-param arguments. `Branch`/`CBranch`/`Switch` terminators wire
+    /// args (via [`merge_branch_args`](Self::merge_branch_args)); a `Call`/`CallInd`
+    /// fall-through or an *unresolved* `BranchInd` is a bare CFG edge. A
     /// predecessor with no terminator is treated as implicit (conservative).
+    ///
+    /// A resolved jump table used to land here: it reached its targets through
+    /// bare edges, so any join below one was unpromotable. `Switch` gives every
+    /// arm an argument list, which is what lets those joins take a parameter.
     fn has_implicit_edge_predecessor(&self, block: BlockId) -> bool {
         self.read()
             .block_ref(block)
@@ -1602,7 +1606,12 @@ impl<'str> Mem2Reg<'_, 'str> {
                     .iter()
                     .last()
                     .map(|i| i.mnemonic().clone());
-                !matches!(term, Some(Mnemonic::Branch(_)) | Some(Mnemonic::CBranch(_)))
+                !matches!(
+                    term,
+                    Some(Mnemonic::Branch(_))
+                        | Some(Mnemonic::CBranch(_))
+                        | Some(Mnemonic::Switch(_))
+                )
             })
     }
 
@@ -2149,6 +2158,65 @@ impl<'str> Mem2Reg<'_, 'str> {
                     load_value = self.resize_forwarded_load_value(block, insn_id, load_value, size);
                     self.body.replace_instruction(insn_id, load_value);
                     state.changed = true;
+                }
+
+                Mnemonic::Switch(switch) => {
+                    // Each arm is an alternative path, so it gets its own frame,
+                    // exactly as the two `CBranch` sides do.
+                    let mut rewritten = switch.clone();
+                    let mut changed_args = false;
+                    let arms = switch
+                        .cases
+                        .iter()
+                        .map(|case| (case.target, case.args.clone()))
+                        .chain(switch.default.map(|d| (d, switch.default_args.clone())))
+                        .collect::<Vec<_>>();
+
+                    let mut merged: Vec<Vec<ValueId>> = Vec::with_capacity(arms.len());
+                    for (target, existing) in &arms {
+                        let existing: Vec<ValueId> = existing
+                            .iter()
+                            .map(|arg| arg.qualify(insn_id.func))
+                            .collect();
+                        let args = self.merge_branch_args(
+                            BranchEdge {
+                                target: BlockId::new(block.func, *target),
+                                source_block: block,
+                                branch_insn: insn_id,
+                                existing_args: &existing,
+                            },
+                            state,
+                        );
+                        changed_args |= existing != args;
+                        merged.push(args);
+                    }
+
+                    for (case, args) in rewritten.cases.iter_mut().zip(&merged) {
+                        case.args = args.iter().map(|a| a.localize(insn_id.func)).collect();
+                    }
+                    if rewritten.default.is_some() {
+                        rewritten.default_args = merged
+                            .last()
+                            .expect("default arm was pushed last")
+                            .iter()
+                            .map(|a| a.localize(insn_id.func))
+                            .collect();
+                    }
+
+                    // Rewrite through `replace_instruction_mnemonic` so the passed
+                    // values register as uses; a directly mutated `args` field
+                    // would leave them looking dead to a later DCE/fold pass.
+                    if changed_args {
+                        self.body
+                            .replace_instruction_mnemonic(insn_id, Mnemonic::Switch(rewritten));
+                        state.changed = true;
+                    }
+
+                    for (target, _) in &arms {
+                        state.frames.push(Frame::default());
+                        self.decide_values_start_from(BlockId::new(block.func, *target), state);
+                        state.frames.pop();
+                    }
                 }
 
                 Mnemonic::CBranch(CBranch {
@@ -4360,6 +4428,96 @@ mod tests {
             join_block.num_params(),
             0,
             "the implicit-edge join must not receive a block param:\n{join_block}"
+        );
+    }
+
+    /// The counterpart of the test above, and the reason `Switch` exists: a
+    /// *resolved* jump table reaches its targets through arms that carry an
+    /// argument list, so a join below one is no longer stuck. The same shape that
+    /// declines promotion behind a `BranchInd` promotes behind a `Switch`.
+    #[test]
+    fn var_live_into_switch_join_is_promoted() {
+        use qcode::testing::TestContext;
+
+        let mut tc = TestContext::new();
+        let (r0, r1, r2, reg) = (tc.r0, tc.r1, tc.r2, tc.reg_space);
+
+        let f = FunctionBody::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000, f);
+        let other = tc.ctx.get_or_make_block(0x1100, f);
+        let join = tc.ctx.get_or_make_block(0x1200, f);
+        {
+            let mut fr = FunctionBody::from_id_mut(&mut tc.ctx, f);
+            fr.set_root(entry).unwrap();
+            fr.add_block(other);
+            fr.add_block(join);
+        }
+
+        // entry stores r0, then dispatches: case 0 lands on the join directly,
+        // case 1 goes the long way round through `other`.
+        {
+            let mut b = tc.ctx.builder(entry);
+            let zero = b.shr().get_const(0u64, 8);
+            b.push_store(zero, ValueId::Varnode(r0), reg);
+            let idx = b.push_load::<false>(ValueId::Varnode(r2), 8, reg).id();
+            b.push_switch(
+                idx,
+                vec![(0, join, Vec::new()), (1, other, Vec::new())],
+                None,
+            );
+        }
+        {
+            let mut b = tc.ctx.builder(other);
+            let one = b.shr().get_const(1u64, 8);
+            b.push_store(one, ValueId::Varnode(r0), reg);
+            b.push_branch(join);
+        }
+        let join_load;
+        {
+            let mut b = tc.ctx.builder(join);
+            join_load = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
+            b.push_store(join_load, ValueId::Varnode(r1), reg);
+            let ret = b.shr().get_const(0u64, 8);
+            b.push_return(ret);
+        }
+
+        let aliases = AliasResult::simple_for_function(&tc.ctx, f);
+        mem2reg(&mut tc.ctx, f, &aliases);
+
+        let ValueId::Instruction(load_id) = join_load else {
+            unreachable!()
+        };
+        let join_block = BasicBlock::from_id(&tc.ctx, join);
+        assert_eq!(
+            join_block.num_params(),
+            1,
+            "a switch arm can carry an argument, so the join takes a param:\n{join_block}"
+        );
+        assert!(
+            !join_block.instruction_ids().contains(&load_id),
+            "r0's load should have been promoted away:\n{join_block}"
+        );
+
+        // Both edges bind the param: the switch arm passes its reaching value
+        // (0) and the `other` path passes its own (1).
+        let entry_term = BasicBlock::from_id(&tc.ctx, entry)
+            .instructions()
+            .last()
+            .expect("entry has a terminator")
+            .mnemonic()
+            .clone();
+        let Mnemonic::Switch(switch) = entry_term else {
+            panic!("expected the entry to still end in a switch, got {entry_term:?}");
+        };
+        let to_join = switch
+            .cases
+            .iter()
+            .find(|case| BlockId::new(f, case.target) == join)
+            .expect("an arm targets the join");
+        assert_eq!(
+            to_join.args.len(),
+            1,
+            "the arm reaching the join must bind its parameter"
         );
     }
 
