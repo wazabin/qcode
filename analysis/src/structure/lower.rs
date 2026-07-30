@@ -346,6 +346,74 @@ mod tests {
         }
     }
 
+    /// Projecting an aggregate names the field it takes. The field name lives in
+    /// the aggregate's *type*, not in the instruction's operands, so the generic
+    /// `opcode(args)` fallback rendered every projection of one value identically
+    /// — losing which register each read.
+    #[test]
+    fn a_projection_names_its_field() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 OUT;
+
+            fn f:
+                <entry @x:i64>
+                    %t = pack(RAX=@x, RDX=i64 0x7);
+                    %hi = extract(%t.RDX);
+                    store(OUT:8, &OUT <- %hi);
+                    return at i64 0x0;
+            "
+        );
+
+        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        assert!(
+            c.contains(".RDX"),
+            "the projection should name its field:\n{c}"
+        );
+        assert!(
+            !c.contains("extract("),
+            "the opaque pseudo-call fallback should be gone:\n{c}"
+        );
+    }
+
+    /// A call nothing reads stays an unbound statement. The dense name counter
+    /// must agree with that: it skips exactly the roots that introduce no name,
+    /// so a call which *is* read has to be counted and one which is not must not
+    /// be — otherwise two values land on the same letter and the second reads as
+    /// a reassignment of the first.
+    #[test]
+    fn an_unread_call_result_is_not_bound() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 OUT;
+
+            fn callee:
+                <c_entry @x:i64>
+                    return at i64 0x0;
+
+            fn f:
+                <entry>
+                    %v = i64 0x10 + i64 0x20;
+                    store(OUT:8, &OUT <- %v);
+                    call fn callee(@x=%v) // -> <cont>;
+                <cont>
+                    return at i64 0x0;
+            "
+        );
+        let _ = callee;
+
+        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        assert!(c.contains("callee("), "expected the call:\n{c}");
+        assert!(
+            !c.contains("= callee("),
+            "an unread call result must not be bound:\n{c}"
+        );
+    }
+
     #[test]
     fn conditional_lowers_to_gotos_with_real_condition() {
         let mut ctx = Context::new();

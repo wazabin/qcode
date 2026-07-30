@@ -56,6 +56,8 @@ pub enum ExprKind {
     },
     /// A named aggregate/pack literal (`{ RAX: x, RDX: y }`).
     Aggregate(Vec<(String, Expr)>),
+    /// Projection of one field out of an aggregate (`call_result.RAX`).
+    Field { base: Box<Expr>, name: String },
     /// A pseudo-call fallback for ops we do not model structurally.
     Unknown { op: String, operands: Vec<Expr> },
 }
@@ -253,6 +255,11 @@ impl Expr {
                 }
                 out.punct("}");
             }
+            ExprKind::Field { base, name } => {
+                Self::child_tokens(out, base, PRIMARY_PREC, false);
+                out.punct(".");
+                out.push_value(name.clone(), TokenKind::Variable, self.value);
+            }
             ExprKind::Unknown { op, operands } => {
                 out.push_value(op.clone(), TokenKind::Label, self.value);
                 out.punct("(");
@@ -286,6 +293,7 @@ impl Expr {
             ExprKind::Const(_)
             | ExprKind::Var(_)
             | ExprKind::Aggregate(_)
+            | ExprKind::Field { .. }
             | ExprKind::Unknown { .. } => PRIMARY_PREC,
             ExprKind::Unary(..) | ExprKind::Deref { .. } | ExprKind::Cast { .. } => UNARY_PREC,
             ExprKind::Binary(op, ..) => op.precedence(),

@@ -97,6 +97,22 @@ pub(crate) fn deref_location(ctx: &Context, ptr: ValueId, size: usize, roots: Ro
     }
 }
 
+/// Whether a statement root introduces a name for its result.
+///
+/// A store or a return never does — it is emitted purely for its effect. A call
+/// does exactly when something reads its result, since that reader has to be able
+/// to refer to it. Anything else is an SSA definition and always binds.
+///
+/// The dense-naming counter below must agree with this, or two values get the
+/// same letter and the second silently reads as a reassignment of the first.
+pub(crate) fn binds_a_name(ctx: &Context, id: InstructionId) -> bool {
+    match Instruction::from_id(ctx, id).mnemonic() {
+        Mnemonic::Store(_) | Mnemonic::Return(_) => false,
+        Mnemonic::Call(_) | Mnemonic::CallInd(_) => !ctx.users(ValueId::Instruction(id)).is_empty(),
+        _ => true,
+    }
+}
+
 /// The display name of an instruction's SSA result.
 ///
 /// Explicit IR names are preserved. Anonymous statement roots are densely named
@@ -115,13 +131,7 @@ pub(crate) fn instruction_name(
                     candidate.func == id.func
                         && candidate.local < id.local
                         && Instruction::from_id(ctx, candidate).name().is_none()
-                        && !matches!(
-                            Instruction::from_id(ctx, candidate).mnemonic(),
-                            Mnemonic::Store(_)
-                                | Mnemonic::Return(_)
-                                | Mnemonic::Call(_)
-                                | Mnemonic::CallInd(_)
-                        )
+                        && binds_a_name(ctx, candidate)
                 })
                 .count();
             if index < 26 {
@@ -243,6 +253,28 @@ fn lower_instruction(ctx: &Context, id: InstructionId, roots: Roots, expand_unkn
                     .collect(),
             ))
         }
+        // Projecting a field of an aggregate — a call's write-set, a returned
+        // tuple. The field *name* lives in the aggregate's type rather than in
+        // the instruction's operands, so the generic `opcode(args)` fallback
+        // would render every projection of one call identically as
+        // `extract(result)`, losing which register each takes.
+        Mnemonic::Extract(e) => {
+            let agg = qualify(e.agg);
+            let base = lower(ctx, agg, roots);
+            match aggregate_field_name(ctx, agg, e.index) {
+                Some(name) => Expr::bare(ExprKind::Field {
+                    base: Box::new(base),
+                    name,
+                }),
+                // An aggregate with no named fields (or a stale index): fall back
+                // to the positional form rather than invent a name.
+                None => Expr::bare(ExprKind::Field {
+                    base: Box::new(base),
+                    name: format!("{}", e.index),
+                }),
+            }
+        }
+
         // Not modeled structurally. As an operand (`expand_unknown` false) refer
         // to the SSA temporary by name; as a defining expression expand it to an
         // opaque `opcode(args)` pseudo-call so the assignment is meaningful.
@@ -504,4 +536,11 @@ fn value_index(value: ValueId) -> usize {
         ValueId::Function(id) => id.into(),
         _ => 0,
     }
+}
+
+/// The declared name of field `index` of `value`'s aggregate type.
+fn aggregate_field_name(ctx: &Context, value: ValueId, index: usize) -> Option<String> {
+    let ty = ctx.stored_type_of(value)?;
+    let field = ctx.shared.types.aggregate_fields(ty)?.get(index)?;
+    Some(field.name.to_string())
 }

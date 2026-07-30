@@ -381,9 +381,10 @@ fn collect_var_leaves<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     match &expr.kind {
         ExprKind::Var(_) => out.push(expr),
         ExprKind::Const(_) => {}
-        ExprKind::Unary(_, e) | ExprKind::Deref { ptr: e, .. } | ExprKind::Cast { expr: e, .. } => {
-            collect_var_leaves(e, out)
-        }
+        ExprKind::Unary(_, e)
+        | ExprKind::Deref { ptr: e, .. }
+        | ExprKind::Cast { expr: e, .. }
+        | ExprKind::Field { base: e, .. } => collect_var_leaves(e, out),
         ExprKind::Binary(_, a, b) => {
             collect_var_leaves(a, out);
             collect_var_leaves(b, out);
@@ -409,9 +410,10 @@ fn collect_expr_insns(expr: &Expr, out: &mut Vec<InstructionId>) {
     }
     match &expr.kind {
         ExprKind::Const(_) | ExprKind::Var(_) => {}
-        ExprKind::Unary(_, e) | ExprKind::Deref { ptr: e, .. } | ExprKind::Cast { expr: e, .. } => {
-            collect_expr_insns(e, out)
-        }
+        ExprKind::Unary(_, e)
+        | ExprKind::Deref { ptr: e, .. }
+        | ExprKind::Cast { expr: e, .. }
+        | ExprKind::Field { base: e, .. } => collect_expr_insns(e, out),
         ExprKind::Binary(_, a, b) => {
             collect_expr_insns(a, out);
             collect_expr_insns(b, out);

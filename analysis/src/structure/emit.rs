@@ -657,6 +657,7 @@ fn statement(ctx: &Context, id: InstructionId, roots: &HashSet<InstructionId>) -
             buf.punct(";");
         }
         Mnemonic::Call(c) => {
+            bind_result(ctx, id, roots, &mut buf);
             let target = c.target.real();
             let name = target
                 .map(|target| FunctionRef::from_id(ctx, target).name().to_string())
@@ -666,6 +667,7 @@ fn statement(ctx: &Context, id: InstructionId, roots: &HashSet<InstructionId>) -
             buf.punct(";");
         }
         Mnemonic::CallInd(c) => {
+            bind_result(ctx, id, roots, &mut buf);
             buf.punct("(");
             buf.push("*", TokenKind::Operator);
             lower_expr_rooted(ctx, qualify(c.ptr), roots).write_tokens(&mut buf);
@@ -693,6 +695,36 @@ fn statement(ctx: &Context, id: InstructionId, roots: &HashSet<InstructionId>) -
         }
     }
     buf
+}
+
+/// Name a call's result when something reads it.
+///
+/// A call is emitted as a statement for its effect, so the result had no name —
+/// yet its `extract`s refer to it, and rendered they would name a value the
+/// reader has never seen bound (or, worse, one that happens to collide with an
+/// unrelated local).
+///
+/// The binding is declared like any other SSA definition. A write-set
+/// aggregate's width is not informative on its own, but leaving the one call
+/// result as the only undeclared name in a function reads as an assignment to
+/// something outside it.
+fn bind_result(
+    ctx: &Context,
+    id: InstructionId,
+    roots: &HashSet<InstructionId>,
+    buf: &mut LineBuf,
+) {
+    if ctx.users(ValueId::Instruction(id)).is_empty() {
+        return;
+    }
+    emit_uint_type(Instruction::from_id(ctx, id).size(), buf);
+    buf.space();
+    buf.push_value(
+        instruction_name(ctx, id, roots),
+        TokenKind::Variable,
+        Some(ValueId::Instruction(id)),
+    );
+    assign(buf);
 }
 
 fn call_args(
