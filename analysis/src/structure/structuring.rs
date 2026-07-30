@@ -497,36 +497,49 @@ impl Structurer<'_, '_> {
                     // Continue at the merge only if some arm reaches it.
                     cur = if then_ft || els_ft { merge } else { None };
                 }
-                // A resolved dispatch: emit the `switch` itself, with each arm
-                // jumping to its target. Structuring the arm bodies into the
-                // cases would need the dispatch's reconvergence point, which the
-                // region walker does not compute for a multi-way exit; the
-                // labelled jumps are already correct and every one is reachable.
+                // A resolved dispatch: structure each arm into its case, exactly
+                // as the two sides of a conditional are structured, bounded by
+                // the dispatch's own reconvergence point.
+                //
+                // Arms sharing a target need no special handling: `region`
+                // degrades an already-emitted block to a `goto`, so the first arm
+                // to reach a shared body inlines it and the rest jump to it.
                 BlockExit::Switch {
                     scrutinee,
                     arms,
                     default,
                     ..
                 } => {
-                    let arm_body = |target: BlockId| -> Vec<Stmt> {
-                        block_arg_moves(self.ctx, b, target)
-                            .into_iter()
-                            .chain(std::iter::once(Stmt::Goto(target)))
-                            .collect()
+                    let merge = self.immediate_postdom(b);
+                    let mut any_fell_through = false;
+                    let mut arm_region = |s: &mut Self, target: BlockId| {
+                        let (body, fell) = s.region(target, merge, depth + 1);
+                        any_fell_through |= fell;
+                        // This edge's phi copies run only on the path that takes it.
+                        prepend(block_arg_moves(s.ctx, b, target), body)
                     };
+
+                    let mut cases = Vec::with_capacity(arms.len());
+                    for (values, target) in arms {
+                        let body = arm_region(self, target);
+                        cases.push(SwitchCase {
+                            values,
+                            body,
+                            insns: Vec::new(),
+                        });
+                    }
+                    let default = match default {
+                        Some(target) => arm_region(self, target),
+                        None => Vec::new(),
+                    };
+
                     out.push(Stmt::Switch {
                         scrutinee: lower_expr(self.ctx, scrutinee),
-                        cases: arms
-                            .into_iter()
-                            .map(|(values, target)| SwitchCase {
-                                values,
-                                body: arm_body(target),
-                                insns: Vec::new(),
-                            })
-                            .collect(),
-                        default: default.map(arm_body).unwrap_or_default(),
+                        cases,
+                        default,
                     });
-                    cur = None;
+                    // Continue past the dispatch only if some arm reaches the merge.
+                    cur = if any_fell_through { merge } else { None };
                 }
                 BlockExit::Indirect { edges } | BlockExit::Unstructured { edges } => {
                     for (_, target) in edges {
@@ -810,6 +823,66 @@ mod tests {
                 "`{name}` should resolve as a decompilation pass"
             );
         }
+    }
+
+    /// Each arm of a resolved dispatch is structured into its case, the same way
+    /// the two sides of a conditional are — not left as a jump to a block printed
+    /// after the switch. An arm sharing a target with an earlier one degrades to a
+    /// `goto`, since the body has already been emitted.
+    #[test]
+    fn switch_arms_are_structured_into_their_cases() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 idx;
+            varnode i64 out;
+
+            fn f:
+            <entry>
+                %i = load(idx:8, &idx);
+                switch %i { 0x0 => <a_lbl>, 0x1 => <b_lbl>, 0x4 => <a_lbl>, 0x2 => <c_lbl> };
+            <a_lbl>
+                store(out:8, &out <- i64 0xaa);
+                return at 0x0;
+            <b_lbl>
+                store(out:8, &out <- i64 0xbb);
+                return at 0x0;
+            <c_lbl>
+                store(out:8, &out <- i64 0xcc);
+                return at 0x0;
+            "
+        );
+
+        let program = structure_regions(&ctx, f);
+        let c = emit_c(&ctx, &program);
+
+        // Each arm's body sits inside its case: the store appears between the
+        // arm's `=>` and its closing brace, not after the switch under a label.
+        for (arm, value) in [("0x0 | 0x4", "0xaa"), ("0x1", "0xbb"), ("0x2", "0xcc")] {
+            let body = c
+                .split_once(&format!("{arm} =>"))
+                .unwrap_or_else(|| panic!("no `{arm}` arm:\n{c}"))
+                .1;
+            let end = body.find('}').expect("arm closes");
+            assert!(
+                body[..end].contains(value),
+                "arm `{arm}` should hold its body {value}, not a jump:\n{c}"
+            );
+        }
+
+        // 0x0 and 0x4 reach one block with the same (empty) arguments, so they
+        // are one arm with two labels rather than a duplicated body.
+        assert_eq!(
+            c.matches("0xaa").count(),
+            1,
+            "the shared target's body should be emitted once:\n{c}"
+        );
+        // Nothing is left over after the dispatch: every body went into an arm.
+        assert!(
+            !c.contains("goto"),
+            "no arm should degrade to a jump here:\n{c}"
+        );
     }
 
     #[test]
