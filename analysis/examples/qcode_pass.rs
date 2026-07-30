@@ -116,7 +116,7 @@ fn run() -> Result<(), String> {
         ctx.set_linked_libraries(args.assume_libs.clone());
     }
 
-    let env = PipelineEnv::headless(&mut ctx);
+    let env = PipelineEnv::headless(&ctx);
     let mut analyses = qcode_analysis::AnalysisManager::default();
     for pass in &args.passes {
         let resolved = make_pass(pass)

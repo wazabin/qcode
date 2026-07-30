@@ -232,6 +232,14 @@ impl Label {
     }
 }
 
+/// Per-parameter arguments on a branch edge: `(param_name, value)` in
+/// declaration order. Empty unless the edge was written as
+/// `goto <block @v1=e1 @v2=e2>`.
+pub type BlockArgs = Vec<(String, TypedAtom)>;
+
+/// One `switch` arm: `(case value, target block, arguments on that edge)`.
+pub type SwitchCase = (u64, Label, BlockArgs);
+
 #[derive(Clone, Debug)]
 pub enum Statement {
     LocalDecl {
@@ -261,7 +269,7 @@ pub enum Statement {
         target: Label,
         /// Per-parameter arguments: `(param_name, value)` in declaration order.
         /// Non-empty when the branch was written as `goto <block @v1=e1 @v2=e2>`.
-        args: Vec<(String, TypedAtom)>,
+        args: BlockArgs,
         span: SourceSpan,
     },
     BranchInd {
@@ -276,17 +284,17 @@ pub enum Statement {
     Switch {
         scrutinee: TypedAtom,
         /// `(case value, target, per-parameter arguments)` in written order.
-        cases: Vec<(u64, Label, Vec<(String, TypedAtom)>)>,
+        cases: Vec<SwitchCase>,
         /// The `default => <block>` arm, when written.
-        default: Option<(Label, Vec<(String, TypedAtom)>)>,
+        default: Option<(Label, BlockArgs)>,
         span: SourceSpan,
     },
     CBranch {
         condition: TypedAtom,
         target: Label,
-        target_args: Vec<(String, TypedAtom)>,
+        target_args: BlockArgs,
         fallthrough: Label,
-        fallthrough_args: Vec<(String, TypedAtom)>,
+        fallthrough_args: BlockArgs,
         span: SourceSpan,
     },
     Call {
@@ -297,7 +305,7 @@ pub enum Statement {
         /// order. The name in each pair is the callee's parameter name as
         /// printed (`@r0`, `@arg1`, …); it is decorative and discarded on
         /// lowering, where only the positional atoms matter.
-        args: Vec<(String, TypedAtom)>,
+        args: BlockArgs,
         /// The call's return (fall-through) block(s), from a `// -> <ret>` edge
         /// hint. A `call` terminates its block; this records where control resumes
         /// after the callee returns. Empty for a non-returning call.

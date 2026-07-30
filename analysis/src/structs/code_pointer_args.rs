@@ -63,10 +63,10 @@ impl Pass for PropagateCodePointerArgs {
                 for insn in block.iter() {
                     if let Mnemonic::CallInd(ci) = insn.mnemonic() {
                         let ptr = ci.ptr.qualify(fid);
-                        if let Some(idx) = params.iter().position(|&p| p == ptr) {
-                            if !indices.contains(&idx) {
-                                indices.push(idx);
-                            }
+                        if let Some(idx) = params.iter().position(|&p| p == ptr)
+                            && !indices.contains(&idx)
+                        {
+                            indices.push(idx);
                         }
                     }
                 }

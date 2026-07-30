@@ -224,10 +224,8 @@ mod tests {
         let names: Vec<_> = FunctionBody::from_id(&ctx, f)
             .iter()
             .flat_map(|block| block.iter())
-            .filter_map(|insn| {
-                matches!(insn.mnemonic(), Mnemonic::Binop(_))
-                    .then(|| insn.name().unwrap().to_owned())
-            })
+            .filter(|insn| matches!(insn.mnemonic(), Mnemonic::Binop(_)))
+            .map(|insn| insn.name().unwrap().to_owned())
             .collect();
         assert_eq!(names, ["ra", "ra1"]);
         assert!(!run(&mut ctx), "allocated ra names must be stable");

@@ -2650,7 +2650,7 @@ mod tests {
         FunctionBody::from_id_mut(&mut ctx, bar)
             .set_root(entry)
             .unwrap();
-        (&mut ctx).builder(entry).push_call(foo);
+        ctx.builder(entry).push_call(foo);
         assert_eq!(crate::CallGraph::analyze(&ctx).callers(foo), vec![bar]);
 
         let (pass, seen) =
@@ -2669,7 +2669,7 @@ mod tests {
         FunctionBody::from_id_mut(&mut ctx, bar)
             .set_root(entry)
             .unwrap();
-        (&mut ctx).builder(entry).push_call(foo);
+        ctx.builder(entry).push_call(foo);
 
         let (pass, seen) = ScriptedModulePass::new([
             ScriptedReport::Functions(vec![foo, bar]),
@@ -3054,7 +3054,7 @@ mod tests {
             last: expected as u64 - 1,
             lifted: 0,
         };
-        let env = PipelineEnv::headless(&mut ctx);
+        let env = PipelineEnv::headless(&ctx);
         let mut services = PipelineServices::with_lifter(&mut lifter);
 
         pipeline
@@ -3109,7 +3109,7 @@ mod tests {
         let _dummy_b = FunctionBody::make_at_addr(&mut ctx, 0x3000, None).id;
         let thunk = FunctionBody::make_at_addr(&mut ctx, 0x4000, None).id;
         let block = BasicBlock::make(&mut ctx, thunk).with_address(0x4000).id;
-        (&mut ctx).builder(block).push_tail_call(callee);
+        ctx.builder(block).push_tail_call(callee);
         FunctionBody::from_id_mut(&mut ctx, thunk)
             .set_root(block)
             .unwrap();
@@ -3268,7 +3268,7 @@ mod tests {
     fn minting_counts_as_a_pass_change() {
         let mut ctx = Context::new();
         let owner = FunctionBody::make(&mut ctx, "owner".into()).unwrap().id;
-        let env = PipelineEnv::headless(&mut ctx);
+        let env = PipelineEnv::headless(&ctx);
         let passes: Vec<Box<dyn DynFunctionPass>> = vec![Box::new(FunctionPassAdapter::<
             MintWithoutChanged,
         >::default())];

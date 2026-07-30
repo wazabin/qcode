@@ -1,8 +1,6 @@
 use jstd::graph::analysis::compute_dominators;
 use qcode::context::Context;
 use qcode::space::{LocalMemorySpaceId, SpaceType};
-#[cfg(test)]
-use qcode::value::block::BlockRef;
 use qcode::value::{
     BlockId, BlockParam, BlockParamId, BodyView, FunctionBody, FunctionId, QCodeView, Value,
     ValueId, ValueRef, Varnode, VarnodeId,
