@@ -26,7 +26,7 @@
 //! the dominator walk in [`super::walk`], so forwarding works across blocks; the pruning
 //! methods drop entries a call clobbers or a loop back-edge invalidates.
 
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use jstd::graph::analysis::DominatorTree;
 
@@ -830,7 +830,77 @@ impl MemForward {
                 frontier.push(child);
             }
         }
-        let stores: Vec<Store> = body
+        self.prune_clobbered_by(host, &body, block_id, aliases, numbering);
+    }
+
+    /// At a join, drop forwarded values a store on a *sibling* path may have
+    /// written.
+    ///
+    /// The walk carries this state down the dominator tree, so a block inherits
+    /// whatever its immediate dominator ended with. That is only a claim about
+    /// one path: forwarding a store in `D` to a load in `J` is sound only when
+    /// *every* `D → J` path is clobber-free, and `D dominates J` does not give
+    /// that — a sibling arm of a diamond writes without ever appearing on the
+    /// dominator chain. Reaching a join through more than one predecessor is
+    /// exactly when such an arm can exist.
+    ///
+    /// The region is everything backward-reachable from this block's
+    /// predecessors, stopping at any block that dominates it: the state was
+    /// valid on entry to a dominator, so only what runs *after* one can
+    /// invalidate it. `dominates` is reflexive, so the block itself terminates
+    /// the walk and a loop back-edge is left to [`Self::prune_loop_carried`].
+    pub(super) fn prune_join_paths<'ctx, 'str: 'ctx>(
+        &mut self,
+        host: impl QCodeView<'ctx, 'str>,
+        block_id: BlockId,
+        tree: &DominatorTree<BlockId>,
+        aliases: Option<&AliasResult>,
+        numbering: &Numbering,
+    ) {
+        if self.byte_map.is_empty() {
+            return;
+        }
+        let mut frontier: Vec<BlockId> = host
+            .block_ref(block_id)
+            .predecessors()
+            .map(|(_, pred)| pred)
+            .collect();
+        if frontier.len() < 2 {
+            return;
+        }
+
+        let owner = block_id.func;
+        let mut seen: HashSet<BlockId> = HashSet::default();
+        let mut region = Vec::new();
+        while let Some(b) = frontier.pop() {
+            if !seen.insert(b) || tree.dominates(b, block_id) {
+                continue;
+            }
+            // A foreign block (reached across a tail-call edge) is not described
+            // by this function's alias oracle, so its stores would read as
+            // non-clobbering. Keep walking through it, but never trust it.
+            if b.func == owner {
+                region.push(b);
+            }
+            frontier.extend(host.block_ref(b).predecessors().map(|(_, pred)| pred));
+        }
+        self.prune_clobbered_by(host, &region, block_id, aliases, numbering);
+    }
+
+    /// Drop every forwarded byte that a store in `blocks` may clobber.
+    ///
+    /// Shared by the loop-carried and join prunes: both ask the same question —
+    /// these blocks may have run since the value was recorded, so anything they
+    /// write makes it stale.
+    fn prune_clobbered_by<'ctx, 'str: 'ctx>(
+        &mut self,
+        host: impl QCodeView<'ctx, 'str>,
+        blocks: &[BlockId],
+        at_block: BlockId,
+        aliases: Option<&AliasResult>,
+        numbering: &Numbering,
+    ) {
+        let stores: Vec<Store> = blocks
             .iter()
             .flat_map(|&b| {
                 host.block_ref(b)
@@ -842,6 +912,10 @@ impl MemForward {
                     .collect::<Vec<_>>()
             })
             .collect();
+        if stores.is_empty() {
+            return;
+        }
+        let block_id = at_block;
 
         let peel = Self::loaded_ptr_peeling(host, block_id);
 
@@ -1287,6 +1361,83 @@ mod tests {
             ValueId::Literal(lid) => Some(ctx.shared.values.literals[lid].value),
             _ => None,
         }
+    }
+
+    /// Build a diamond: `entry` stores `r0`, one arm stores `store_ptr`, and the
+    /// join reads `r0` into `r1`. Returns the value the join ends up storing.
+    fn diamond_join_value(store_ptr: qcode::value::VarnodeId, width: usize) -> LocalValueId {
+        let mut tc = TestContext::new();
+        let (r0, r1, r2, reg) = (tc.r0, tc.r1, tc.r2, tc.reg_space);
+
+        let f = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000, f);
+        let arm = tc.ctx.get_or_make_block(0x1100, f);
+        let join = tc.ctx.get_or_make_block(0x1200, f);
+        {
+            let mut fb = FunctionBody::from_id_mut(&mut tc.ctx, f);
+            fb.set_root(entry).unwrap();
+            fb.add_block(arm);
+            fb.add_block(join);
+        }
+
+        {
+            let mut b = tc.ctx.builder(entry);
+            let k = b.shr().get_const(0x11u64, 8);
+            b.push_store(k, ValueId::Varnode(r0), reg);
+            // Opaque: a constant condition would let gvn fold the branch and
+            // make the arm unreachable, which is a different situation entirely.
+            let cond = b.push_load::<false>(ValueId::Varnode(r2), 1, reg).id();
+            b.push_cbranch(cond, join, arm);
+        }
+        {
+            let mut b = tc.ctx.builder(arm);
+            let v = b.shr().get_const(0x22u64, width);
+            b.push_store(v, ValueId::Varnode(store_ptr), reg);
+            b.push_branch(join);
+        }
+        {
+            let mut b = tc.ctx.builder(join);
+            let loaded = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
+            b.push_store(loaded, ValueId::Varnode(r1), reg);
+            let ret = b.shr().get_const(0u64, 8);
+            b.push_return(ret);
+        }
+
+        let aliases = AliasResult::simple_for_function(&tc.ctx, f);
+        crate::gvn::gvn_function(&mut tc.ctx, f, Some(&aliases));
+
+        BasicBlock::from_id(&tc.ctx, join)
+            .iter()
+            .find_map(|insn| match insn.mnemonic() {
+                Mnemonic::Store(store) if store.ptr == LocalValueId::Varnode(r1) => Some(store.src),
+                _ => None,
+            })
+            .expect("the join stores its r0 read into r1")
+    }
+
+    /// Control: a *full-width* store to `r0` on the sibling arm.
+    #[test]
+    fn does_not_forward_across_a_full_store_on_a_sibling_arm() {
+        let tc = TestContext::new();
+        let r0 = tc.r0;
+        assert!(
+            !matches!(diamond_join_value(r0, 8), LocalValueId::Literal(_)),
+            "forwarded the pre-branch r0 value past a full-width store on the other arm"
+        );
+    }
+
+    /// The `cmov` shape: a *narrow* store to `r0`'s low half on the sibling arm
+    /// redefines part of the wide register, so the join's read of `r0` still has
+    /// two reaching values and must not be forwarded.
+    #[test]
+    fn does_not_forward_across_a_narrow_store_on_a_sibling_arm() {
+        let tc = TestContext::new();
+        let r0_lo32 = tc.r0_lo32;
+        assert!(
+            !matches!(diamond_join_value(r0_lo32, 4), LocalValueId::Literal(_)),
+            "forwarded the pre-branch r0 value past a narrow store to its low half on the \
+             other arm — the shape a `cmov` lowers to, so the conditional move is lost"
+        );
     }
 
     /// Exact same-width forward returns the stored value with no new instructions.

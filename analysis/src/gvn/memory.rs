@@ -60,6 +60,7 @@ impl<'str> SubPass<'str> for MemoryForwarding {
         if is_shared {
             state.clear();
         }
+        state.prune_join_paths(cx.body_view(body), block_id, tree, aliases, numbering);
         state.prune_loop_carried(cx.body_view(body), block_id, tree, aliases, numbering);
     }
 
