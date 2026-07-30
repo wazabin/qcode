@@ -457,6 +457,42 @@ mod tests {
         assert!(!c.contains("= extract("), "stale extract rendering:\n{c}");
     }
 
+    /// A tail call reads as a return of the callee. Left to the generic
+    /// `opcode(args)` renderer it printed as an SSA definition of a zero-width
+    /// value, naming no callee at all — gcc emits these when it splits a cold arm
+    /// into its own function and jumps to it.
+    #[test]
+    fn a_tail_call_reads_as_a_return_of_the_callee() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn helper:
+                <h_entry>
+                    return at i64 0x0;
+
+            fn f:
+                <entry>
+                    tailcall fn helper();
+            "
+        );
+        let _ = helper;
+
+        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        assert!(
+            c.contains("return helper("),
+            "a tail call should name its callee:\n{c}"
+        );
+        assert!(
+            !c.contains("tailcall("),
+            "the opaque fallback should be gone:\n{c}"
+        );
+        assert!(
+            !c.contains("uint0_t"),
+            "a terminator must not render as a zero-width definition:\n{c}"
+        );
+    }
+
     #[test]
     fn conditional_lowers_to_gotos_with_real_condition() {
         let mut ctx = Context::new();

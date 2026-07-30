@@ -319,10 +319,10 @@ fn scan_scopes(
     refs: &mut Vec<(InstructionId, Vec<usize>)>,
 ) {
     let nested = |body: &[Stmt],
-                      path: &mut Vec<usize>,
-                      next_scope: &mut usize,
-                      defs: &mut HashMap<InstructionId, Vec<Vec<usize>>>,
-                      refs: &mut Vec<(InstructionId, Vec<usize>)>| {
+                  path: &mut Vec<usize>,
+                  next_scope: &mut usize,
+                  defs: &mut HashMap<InstructionId, Vec<Vec<usize>>>,
+                  refs: &mut Vec<(InstructionId, Vec<usize>)>| {
         *next_scope += 1;
         path.push(*next_scope);
         scan_scopes(ctx, body, roots, path, next_scope, defs, refs);
@@ -889,6 +889,23 @@ fn statement(
                 .unwrap_or_else(|| format!("minted_{}", c.target.minted().unwrap_or_default()));
             buf.push_function(name, TokenKind::Label, target);
             call_args(ctx, id.func, &c.args, roots, &mut buf);
+            buf.punct(";");
+        }
+        // A tail call transfers control to the callee and returns whatever it
+        // returns, so it reads as a return of the call. Without this it fell to
+        // the generic `opcode(args)` renderer and printed as an SSA definition of
+        // a zero-width value — `uint0_t b = tailcall();` — losing the callee
+        // entirely. gcc produces these when it splits a cold arm into its own
+        // `.cold` function and jumps to it.
+        Mnemonic::TailCall(t) => {
+            buf.keyword("return");
+            buf.space();
+            let target = t.target.real();
+            let name = target
+                .map(|target| FunctionRef::from_id(ctx, target).name().to_string())
+                .unwrap_or_else(|| format!("minted_{}", t.target.minted().unwrap_or_default()));
+            buf.push_function(name, TokenKind::Label, target);
+            call_args(ctx, id.func, &t.args, roots, &mut buf);
             buf.punct(";");
         }
         Mnemonic::CallInd(c) => {
