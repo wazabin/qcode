@@ -583,6 +583,34 @@ impl Solver<'_> {
         v
     }
 
+    /// Split `v` into `(base, c)` such that `v == base + c`, with `c == 0` when
+    /// `v` is not a constant-offset add.
+    ///
+    /// A `switch` whose lowest case is not zero compiles to a *biased* index:
+    /// the dispatch reads `x + c` while the bound test that guards it is written
+    /// against `x`. Recognizing the bias on both sides lets a constraint on one
+    /// be carried to the other.
+    fn as_add_const(&self, v: ValueId) -> (ValueId, u64) {
+        let ValueId::Instruction(id) = v else {
+            return (v, 0);
+        };
+        if let Mnemonic::Binop(Binary {
+            op: Binop::Int(IntBinop::Add),
+            lhs,
+            rhs,
+        }) = self.ctx.get_insn(id).mnemonic()
+        {
+            let (lhs, rhs) = (lhs.qualify(id.func), rhs.qualify(id.func));
+            if let Some(c) = numeric_const(self.ctx, rhs) {
+                return (lhs, c);
+            }
+            if let Some(c) = numeric_const(self.ctx, lhs) {
+                return (rhs, c);
+            }
+        }
+        (v, 0)
+    }
+
     /// Recognize `base - c` (a constant subtrahend), the shape the `cmp`
     /// instruction lowers to before its result feeds a flag test. Returns
     /// `(base, c)`.
@@ -791,10 +819,21 @@ impl Solver<'_> {
             k = k.wrapping_add(c0);
         }
 
-        let core = self.zext_core(v);
-        if self.zext_core(cmp_base) != core {
+        // The queried value and the comparison base may sit at different
+        // constant offsets over a shared base — a `switch` whose lowest case is
+        // not zero dispatches on `x + c` while its bound test reads `x`. Match
+        // on the shared base and carry the interval across by the difference.
+        let (core, v_off) = self.as_add_const(self.zext_core(v));
+        let (cmp_core, cmp_off) = self.as_add_const(self.zext_core(cmp_base));
+        if cmp_core != core {
             return None;
         }
+        // `v == cmp_base + delta`, so the interval derived for the comparison
+        // base shifts by `delta` to describe `v`.
+        let delta = v_off.wrapping_sub(cmp_off);
+        // The offsets are applied at the shared base's own width, which is where
+        // the add wraps — not at the (possibly wider, zero-extended) query width.
+        let core_mask = all_ones(value_size(self.ctx, core));
         let k = k & mask;
 
         let range = match (*op, v_is_lhs, taken) {
@@ -828,8 +867,23 @@ impl Solver<'_> {
             // from the middle of the interval: not representable, no gain.
             _ => return None,
         };
-        Some(range)
+        translate(range, delta, core_mask)
     }
+}
+
+/// Shift `range` by `delta`, refusing when the result would wrap the width the
+/// offset is applied at.
+///
+/// A wrapped interval is *two* intervals, which this domain cannot represent, so
+/// there is nothing sound to return. The case that matters in practice — an
+/// equality constraint on a biased index — is a single point and never wraps.
+fn translate(range: ValueRange, delta: u64, mask: u64) -> Option<ValueRange> {
+    if delta == 0 {
+        return Some(range);
+    }
+    let min = range.min.checked_add(delta)?;
+    let max = range.max.checked_add(delta)?;
+    (min <= mask && max <= mask).then_some(ValueRange { min, max })
 }
 
 #[cfg(test)]
@@ -1032,6 +1086,77 @@ mod tests {
         // representable), so the result is the sound over-approximation [7, MAX].
         let r = value_range(&ctx, idx.into(), oob);
         assert_eq!(r.min, 7);
+    }
+
+    /// The same `jbe` lowering over a *biased* index. A `switch` whose lowest
+    /// case is negative dispatches on `x + 2`, but its bound test is written
+    /// against `x`, so the two disjuncts constrain values a constant apart: the
+    /// `< 8` disjunct bounds the biased index directly while the `(x - 6) == 0`
+    /// one speaks about `x`. Carrying the equality across the bias is what lets
+    /// the hull close at `[0, 8]` instead of collapsing to Top.
+    #[test]
+    fn jbe_flag_lowering_bounds_a_biased_index() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 A;
+            <entry>
+                %edi = load(A:4, &A);
+                %biased = %edi + 0x2;
+                %idx = zext(i64, %biased);
+                %lt = %idx < 0x8;
+                %sub = %edi - 0x6;
+                %zf = %sub == 0x0;
+                %le = %lt | %zf;
+                %above = %le == false;
+                if %above goto <oob> else goto <disp>;
+            <disp>
+                goto <0x1001>;
+            <oob>
+                goto <0x1002>;
+            "
+        );
+
+        // Nine cases: `x` in [-2, 6] biases to an index in [0, 8].
+        let r = value_range(&ctx, idx.into(), disp);
+        assert_eq!((r.min, r.max), (0, 8));
+        assert_eq!(r.count(), 9);
+    }
+
+    /// Carrying a constraint across a bias must refuse rather than guess when
+    /// the shifted interval leaves the width the bias is applied at: there the
+    /// add wraps, and a wrapped interval is two intervals.
+    #[test]
+    fn biased_index_refuses_to_carry_a_wrapping_offset() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 A;
+            <entry>
+                %edi = load(A:4, &A);
+                %biased = %edi + 0x2;
+                %idx = zext(i64, %biased);
+                %sub = %edi - 0xffffffff;
+                %zf = %sub == 0x0;
+                if %zf goto <disp> else goto <oob>;
+            <disp>
+                goto <0x1001>;
+            <oob>
+                goto <0x1002>;
+            "
+        );
+
+        // `edi == 0xffffffff` biases to 1, having wrapped the 32-bit add, so the
+        // translated interval [0x100000001] is not representable. Whatever the
+        // fallback yields must still contain the true value.
+        let r = value_range(&ctx, idx.into(), disp);
+        assert!(
+            r.min <= 1 && 1 <= r.max,
+            "unsound bound {:?} excludes the true index 1",
+            (r.min, r.max)
+        );
     }
 
     #[test]
