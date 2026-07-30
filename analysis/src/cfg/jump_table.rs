@@ -345,6 +345,51 @@ impl HandleJumpTables {
             else {
                 continue;
             };
+            // Every slot landed in this function: rewrite the indirect branch
+            // into a real `Switch`, so the value that selects each successor
+            // survives into the IR instead of being implied by an unlabelled
+            // edge. That is what lets the decompiler emit a `switch` rather than
+            // one goto per successor.
+            //
+            // This is deliberately *not* gated on the edge comparison below. The
+            // clean IR already carries these edges from an earlier round — they
+            // are what let function-splitting follow the dispatch — so `existing
+            // == desired` is the common case here, and skipping on it would
+            // leave the terminator indirect forever. Rewriting is idempotent by
+            // construction instead: once the block ends in a `Switch`,
+            // `resolve_block` reports `NotIndirect` and produces no further
+            // edits for it.
+            //
+            // A table with any cross-function target keeps its `BranchInd`: a
+            // foreign landing carries no intra-function edge (strict IR
+            // locality) and stays a discovery until the clean lifter
+            // canonicalizes ownership, so there is no block for an arm to name.
+            let all_local = resolved
+                .iter()
+                .all(|target| matches!(target, LocalTarget::Local(_)));
+            if all_local && !edits.is_empty() {
+                let scrutinee = edits[0].index;
+                let cases: Vec<(u64, BlockId, Vec<ValueId>)> = edits
+                    .iter()
+                    .zip(&resolved)
+                    .filter_map(|(edit, target)| match target {
+                        LocalTarget::Local(tb) => Some((edit.value, *tb, Vec::new())),
+                        LocalTarget::Foreign(_) => None,
+                    })
+                    .collect();
+                changed = true;
+                clear_successors(ctx, from);
+                {
+                    let mut block = BasicBlock::from_id_mut(ctx, from);
+                    block.pop_insn();
+                }
+                // The bounds check that guards the table is a separate branch
+                // above this block, so the dispatch is total over the slots it
+                // lists and needs no default arm.
+                ctx.builder(from).push_switch(scrutinee, cases, None);
+                continue;
+            }
+
             let mut existing: Vec<Option<u64>> = BasicBlock::from_id(ctx, from)
                 .successors()
                 .map(|(_, succ)| BasicBlock::from_id(ctx, succ).address())
@@ -366,6 +411,7 @@ impl HandleJumpTables {
             // Clear the block's existing edges first so a re-resolution does not
             // double them.
             clear_successors(ctx, from);
+
             for target in resolved {
                 // A cross-function switch target carries no intra-function edge
                 // (strict IR locality). Foreign mid-function landings remain
@@ -1113,10 +1159,30 @@ mod tests {
             assert_eq!(ctx.truth(prop).map(|t| t.value), Some(true));
         }
 
-        // A >2-case table keeps its `BranchInd`, so the pass re-resolves it on
-        // every fixpoint iteration. Re-running against the already-connected
-        // block must be a no-op reporting no change — otherwise any
-        // `repeat_until` stage containing this pass never converges.
+        // The dispatch is now a real `Switch`: which index selects which target
+        // is recorded in the terminator instead of being implied by unlabelled
+        // edges, so the decompiler can emit a `switch` rather than one goto per
+        // successor.
+        let terminator = BasicBlock::from_id(&ctx, disp)
+            .instructions()
+            .last()
+            .expect("dispatch block has a terminator")
+            .mnemonic()
+            .clone();
+        let Mnemonic::Switch(switch) = terminator else {
+            panic!("expected a switch terminator, got {terminator:?}");
+        };
+        assert_eq!(
+            switch.cases.iter().map(|c| c.value).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+        );
+        // The bounds check is a separate branch above, so no default arm.
+        assert!(switch.default.is_none());
+
+        // Re-running against the already-resolved block must be a no-op
+        // reporting no change — otherwise any `repeat_until` stage containing
+        // this pass never converges. The rewrite is what makes this hold: the
+        // block no longer ends in a `BranchInd`, so it yields no further edits.
         let changed = HandleJumpTables::resolve_function(&mut ctx, &image, fun).unwrap();
         assert!(
             !changed,
