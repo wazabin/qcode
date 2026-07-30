@@ -5,7 +5,7 @@
 //! multiply-used values become their own assignments), syntax-classified for
 //! highlighting, and tagged with indentation and block provenance.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use qcode::{
     context::Context,
@@ -17,7 +17,7 @@ use qcode::{
 
 use super::{
     ast::{Program, Stmt},
-    cast::ExprKind,
+    cast::{Expr, ExprKind},
     lower_expr::{
         deref_location, instruction_declared_signed, instruction_name, lower_condition,
         lower_defining_expr, lower_expr_rooted,
@@ -31,16 +31,54 @@ use super::{
 /// `fn name(args) -> rets {` … `}` header and indented one level beneath it.
 pub fn emit_tokens(ctx: &Context, program: &Program) -> Vec<TokenLine> {
     let roots = compute_roots(ctx, program);
+    let hoisted = hoisted_roots(ctx, program, &roots);
     let mut out = Vec::new();
     match program.function {
         Some(function_id) => {
             out.push(header_line(ctx, program, function_id));
-            emit_stmts(ctx, program, &program.stmts, 1, &roots, &mut out);
+            emit_hoisted_decls(ctx, &roots, &hoisted, 1, &mut out);
+            emit_stmts(ctx, program, &program.stmts, 1, &roots, &hoisted, &mut out);
             out.push(brace_line("}", 0));
         }
-        None => emit_stmts(ctx, program, &program.stmts, 0, &roots, &mut out),
+        None => {
+            emit_hoisted_decls(ctx, &roots, &hoisted, 0, &mut out);
+            emit_stmts(ctx, program, &program.stmts, 0, &roots, &hoisted, &mut out);
+        }
     }
     out
+}
+
+/// Bare declarations for the values whose definition sits in a scope some reader
+/// of them has already left. Their defining statement then assigns without
+/// re-declaring.
+fn emit_hoisted_decls(
+    ctx: &Context,
+    roots: &HashSet<InstructionId>,
+    hoisted: &HashSet<InstructionId>,
+    indent: usize,
+    out: &mut Vec<TokenLine>,
+) {
+    let mut ids: Vec<InstructionId> = hoisted.iter().copied().collect();
+    ids.sort_unstable_by_key(|id| (id.func, usize::from(id.local)));
+    for id in ids {
+        let mut buf = LineBuf::default();
+        if instruction_declared_signed(ctx, id) {
+            buf.push(
+                format!("int{}_t", Instruction::from_id(ctx, id).size() * 8),
+                TokenKind::Type,
+            );
+        } else {
+            emit_uint_type(Instruction::from_id(ctx, id).size(), &mut buf);
+        }
+        buf.space();
+        buf.push_value(
+            instruction_name(ctx, id, roots),
+            TokenKind::Variable,
+            Some(ValueId::Instruction(id)),
+        );
+        buf.punct(";");
+        out.push(buf.into_line(indent, None));
+    }
 }
 
 /// Builds the `fn name(inputs) -> { output types } {` header from the function's
@@ -223,6 +261,184 @@ fn compute_roots(ctx: &Context, program: &Program) -> HashSet<InstructionId> {
     raws.into_iter().filter(|&id| is_root(ctx, id)).collect()
 }
 
+/// Roots whose declaration has to move to the top of the function.
+///
+/// A root is declared where it is defined (`uintN_t a = …;`), which is correct
+/// only while every reference sits in that scope or one nested inside it. A loop
+/// body and an `if` arm are scopes: a value defined in one and read after it
+/// would be declared inside a block the reader has already left, so the name
+/// dangles. gcc produces exactly that shape when it turns a recursive call into
+/// a loop and the result is read after it.
+///
+/// Scopes are identified by the path of enclosing-body ids at each point, so a
+/// reference is inside a definition's scope exactly when that definition's path
+/// is a prefix of the reference's.
+///
+/// A value can be defined more than once: cross-jump reversal duplicates a block,
+/// so the same instruction is emitted in several scopes, each declaring and using
+/// it locally. Such a value escapes only if some reference is covered by *none*
+/// of its definitions — checking against a single one would hoist every
+/// duplicated block's locals for no reason.
+fn hoisted_roots(
+    ctx: &Context,
+    program: &Program,
+    roots: &HashSet<InstructionId>,
+) -> HashSet<InstructionId> {
+    let mut defs: HashMap<InstructionId, Vec<Vec<usize>>> = HashMap::new();
+    let mut refs: Vec<(InstructionId, Vec<usize>)> = Vec::new();
+    let mut next_scope = 0usize;
+    scan_scopes(
+        ctx,
+        &program.stmts,
+        roots,
+        &mut Vec::new(),
+        &mut next_scope,
+        &mut defs,
+        &mut refs,
+    );
+
+    refs.into_iter()
+        .filter(|(id, at)| {
+            defs.get(id)
+                .is_some_and(|declared| !declared.iter().any(|scope| at.starts_with(scope)))
+        })
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Record where each root is defined and where each is referenced, tagging both
+/// with the stack of enclosing scopes.
+#[allow(clippy::too_many_arguments)]
+fn scan_scopes(
+    ctx: &Context,
+    stmts: &[Stmt],
+    roots: &HashSet<InstructionId>,
+    path: &mut Vec<usize>,
+    next_scope: &mut usize,
+    defs: &mut HashMap<InstructionId, Vec<Vec<usize>>>,
+    refs: &mut Vec<(InstructionId, Vec<usize>)>,
+) {
+    let nested = |body: &[Stmt],
+                      path: &mut Vec<usize>,
+                      next_scope: &mut usize,
+                      defs: &mut HashMap<InstructionId, Vec<Vec<usize>>>,
+                      refs: &mut Vec<(InstructionId, Vec<usize>)>| {
+        *next_scope += 1;
+        path.push(*next_scope);
+        scan_scopes(ctx, body, roots, path, next_scope, defs, refs);
+        path.pop();
+    };
+
+    for stmt in stmts {
+        match stmt {
+            Stmt::Raw(id) => {
+                if roots.contains(id) {
+                    defs.entry(*id).or_default().push(path.clone());
+                }
+                let mut seen = HashSet::default();
+                let mut found = Vec::new();
+                for arg in Instruction::from_id(ctx, *id).mnemonic().args() {
+                    value_root_refs(ctx, arg.qualify(id.func), roots, &mut found, &mut seen);
+                }
+                refs.extend(found.into_iter().map(|r| (r, path.clone())));
+            }
+            Stmt::Assign { value, .. } | Stmt::SaveTemp { value, .. } => {
+                let mut seen = HashSet::default();
+                let mut found = Vec::new();
+                value_root_refs(ctx, *value, roots, &mut found, &mut seen);
+                refs.extend(found.into_iter().map(|r| (r, path.clone())));
+            }
+            Stmt::GotoIf { cond, .. } => expr_root_refs(cond, roots, path, refs),
+            Stmt::If { cond, then, els } => {
+                expr_root_refs(cond, roots, path, refs);
+                nested(then, path, next_scope, defs, refs);
+                nested(els, path, next_scope, defs, refs);
+            }
+            Stmt::While { cond, body } | Stmt::DoWhile { cond, body } => {
+                expr_root_refs(cond, roots, path, refs);
+                nested(body, path, next_scope, defs, refs);
+            }
+            Stmt::Loop { body } => nested(body, path, next_scope, defs, refs),
+            Stmt::Switch {
+                scrutinee,
+                cases,
+                default,
+            } => {
+                expr_root_refs(scrutinee, roots, path, refs);
+                for case in cases {
+                    nested(&case.body, path, next_scope, defs, refs);
+                }
+                nested(default, path, next_scope, defs, refs);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Roots an expression names directly (an inlined sub-expression is expanded in
+/// place and names nothing).
+fn expr_root_refs(
+    expr: &Expr,
+    roots: &HashSet<InstructionId>,
+    path: &[usize],
+    refs: &mut Vec<(InstructionId, Vec<usize>)>,
+) {
+    let mut found = Vec::new();
+    collect_expr_roots(expr, roots, &mut found);
+    refs.extend(found.into_iter().map(|r| (r, path.to_vec())));
+}
+
+fn collect_expr_roots(expr: &Expr, roots: &HashSet<InstructionId>, out: &mut Vec<InstructionId>) {
+    if let Some(ValueId::Instruction(id)) = expr.value
+        && roots.contains(&id)
+    {
+        out.push(id);
+    }
+    match &expr.kind {
+        ExprKind::Const(_) | ExprKind::Var(_) => {}
+        ExprKind::Unary(_, e)
+        | ExprKind::Deref { ptr: e, .. }
+        | ExprKind::Cast { expr: e, .. }
+        | ExprKind::Field { base: e, .. } => collect_expr_roots(e, roots, out),
+        ExprKind::Binary(_, a, b) => {
+            collect_expr_roots(a, roots, out);
+            collect_expr_roots(b, roots, out);
+        }
+        ExprKind::Aggregate(fields) => {
+            for (_, e) in fields {
+                collect_expr_roots(e, roots, out);
+            }
+        }
+        ExprKind::Unknown { operands, .. } => {
+            for e in operands {
+                collect_expr_roots(e, roots, out);
+            }
+        }
+    }
+}
+
+/// Walk down from `v`, stopping at each root: those are the values the rendered
+/// expression refers to by name rather than expanding.
+fn value_root_refs(
+    ctx: &Context,
+    v: ValueId,
+    roots: &HashSet<InstructionId>,
+    out: &mut Vec<InstructionId>,
+    seen: &mut HashSet<InstructionId>,
+) {
+    let ValueId::Instruction(id) = v else { return };
+    if roots.contains(&id) {
+        out.push(id);
+        return;
+    }
+    if !seen.insert(id) {
+        return;
+    }
+    for arg in Instruction::from_id(ctx, id).mnemonic().args() {
+        value_root_refs(ctx, arg.qualify(id.func), roots, out, seen);
+    }
+}
+
 fn collect_raws(stmts: &[Stmt], out: &mut Vec<InstructionId>) {
     for stmt in stmts {
         match stmt {
@@ -312,31 +528,35 @@ pub(crate) fn is_memory_read(m: &Mnemonic) -> bool {
 // Statement emission.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn emit_stmts(
     ctx: &Context,
     program: &Program,
     stmts: &[Stmt],
     indent: usize,
     roots: &HashSet<InstructionId>,
+    hoisted: &HashSet<InstructionId>,
     out: &mut Vec<TokenLine>,
 ) {
     let mut line_indent = indent;
     for stmt in stmts {
         if matches!(stmt, Stmt::Label(_)) {
-            emit_stmt(ctx, program, stmt, indent, roots, out);
+            emit_stmt(ctx, program, stmt, indent, roots, hoisted, out);
             line_indent = indent + 1;
         } else {
-            emit_stmt(ctx, program, stmt, line_indent, roots, out);
+            emit_stmt(ctx, program, stmt, line_indent, roots, hoisted, out);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_stmt(
     ctx: &Context,
     program: &Program,
     stmt: &Stmt,
     indent: usize,
     roots: &HashSet<InstructionId>,
+    hoisted: &HashSet<InstructionId>,
     out: &mut Vec<TokenLine>,
 ) {
     match stmt {
@@ -355,7 +575,7 @@ fn emit_stmt(
             if emit_named_return_tuple(ctx, program, *id, indent, roots, out) {
                 return;
             }
-            let mut buf = statement(ctx, *id, roots);
+            let mut buf = statement(ctx, *id, roots, hoisted);
             // The statement's operand expressions were lowered with `Some(roots)`,
             // so `buf.insns` holds every genuinely inlined operand plus any root
             // referenced by name. Drop the named roots (each is its own line) and
@@ -423,7 +643,7 @@ fn emit_stmt(
             head.punct("{");
             out.push(head.into_line(indent, None));
 
-            emit_stmts(ctx, program, then, indent + 1, roots, out);
+            emit_stmts(ctx, program, then, indent + 1, roots, hoisted, out);
 
             if els.is_empty() {
                 out.push(brace_line("}", indent));
@@ -437,7 +657,7 @@ fn emit_stmt(
                 mid.space();
                 mid.punct("{");
                 out.push(mid.into_line(indent, None));
-                emit_stmts(ctx, program, els, indent + 1, roots, out);
+                emit_stmts(ctx, program, els, indent + 1, roots, hoisted, out);
                 out.push(brace_line("}", indent));
             }
         }
@@ -451,7 +671,7 @@ fn emit_stmt(
             head.space();
             head.punct("{");
             out.push(head.into_line(indent, None));
-            emit_stmts(ctx, program, body, indent + 1, roots, out);
+            emit_stmts(ctx, program, body, indent + 1, roots, hoisted, out);
             out.push(brace_line("}", indent));
         }
         Stmt::DoWhile { cond, body } => {
@@ -460,7 +680,7 @@ fn emit_stmt(
             head.space();
             head.punct("{");
             out.push(head.into_line(indent, None));
-            emit_stmts(ctx, program, body, indent + 1, roots, out);
+            emit_stmts(ctx, program, body, indent + 1, roots, hoisted, out);
             let mut tail = LineBuf::default();
             tail.punct("}");
             tail.space();
@@ -482,7 +702,7 @@ fn emit_stmt(
             head.space();
             head.punct("{");
             out.push(head.into_line(indent, None));
-            emit_stmts(ctx, program, body, indent + 1, roots, out);
+            emit_stmts(ctx, program, body, indent + 1, roots, hoisted, out);
             out.push(brace_line("}", indent));
         }
         Stmt::Break => {
@@ -535,7 +755,7 @@ fn emit_stmt(
                     arm.note_insn(insn);
                 }
                 out.push(arm.into_line(indent + 1, None));
-                emit_stmts(ctx, program, &case.body, indent + 2, roots, out);
+                emit_stmts(ctx, program, &case.body, indent + 2, roots, hoisted, out);
                 out.push(brace_line("}", indent + 1));
             }
 
@@ -547,7 +767,7 @@ fn emit_stmt(
             arm.space();
             arm.punct("{");
             out.push(arm.into_line(indent + 1, None));
-            emit_stmts(ctx, program, default, indent + 2, roots, out);
+            emit_stmts(ctx, program, default, indent + 2, roots, hoisted, out);
             out.push(brace_line("}", indent + 1));
 
             out.push(brace_line("}", indent));
@@ -635,7 +855,12 @@ fn emit_named_return_tuple(
 }
 
 /// Builds the tokens for a single root instruction rendered as a C statement.
-fn statement(ctx: &Context, id: InstructionId, roots: &HashSet<InstructionId>) -> LineBuf {
+fn statement(
+    ctx: &Context,
+    id: InstructionId,
+    roots: &HashSet<InstructionId>,
+    hoisted: &HashSet<InstructionId>,
+) -> LineBuf {
     let insn = Instruction::from_id(ctx, id);
     let qualify = |value: LocalValueId| value.qualify(id.func);
     let mut buf = LineBuf::default();
@@ -678,12 +903,17 @@ fn statement(ctx: &Context, id: InstructionId, roots: &HashSet<InstructionId>) -
         // An SSA result is defined exactly once, so its assignment is also its
         // declaration: `uintN_t name = <defining expression>;`.
         _ => {
-            if instruction_declared_signed(ctx, id) {
-                buf.push(format!("int{}_t", insn.size() * 8), TokenKind::Type);
-            } else {
-                emit_uint_type(insn.size(), &mut buf);
+            // A hoisted value was already declared at the top of the function;
+            // re-declaring here would shadow it inside this scope, which is the
+            // very thing the hoist exists to avoid.
+            if !hoisted.contains(&id) {
+                if instruction_declared_signed(ctx, id) {
+                    buf.push(format!("int{}_t", insn.size() * 8), TokenKind::Type);
+                } else {
+                    emit_uint_type(insn.size(), &mut buf);
+                }
+                buf.space();
             }
-            buf.space();
             buf.push_value(
                 instruction_name(ctx, id, roots),
                 TokenKind::Variable,

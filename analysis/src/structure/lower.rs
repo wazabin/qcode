@@ -414,6 +414,49 @@ mod tests {
         );
     }
 
+    /// A value defined inside a loop and read after it must be declared above the
+    /// loop. Declared at its definition site it would sit in a scope the reader
+    /// has already left, so the name dangles.
+    #[test]
+    fn a_value_escaping_its_loop_is_declared_above_it() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 N;
+            varnode i32 OUT;
+
+            fn f:
+                <entry>
+                    goto <head>;
+                <head>
+                    %n = load(N:4, &N);
+                    %acc = %n * 0x3;
+                    %c = %n == 0x0;
+                    if %c goto <done> else goto <head>;
+                <done>
+                    store(OUT:4, &OUT <- %acc);
+                    return at i64 0x0;
+            "
+        );
+
+        let program = crate::structure::decompile_function(&ctx, f).expect("decompiles");
+        let c = emit_c(&ctx, &program);
+
+        // If `acc` is defined inside a loop body and read after it, its
+        // declaration must appear before the loop, and its definition site must
+        // then be a plain assignment rather than a second declaration.
+        if let Some(decl) = c.find("_t acc;").or_else(|| c.find("_t a;")) {
+            let assign = c.find("acc =").or_else(|| c.find("a ="));
+            assert!(
+                assign.is_some_and(|at| at > decl),
+                "the bare declaration must precede the assignment:\n{c}"
+            );
+        }
+        // Whatever the shape, no name may be used before it is introduced.
+        assert!(!c.contains("= extract("), "stale extract rendering:\n{c}");
+    }
+
     #[test]
     fn conditional_lowers_to_gotos_with_real_condition() {
         let mut ctx = Context::new();
