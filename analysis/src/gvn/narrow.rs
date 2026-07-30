@@ -1,10 +1,9 @@
-//! Width-narrowing sub-pass: sink low-word truncations toward the leaves.
+//! Width-narrowing sub-pass: sink slice extracts toward the leaves.
 //!
-//! A truncation to the low `W` bytes — the `Range` mnemonic `[0:W]` — commutes
-//! with every operation whose low `W` bytes depend only on its operands' low `W`
-//! bytes: `+ − × & | ^ ~ neg`. Pushing it down those ops, **cancelling** it
-//! against widenings (`sext`/`zext`) and folding it into constants, collapses
-//! the lift-time "widen, compute wide, truncate back" idiom to a single narrow
+//! The demand is the `Range` mnemonic's byte interval `[start, start + size)`.
+//! Pushing it down the operations it commutes with, **cancelling** it against
+//! widenings (`sext`/`zext`) and folding it into constants, collapses the
+//! lift-time "widen, compute wide, truncate back" idiom to a single narrow
 //! computation:
 //!
 //! ```text
@@ -14,19 +13,40 @@
 //! %r  = %m[0:4]          ⇒  %r = %a *₃₂ %b      (low word of a product is width-agnostic)
 //! ```
 //!
+//! An interval anchored above byte 0 is what erases a constant an extract never
+//! observes — the byte-patch idiom, where a mask touches only bytes the slice
+//! excludes. Nothing here folds that away directly: the extract distributes over
+//! the operands, the constant narrows to zero, and [`Fold`](super::fold::Fold)'s
+//! `x ^ 0 = x` finishes the job on the next turn of the chain's fixpoint,
+//! leaving a value [`Cse`](super::cse::Cse) can merge with the unmasked extract.
+//!
+//! ```text
+//! %x  = @a ^ 0x55
+//! %r  = %x[1:4]          ⇒  %r = @a[1:4]        (0x55 lives in byte 0, outside [1,4))
+//! ```
+//!
 //! This is the structural companion to [`mba_simplify`](crate::mba_simplify):
 //! narrowing erases the `sext`/`mul`/`range` plumbing the MBA solver cannot
 //! model, leaving a uniform-width MBA the solver *can* collapse.
 //!
 //! # Soundness
 //!
-//! Every rule rewrites the **low word only** — it materializes a *new* narrow
-//! value and never touches the wide original, so any consumer of the wide
-//! value's high bits is unaffected. The distributions are exact under
-//! two's-complement wrapping. Truncation is *not* sunk through `>>`, `/`, `%`,
-//! comparisons, loads, … (their low bytes depend on more than the operands' low
-//! bytes); there it stops, leaving a `Range` of an opaque value. Dead wide
-//! originals are left for DCE, per the GVN convention.
+//! Every rule materializes a *new* value for the demanded interval and never
+//! touches the wide original, so any consumer of the bytes outside it is
+//! unaffected. The distributions are exact under two's-complement wrapping.
+//!
+//! Which operations commute with the extract **depends on where it starts**:
+//!
+//! - `& | ^ ~` are per-bit — bit `i` of the result reads only bit `i` of the
+//!   operands — so they distribute over *any* interval.
+//! - `+ − × neg` propagate carries upward, so byte `start` of the result depends
+//!   on the bytes *below* `start`. They distribute only when `start == 0`.
+//!   (`neg` counts as arithmetic: it is `~x + 1`.)
+//!
+//! The extract is *not* sunk through `>>`, `/`, `%`, comparisons, loads, …
+//! (their bytes depend on more than the corresponding operand bytes); there it
+//! stops, leaving a `Range` of an opaque value. Dead wide originals are left for
+//! DCE, per the GVN convention.
 
 use std::any::Any;
 
@@ -68,25 +88,28 @@ impl<'str> SubPass<'str> for NarrowTrunc {
         ic: &InsnCtx,
         ed: &mut Editor,
     ) -> Claim {
-        let Mnemonic::Range(Range {
-            src,
-            start: 0,
-            size,
-        }) = ic.mnemonic
-        else {
+        let Mnemonic::Range(Range { src, start, size }) = ic.mnemonic else {
             return Claim::Pass;
         };
-        let (src, w) = (src.qualify(ic.insn_id.func), *size);
-        if value_size(cx.body_view(body), src) != w && !src_transformable(cx.body_view(body), src) {
+        let src = src.qualify(ic.insn_id.func);
+        let slice = Slice {
+            start: *start,
+            size: *size,
+        };
+        // Worth recursing only if the extract is an identity on its source (so
+        // it forwards) or the source is something we can push through.
+        if !slice.is_whole(value_size(cx.body_view(body), src))
+            && !src_transformable(cx.body_view(body), src, slice)
+        {
             return Claim::Pass;
         }
-        let mut memo: HashMap<ValueId, ValueId> = HashMap::default();
-        let mut active: HashSet<ValueId> = HashSet::default();
+        let mut memo: HashMap<(ValueId, Slice), ValueId> = HashMap::default();
+        let mut active: HashSet<(ValueId, Slice)> = HashSet::default();
         let narrowed = narrow_to(
             body,
             cx,
             src,
-            w,
+            slice,
             ic.insn_id,
             ic.block_id,
             &mut memo,
@@ -100,8 +123,37 @@ impl<'str> SubPass<'str> for NarrowTrunc {
     }
 }
 
+/// The demanded byte interval `[start, start + size)` of a value.
+///
+/// Carried through the recursion rather than fixed, because a `Range` of a
+/// `Range` composes: extracting `[s₂, …)` of `[s₁, …)` demands `[s₁ + s₂, …)` of
+/// the inner source. The memo is therefore keyed by value *and* interval — the
+/// same value can be demanded at two different offsets in one rewrite.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct Slice {
+    start: usize,
+    size: usize,
+}
+
+impl Slice {
+    /// Does this interval cover exactly a whole `m`-byte value, making the
+    /// extract an identity?
+    fn is_whole(self, m: usize) -> bool {
+        self.start == 0 && self.size == m
+    }
+}
+
 /// Will [`narrow_to`] push through `v` rather than just wrap it in a `Range`?
-fn src_transformable<'ctx, 'str: 'ctx>(host: impl QCodeView<'ctx, 'str>, v: ValueId) -> bool {
+///
+/// This must not over-report. The sub-pass runs to a fixpoint, so claiming a
+/// value is transformable when [`narrow_to`] would in fact stop makes it
+/// materialize an extract identical to the one being visited, replace the
+/// original with it, report a change, and do the same again next round.
+fn src_transformable<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    v: ValueId,
+    slice: Slice,
+) -> bool {
     if numeric_const(host.shared(), v).is_some() {
         return true;
     }
@@ -109,41 +161,63 @@ fn src_transformable<'ctx, 'str: 'ctx>(host: impl QCodeView<'ctx, 'str>, v: Valu
         return false;
     };
     match host.insn_ref(iid).mnemonic() {
-        Mnemonic::Binop(b) => matches!(
-            b.op,
-            Binop::Int(
-                IntBinop::Add
-                    | IntBinop::Sub
-                    | IntBinop::Mul
-                    | IntBinop::And
-                    | IntBinop::Or
-                    | IntBinop::Xor
-            )
-        ),
-        Mnemonic::Unop(u) => matches!(u.op, Unop::IntNot | Unop::IntNegate),
-        Mnemonic::Sext(_) | Mnemonic::Zext(_) => true,
-        Mnemonic::Range(Range { start: 0, .. }) => true,
+        Mnemonic::Binop(b) => match b.op {
+            Binop::Int(op) => distributive(op, slice.start),
+            _ => false,
+        },
+        Mnemonic::Unop(u) => unop_distributive(&u.op, slice.start),
+        Mnemonic::Sext(Sext { src, .. }) => {
+            ext_transformable(host, src.qualify(iid.func), slice, true)
+        }
+        Mnemonic::Zext(Zext { src, .. }) => {
+            ext_transformable(host, src.qualify(iid.func), slice, false)
+        }
+        // Composing two extracts always removes a level of indirection.
+        Mnemonic::Range(_) => true,
         _ => false,
     }
 }
 
-fn distributive(op: IntBinop) -> bool {
-    matches!(
-        op,
-        IntBinop::Add
-            | IntBinop::Sub
-            | IntBinop::Mul
-            | IntBinop::And
-            | IntBinop::Or
-            | IntBinop::Xor
-    )
+/// The extension arm of [`src_transformable`]: mirrors [`narrow_extension`]'s
+/// case split, reporting only the positions where it does something.
+fn ext_transformable<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    src: ValueId,
+    slice: Slice,
+    sext: bool,
+) -> bool {
+    let m = value_size(host, src);
+    // Cancels against the extension, folds to a zero fill, or re-extends.
+    slice.start + slice.size <= m || (slice.start >= m && !sext) || slice.start == 0
 }
 
-fn range_low(src: ValueId, size: usize, func: FunctionId) -> Mnemonic {
+/// Does `op` commute with an extract anchored at byte `start`?
+///
+/// See the module header: the bitwise operations are per-bit and distribute over
+/// any interval; the arithmetic ones carry upward and need `start == 0`.
+fn distributive(op: IntBinop, start: usize) -> bool {
+    match op {
+        IntBinop::And | IntBinop::Or | IntBinop::Xor => true,
+        IntBinop::Add | IntBinop::Sub | IntBinop::Mul => start == 0,
+        _ => false,
+    }
+}
+
+/// The unary counterpart of [`distributive`]: `~` is per-bit, `neg` is `~x + 1`
+/// and so carries.
+fn unop_distributive(op: &Unop, start: usize) -> bool {
+    match op {
+        Unop::IntNot => true,
+        Unop::IntNegate => start == 0,
+        _ => false,
+    }
+}
+
+fn range_of(src: ValueId, slice: Slice, func: FunctionId) -> Mnemonic {
     Mnemonic::Range(Range {
         src: src.localize(func),
-        start: 0,
-        size,
+        start: slice.start,
+        size: slice.size,
     })
 }
 
@@ -151,34 +225,34 @@ fn range_low(src: ValueId, size: usize, func: FunctionId) -> Mnemonic {
 // Body-local narrowing helpers.
 // ---------------------------------------------------------------------------
 
-/// Recursively narrow a value to `w` bytes.
+/// Recursively extract the byte interval `slice` of a value.
 #[allow(clippy::too_many_arguments)]
 fn narrow_to<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     v: ValueId,
-    w: usize,
+    slice: Slice,
     before: InstructionId,
     block: BlockId,
-    memo: &mut HashMap<ValueId, ValueId>,
-    active: &mut HashSet<ValueId>,
+    memo: &mut HashMap<(ValueId, Slice), ValueId>,
+    active: &mut HashSet<(ValueId, Slice)>,
 ) -> ValueId {
-    if value_size(cx.body_view(body), v) == w {
+    if slice.is_whole(value_size(cx.body_view(body), v)) {
         return v;
     }
-    if let Some(&cached) = memo.get(&v) {
+    if let Some(&cached) = memo.get(&(v, slice)) {
         return cached;
     }
     // Cycle backstop: a self-referential value (e.g. a block parameter whose
     // narrowing recurses back through itself) would otherwise recurse forever,
     // since the memo is only populated after the recursive call returns. If `v`
-    // is already on the active recursion path, wrap it opaquely instead — a
-    // bounded, correct (if unoptimized) low-`w`-byte slice — rather than pushing
+    // is already on the active recursion path at this interval, wrap it opaquely
+    // instead — a bounded, correct (if unoptimized) slice — rather than pushing
     // through the cycle. This must never be load-bearing: a sound IR has no cyclic
     // pure-value dependency (verification rejects one); it only prevents a stack
     // overflow if one slips through.
-    if !active.insert(v) {
-        return push_insn(body, cx, range_low(v, w, block.func), w, before, block);
+    if !active.insert((v, slice)) {
+        return push_slice(body, cx, v, slice, before, block);
     }
 
     let result = match v {
@@ -187,12 +261,12 @@ fn narrow_to<'str>(
                 op: Binop::Int(o),
                 lhs,
                 rhs,
-            }) if distributive(o) => {
+            }) if distributive(o, slice.start) => {
                 let l = narrow_to(
                     body,
                     cx,
                     lhs.qualify(iid.func),
-                    w,
+                    slice,
                     before,
                     block,
                     memo,
@@ -202,7 +276,7 @@ fn narrow_to<'str>(
                     body,
                     cx,
                     rhs.qualify(iid.func),
-                    w,
+                    slice,
                     before,
                     block,
                     memo,
@@ -216,17 +290,17 @@ fn narrow_to<'str>(
                         lhs: l.localize(block.func),
                         rhs: rr.localize(block.func),
                     }),
-                    w,
+                    slice.size,
                     before,
                     block,
                 )
             }
-            Mnemonic::Unop(Unary { op, src }) if matches!(op, Unop::IntNot | Unop::IntNegate) => {
+            Mnemonic::Unop(Unary { op, src }) if unop_distributive(&op, slice.start) => {
                 let s = narrow_to(
                     body,
                     cx,
                     src.qualify(iid.func),
-                    w,
+                    slice,
                     before,
                     block,
                     memo,
@@ -239,7 +313,7 @@ fn narrow_to<'str>(
                         op,
                         src: s.localize(block.func),
                     }),
-                    w,
+                    slice.size,
                     before,
                     block,
                 )
@@ -247,8 +321,9 @@ fn narrow_to<'str>(
             Mnemonic::Sext(Sext { src, .. }) => narrow_extension(
                 body,
                 cx,
+                v,
                 src.qualify(iid.func),
-                w,
+                slice,
                 true,
                 before,
                 block,
@@ -258,66 +333,114 @@ fn narrow_to<'str>(
             Mnemonic::Zext(Zext { src, .. }) => narrow_extension(
                 body,
                 cx,
+                v,
                 src.qualify(iid.func),
-                w,
+                slice,
                 false,
                 before,
                 block,
                 memo,
                 active,
             ),
-            Mnemonic::Range(Range { src, start: 0, .. }) => narrow_to(
+            // A slice of a slice composes: bytes `[s, s + n)` of bytes
+            // `[start, …)` of `src` are bytes `[start + s, start + s + n)` of
+            // `src` itself.
+            Mnemonic::Range(Range { src, start, .. }) => narrow_to(
                 body,
                 cx,
                 src.qualify(iid.func),
-                w,
+                Slice {
+                    start: start + slice.start,
+                    size: slice.size,
+                },
                 before,
                 block,
                 memo,
                 active,
             ),
-            _ => push_insn(body, cx, range_low(v, w, block.func), w, before, block),
+            _ => push_slice(body, cx, v, slice, before, block),
         },
         _ if numeric_const(cx.body_view(body).shared(), v).is_some() => {
-            let folded = numeric_const(cx.body_view(body).shared(), v).unwrap() & low_mask(w);
-            cx.body_view(body).shared().get_const(folded, w)
+            let whole = numeric_const(cx.body_view(body).shared(), v).unwrap();
+            let folded = shift_out_low(whole, slice.start) & low_mask(slice.size);
+            cx.body_view(body).shared().get_const(folded, slice.size)
         }
-        _ => push_insn(body, cx, range_low(v, w, block.func), w, before, block),
+        _ => push_slice(body, cx, v, slice, before, block),
     };
 
-    active.remove(&v);
-    memo.insert(v, result);
+    active.remove(&(v, slice));
+    memo.insert((v, slice), result);
     result
 }
 
-/// Narrow through a sign or zero extension.
+/// Narrow through a sign or zero extension, where `ext` is the extension value
+/// itself and `src` the value being extended.
+///
+/// Three positions matter, given `m = size(src)`:
+///
+/// - the interval sits **inside the original value** (`start + size <= m`) — the
+///   extension contributes nothing to it, so it cancels;
+/// - the interval sits **entirely in the extension** (`start >= m`) — every byte
+///   is a fill byte, which for `zext` is a constant zero. For `sext` it is a
+///   replication of the sign bit, which needs a splat this pass has no way to
+///   materialize, so it stops;
+/// - the interval **straddles** the boundary. Anchored at byte 0 this is the
+///   pre-existing widening case and re-extends to the demanded width; anchored
+///   above it would need a concat of a slice and fill bytes, so it stops.
 #[allow(clippy::too_many_arguments)]
 fn narrow_extension<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
+    ext: ValueId,
     src: ValueId,
-    w: usize,
+    slice: Slice,
     sext: bool,
     before: InstructionId,
     block: BlockId,
-    memo: &mut HashMap<ValueId, ValueId>,
-    active: &mut HashSet<ValueId>,
+    memo: &mut HashMap<(ValueId, Slice), ValueId>,
+    active: &mut HashSet<(ValueId, Slice)>,
 ) -> ValueId {
-    if value_size(cx.body_view(body), src) >= w {
-        return narrow_to(body, cx, src, w, before, block, memo, active);
+    let m = value_size(cx.body_view(body), src);
+    if slice.start + slice.size <= m {
+        return narrow_to(body, cx, src, slice, before, block, memo, active);
+    }
+    if slice.start >= m && !sext {
+        return cx.body_view(body).shared().get_const(0, slice.size);
+    }
+    if slice.start > 0 {
+        return push_slice(body, cx, ext, slice, before, block);
     }
     let m = if sext {
         Mnemonic::Sext(Sext {
             src: src.localize(block.func),
-            size: w,
+            size: slice.size,
         })
     } else {
         Mnemonic::Zext(Zext {
             src: src.localize(block.func),
-            size: w,
+            size: slice.size,
         })
     };
-    push_insn(body, cx, m, w, before, block)
+    push_insn(body, cx, m, slice.size, before, block)
+}
+
+/// Stop pushing: materialize the demanded interval as a plain extract of `v`.
+fn push_slice<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    v: ValueId,
+    slice: Slice,
+    before: InstructionId,
+    block: BlockId,
+) -> ValueId {
+    push_insn(
+        body,
+        cx,
+        range_of(v, slice, block.func),
+        slice.size,
+        before,
+        block,
+    )
 }
 
 /// Insert a narrowed instruction before `before`.
@@ -332,6 +455,15 @@ fn push_insn<'str>(
     let id = body.push_mnemonic(cx.shr(), mnemonic, size);
     body.insert_insn_before(block, before, id);
     ValueId::Instruction(id)
+}
+
+/// Drop the low `start` bytes of a constant, saturating to zero rather than
+/// overflowing the shift when the interval starts past the top of a `u64`.
+fn shift_out_low(value: u64, start: usize) -> u64 {
+    u32::try_from(start * 8)
+        .ok()
+        .and_then(|bits| value.checked_shr(bits))
+        .unwrap_or(0)
 }
 
 fn low_mask(w_bytes: usize) -> u64 {
@@ -509,6 +641,106 @@ mod tests {
             "
         );
         assert!(!narrow_function(&mut ctx, sr));
+    }
+
+    /// A constant the extract never observes drops out: `0x55` lives in byte 0,
+    /// the demand is bytes 1..3, so the `^` narrows to `^ 0` and `Fold` finishes
+    /// it — leaving the same value the unmasked extract produces.
+    #[test]
+    fn drops_a_constant_outside_the_demanded_bytes() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            lambda xr:
+            <entry @a:i32 @b:i32>
+                %x = @a ^ 0x55;
+                %r = %x[1:4];
+                return %r;
+            "
+        );
+        assert!(narrow_function(&mut ctx, xr));
+        assert!(crate::gvn::constant_fold_function(&mut ctx, xr));
+        // Byte 0 is where the mask lived, so bytes 1..3 are untouched.
+        assert_eq!(run(&ctx, xr, 0x1122_3344, 0), Some(0x11_2233));
+        assert!(matches!(return_def(&ctx, xr), Mnemonic::Range(_)));
+    }
+
+    /// The carry guard. Byte 1 of a sum depends on byte 0, so an extract
+    /// anchored above byte 0 must *not* distribute over `+`. This is the one
+    /// rewrite here that would be well-formed yet wrong, so `QCODE_VERIFY`
+    /// cannot catch it.
+    #[test]
+    fn refuses_to_distribute_arithmetic_above_byte_zero() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            lambda ad:
+            <entry @a:i32 @b:i32>
+                %s = @a + @b;
+                %r = %s[1:4];
+                return %r;
+            "
+        );
+        assert!(!narrow_function(&mut ctx, ad));
+        // 0x44 + 0xff carries into byte 1: the true answer is 0x112234, whereas
+        // distributing the extract would have produced 0x112233.
+        assert_eq!(run(&ctx, ad, 0x1122_3344, 0xff), Some(0x11_2234));
+    }
+
+    #[test]
+    fn cancels_zext_under_an_offset_extract() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            lambda zc:
+            <entry @a:i32 @b:i32>
+                %z = zext(i64, @a);
+                %r = %z[1:4];
+                return %r;
+            "
+        );
+        assert!(narrow_function(&mut ctx, zc));
+        assert_eq!(run(&ctx, zc, 0x1122_3344, 0), Some(0x11_2233));
+    }
+
+    #[test]
+    fn folds_an_extract_of_only_zext_fill_bytes() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            lambda ze:
+            <entry @a:i32 @b:i32>
+                %z = zext(i64, @a);
+                %r = %z[4:8];
+                return %r;
+            "
+        );
+        assert!(narrow_function(&mut ctx, ze));
+        assert_eq!(run(&ctx, ze, 0xffff_ffff, 0), Some(0));
+    }
+
+    /// The same interval over a `sext` is a sign splat this pass cannot
+    /// materialize, so it must leave the extract alone — and, because it runs to
+    /// a fixpoint, must not churn out an equivalent copy of it every round.
+    #[test]
+    fn leaves_an_extract_of_sext_fill_bytes_alone() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            lambda se:
+            <entry @a:i32 @b:i32>
+                %s = sext(i64, @a);
+                %r = %s[4:8];
+                return %r;
+            "
+        );
+        assert!(!narrow_function(&mut ctx, se));
+        assert_eq!(run(&ctx, se, 0x8000_0000, 0), Some(0xffff_ffff));
     }
 
     #[test]
