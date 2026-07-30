@@ -43,8 +43,17 @@ const DECOMPILE_PIPELINE: &[&str] = &[
     "validate_structuring",
     "refine_loops",
     "recover_switch",
+    // Last, as SAILR prescribes for cross-jump reversion: it is the most
+    // aggressive deopt, and running it earlier destroys the shapes the passes
+    // above recognize — duplicating a shared default is exactly what stops
+    // `recover_switch` seeing a comparison tree.
+    "cross_jump_revert",
     "validate_labels",
 ];
+
+/// The passes a speculative candidate must be put through before its goto count
+/// means anything: whatever runs between structuring and the deopt.
+const RESTRUCTURE_CHAIN: &[&str] = &["refine_loops", "recover_switch"];
 
 /// Decompiles `function_id` to a high-level [`Program`] by running the
 /// decompilation pass pipeline over it. Each pass reads the (immutable) qcode IR
@@ -127,6 +136,123 @@ impl DecompilePass for ValidateStructuring {
 }
 
 crate::register_decompile_pass!(ValidateStructuring);
+
+/// How many duplications to accept before stopping. Each one is re-structured
+/// and measured, so the cap bounds work as well as output growth. Matches the
+/// default angr's `CrossJumpReverter` uses.
+const MAX_DUPLICATIONS: usize = 3;
+
+/// SAILR cross-jump reversal: undo the compiler's code deduplication.
+///
+/// A shared tail — the `default:` arm of a switch reached from several paths, a
+/// common epilogue — is emitted once by the compiler and jumped to from
+/// everywhere else. Region structuring cannot place it: a block with N
+/// predecessors has no single nesting position all N reach, so all but one path
+/// gets a `goto`, often *into* a nested block. No amount of better region
+/// selection fixes that, because the shape is an artifact of the optimization,
+/// not of the source.
+///
+/// The reversal is duplication: give each path its own copy and the gotos
+/// dissolve. Here that needs no CFG surgery — [`Structurer`] emits a goto
+/// precisely when a block is already `visited`, so permitting a second emission
+/// *is* the duplication (see [`Structurer::permit_dup`]).
+///
+/// Speculative, as in SAILR: each candidate is applied, the function
+/// re-structured, and the result kept only if [`Program::goto_count`] strictly
+/// drops. A duplication that does not pay for itself is reverted, so the pass
+/// cannot make output worse by its own measure.
+#[derive(Default)]
+pub struct CrossJumpRevert;
+
+impl DecompilePass for CrossJumpRevert {
+    const NAME: &'static str = "cross_jump_revert";
+
+    fn description(&self) -> &'static str {
+        "SAILR deopt: duplicate shared tails to undo compiler code deduplication"
+    }
+
+    fn run(
+        &self,
+        ctx: &Context,
+        fun_id: FunctionId,
+        program: &mut Program,
+    ) -> Result<bool, String> {
+        let mut permit: HashSet<BlockId> = HashSet::default();
+        let mut best_gotos = program.goto_count();
+        let mut changed = false;
+
+        for _ in 0..MAX_DUPLICATIONS {
+            // Re-read the candidates each round: duplicating one tail can expose
+            // or remove others.
+            let mut targets = Vec::new();
+            collect_goto_targets(&program.stmts, &mut targets);
+            targets.retain(|b| !permit.contains(b));
+            targets.dedup();
+            if targets.is_empty() {
+                break;
+            }
+
+            let Some((winner, candidate)) = targets
+                .into_iter()
+                .filter_map(|target| {
+                    permit.insert(target);
+                    let candidate = restructure_with(ctx, fun_id, &permit).ok();
+                    permit.remove(&target);
+                    let candidate = candidate?;
+                    (candidate.goto_count() < best_gotos).then_some((target, candidate))
+                })
+                .min_by_key(|(_, candidate)| candidate.goto_count())
+            else {
+                // Nothing left that pays for itself.
+                break;
+            };
+
+            permit.insert(winner);
+            best_gotos = candidate.goto_count();
+            *program = candidate;
+            changed = true;
+        }
+
+        if changed {
+            // Duplication removes the jumps that made a label necessary; left
+            // behind it would be dead text, and the same label printed twice
+            // reads to `validate_labels` as a dangling jump.
+            let mut targets = Vec::new();
+            collect_goto_targets(&program.stmts, &mut targets);
+            let used: HashSet<BlockId> = targets.into_iter().collect();
+            prune_unused_labels(&mut program.stmts, &used);
+        }
+        Ok(changed)
+    }
+}
+
+crate::register_decompile_pass!(CrossJumpRevert);
+
+/// Re-structure with `permit_dup`, then replay the passes that normally run
+/// between structuring and this one.
+///
+/// Measuring a candidate on raw structuring alone would compare it against a
+/// program those passes have already improved, and would miss that a duplication
+/// can *destroy* what they recognize: splitting a shared default removes the very
+/// shape `recover_switch` folds into a `match`, trading a goto for a whole
+/// switch. Putting the candidate through the same chain makes the comparison
+/// honest.
+fn restructure_with(
+    ctx: &Context,
+    fun_id: FunctionId,
+    permit_dup: &HashSet<BlockId>,
+) -> Result<Program, String> {
+    let mut program = structure_regions_with(ctx, fun_id, permit_dup);
+    for &name in RESTRUCTURE_CHAIN {
+        match make_pass(name) {
+            Some(RegisteredPass::Decompile(pass)) => {
+                pass.run(ctx, fun_id, &mut program)?;
+            }
+            _ => return Err(format!("`{name}` is not a decompilation pass")),
+        }
+    }
+    Ok(program)
+}
 
 /// Final label-consistency validation, run after the switch pass. Switch recovery
 /// absorbs a shared default block's label into the `match`; if some other part of
@@ -269,12 +395,34 @@ fn block_has_body(ctx: &Context, block: BlockId) -> bool {
 /// [`Stmt::Loop`]s), falling back to flat goto-based lowering for functions with
 /// irreducible control flow. The [`Structure`] pass's implementation.
 fn structure_regions(ctx: &Context, function_id: FunctionId) -> Program {
-    structure_regions_limited(ctx, function_id, MAX_REGION_DEPTH)
+    structure_regions_limited(ctx, function_id, MAX_REGION_DEPTH, &HashSet::default())
+}
+
+/// [`structure_regions`] with a set of *duplication roots*: blocks the structurer
+/// may emit a second time rather than refer to by `goto`.
+///
+/// Each root is expanded to the subtree it dominates, because duplicating a
+/// block means duplicating its whole region. Re-emitting only the header would
+/// walk straight into its already-visited successors and emit a fresh goto for
+/// each — trading one jump for several. Dominance is the right closure: a block
+/// the root dominates is reachable only through it, so copying it alongside the
+/// root cannot strand any other path.
+fn structure_regions_with(
+    ctx: &Context,
+    function_id: FunctionId,
+    permit_dup: &HashSet<BlockId>,
+) -> Program {
+    structure_regions_limited(ctx, function_id, MAX_REGION_DEPTH, permit_dup)
 }
 
 /// [`structure_regions`] with an explicit region-depth limit, so tests can drive
 /// the deep-cascade fallback without materializing thousands of blocks.
-fn structure_regions_limited(ctx: &Context, function_id: FunctionId, max_depth: usize) -> Program {
+fn structure_regions_limited(
+    ctx: &Context,
+    function_id: FunctionId,
+    max_depth: usize,
+    permit_dup: &HashSet<BlockId>,
+) -> Program {
     let function = qcode::value::FunctionRef::from_id(ctx, function_id);
     let Some(root) = function.root() else {
         return Program {
@@ -306,6 +454,18 @@ fn structure_regions_limited(ctx: &Context, function_id: FunctionId, max_depth: 
     let exit_set = exit_blocks(ctx, &nodes, &node_set);
     let pdom = compute_postdominators(&function, &nodes, &node_set, &exit_set);
 
+    // Expand each duplication root to the blocks it dominates (see
+    // `structure_regions_with`).
+    let permit_dup: HashSet<BlockId> = if permit_dup.is_empty() {
+        HashSet::default()
+    } else {
+        nodes
+            .iter()
+            .copied()
+            .filter(|&b| permit_dup.iter().any(|&root| doms.dominates(root, b)))
+            .collect()
+    };
+
     let labels = assign_labels(ctx, &nodes);
     let mut structurer = Structurer {
         ctx,
@@ -313,6 +473,7 @@ fn structure_regions_limited(ctx: &Context, function_id: FunctionId, max_depth: 
         pdom,
         loops,
         visited: HashSet::default(),
+        permit_dup,
         frames: Vec::new(),
         max_depth,
         overflowed: false,
@@ -409,6 +570,12 @@ struct Structurer<'ctx, 'a> {
     loops: HashMap<BlockId, LoopInfo>,
     /// Blocks already emitted, to guarantee termination and avoid duplication.
     visited: HashSet<BlockId>,
+    /// Blocks that may be emitted more than once. A goto is the structurer's way
+    /// of saying "this block is already printed elsewhere"; permitting a second
+    /// emission is exactly SAILR's cross-jump reversal, expressed without
+    /// touching the CFG. Populated by [`CrossJumpRevert`], which only keeps a
+    /// permission that strictly reduces the goto count.
+    permit_dup: HashSet<BlockId>,
     /// The stack of enclosing loops (innermost last).
     frames: Vec<LoopFrame>,
     /// The region-recursion depth beyond which structuring bails out.
@@ -447,9 +614,11 @@ impl Structurer<'_, '_> {
                 fell_through = true;
                 break;
             }
-            // A target outside the analyzed subgraph or an already-emitted join:
-            // reference it by goto.
-            if !self.node_set.contains(&b) || self.visited.contains(&b) {
+            // A target outside the analyzed subgraph, or an already-emitted join
+            // we have no permission to repeat: reference it by goto.
+            if !self.node_set.contains(&b)
+                || (self.visited.contains(&b) && !self.permit_dup.contains(&b))
+            {
                 out.push(Stmt::Goto(b));
                 break;
             }
@@ -829,6 +998,93 @@ mod tests {
     /// the two sides of a conditional are — not left as a jump to a block printed
     /// after the switch. An arm sharing a target with an earlier one degrades to a
     /// `goto`, since the body has already been emitted.
+    /// SAILR cross-jump reversal: a tail shared by two paths is emitted once by
+    /// the compiler and jumped to from the other, which region structuring cannot
+    /// place. Duplicating it removes the goto.
+    #[test]
+    fn shared_tail_is_duplicated_to_remove_a_goto() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i8 cond;
+            varnode i32 out;
+
+            fn f:
+            <entry>
+                %c = load(cond:1, &cond);
+                if %c goto <mid_lbl> else goto <tail_lbl>;
+            <mid_lbl>
+                store(out:4, &out <- i32 0x1);
+                goto <tail_lbl>;
+            <tail_lbl>
+                store(out:4, &out <- i32 0x9);
+                return at 0x0;
+            "
+        );
+
+        // Structuring alone reaches `tail_lbl` from two places and must jump.
+        let plain = structure_regions(&ctx, f);
+
+        let mut deopted = plain.clone();
+        let changed = CrossJumpRevert
+            .run(&ctx, f, &mut deopted)
+            .expect("deopt runs");
+
+        if plain.goto_count() > 0 {
+            assert!(changed, "a shared tail should have been duplicated");
+            assert!(
+                deopted.goto_count() < plain.goto_count(),
+                "the deopt must strictly reduce gotos: {} -> {}",
+                plain.goto_count(),
+                deopted.goto_count()
+            );
+            // The tail's body is now printed on both paths.
+            let c = emit_c(&ctx, &deopted);
+            assert!(
+                c.matches("out = 0x9").count() >= 2,
+                "the shared tail should appear on each path:\n{c}"
+            );
+        }
+    }
+
+    /// The deopt is speculative: a candidate that does not strictly reduce the
+    /// goto count is reverted, so the pass can never make its own metric worse.
+    #[test]
+    fn deopt_never_increases_the_goto_count() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i8 cond;
+            varnode i32 out;
+
+            fn f:
+            <entry>
+                %c = load(cond:1, &cond);
+                if %c goto <a_lbl> else goto <b_lbl>;
+            <a_lbl>
+                store(out:4, &out <- i32 0x1);
+                return at 0x0;
+            <b_lbl>
+                store(out:4, &out <- i32 0x2);
+                return at 0x0;
+            "
+        );
+
+        let plain = structure_regions(&ctx, f);
+        let mut deopted = plain.clone();
+        CrossJumpRevert
+            .run(&ctx, f, &mut deopted)
+            .expect("deopt runs");
+        assert!(
+            deopted.goto_count() <= plain.goto_count(),
+            "deopt must not increase gotos: {} -> {}",
+            plain.goto_count(),
+            deopted.goto_count()
+        );
+    }
+
     #[test]
     fn switch_arms_are_structured_into_their_cases() {
         let mut ctx = Context::new();
@@ -1379,14 +1635,14 @@ mod tests {
 
         // A generous limit structures the cascade; a tiny one trips the guard and
         // yields exactly the flat lowering.
-        let deep = structure_regions_limited(&ctx, f, 2);
+        let deep = structure_regions_limited(&ctx, f, 2, &HashSet::default());
         let flat = lower_function(&ctx, f);
         assert_eq!(
             emit_c(&ctx, &deep),
             emit_c(&ctx, &flat),
             "an over-deep cascade should fall back to flat lowering"
         );
-        let shallow = structure_regions_limited(&ctx, f, MAX_REGION_DEPTH);
+        let shallow = structure_regions_limited(&ctx, f, MAX_REGION_DEPTH, &HashSet::default());
         assert!(
             shallow.goto_count() < flat.goto_count(),
             "within the limit it should still structure"
