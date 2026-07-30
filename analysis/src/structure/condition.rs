@@ -67,6 +67,22 @@ pub enum BlockExit {
         false_edge: EdgeId,
         false_target: BlockId,
     },
+    /// A resolved multi-way dispatch. Unlike [`BlockExit::Indirect`], each
+    /// successor is selected by known scrutinee values, so the backend can emit
+    /// a `switch` instead of one goto per successor.
+    Switch {
+        /// The value dispatched on.
+        scrutinee: ValueId,
+        /// `(case values, target)` grouped by target in first-seen order.
+        /// Several values may select one target — a table whose slots repeat is
+        /// a shared `case 1: case 6:` arm.
+        arms: Vec<(Vec<u64>, BlockId)>,
+        /// Where an unlisted value goes, when the dispatch names a block for it.
+        default: Option<BlockId>,
+        /// Every outgoing edge. Kept alongside `arms` because a dispatch may
+        /// reach one target through several parallel edges, one per case.
+        edges: Vec<(EdgeId, BlockId)>,
+    },
     /// An indirect / computed branch (resolved jump table, indirect tail call).
     /// Its successors carry no recoverable per-edge predicate at this phase.
     Indirect { edges: Vec<(EdgeId, BlockId)> },
@@ -110,9 +126,9 @@ impl BlockExit {
                 false_edge,
                 ..
             } => vec![*true_edge, *false_edge],
-            BlockExit::Indirect { edges } | BlockExit::Unstructured { edges } => {
-                edges.iter().map(|&(e, _)| e).collect()
-            }
+            BlockExit::Switch { edges, .. }
+            | BlockExit::Indirect { edges }
+            | BlockExit::Unstructured { edges } => edges.iter().map(|&(e, _)| e).collect(),
         }
     }
 }
@@ -178,6 +194,39 @@ pub fn block_exit(block: BlockRef<'_, '_>) -> BlockExit {
                     false_target: BlockId::new(block.id.func, c.failure_block),
                 },
                 _ => unstructured(&block),
+            }
+        }
+
+        // A resolved dispatch: the terminator records which value selects which
+        // successor, so group the cases by target and hand the backend a real
+        // multi-way exit. Repeated targets become one arm with several labels.
+        Mnemonic::Switch(switch) => {
+            let func = block.id.func;
+            // Group by target *and* argument list: the arm body is emitted once,
+            // so two cases reaching one block with different block arguments
+            // cannot share an arm. (A jump table passes none, so in practice
+            // every repeat merges.)
+            let mut arms: Vec<(Vec<u64>, BlockId)> = Vec::new();
+            let mut arm_args: Vec<&[qcode::value::LocalValueId]> = Vec::new();
+            for case in &switch.cases {
+                let target = BlockId::new(func, case.target);
+                let existing = arms
+                    .iter()
+                    .position(|(_, t)| *t == target)
+                    .filter(|&i| arm_args[i] == case.args.as_slice());
+                match existing {
+                    Some(i) => arms[i].0.push(case.value),
+                    None => {
+                        arms.push((vec![case.value], target));
+                        arm_args.push(&case.args);
+                    }
+                }
+            }
+            BlockExit::Switch {
+                scrutinee: switch.scrutinee.qualify(func),
+                arms,
+                default: switch.default.map(|d| BlockId::new(func, d)),
+                edges: successors(&block),
             }
         }
 

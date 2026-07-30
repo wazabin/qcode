@@ -13,7 +13,9 @@ use qcode::{
     value::{BasicBlock, BlockId, BlockRef, FunctionId, InstructionRef, ValueId, insn::Mnemonic},
 };
 
-use super::{BlockExit, ast::Program, ast::Stmt, block_exit, lower_expr::lower_expr};
+use super::{
+    BlockExit, ast::Program, ast::Stmt, ast::SwitchCase, block_exit, lower_expr::lower_expr,
+};
 
 /// Lowers `function_id` into a flat, goto-based [`Program`].
 ///
@@ -111,6 +113,45 @@ fn lower_block(ctx: &Context, block: BlockRef<'_, '_>, out: &mut Vec<Stmt>) {
             out.extend(block_arg_moves(ctx, from, false_target));
             out.push(Stmt::Goto(false_target));
         }
+        // A resolved dispatch becomes a real `switch`, each arm jumping to its
+        // target. The baseline still uses gotos for the bodies — assembling
+        // those is the structurer's job — but the dispatch itself is now
+        // explicit, and every goto is reachable, where the indirect fallback
+        // below emits one per successor of which only the first can run.
+        BlockExit::Switch {
+            scrutinee,
+            arms,
+            default,
+            ..
+        } => {
+            let cases = arms
+                .into_iter()
+                .map(|(values, target)| SwitchCase {
+                    values,
+                    body: block_arg_moves(ctx, from, target)
+                        .into_iter()
+                        .chain(std::iter::once(Stmt::Goto(target)))
+                        .collect(),
+                    // No comparison instructions were folded away: the labels
+                    // came from the terminator, not from an equality cascade.
+                    insns: Vec::new(),
+                })
+                .collect();
+            let default = default
+                .map(|target| {
+                    block_arg_moves(ctx, from, target)
+                        .into_iter()
+                        .chain(std::iter::once(Stmt::Goto(target)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(Stmt::Switch {
+                scrutinee: lower_expr(ctx, scrutinee),
+                cases,
+                default,
+            });
+        }
+
         // Indirect / unstructured exits: preserve reachability with a goto to
         // every successor. Lossy but keeps the baseline correct-by-construction.
         BlockExit::Indirect { edges } | BlockExit::Unstructured { edges } => {
@@ -229,6 +270,16 @@ fn edge_args(ctx: &Context, from: BlockId, to: BlockId) -> Vec<ValueId> {
             .iter()
             .map(|value| value.qualify(from.func))
             .collect(),
+        // The first arm reaching `to`. `block_exit` only groups cases that agree
+        // on their argument list, so any arm printed for `to` carries these.
+        Mnemonic::Switch(sw) => sw
+            .cases
+            .iter()
+            .find(|case| case.target == to.local)
+            .map(|case| case.args.as_slice())
+            .or_else(|| (sw.default == Some(to.local)).then_some(sw.default_args.as_slice()))
+            .map(|args| args.iter().map(|v| v.qualify(from.func)).collect())
+            .unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -238,7 +289,7 @@ fn edge_args(ctx: &Context, from: BlockId, to: BlockId) -> Vec<ValueId> {
 pub(crate) fn is_replaced_by_goto(insn: &InstructionRef<'_, '_>) -> bool {
     matches!(
         insn.mnemonic(),
-        Mnemonic::Branch(_) | Mnemonic::CBranch(_) | Mnemonic::BranchInd(_)
+        Mnemonic::Branch(_) | Mnemonic::CBranch(_) | Mnemonic::BranchInd(_) | Mnemonic::Switch(_)
     )
 }
 
@@ -247,6 +298,53 @@ mod tests {
     use super::*;
     use crate::structure::emit_c;
     use qcode_macro::qcode;
+
+    /// A `switch` terminator lowers to a real multi-way statement, not one goto
+    /// per successor. Cases reaching the same block share an arm, which is what
+    /// makes a jump table with repeated slots read as `case a | b:`.
+    #[test]
+    fn switch_lowers_to_a_multiway_statement_with_shared_arms() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 idx;
+
+            fn f:
+            <entry>
+                %i = load(idx:8, &idx);
+                switch %i { 0x0 => <a_lbl>, 0x1 => <b_lbl>, 0x5 => <b_lbl>, 0x2 => <c_lbl> };
+            <a_lbl>
+                goto <0x1001>;
+            <b_lbl>
+                goto <0x1002>;
+            <c_lbl>
+                goto <0x1003>;
+            "
+        );
+
+        let program = lower_function(&ctx, f);
+        let c = emit_c(&ctx, &program);
+
+        // The scrutinee is a real expression, and the dispatch is one statement.
+        assert!(c.contains("match idx"), "expected a dispatch on idx:\n{c}");
+        // 0x1 and 0x5 both reach `b_lbl`, so they share one arm rather than
+        // producing two.
+        assert!(
+            c.contains("0x1 | 0x5 =>"),
+            "cases reaching one block should share an arm:\n{c}"
+        );
+        assert!(c.contains("0x0 =>"), "expected the 0x0 arm:\n{c}");
+        assert!(c.contains("0x2 =>"), "expected the 0x2 arm:\n{c}");
+        // Every arm jumps to its own target: no arm is unreachable, unlike the
+        // indirect fallback's straight-line goto list.
+        for label in ["a_lbl", "b_lbl", "c_lbl"] {
+            assert!(
+                c.contains(&format!("goto {label}")),
+                "expected a jump to {label}:\n{c}"
+            );
+        }
+    }
 
     #[test]
     fn conditional_lowers_to_gotos_with_real_condition() {

@@ -25,7 +25,7 @@ use crate::pipeline::{DecompilePass, RegisteredPass, make_pass};
 
 use super::{
     BlockExit,
-    ast::{Program, Stmt},
+    ast::{Program, Stmt, SwitchCase},
     block_exit,
     lower::{assign_labels, block_arg_moves, is_replaced_by_goto},
     lower_expr::lower_expr,
@@ -496,6 +496,37 @@ impl Structurer<'_, '_> {
                     });
                     // Continue at the merge only if some arm reaches it.
                     cur = if then_ft || els_ft { merge } else { None };
+                }
+                // A resolved dispatch: emit the `switch` itself, with each arm
+                // jumping to its target. Structuring the arm bodies into the
+                // cases would need the dispatch's reconvergence point, which the
+                // region walker does not compute for a multi-way exit; the
+                // labelled jumps are already correct and every one is reachable.
+                BlockExit::Switch {
+                    scrutinee,
+                    arms,
+                    default,
+                    ..
+                } => {
+                    let arm_body = |target: BlockId| -> Vec<Stmt> {
+                        block_arg_moves(self.ctx, b, target)
+                            .into_iter()
+                            .chain(std::iter::once(Stmt::Goto(target)))
+                            .collect()
+                    };
+                    out.push(Stmt::Switch {
+                        scrutinee: lower_expr(self.ctx, scrutinee),
+                        cases: arms
+                            .into_iter()
+                            .map(|(values, target)| SwitchCase {
+                                values,
+                                body: arm_body(target),
+                                insns: Vec::new(),
+                            })
+                            .collect(),
+                        default: default.map(arm_body).unwrap_or_default(),
+                    });
+                    cur = None;
                 }
                 BlockExit::Indirect { edges } | BlockExit::Unstructured { edges } => {
                     for (_, target) in edges {
