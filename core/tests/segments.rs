@@ -184,6 +184,35 @@ fn control_flow() {
     );
 }
 
+/// A resolved jump table: arms carry block arguments like any other branch
+/// target, and the default is optional — a table behind a bounds check is total
+/// over the values it lists.
+#[test]
+fn switch_terminator() {
+    check(
+        "
+        <entry @i:i64 @p:i64>
+            switch @i { 0x0 => <a>, 0x3 => <b @v=@p>, default => <d> };
+        <a>
+            return @i;
+        <b @v:i64>
+            return @v;
+        <d>
+            return @i;
+        ",
+    );
+    check(
+        "
+        <entry @i:i64>
+            switch @i { 0x0 => <a>, 0x1 => <b> };
+        <a>
+            return @i;
+        <b>
+            return @i;
+        ",
+    );
+}
+
 #[test]
 fn assert_stmt() {
     check(

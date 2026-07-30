@@ -21,7 +21,7 @@ label           =  { "<" ~ (ident | integer) ~ ">" }
 label_decl      =  { "<" ~ (ident ~ block_param_decl* | integer) ~ ">" }
 block_param_decl = { block_param_name ~ (":" ~ ty)? }
 label_stmt      =  { SOI ~ label ~ EOI }
-terminator      =  { badinsn_stmt | return_stmt | branchind_stmt | callind_stmt | cbranch_stmt | branch_stmt | tailcall_stmt | call_stmt }
+terminator      =  { badinsn_stmt | return_stmt | switch_stmt | branchind_stmt | callind_stmt | cbranch_stmt | branch_stmt | tailcall_stmt | call_stmt }
 terminator_stmt =  { SOI ~ terminator ~ EOI }
 branch_stmt     =  { "goto" ~ branch_label }
 branch_label    =  { "<" ~ (ident | integer) ~ branch_arg* ~ ">" }
@@ -35,6 +35,14 @@ branchind_stmt  =  { "goto" ~ "[" ~ typed_atom ~ "]" ~ edge_hint? }
 // this hint.
 edge_hint       =  { "//" ~ "->" ~ label ~ ("," ~ label)* }
 cbranch_stmt    =  { "if" ~ typed_atom ~ "goto" ~ branch_label ~ "else" ~ "goto" ~ branch_label }
+// Multi-way dispatch on an integer scrutinee: the resolved form of a jump table.
+// Targets reuse `branch_label`, so each arm carries block arguments exactly as a
+// `goto` does. `default` is optional — a table guarded by a preceding bounds
+// check is total over the values it lists.
+switch_stmt     =  { "switch" ~ typed_atom ~ "{" ~ (switch_arm ~ ("," ~ switch_arm)*)? ~ "}" }
+switch_arm      =  { switch_default | switch_case }
+switch_case     =  { integer ~ "=>" ~ branch_label }
+switch_default  =  { "default" ~ "=>" ~ branch_label }
 // `call fn name(@p0=arg, …)` is canonical (the printed form). A direct callee
 // may instead be an unresolved `<minted:N>` placeholder. `call <name>` is an
 // accepted arg-less shorthand kept for hand-written IR / older tests.

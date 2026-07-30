@@ -414,6 +414,12 @@ fn prepare_address_blocks(
                 push(target);
                 push(fallthrough);
             }
+            Statement::Switch { cases, default, .. } => {
+                cases.iter().for_each(|(_, target, _)| push(target));
+                if let Some((target, _)) = default {
+                    push(target);
+                }
+            }
             _ => {}
         }
     }
@@ -679,6 +685,29 @@ impl Lowerer<'_, '_, '_> {
                 let p = self.ptr_atom(ptr)?;
                 self.b.push_branchind(p);
                 self.add_edge_hints(targets)?;
+            }
+
+            Statement::Switch {
+                scrutinee,
+                cases,
+                default,
+                ..
+            } => {
+                let value = self.atom(scrutinee, None)?;
+                let mut arms = Vec::with_capacity(cases.len());
+                for (case, target, args) in cases {
+                    let block = self.block(target)?;
+                    let args = self.branch_args(target, args)?;
+                    arms.push((*case, block, args));
+                }
+                let default = match default {
+                    Some((target, args)) => {
+                        let block = self.block(target)?;
+                        Some((block, self.branch_args(target, args)?))
+                    }
+                    None => None,
+                };
+                self.b.push_switch(value, arms, default);
             }
 
             Statement::CBranch {

@@ -56,7 +56,7 @@ pub use pcode_op::{PCodeOp, PCodeOpId};
 pub use scan::Scan;
 pub use terminator::{
     Apply, BadInsn, Branch, BranchInd, CBranch, Call, CallInd, CallTag, Callee, Return,
-    ReturnValue, TailCall,
+    ReturnValue, Switch, SwitchArm, TailCall,
 };
 pub use unop::{Unary, Unop};
 

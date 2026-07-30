@@ -413,6 +413,56 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
             Ok(Statement::BranchInd { ptr, targets, span })
         }
 
+        Rule::switch_stmt => {
+            let mut inner = specific.into_inner();
+            let scrutinee = parse_typed_atom(
+                inner
+                    .next()
+                    .ok_or_else(|| ParseError::new("missing switch scrutinee"))?,
+            )?;
+            let mut cases = Vec::new();
+            let mut default = None;
+            for arm in inner {
+                let arm = arm
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| ParseError::new("empty switch arm"))?;
+                match arm.as_rule() {
+                    Rule::switch_case => {
+                        let mut parts = arm.into_inner();
+                        let value = parse_integer(
+                            parts
+                                .next()
+                                .ok_or_else(|| ParseError::new("missing switch case value"))?
+                                .as_str(),
+                        )?;
+                        let (target, args) = parse_branch_label(
+                            parts
+                                .next()
+                                .ok_or_else(|| ParseError::new("missing switch case target"))?,
+                        )?;
+                        cases.push((value, target, args));
+                    }
+                    Rule::switch_default => {
+                        let target = arm
+                            .into_inner()
+                            .next()
+                            .ok_or_else(|| ParseError::new("missing switch default target"))?;
+                        default = Some(parse_branch_label(target)?);
+                    }
+                    other => {
+                        return Err(ParseError::new(format!("unexpected switch arm {other:?}")));
+                    }
+                }
+            }
+            Ok(Statement::Switch {
+                scrutinee,
+                cases,
+                default,
+                span,
+            })
+        }
+
         Rule::cbranch_stmt => {
             let mut inner = specific.into_inner();
             let condition = parse_typed_atom(
@@ -2076,6 +2126,54 @@ mod tests {
                 assert!(matches!(&fallthrough_args[0].1.atom, Atom::Ssa(n) if n == "v"));
             }
             _ => panic!("expected cbranch with args"),
+        }
+    }
+
+    #[test]
+    fn parses_switch_with_cases_and_default() {
+        let statements =
+            stmts("switch %idx { 0x0 => <a_lbl>, 0x3 => <b_lbl @p=%v>, default => <d_lbl> }");
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::Switch {
+                scrutinee,
+                cases,
+                default,
+                ..
+            } => {
+                assert!(matches!(&scrutinee.atom, Atom::Ssa(n) if n == "idx"));
+                assert_eq!(cases.len(), 2);
+
+                assert_eq!(cases[0].0, 0);
+                assert!(matches!(&cases[0].1, Label::Named { name, .. } if name == "a_lbl"));
+                assert!(cases[0].2.is_empty());
+
+                // A case arm carries block arguments just as a `goto` does.
+                assert_eq!(cases[1].0, 3);
+                assert!(matches!(&cases[1].1, Label::Named { name, .. } if name == "b_lbl"));
+                assert_eq!(cases[1].2.len(), 1);
+                assert_eq!(cases[1].2[0].0, "p");
+                assert!(matches!(&cases[1].2[0].1.atom, Atom::Ssa(n) if n == "v"));
+
+                let (default_label, default_args) = default.as_ref().expect("default arm");
+                assert!(matches!(default_label, Label::Named { name, .. } if name == "d_lbl"));
+                assert!(default_args.is_empty());
+            }
+            other => panic!("expected switch, got {other:?}"),
+        }
+    }
+
+    /// A jump table guarded by a bounds check is total over the values it lists,
+    /// so the default arm is optional.
+    #[test]
+    fn parses_switch_without_default() {
+        let statements = stmts("switch %idx { 0x0 => <a_lbl>, 0x1 => <b_lbl> }");
+        match &statements[0] {
+            Statement::Switch { cases, default, .. } => {
+                assert_eq!(cases.len(), 2);
+                assert!(default.is_none());
+            }
+            other => panic!("expected switch, got {other:?}"),
         }
     }
 

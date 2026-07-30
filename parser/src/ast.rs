@@ -272,6 +272,15 @@ pub enum Statement {
         targets: Vec<Label>,
         span: SourceSpan,
     },
+    /// Multi-way dispatch: `switch %idx { 0x0 => <a>, default => <d> }`.
+    Switch {
+        scrutinee: TypedAtom,
+        /// `(case value, target, per-parameter arguments)` in written order.
+        cases: Vec<(u64, Label, Vec<(String, TypedAtom)>)>,
+        /// The `default => <block>` arm, when written.
+        default: Option<(Label, Vec<(String, TypedAtom)>)>,
+        span: SourceSpan,
+    },
     CBranch {
         condition: TypedAtom,
         target: Label,

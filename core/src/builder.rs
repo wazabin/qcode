@@ -54,7 +54,8 @@ use crate::{
             Extract, FloatBinop, FloatToFloat, FloatToInt, Gep, InstructionId, InstructionRef,
             IntBinop, IntToFloat, IntrinsicApp, IntrinsicId, IsFloatNaN, Load, LocalInsnId,
             LzCount, Map, Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return, ReturnValue,
-            SBorrow, SCarry, Scan, Sext, Store, TailCall, Tuple, Unary, Unop, Zext,
+            SBorrow, SCarry, Scan, Sext, Store, Switch, SwitchArm, TailCall, Tuple, Unary, Unop,
+            Zext,
         },
         varnode::Varnode,
     },
@@ -2207,6 +2208,66 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 condition,
                 failure_block: fallthrough,
                 failure_args: fallthrough_args,
+            }),
+            0,
+        );
+        self.is_terminated = true;
+        id
+    }
+
+    /// Multi-way dispatch on `scrutinee`. Wires a CFG edge to every arm and to
+    /// the default, exactly as the conditional branch wires its two.
+    pub fn push_switch(
+        &mut self,
+        scrutinee: ValueId,
+        cases: Vec<(u64, BlockId, Vec<ValueId>)>,
+        default: Option<(BlockId, Vec<ValueId>)>,
+    ) -> InstructionRef<'str, '_, BodyView<'_, 'str>> {
+        let scrutinee = self.loc(scrutinee);
+        let cases = cases
+            .into_iter()
+            .map(|(value, target, args)| (value, target.local, self.loc_vec(args)))
+            .collect();
+        let default = default.map(|(target, args)| (target.local, self.loc_vec(args)));
+        let local = self.push_switch_local(scrutinee, cases, default);
+        self.insn_ref(local)
+    }
+
+    /// Body-local sibling of [`push_switch`](Self::push_switch).
+    pub fn push_switch_local(
+        &mut self,
+        scrutinee: LocalValueId,
+        cases: Vec<(u64, LocalBlockId, Vec<LocalValueId>)>,
+        default: Option<(LocalBlockId, Vec<LocalValueId>)>,
+    ) -> LocalInsnId {
+        assert!(
+            !matches!(scrutinee, LocalValueId::Varnode(_)),
+            "push_switch: varnode scrutinee not allowed; load the value first"
+        );
+        let current = self.block;
+        for &(_, target, _) in &cases {
+            self.add_cfg_edge_local(current, target);
+        }
+        if let Some((target, _)) = &default {
+            self.add_cfg_edge_local(current, *target);
+        }
+        let (default_block, default_args) = match default {
+            Some((target, args)) => (Some(target), args),
+            None => (None, Vec::new()),
+        };
+        let id = self.store_insn(
+            Mnemonic::Switch(Switch {
+                scrutinee,
+                cases: cases
+                    .into_iter()
+                    .map(|(value, target, args)| SwitchArm {
+                        value,
+                        target,
+                        args,
+                    })
+                    .collect(),
+                default: default_block,
+                default_args,
             }),
             0,
         );

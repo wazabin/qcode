@@ -368,6 +368,28 @@ fn mnemonic_segments<'ctx, 'str: 'ctx>(
             seg.value(b.ptr.qualify(func));
             seg.punct("];");
         }
+        Mnemonic::Switch(sw) => {
+            seg.kw("switch ");
+            seg.value(sw.scrutinee.qualify(func));
+            seg.punct(" { ");
+            for (i, case) in sw.cases.iter().enumerate() {
+                if i > 0 {
+                    seg.punct(", ");
+                }
+                seg.push(format!("{:#x}", case.value), TokenKind::Literal, None);
+                seg.op(" => ");
+                seg.branch_target(func, case.target, &case.args);
+            }
+            if let Some(default) = sw.default {
+                if !sw.cases.is_empty() {
+                    seg.punct(", ");
+                }
+                seg.kw("default");
+                seg.op(" => ");
+                seg.branch_target(func, default, &sw.default_args);
+            }
+            seg.punct(" };");
+        }
         Mnemonic::CBranch(cb) => {
             seg.kw("if ");
             seg.value(cb.condition.qualify(func));

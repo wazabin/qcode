@@ -4,7 +4,7 @@ use crate::value::{
     insn::{
         Apply, Assert, BadInsn, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract,
         FloatToFloat, FloatToInt, Gep, IntToFloat, IntrinsicApp, IsFloatNaN, Load, LzCount, Map,
-        PCodeOp, PopCount, Range, Return, ReturnValue, SBorrow, SCarry, Scan, Sext, Store,
+        PCodeOp, PopCount, Range, Return, ReturnValue, SBorrow, SCarry, Scan, Sext, Store, Switch,
         TailCall, Tuple, Unary, Zext,
     },
 };
@@ -31,7 +31,7 @@ pub trait MnemonicKind {
 
     /// Returns `true` if this instruction ends a basic block.
     ///
-    /// Terminators are: [`Branch`], [`CBranch`], [`BranchInd`], [`Call`],
+    /// Terminators are: [`Branch`], [`CBranch`], [`BranchInd`], [`Switch`], [`Call`],
     /// [`CallInd`], and [`Return`].
     fn is_terminator(&self) -> bool {
         false
@@ -49,7 +49,7 @@ pub trait MnemonicKind {
 /// | Variants | Category |
 /// |---|---|
 /// | [`Load`], [`Store`] | Memory access |
-/// | [`Branch`], [`CBranch`], [`BranchInd`], [`Call`], [`CallInd`], [`Return`], [`ReturnValue`], [`BadInsn`] | Control flow (terminators) |
+/// | [`Branch`], [`CBranch`], [`BranchInd`], [`Switch`], [`Call`], [`CallInd`], [`Return`], [`ReturnValue`], [`BadInsn`] | Control flow (terminators) |
 /// | [`Unop`](Mnemonic::Unop) | Unary integer/float/bool operations |
 /// | [`Binop`](Mnemonic::Binop) | Binary integer/float/bool operations |
 /// | [`Zext`], [`Sext`], [`Range`], [`IntToFloat`], [`FloatToInt`], [`FloatToFloat`] | Type casts and bit extraction |
@@ -69,6 +69,8 @@ pub enum Mnemonic {
     CBranch(CBranch),
     /// Unconditional indirect branch to a dynamically-computed address.
     BranchInd(BranchInd),
+    /// Multi-way dispatch on an integer scrutinee — a resolved jump table.
+    Switch(Switch),
     /// Direct call to a known function.
     Call(Call),
     /// Tail call: a function-level transfer of control to another function's
@@ -175,6 +177,7 @@ impl Mnemonic {
             Mnemonic::Branch(m) => m,
             Mnemonic::CBranch(m) => m,
             Mnemonic::BranchInd(m) => m,
+            Mnemonic::Switch(m) => m,
             Mnemonic::Call(m) => m,
             Mnemonic::TailCall(m) => m,
             Mnemonic::Apply(m) => m,
@@ -256,6 +259,14 @@ impl Mnemonic {
         match self {
             Mnemonic::Branch(b) => smallvec::smallvec![b.target],
             Mnemonic::CBranch(c) => smallvec::smallvec![c.success_block, c.failure_block],
+            // Every arm plus the default, if it has one: a resolved dispatch
+            // knows all of its successors statically.
+            Mnemonic::Switch(s) => s
+                .cases
+                .iter()
+                .map(|case| case.target)
+                .chain(s.default)
+                .collect(),
             _ => smallvec::SmallVec::new(),
         }
     }
@@ -299,6 +310,23 @@ impl Mnemonic {
                 if m.ptr == old {
                     m.ptr = new;
                 }
+            }
+            Mnemonic::Switch(m) => {
+                if m.scrutinee == old {
+                    m.scrutinee = new;
+                }
+                for case in m.cases.iter_mut() {
+                    case.args.iter_mut().for_each(|a| {
+                        if *a == old {
+                            *a = new;
+                        }
+                    });
+                }
+                m.default_args.iter_mut().for_each(|a| {
+                    if *a == old {
+                        *a = new;
+                    }
+                });
             }
             Mnemonic::Call(m) => {
                 m.args.iter_mut().for_each(|a| {

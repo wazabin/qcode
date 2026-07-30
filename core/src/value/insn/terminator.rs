@@ -68,6 +68,65 @@ impl MnemonicKind for Branch {
     }
 }
 
+/// One arm of a [`Switch`]: the scrutinee value that selects it, the block it
+/// transfers to, and that block's parameter arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct SwitchArm {
+    /// The scrutinee value this arm matches.
+    pub value: u64,
+    /// The CFG successor, a bare body-local block index — same locality rule as
+    /// [`Branch::target`].
+    pub target: LocalBlockId,
+    /// Arguments passed to `target`'s parameters when this arm is taken.
+    pub args: Vec<LocalValueId>,
+}
+
+/// Multi-way dispatch on an integer scrutinee: the resolved form of a jump
+/// table.
+///
+/// [`BranchInd`] is the *unresolved* indirect branch — its successors are
+/// whatever edges an analysis managed to materialize, with no record of which
+/// scrutinee value picks which. `handle_jump_tables` rewrites it to a `Switch`
+/// once it recognizes the table and bounds the index, the same way a two-target
+/// resolution already becomes a real [`CBranch`]. Keeping the mapping in the
+/// terminator is what lets the decompiler emit a `switch` rather than a list of
+/// gotos, and — unlike a bare indirect edge — gives each successor an argument
+/// list, so block parameters can cross a dispatch.
+///
+/// `default` is optional. A table guarded by a preceding bounds check is total
+/// over the values it lists, and inventing an unreachable default block for it
+/// would only give DCE something to remove.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Switch {
+    /// The value dispatched on (the table index, after any bias).
+    pub scrutinee: LocalValueId,
+    /// Arms in table order. Case values are pairwise distinct.
+    pub cases: Vec<SwitchArm>,
+    /// Where an unlisted scrutinee value goes, when that is representable.
+    pub default: Option<LocalBlockId>,
+    /// Arguments passed to `default`'s parameters.
+    pub default_args: Vec<LocalValueId>,
+}
+
+impl MnemonicKind for Switch {
+    fn opcode(&self) -> &'static str {
+        "switch"
+    }
+
+    fn is_terminator(&self) -> bool {
+        true
+    }
+
+    fn args(&self) -> Args {
+        let mut args = smallvec![self.scrutinee];
+        for case in &self.cases {
+            args.extend_from_slice(&case.args);
+        }
+        args.extend_from_slice(&self.default_args);
+        args
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BranchInd {
     pub ptr: LocalValueId,

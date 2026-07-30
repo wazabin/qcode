@@ -220,6 +220,19 @@ fn collect_statement(stmt: &Statement, names: &mut Names, local_temps: bool) {
             }
         }
         Statement::BranchInd { ptr, .. } => collect_atom(ptr, names),
+        Statement::Switch {
+            scrutinee,
+            cases,
+            default,
+            ..
+        } => {
+            collect_atom(scrutinee, names);
+            let case_args = cases.iter().flat_map(|(_, _, args)| args);
+            let default_args = default.iter().flat_map(|(_, args)| args);
+            for (_, atom) in case_args.chain(default_args) {
+                collect_atom(atom, names);
+            }
+        }
         Statement::CBranch {
             condition,
             target_args,

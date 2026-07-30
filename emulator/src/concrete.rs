@@ -1301,6 +1301,35 @@ impl StandaloneEmulator {
                 self.idx = 0;
             }
 
+            Mnemonic::Switch(switch) => {
+                let value = self
+                    .get_value(ctx, switch.scrutinee.qualify(id.func))
+                    .unwrap();
+                let arm = switch
+                    .cases
+                    .iter()
+                    .find(|case| case.value == value)
+                    .map(|case| (case.target, &case.args));
+                let (target, args) = match arm
+                    .or_else(|| switch.default.map(|target| (target, &switch.default_args)))
+                {
+                    Some(arm) => arm,
+                    // No arm matches and there is no default. A table behind a
+                    // bounds check is total over its listed values, so arriving
+                    // here means the guard that guaranteed that was wrong.
+                    None => {
+                        return Err(
+                            self.make_error(ctx, EmulatorErrorKind::InvalidBlockAddress(value))
+                        );
+                    }
+                };
+                let target = BlockId::new(id.func, target);
+                self.bind_block_args(ctx, id.func, target, args)
+                    .map_err(|kind| self.make_error(ctx, kind))?;
+                self.block = target;
+                self.idx = 0;
+            }
+
             Mnemonic::BranchInd(BranchInd { ptr }) => {
                 let addr = self.get_value(ctx, ptr.qualify(id.func)).unwrap();
                 let target = self.block_at(ctx, addr).ok_or_else(|| {
@@ -3023,6 +3052,48 @@ mod tests {
         let mut emu = StandaloneEmulator::new(entry);
         emu.run_pure(&ctx, f, &[bound], 1000).ok()?;
         emu.get_value(&ctx, lane)
+    }
+
+    /// Dispatch through a `switch`: the arm whose case matches the scrutinee is
+    /// taken, an unmatched value falls to the default, and an arm's block
+    /// arguments are bound on the way through.
+    fn run_switch(scrutinee: u64) -> Option<u64> {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            lambda sw:
+            <entry @i:i64>
+                switch @i { 0x0 => <a>, 0x3 => <b @v=0x63>, default => <d> };
+            <a>
+                return 0x11;
+            <b @v:i64>
+                return @v;
+            <d>
+                return 0x99;
+            "
+        );
+        let root = FunctionBody::from_id(&ctx, sw).root().expect("root").id;
+        let mut emu = StandaloneEmulator::new(root);
+        emu.run_pure(&ctx, sw, &[SizedValue::new(scrutinee, 8)], 1000)
+            .ok()?;
+        let term = BasicBlock::from_id(&ctx, emu.block)
+            .instruction_ids()
+            .last()
+            .copied()?;
+        let Mnemonic::ReturnValue(r) = Instruction::from_id(&ctx, term).mnemonic() else {
+            return None;
+        };
+        emu.get_value(&ctx, r.value.qualify(term.func))
+    }
+
+    #[test]
+    fn switch_selects_the_matching_arm() {
+        assert_eq!(run_switch(0), Some(0x11));
+        // The matching arm binds its target's block parameter.
+        assert_eq!(run_switch(3), Some(0x63));
+        // No case matches 7, so control reaches the default.
+        assert_eq!(run_switch(7), Some(0x99));
     }
 
     /// A literal-bound `[i8;4]` array param resolves through the `BlockParam` arm
