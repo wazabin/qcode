@@ -286,11 +286,21 @@ fn edge_args(ctx: &Context, from: BlockId, to: BlockId) -> Vec<ValueId> {
 
 /// Whether an instruction is a pure control-flow terminator that phase 1 replaces
 /// with structured gotos (as opposed to a value/effect statement to keep).
+///
+/// An indirect branch qualifies only when its successors were actually
+/// materialized (a resolved jump table): then the gotos to those successors say
+/// everything the terminator did. An *unresolved* `branchind` has no successors,
+/// so there is no goto to replace it with — dropping it would silently delete
+/// the transfer of control (typically an indirect tail call, `jmp *%rax`). It is
+/// kept as a body statement and rendered by the backend instead.
 pub(crate) fn is_replaced_by_goto(insn: &InstructionRef<'_, '_>) -> bool {
-    matches!(
-        insn.mnemonic(),
-        Mnemonic::Branch(_) | Mnemonic::CBranch(_) | Mnemonic::BranchInd(_) | Mnemonic::Switch(_)
-    )
+    match insn.mnemonic() {
+        Mnemonic::Branch(_) | Mnemonic::CBranch(_) | Mnemonic::Switch(_) => true,
+        Mnemonic::BranchInd(_) => insn
+            .block()
+            .is_some_and(|block| block.successors().next().is_some()),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -455,6 +465,36 @@ mod tests {
         }
         // Whatever the shape, no name may be used before it is introduced.
         assert!(!c.contains("= extract("), "stale extract rendering:\n{c}");
+    }
+
+    /// An unresolved indirect branch has no successors, so there is no goto that
+    /// stands for it. It used to be dropped as "replaced by a goto" anyway,
+    /// deleting the whole transfer of control — the indirect form of a tail call
+    /// (`jmp *%rax`) simply vanished from the output.
+    #[test]
+    fn an_unresolved_indirect_branch_survives_lowering() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 dst;
+
+            fn f:
+            <entry>
+                %p = load(dst:8, &dst);
+                goto [i64 %p];
+            "
+        );
+
+        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        assert!(
+            c.contains("goto *dst"),
+            "the indirect transfer must survive lowering:\n{c}"
+        );
+        assert!(
+            !c.contains("branchind"),
+            "the opaque fallback should be gone:\n{c}"
+        );
     }
 
     /// A tail call reads as a return of the callee. Left to the generic

@@ -18,7 +18,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use jstd::graph::analysis::{DominatorTree, compute_dominators, compute_postdominators};
 use qcode::{
     context::Context,
-    value::{BasicBlock, BlockId, Instruction, function::FunctionId},
+    value::{BasicBlock, BlockId, InstructionId, function::FunctionId},
 };
 
 use crate::pipeline::{DecompilePass, RegisteredPass, make_pass};
@@ -288,10 +288,13 @@ crate::register_decompile_pass!(ValidateLabels);
 
 /// Checks the structural invariants the emitter relies on:
 ///
-/// 1. **Coverage** (only when `coverage`) — every reachable block with a
-///    non-control-flow body appears in the output. A block that vanished had its
-///    body dropped. Skipped after switch recovery, which legitimately elides the
-///    comparison setup that coverage would read as dropped.
+/// 1. **Coverage** (only when `coverage`) — every instruction of every reachable
+///    block that is not replaced by a goto appears in the output. Checking whole
+///    blocks instead was too coarse: a block whose ordinary body was emitted
+///    counted as covered even when its *terminator* was dropped, which is exactly
+///    how an unresolved indirect tail call used to vanish without a trace.
+///    Skipped after switch recovery, which legitimately elides the comparison
+///    setup that coverage would read as dropped.
 /// 2. **Goto/label consistency** — every `goto` to an in-subgraph block targets
 ///    a label that is actually printed. A goto to a suppressed label is a jump
 ///    into the void.
@@ -317,8 +320,13 @@ fn validate_program(
 
     if coverage {
         for &b in &node_set {
-            if block_has_body(ctx, b) && !covered.contains(&b) {
-                return Err(format!("block {b:?} was dropped from structured output"));
+            for insn in BasicBlock::from_id(ctx, b).instructions() {
+                if !is_replaced_by_goto(&insn) && !covered.contains(&insn.id) {
+                    return Err(format!(
+                        "instruction {:?} of block {b:?} was dropped from structured output",
+                        insn.id
+                    ));
+                }
             }
         }
     }
@@ -340,12 +348,10 @@ fn collect_validation(
     stmts: &[Stmt],
     labels: &mut HashSet<BlockId>,
     gotos: &mut HashSet<BlockId>,
-    covered: &mut HashSet<BlockId>,
+    covered: &mut HashSet<InstructionId>,
 ) {
-    let cover_insn = |id, covered: &mut HashSet<BlockId>| {
-        if let Some(block) = Instruction::from_id(ctx, id).block() {
-            covered.insert(block.id);
-        }
+    let cover_insn = |id, covered: &mut HashSet<InstructionId>| {
+        covered.insert(id);
     };
     for stmt in stmts {
         match stmt {
@@ -381,14 +387,6 @@ fn collect_validation(
             | Stmt::Continue => {}
         }
     }
-}
-
-/// Whether `block` has any instruction that survives as a statement (i.e. is not
-/// a pure control-flow terminator the structurer turns into a goto).
-fn block_has_body(ctx: &Context, block: BlockId) -> bool {
-    BasicBlock::from_id(ctx, block)
-        .instructions()
-        .any(|insn| !is_replaced_by_goto(&insn))
 }
 
 /// Structures `function_id` into nested control flow (with loops as endless
@@ -980,6 +978,78 @@ mod tests {
             Stmt::If { then, els, .. } => has_loop(then) || has_loop(els),
             _ => false,
         })
+    }
+
+    /// An unresolved indirect branch closing a block is a real transfer of
+    /// control with no goto to stand for it, so it must reach the output — and
+    /// the coverage validator must be able to see it go missing. Whole-block
+    /// coverage could not: the block's ordinary body was emitted, so it counted
+    /// as covered while its terminator was silently dropped.
+    #[test]
+    fn indirect_branch_survives_structuring() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i8 cond;
+            varnode i64 dst;
+
+            fn f:
+            <entry>
+                %c = load(cond:1, &cond);
+                if %c goto <tail> else goto <done>;
+            <tail>
+                %p = load(dst:8, &dst);
+                goto [i64 %p];
+            <done>
+                return at i64 0x0;
+            "
+        );
+
+        let program = decompile_function(&ctx, f).unwrap();
+        let c = emit_c(&ctx, &program);
+        assert!(
+            c.contains("goto *dst"),
+            "the indirect transfer must survive structuring:\n{c}"
+        );
+
+        // And the validator must count it: dropping it is an error, not a pass.
+        let mut stripped = program.clone();
+        strip_indirect(&mut stripped.stmts, &ctx);
+        assert!(
+            validate_program(&ctx, f, &stripped, true).is_err(),
+            "a dropped indirect branch must fail coverage validation"
+        );
+    }
+
+    /// Removes every `branchind` statement from a statement tree, to check that
+    /// validation notices.
+    fn strip_indirect(stmts: &mut Vec<Stmt>, ctx: &Context) {
+        stmts.retain(|s| match s {
+            Stmt::Raw(id) => !matches!(
+                qcode::value::Instruction::from_id(ctx, *id).mnemonic(),
+                qcode::value::insn::Mnemonic::BranchInd(_)
+            ),
+            _ => true,
+        });
+        for stmt in stmts.iter_mut() {
+            match stmt {
+                Stmt::If { then, els, .. } => {
+                    strip_indirect(then, ctx);
+                    strip_indirect(els, ctx);
+                }
+                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Loop { body } => {
+                    strip_indirect(body, ctx)
+                }
+                Stmt::Switch { cases, default, .. } => {
+                    for case in cases.iter_mut() {
+                        strip_indirect(&mut case.body, ctx);
+                    }
+                    strip_indirect(default, ctx);
+                }
+                _ => {}
+            }
+        }
     }
 
     #[test]

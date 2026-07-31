@@ -908,6 +908,21 @@ fn statement(
             call_args(ctx, id.func, &t.args, roots, &mut buf);
             buf.punct(";");
         }
+        // An indirect branch whose successors were never resolved reaches the
+        // backend only when there is no goto that stands for it (see
+        // `is_replaced_by_goto`). It reads as a computed goto: control leaves
+        // through a pointer this function computed. In practice it is almost
+        // always an indirect tail call (`jmp *%rax`), which would read more
+        // naturally as `return (*ptr)();` — but the same shape is also an
+        // unresolved intra-function jump table, and calling *that* a tail call
+        // would be a lie. `goto *ptr;` is true of both.
+        Mnemonic::BranchInd(b) => {
+            buf.keyword("goto");
+            buf.space();
+            buf.push("*", TokenKind::Operator);
+            lower_expr_rooted(ctx, qualify(b.ptr), roots).write_tokens(&mut buf);
+            buf.punct(";");
+        }
         Mnemonic::CallInd(c) => {
             bind_result(ctx, id, roots, &mut buf);
             buf.punct("(");
