@@ -316,7 +316,7 @@ fn validate_program(
     let mut labels = HashSet::default();
     let mut gotos = HashSet::default();
     let mut covered = HashSet::default();
-    collect_validation(ctx, &program.stmts, &mut labels, &mut gotos, &mut covered);
+    collect_validation(&program.stmts, &mut labels, &mut gotos, &mut covered);
 
     if coverage {
         for &b in &node_set {
@@ -344,7 +344,6 @@ fn validate_program(
 /// and every block whose body was emitted (via a [`Stmt::Raw`], or — once a
 /// switch has folded its comparison tree — via the case's recorded provenance).
 fn collect_validation(
-    ctx: &Context,
     stmts: &[Stmt],
     labels: &mut HashSet<BlockId>,
     gotos: &mut HashSet<BlockId>,
@@ -363,11 +362,11 @@ fn collect_validation(
             }
             Stmt::Raw(id) => cover_insn(*id, covered),
             Stmt::If { then, els, .. } => {
-                collect_validation(ctx, then, labels, gotos, covered);
-                collect_validation(ctx, els, labels, gotos, covered);
+                collect_validation(then, labels, gotos, covered);
+                collect_validation(els, labels, gotos, covered);
             }
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Loop { body } => {
-                collect_validation(ctx, body, labels, gotos, covered);
+                collect_validation(body, labels, gotos, covered);
             }
             Stmt::Switch { cases, default, .. } => {
                 for case in cases {
@@ -376,9 +375,9 @@ fn collect_validation(
                     for &id in &case.insns {
                         cover_insn(id, covered);
                     }
-                    collect_validation(ctx, &case.body, labels, gotos, covered);
+                    collect_validation(&case.body, labels, gotos, covered);
                 }
-                collect_validation(ctx, default, labels, gotos, covered);
+                collect_validation(default, labels, gotos, covered);
             }
             Stmt::Assign { .. }
             | Stmt::SaveTemp { .. }
