@@ -211,6 +211,19 @@ pub trait DynFunctionPass: Send + Sync {
 /// after publication. With no path to global mutable state, workers can run these in
 /// parallel (Stage 6) with the `ContextView` shared and the bodies disjoint.
 ///
+/// **Pass-owned scratch state.** `run` takes `&self`, and the pipeline builds one
+/// instance per TOML entry and reuses it for every round — so a pass may carry
+/// state across functions and rounds in a `Sync` field with interior mutability.
+/// The bound on [`DynFunctionPass`] makes that sound. It is a deliberate, narrow
+/// exception to "nothing else" above, and only *semantically transparent* state
+/// qualifies: a memo or a counter, which can change how long a pass takes but
+/// never what it produces. Anything a pass's output depends on belongs in the IR
+/// or in an analysis-manager entry that can be invalidated — not in a field,
+/// where nothing tracks its staleness. `mba_simplify` is the current example: it
+/// owns the rumba solver's cache (`rumba_core::simplify::SimplifyCache`), whose
+/// entries are keyed on the expression alone and so stay valid across every
+/// function, round, and binary the instance sees.
+///
 /// The [`FunctionPassAdapter`] lets a `FunctionPass` be stored and driven through the
 /// object-safe [`DynFunctionPass`] the registry speaks (it performs the split →
 /// run → barrier dance internally), so a `module(<fn>)` stage and unit tests can

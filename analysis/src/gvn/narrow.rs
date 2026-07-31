@@ -852,7 +852,11 @@ mod tests {
                 &ctx.shared,
                 &ctx.interfaces,
             );
-            mba_simplify(&mut host, mtmul)
+            mba_simplify(
+                &mut host,
+                mtmul,
+                &rumba_core::simplify::SimplifyCache::new(),
+            )
         };
         assert!(mba_changed);
 

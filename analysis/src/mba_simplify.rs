@@ -24,12 +24,17 @@
 //!    Only a region that genuinely *mixes* arithmetic (`+ − × neg <<`) and
 //!    boolean (`& | ^ ~`) operators is handed to the solver — a pure-arithmetic
 //!    tree is const_fold/gvn's job, and a pure-bitwise tree has no MBA to undo.
-//! 2. **Solve** with [`simplify_mba`].
-//! 3. **Rebuild** `~`, `^` and `|`. The solver only ever returns `{+, *, &}`
+//! 2. **Link** tied constants ([`link`]) over a shared symbolic basis, so the
+//!    solver can cancel constants that are not independent (`c` and `c | 1`);
+//!    the concrete masks are substituted back after the solve. This is a local
+//!    preprocessing step, not part of published rumba.
+//! 3. **Solve** with [`simplify_mba_cached`], against the pass-owned
+//!    [`SimplifyCache`] so recurring linear MBAs are solved once per pipeline run.
+//! 4. **Rebuild** `~`, `^` and `|`. The solver only ever returns `{+, *, &}`
 //!    (plus `Scale`/`Const`/`Var`), encoding the others arithmetically
 //!    (`~x = -1 + -1·x`, `x|y = x + y - (x&y)`, `x^y = x + y - 2(x&y)`); a small
 //!    bottom-up matcher folds those back for legibility. See [`canonicalize`].
-//! 4. **Emit** the rebuilt graph immediately before the root and forward the
+//! 5. **Emit** the rebuilt graph immediately before the root and forward the
 //!    root's uses to it — but only when the result is strictly cheaper than the
 //!    region it replaces. The now-dead region is pruned in place.
 //!
@@ -54,14 +59,36 @@ use qcode::value::{
 
 use rumba_core::{
     expr::{Expr, VarId},
-    simplify::simplify_mba,
-    varint::{VarInt, make_mask},
+    simplify::{SimplifyCache, simplify_mba_cached},
 };
 
 use crate::{ContextView, FunctionBody, FunctionPass, Outcome};
 
+mod link;
+
+/// The low `n` bits set. rumba keeps its own copy private, and a region's width
+/// is needed on both sides of the boundary, so define it here.
+const fn make_mask(n: u8) -> u64 {
+    if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
+}
+
+/// The MBA solver is the pass's cost centre, and the same linear MBAs recur —
+/// across the functions of one round, and across rounds, since the pipeline
+/// re-runs this stage until the IR converges. So the pass carries the solver's
+/// memo rather than letting each region build and discard its own.
+///
+/// The pipeline builds one `MbaSimplify` when it resolves the TOML and reuses it
+/// for every round, so this cache's lifetime is the pipeline's. It is keyed on
+/// `Expr` alone — no `Context` identity leaks in — so entries stay valid across
+/// functions, rounds, and binaries.
+///
+/// [`SimplifyCache`] is `Sync` (a `Mutex` around the memo), which is what lets a
+/// `&self` pass own it and what keeps this sound under the parallel driver. See
+/// the note on pass-owned scratch state in [`FunctionPass`].
 #[derive(Default)]
-pub struct MbaSimplify;
+pub struct MbaSimplify {
+    solver_cache: SimplifyCache,
+}
 
 impl FunctionPass for MbaSimplify {
     const NAME: &'static str = "mba_simplify";
@@ -78,8 +105,10 @@ impl FunctionPass for MbaSimplify {
     ) -> Result<Outcome<'str>, String> {
         let fid = body.id();
         let mut host = m.host(body);
-        Ok(Outcome::changed(mba_simplify(&mut host, fid))
-            .preserving_global::<crate::AddressAnalysis>())
+        Ok(
+            Outcome::changed(mba_simplify(&mut host, fid, &self.solver_cache))
+                .preserving_global::<crate::AddressAnalysis>(),
+        )
     }
 }
 
@@ -97,7 +126,11 @@ fn users_of(host: BodyView<'_, '_>, v: ValueId) -> Vec<InstructionId> {
 /// Maximum width rumba can model. Wider roots are skipped.
 const MAX_WIDTH_BYTES: usize = 8;
 
-pub fn mba_simplify<'str>(host: &mut BodyMut<'_, 'str>, fun: FunctionId) -> bool {
+pub fn mba_simplify<'str>(
+    host: &mut BodyMut<'_, 'str>,
+    fun: FunctionId,
+    cache: &SimplifyCache,
+) -> bool {
     let roots: Vec<InstructionId> = FunctionRef::new(host.view(), fun)
         .blocks()
         .flat_map(|b| b.instruction_ids().to_vec())
@@ -106,7 +139,7 @@ pub fn mba_simplify<'str>(host: &mut BodyMut<'_, 'str>, fun: FunctionId) -> bool
 
     let mut changed = false;
     for root in roots {
-        changed |= try_simplify_root(host, root);
+        changed |= try_simplify_root(host, root, cache);
     }
     changed
 }
@@ -130,7 +163,11 @@ fn is_root(host: BodyView<'_, '_>, iid: InstructionId) -> bool {
     true
 }
 
-fn try_simplify_root<'str>(host: &mut BodyMut<'_, 'str>, root: InstructionId) -> bool {
+fn try_simplify_root<'str>(
+    host: &mut BodyMut<'_, 'str>,
+    root: InstructionId,
+    cache: &SimplifyCache,
+) -> bool {
     let size = insn_size(host.view(), root);
     if size == 0 || size > MAX_WIDTH_BYTES {
         return false;
@@ -174,14 +211,53 @@ fn try_simplify_root<'str>(host: &mut BodyMut<'_, 'str>, root: InstructionId) ->
         (raw, ex.leaves)
     };
 
-    // 3 + 4. Solve, then rebuild ~/^/|. The solver aborts on inputs it cannot
-    // handle (e.g. a linear system still carrying more than 20 variables after
-    // reduction / PCT expansion); [`simplify_mba_checked`] turns that abort into a
-    // soft "leave this region un-simplified" instead of crashing the analysis.
-    let Some(solved) = simplify_mba_checked(raw, n) else {
-        return false;
+    // 3 + 4. Solve, then rebuild ~/^/|. Simplifying an MBA is best-effort: the
+    // solver rejects inputs it cannot handle (e.g. a linear system still carrying
+    // more variables than its internal limit after reduction / PCT expansion), and
+    // such a region is simply left un-simplified.
+    let solved = match simplify_mba_cached(raw.clone(), n, cache) {
+        Ok(solved) => solved,
+        Err(err) => {
+            qcode::pass_log!(debug, "solver rejected region at {root:?}: {err}");
+            return false;
+        }
     };
-    let pretty = canonicalize(solved, mask);
+    let mut pretty = canonicalize(solved, mask);
+
+    // Constant linking ([`link`], not part of published rumba): rewrite tied
+    // constants over a shared symbolic basis so the solver can cancel constants
+    // that are not independent — `c` and `c | 1`, say, which it cannot otherwise
+    // relate. It bails out cheaply when there is no tie to exploit.
+    //
+    // Speculative, so it is *measured* rather than trusted. Turning a constant
+    // into a free variable takes away what rumba's own constant handling exploits
+    // (it relates a complement pair natively), and on such a region linking
+    // returns a correct but bulkier form — `-a + -(a·~k)` where the plain solve
+    // gives `k·a`. The region cost gate cannot catch that on its own: it scores
+    // against the *original* region, which both forms beat. So keep the linked
+    // result only when it also beats the plain solve.
+    if let Some(linked) = link::link_constants(&raw, n) {
+        match simplify_mba_cached(linked.expr, n, cache) {
+            Ok(solved) => {
+                let restored = link::fold_consts(link::substitute(solved, &linked.subs), mask);
+                let candidate = canonicalize(restored, mask);
+                if !vars_within(&candidate, leaves.len()) {
+                    // A base variable outlived substitution, so this candidate
+                    // cannot be emitted. Drop it and keep the plain solve.
+                    qcode::pass_log!(debug, "linked region at {root:?} kept a base variable");
+                } else if cost(&candidate, mask) < cost(&pretty, mask) {
+                    pretty = candidate;
+                }
+            }
+            Err(err) => qcode::pass_log!(debug, "solver rejected linked region at {root:?}: {err}"),
+        }
+    }
+
+    // Belt and braces: whatever `pretty` ended up being, it has to be emittable.
+    if !vars_within(&pretty, leaves.len()) {
+        qcode::pass_log!(debug, "solved region at {root:?} names an unknown variable");
+        return false;
+    }
 
     // 4. Only commit when the result is strictly cheaper.
     if cost(&pretty, mask) >= region_cost {
@@ -195,22 +271,6 @@ fn try_simplify_root<'str>(host: &mut BodyMut<'_, 'str>, root: InstructionId) ->
     host.replace_all_uses_with(ValueId::Instruction(root), new_val);
     prune_dead(host, root);
     true
-}
-
-/// [`simplify_mba`] guarded against the solver's `panic!`s. rumba *aborts* (rather
-/// than returning an error) on expressions it cannot solve — most notably a linear
-/// MBA still holding more than 20 variables after reduction/PCT expansion, which
-/// `panic!`s with "Too many variables". Left unhandled, that unwinds all the way
-/// out of the analysis and is reported as a hard crash. Simplifying an MBA is
-/// best-effort: a region the solver rejects should simply be left as-is, not abort
-/// the whole run. So catch the unwind and report "no simplification" via `None`.
-///
-/// Sound to catch here: the solve step touches no [`Context`] and holds no lock (it
-/// runs on an owned `Expr`, after the `ctx` borrow that built it has been
-/// released), and `simplify_mba` builds its own scratch state per call — so a
-/// caught unwind leaves no half-mutated shared state behind.
-fn simplify_mba_checked(raw: Expr, n: u8) -> Option<Expr> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| simplify_mba(raw, n))).ok()
 }
 
 // --- qcode subgraph -> rumba Expr ------------------------------------------
@@ -238,7 +298,7 @@ impl Extract<'_, '_> {
     /// Translate an operand: a constant, an inlinable MBA child, or a leaf.
     fn child(&mut self, v: ValueId) -> Expr {
         if let Some(c) = numeric_const(self.host, v) {
-            return Expr::Const(VarInt::from(c & self.mask));
+            return Expr::Const(c & self.mask);
         }
         match inlinable_child(self.host, self.region, v) {
             Some(iid) => self.expand(iid),
@@ -256,7 +316,7 @@ impl Extract<'_, '_> {
                     IntBinop::Sub => {
                         let l = self.child(lhs);
                         let r = self.child(rhs);
-                        Expr::Add(vec![l, Expr::Scale(VarInt::MAX, Box::new(r))])
+                        Expr::Add(vec![l, Expr::Scale(u64::MAX, Box::new(r))])
                     }
                     IntBinop::Mul => Expr::Mul(vec![self.child(lhs), self.child(rhs)]),
                     IntBinop::And => Expr::And(vec![self.child(lhs), self.child(rhs)]),
@@ -266,7 +326,7 @@ impl Extract<'_, '_> {
                         // `x << c` with constant `c < width` is `x * 2^c`.
                         let c = numeric_const(self.host, rhs).expect("shl gate ensures const");
                         let factor = 1u64.wrapping_shl(c as u32) & self.mask;
-                        Expr::Scale(VarInt::from(factor), Box::new(self.child(lhs)))
+                        Expr::Scale(factor, Box::new(self.child(lhs)))
                     }
                     _ => unreachable!("is_mba_insn gates the opset"),
                 }
@@ -275,7 +335,7 @@ impl Extract<'_, '_> {
                 let src = u.src.qualify(iid.func);
                 match u.op {
                     Unop::IntNot => Expr::Not(Box::new(self.child(src))),
-                    Unop::IntNegate => Expr::Scale(VarInt::MAX, Box::new(self.child(src))),
+                    Unop::IntNegate => Expr::Scale(u64::MAX, Box::new(self.child(src))),
                     _ => unreachable!("is_mba_insn gates the opset"),
                 }
             }
@@ -324,9 +384,32 @@ impl Classify<'_, '_> {
 
 // --- rebuild ~, ^, | from the solver's {+, *, &} output --------------------
 
+/// Rebuild `e` with `f` applied to each direct child. rumba keeps its own
+/// equivalent private, and both rewrites below are bottom-up, so define it here.
+///
+/// `Not`/`Scale` go back through rumba's operators rather than the raw variants:
+/// `u64 * Expr` folds a coefficient of 0 or 1 away, which is the normalization
+/// the matchers downstream expect.
+fn map_children<F>(e: Expr, mut f: F) -> Expr
+where
+    F: FnMut(Expr) -> Expr,
+{
+    let vec_map = |exprs: Vec<Expr>, f: F| exprs.into_iter().map(f).collect();
+    match e {
+        Expr::Var(_) | Expr::Const(_) => e,
+        Expr::Not(x) => !f(*x),
+        Expr::Scale(c, x) => c * f(*x),
+        Expr::And(v) => Expr::And(vec_map(v, f)),
+        Expr::Or(v) => Expr::Or(vec_map(v, f)),
+        Expr::Xor(v) => Expr::Xor(vec_map(v, f)),
+        Expr::Add(v) => Expr::Add(vec_map(v, f)),
+        Expr::Mul(v) => Expr::Mul(vec_map(v, f)),
+    }
+}
+
 /// Strip the singleton wrappers the solver emits (`And([x]) == x`, etc.).
 fn unwrap_singletons(e: Expr) -> Expr {
-    let e = e.map(unwrap_singletons);
+    let e = map_children(e, unwrap_singletons);
     match e {
         Expr::And(ref v)
         | Expr::Or(ref v)
@@ -343,7 +426,7 @@ fn unwrap_singletons(e: Expr) -> Expr {
 
 fn scale_parts(e: &Expr, mask: u64) -> Option<(u64, &Expr)> {
     match e {
-        Expr::Scale(c, inner) => Some((c.get(mask), inner)),
+        Expr::Scale(c, inner) => Some((c & mask, inner)),
         _ => None,
     }
 }
@@ -351,14 +434,14 @@ fn scale_parts(e: &Expr, mask: u64) -> Option<(u64, &Expr)> {
 /// Bottom-up matcher folding the solver's arithmetic encodings back into `~`,
 /// `|` and `^`. `mask == -1` and `mask - 1 == -2` at this width.
 fn rebuild_bitops(e: Expr, mask: u64) -> Expr {
-    let e = e.map(|c| rebuild_bitops(c, mask));
+    let e = map_children(e, |c| rebuild_bitops(c, mask));
     let Expr::Add(terms) = &e else { return e };
 
     // ~X  ==  -1 + (-1)·X
     if terms.len() == 2 {
         for i in 0..2 {
             let Expr::Const(c) = &terms[i] else { continue };
-            if c.get(mask) != mask {
+            if c & mask != mask {
                 continue;
             }
             if let Some((coeff, x)) = scale_parts(&terms[1 - i], mask)
@@ -415,13 +498,31 @@ fn cost(e: &Expr, mask: u64) -> usize {
     match e {
         Expr::Var(_) | Expr::Const(_) => 0,
         Expr::Not(x) => 1 + cost(x, mask),
-        Expr::Scale(c, x) => match c.get(mask) {
+        Expr::Scale(c, x) => match c & mask {
             0 => 0,
             1 => cost(x, mask),
             _ => 1 + cost(x, mask),
         },
         Expr::And(v) | Expr::Or(v) | Expr::Xor(v) | Expr::Add(v) | Expr::Mul(v) => {
             v.iter().map(|c| cost(c, mask)).sum::<usize>() + v.len().saturating_sub(1)
+        }
+    }
+}
+
+/// Every `Var` in `e` indexes a real leaf.
+///
+/// [`emit`] indexes `leaves` directly, and it runs on a pass worker where a panic
+/// takes down the whole analysis rather than one function — so this is verified
+/// before any rewrite is committed instead of assumed. The solver is only ever
+/// handed variables that index `leaves`, but [`link`] mints fresh base variables
+/// *above* them, and one surviving substitution would index past the end.
+fn vars_within(e: &Expr, leaves: usize) -> bool {
+    match e {
+        Expr::Var(VarId(i)) => *i < leaves,
+        Expr::Const(_) => true,
+        Expr::Not(x) | Expr::Scale(_, x) => vars_within(x, leaves),
+        Expr::And(v) | Expr::Or(v) | Expr::Xor(v) | Expr::Add(v) | Expr::Mul(v) => {
+            v.iter().all(|x| vars_within(x, leaves))
         }
     }
 }
@@ -440,7 +541,7 @@ fn emit<'str>(
 ) -> ValueId {
     match e {
         Expr::Var(VarId(i)) => leaves[*i],
-        Expr::Const(c) => host.shr().get_const(c.get(mask), size),
+        Expr::Const(c) => host.shr().get_const(c & mask, size),
         Expr::Not(x) => {
             let xv = emit(host, x, leaves, size, mask, before, block);
             push_insn(
@@ -455,7 +556,7 @@ fn emit<'str>(
             )
         }
         Expr::Scale(c, x) => {
-            let cv = c.get(mask);
+            let cv = c & mask;
             if cv == 0 {
                 return host.shr().get_const(0, size);
             }
@@ -680,7 +781,7 @@ mod tests {
     /// place — the pass surface is pass-scoped — leaving the rewritten body in `ctx`.
     fn run_mba(ctx: &mut Context, fid: FunctionId) -> bool {
         let mut host = BodyMut::new(&mut ctx.bodies[fid], &ctx.shared, &ctx.interfaces);
-        mba_simplify(&mut host, fid)
+        mba_simplify(&mut host, fid, &SimplifyCache::new())
     }
 
     fn return_value(ctx: &Context, fun: FunctionId) -> ValueId {
@@ -717,10 +818,10 @@ mod tests {
     }
 
     /// A region the solver cannot handle must be a *soft* skip, never a crash. The
-    /// solver `panic!`s ("Too many variables") on a linear MBA left with more than
-    /// 20 variables; here a sum of 11 independent AND-terms over 22 distinct
-    /// variables. `simplify_mba_checked` must catch that unwind and report `None`
-    /// (leave the expression as-is) rather than let the panic abort the analysis.
+    /// solver rejects a linear MBA left with more variables than its internal
+    /// limit; here a sum of 11 independent AND-terms over 22 distinct variables.
+    /// That must come back as `Err` (leave the expression as-is) rather than abort
+    /// the analysis.
     #[test]
     fn oversized_mba_is_soft_skipped_not_a_crash() {
         let raw = Expr::Add(
@@ -730,28 +831,21 @@ mod tests {
                 .collect(),
         );
 
-        // Silence the solver's panic message for this one intentional panic so the
-        // test output stays clean; the caught unwind is the behaviour under test.
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let result = simplify_mba_checked(raw, 32);
-        std::panic::set_hook(prev);
-
         assert!(
-            result.is_none(),
+            simplify_mba_cached(raw, 32, &SimplifyCache::new()).is_err(),
             "an over-large MBA must be softly skipped, not crash the analysis"
         );
     }
 
-    /// The guard is transparent on inputs the solver *can* handle: a solvable MBA
-    /// still returns a simplification (here `v0 + v0` collapses to `2·v0`), so the
-    /// panic guard costs nothing on the common path.
+    /// The rejection path is transparent on inputs the solver *can* handle: a
+    /// solvable MBA still returns a simplification (here `v0 + v0` collapses to
+    /// `2·v0`).
     #[test]
-    fn checked_solver_passes_through_normal_results() {
+    fn solver_passes_through_normal_results() {
         let raw = Expr::Add(vec![Expr::Var(VarId(0)), Expr::Var(VarId(0))]);
         assert!(
-            simplify_mba_checked(raw, 32).is_some(),
-            "a solvable MBA must still be simplified through the guard"
+            simplify_mba_cached(raw, 32, &SimplifyCache::new()).is_ok(),
+            "a solvable MBA must still be simplified"
         );
     }
 
