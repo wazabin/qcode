@@ -483,13 +483,31 @@ fn abi_unknown_proto(abi: &CallingConvention) -> CFunctionProto {
 /// kinds, or stack slots, so those stay absent and the RAM channel keeps
 /// treating the callee conservatively.
 fn apply_abi_fallback_signature(ctx: &mut Context, fun_id: FunctionId, abi: &CallingConvention) {
-    let proto = abi_unknown_proto(abi);
-    let Some((inputs, outputs, ..)) = map_prototype(&proto, abi) else {
+    let Some(reg_map) = abi_clobber_leaf(abi) else {
         return;
     };
-    let reg_map = register_interface_map(inputs, &outputs, abi);
     FunctionBody::from_id_mut(ctx, fun_id)
         .set_register_effects(RegisterChannelState::Materialized(reg_map));
+}
+
+/// The register interface of the **ABI clobber leaf**: the synthetic callee an
+/// unprototyped symbol is modelled as under `abi` — inputs = every
+/// argument-passing register, outputs = the return register(s) ∪ every
+/// caller-saved register (see [`apply_abi_fallback_signature`] for the ruling
+/// this rests on).
+///
+/// Shared with the *indirect* call path: an unresolved `CallInd` target is
+/// exactly an unprototyped callee, so its sites are bound against this same
+/// leaf (`argpromote::registers`). `None` when the architecture carries no
+/// modelled convention, which leaves both paths inert rather than inventing an
+/// interface out of an empty ABI.
+pub(crate) fn abi_clobber_leaf(abi: &CallingConvention) -> Option<RegisterInterfaceMap> {
+    if !abi_is_known(abi) {
+        return None;
+    }
+    let proto = abi_unknown_proto(abi);
+    let (inputs, outputs, ..) = map_prototype(&proto, abi)?;
+    Some(register_interface_map(inputs, &outputs, abi))
 }
 
 /// Assign a signature and call interface to `fun_id` if it is a known external

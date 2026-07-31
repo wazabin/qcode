@@ -2317,7 +2317,7 @@ mod tests {
         assert_eq!(eff.outputs, vec![r0]);
         let call = set_call(&mut tc, g_call, f, vec![]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
-        assert!(argpromote_registers(&mut tc.ctx, None));
+        assert!(argpromote_registers(&mut tc.ctx, None, None));
         assert_eq!(register_writeset_len(&tc, f), Some(1));
         let RegisterChannelState::Materialized(map) =
             &FunctionBody::from_id(&tc.ctx, f).effects().register
@@ -2412,7 +2412,7 @@ mod tests {
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
         assert!(
-            argpromote_registers(&mut tc.ctx, None),
+            argpromote_registers(&mut tc.ctx, None, None),
             "f's register clobber should be promoted"
         );
 
@@ -2476,7 +2476,7 @@ mod tests {
         let call_id = set_call(&mut tc, g_call, f, vec![]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
-        assert!(argpromote_registers(&mut tc.ctx, None));
+        assert!(argpromote_registers(&mut tc.ctx, None, None));
 
         // f gained exactly one by-value input param (r0).
         let root = FunctionBody::from_id(&tc.ctx, f).root().unwrap().id;
@@ -2575,7 +2575,7 @@ mod tests {
         };
 
         let original = run(&tc.ctx);
-        assert!(argpromote_registers(&mut tc.ctx, None));
+        assert!(argpromote_registers(&mut tc.ctx, None, None));
         let transformed = run(&tc.ctx);
 
         assert_eq!(original, 11, "original: r0 = 10 + 1");
@@ -3878,7 +3878,7 @@ mod tests {
         set_call(&mut tc, c_call, callee, vec![]);
         tc.ctx.add_cfg_edge(c_call, c_cont);
 
-        assert!(argpromote_registers(&mut tc.ctx, None));
+        assert!(argpromote_registers(&mut tc.ctx, None, None));
 
         // The callee's read of r0 propagated into the caller's solved interface —
         // it is a by-value input, not a stranded load.
@@ -3931,7 +3931,7 @@ mod tests {
         set_call(&mut tc, c_call, callee, vec![]);
         tc.ctx.add_cfg_edge(c_call, c_cont);
 
-        assert!(argpromote_registers(&mut tc.ctx, None));
+        assert!(argpromote_registers(&mut tc.ctx, None, None));
 
         let RegisterChannelState::Materialized(map) = &FunctionBody::from_id(&tc.ctx, grandcaller)
             .effects()
@@ -4258,7 +4258,7 @@ mod tests {
         );
         let _ = (f_entry, g_entry, g_cont);
         set_call(&mut tc, g_entry, f, vec![]);
-        argpromote_registers(&mut tc.ctx, None);
+        argpromote_registers(&mut tc.ctx, None, None);
 
         let qcode::value::RegisterChannelState::Solved(sets) =
             FunctionBody::from_id(&tc.ctx, f).effects().register.clone()
@@ -4562,6 +4562,7 @@ mod tests {
             &graph,
             &targets,
             None,
+            None,
         );
 
         let call_id = BasicBlock::from_id(&tc.ctx, g_call)
@@ -4611,6 +4612,7 @@ mod tests {
             &graph,
             &targets,
             None,
+            None,
         );
 
         assert!(
@@ -4631,7 +4633,7 @@ mod tests {
         let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("noproto".into())).id;
         let (g, _g_call, _g_cont) = caller_of(&mut tc, ext);
 
-        argpromote_registers(&mut tc.ctx, None);
+        argpromote_registers(&mut tc.ctx, None, None);
 
         assert!(
             matches!(
@@ -4676,6 +4678,7 @@ mod tests {
             &graph,
             &targets,
             Some(r3),
+            None,
         );
 
         assert!(
@@ -4690,6 +4693,44 @@ mod tests {
         });
         let _ = g;
         assert!(sp_load, "the SP-relative stack RAM load stays in the body");
+    }
+
+    /// Count the `store(SP <- load(SP) + ptr_width)` return-address pops in
+    /// `block`. **Test-only** structural recognition: the pass itself must never
+    /// key on this shape (SLEIGH's genuine `pop`/`ret`/`add $8,%rsp` all produce
+    /// it), which is exactly why the old `sp_pop_present` idempotence guard was
+    /// removed — but a test asserting the fixup landed may look for it.
+    fn sp_pops_in(ctx: &Context<'_>, block: BlockId, sp: VarnodeId, ptr_width: usize) -> usize {
+        use qcode::value::LocalValueId as L;
+        let func = block.func;
+        let is_sp_load = |v: L| {
+            matches!(v.qualify(func), ValueId::Instruction(l)
+                if matches!(ctx.get_insn(l).mnemonic(), Mnemonic::Load(ld) if ld.ptr == L::Varnode(sp)))
+        };
+        let is_ptr_width =
+            |v: L| matches!(v, L::Literal(id) if ctx.get_literal_value(id) == ptr_width as u64);
+        BasicBlock::from_id(ctx, block)
+            .iter()
+            .filter(|insn| {
+                let Mnemonic::Store(s) = insn.mnemonic() else {
+                    return false;
+                };
+                if s.ptr != L::Varnode(sp) {
+                    return false;
+                }
+                let ValueId::Instruction(add) = s.src.qualify(func) else {
+                    return false;
+                };
+                let Mnemonic::Binop(bin) = ctx.get_insn(add).mnemonic() else {
+                    return false;
+                };
+                matches!(
+                    bin.op,
+                    qcode::value::insn::Binop::Int(qcode::value::insn::IntBinop::Add)
+                ) && is_sp_load(bin.lhs)
+                    && is_ptr_width(bin.rhs)
+            })
+            .count()
     }
 
     /// Build an external with `outputs`, call it from `g`, run pass 3 with `r3`
@@ -4722,9 +4763,10 @@ mod tests {
             &graph,
             &targets,
             Some(r3),
+            None,
         );
         let width = qcode::value::Varnode::from_id(&tc.ctx, r3).size();
-        crate::calls::argpromote::registers::sp_pop_present(&tc.ctx, g_cont, r3, width)
+        sp_pops_in(&tc.ctx, g_cont, r3, width) > 0
     }
 
     /// A bodyless callee never performs the `ret` that undoes the CALL's push,
@@ -4746,6 +4788,191 @@ mod tests {
         assert!(
             !external_call_pops_sp(true),
             "a callee whose outputs include SP must not get a second pop"
+        );
+    }
+
+    // ---- indirect callees as ABI clobber leaves -----------------------------
+
+    /// A toy convention over the TestContext registers: `r1` is the sole
+    /// argument register, `r0` the integer return, `r0`/`r2` caller-saved. `r3`
+    /// plays the stack pointer and — like every real ABI's SP — appears in
+    /// neither set, so the clobber leaf never covers it.
+    fn indirect_abi(tc: &qcode::testing::TestContext) -> crate::CallingConvention {
+        let gp = |vn: VarnodeId| crate::GpReg {
+            widths: vec![(8, vn)],
+        };
+        crate::CallingConvention {
+            int_args: vec![gp(tc.r1)],
+            sse_args: vec![],
+            int_ret: Some(gp(tc.r0)),
+            sse_ret: None,
+            caller_saved: vec![tc.r0, tc.r2],
+        }
+    }
+
+    /// `g` calls indirectly at `<g_call>` and falls through to `<g_cont>`, whose
+    /// body is a **genuine `pop r0`**: `%sp = load(SP); %v = load(ram, %sp);
+    /// r0 <- %v; SP <- %sp + 8`. Exactly the shape the synthetic return-address
+    /// fixup has — which is why no pass may key on it.
+    fn indirect_caller_with_genuine_pop() -> (qcode::testing::TestContext, FunctionId, BlockId) {
+        let mut tc = qcode::testing::TestContext::new();
+        let (r0, r3) = (tc.r0, tc.r3);
+        qcode!(
+            tc.ctx,
+            "
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <callee>;
+                <g_cont>
+                    %sp = load(register:8, {r3});
+                    %v = load(ram:8, %sp);
+                    store(register:8, {r0} <- %v);
+                    %sp2 = %sp + i64 8;
+                    store(register:8, {r3} <- %sp2);
+                    return at i64 0;
+            fn callee:
+                <e_entry>
+                    return at i64 0;
+            "
+        );
+        let _ = (g_entry, g_call, e_entry, callee);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        make_call_indirect(&mut tc, g_call);
+        (tc, g, g_cont)
+    }
+
+    /// The bug the deleted `sp_pop_present` guard caused: it matched *any*
+    /// `store(SP <- load(SP) + 8)` in the continuation, so an indirect call
+    /// whose continuation contains a real `pop`/`ret`/`add $8,%rsp` silently
+    /// lost its return-address fixup. Idempotence now comes from the call site's
+    /// own state, so the genuine pop is irrelevant and the fixup still lands.
+    #[test]
+    fn indirect_call_gets_sp_fixup_despite_a_genuine_pop_in_the_continuation() {
+        let (mut tc, g, g_cont) = indirect_caller_with_genuine_pop();
+        let (r3, abi) = (tc.r3, indirect_abi(&tc));
+        let before = sp_pops_in(&tc.ctx, g_cont, r3, 8);
+        assert_eq!(before, 1, "the fixture's genuine pop");
+
+        argpromote_registers(&mut tc.ctx, Some(r3), Some(&abi));
+
+        assert_eq!(
+            sp_pops_in(&tc.ctx, g_cont, r3, 8),
+            before + 1,
+            "the indirect call's return-address fixup must land beside the genuine pop"
+        );
+        let _ = g;
+    }
+
+    /// The indirect site is bound against the ABI clobber leaf: its args are the
+    /// convention's argument registers, its result is the return ∪ clobbers
+    /// pack, and the continuation replays the return register from the pack
+    /// while every remaining clobber becomes poison.
+    #[test]
+    fn indirect_call_binds_the_abi_clobber_leaf() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (r0, r1, r2, r3) = (tc.r0, tc.r1, tc.r2, tc.r3);
+        qcode!(
+            tc.ctx,
+            "
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <callee>;
+                <g_cont>
+                    return at i64 0;
+            fn callee:
+                <e_entry>
+                    return at i64 0;
+            "
+        );
+        let _ = (g_entry, e_entry, callee);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        make_call_indirect(&mut tc, g_call);
+        let abi = indirect_abi(&tc);
+
+        argpromote_registers(&mut tc.ctx, Some(r3), Some(&abi));
+
+        let call_id = BasicBlock::from_id(&tc.ctx, g_call)
+            .iter()
+            .last()
+            .expect("terminator")
+            .id;
+        let Mnemonic::CallInd(call) = tc.ctx.get_insn(call_id).mnemonic().clone() else {
+            panic!("the site stays a CallInd — there is no resolved callee to name");
+        };
+        assert_eq!(
+            call.args.len(),
+            1,
+            "one arg per convention argument register"
+        );
+        assert_eq!(
+            tc.ctx
+                .shared
+                .types
+                .aggregate_fields(tc.ctx.get_insn(call_id).type_id())
+                .map(|f| f.len()),
+            Some(2),
+            "result is the return ∪ clobbers pack (r0 return, r2 clobber)"
+        );
+
+        let replayed = |reg: VarnodeId, poison: bool| {
+            BasicBlock::from_id(&tc.ctx, g_cont).iter().any(|i| {
+                matches!(i.mnemonic(),
+                    Mnemonic::Store(s)
+                        if s.ptr.qualify(i.id.func) == ValueId::Varnode(reg)
+                            && matches!(s.src, LocalValueId::Poison(_)) == poison)
+            })
+        };
+        assert!(
+            replayed(r0, false),
+            "the ABI return register is replayed from the pack, not poisoned"
+        );
+        assert!(
+            replayed(r2, true),
+            "a caller-saved clobber the callee may trash becomes poison"
+        );
+        assert!(
+            BasicBlock::from_id(&tc.ctx, g_call).iter().any(|i| {
+                matches!(i.mnemonic(),
+                    Mnemonic::Load(l) if l.ptr == LocalValueId::Varnode(r1))
+            }),
+            "the argument register is loaded into the call's explicit arg"
+        );
+    }
+
+    /// Idempotence comes from the *site's own state* (its result type is the
+    /// leaf's pack aggregate), so a second run adds nothing — including no
+    /// second return-address pop. The fixture keeps the genuine pop in the
+    /// continuation to prove the check does not consult neighbouring code.
+    #[test]
+    fn binding_an_indirect_call_is_idempotent() {
+        let (mut tc, g, g_cont) = indirect_caller_with_genuine_pop();
+        let (r3, abi) = (tc.r3, indirect_abi(&tc));
+
+        argpromote_registers(&mut tc.ctx, Some(r3), Some(&abi));
+        let after_first: Vec<usize> = FunctionBody::from_id(&tc.ctx, g)
+            .blocks()
+            .map(|b| b.iter().count())
+            .collect();
+        let pops = sp_pops_in(&tc.ctx, g_cont, r3, 8);
+
+        argpromote_registers(&mut tc.ctx, Some(r3), Some(&abi));
+
+        assert_eq!(
+            FunctionBody::from_id(&tc.ctx, g)
+                .blocks()
+                .map(|b| b.iter().count())
+                .collect::<Vec<_>>(),
+            after_first,
+            "re-running the pass must add no instruction to an already-bound site"
+        );
+        assert_eq!(
+            sp_pops_in(&tc.ctx, g_cont, r3, 8),
+            pops,
+            "the return-address pop must not be materialized twice"
         );
     }
 

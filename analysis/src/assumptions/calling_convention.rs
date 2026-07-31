@@ -13,9 +13,16 @@
 //! whole-program hypothesis and caches its [`AssumedCallEffect`] on the context;
 //! the mem2reg / alias register classifier (`classify_call_reg_effect`) then
 //! consults it so callee-saved registers survive across such calls. It does
-//! **not** feed back into the argpromote effect-summary fixpoint, which keeps
-//! modelling `CallInd` as `Some(empty)` in the register channel (see
-//! `reg_summary::RegChannel::indirect_call_effects`).
+//! **not** feed back into the argpromote effect-summary fixpoint.
+//!
+//! Distinct from — and strictly stronger than — the ABI clobber leaf the
+//! register channel binds indirect *call sites* against
+//! (`reg_summary::RegChannel::indirect_call_effects`,
+//! `registers::regpure_indirect_sites`). That leaf only *adds* explicit
+//! caller-saved kills and an explicit return value at the site; the `CallInd`
+//! itself still clobbers every register in `classify_call_reg_effect`, so
+//! callee-saved registers do not survive it. This hypothesis is what removes
+//! that remaining conservatism — and that is the unsound part.
 //!
 //! No verifier: the hypothesis is never proven, so it is not discharged in v1;
 //! the checkpoint+replay net never acts on it. Like [`super::arg_frame`] it is

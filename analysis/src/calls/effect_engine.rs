@@ -55,9 +55,10 @@ pub(crate) trait EffectChannel {
 
     /// The effects to assume for a function containing an *unresolved indirect
     /// call*. `None` (the default) is ⊤: the unknown callee poisons the
-    /// function. A channel whose indirect calls keep sound in-body modelling
-    /// (the register channel: `CallInd` retains its clobbers-all behaviour in
-    /// mem2reg) may return effects to join into the seed scan instead.
+    /// function. A channel that can model the unknown callee may return effects
+    /// to join into the seed scan instead — the register channel binds every
+    /// `CallInd` against the platform-ABI clobber leaf and returns that leaf's
+    /// reads/writes, which is exactly the traffic it materializes at the site.
     fn indirect_call_effects(&self, _ctx: &Context, _fid: FunctionId) -> Option<Self::Effects> {
         None
     }

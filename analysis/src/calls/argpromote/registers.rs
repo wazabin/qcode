@@ -11,7 +11,7 @@ use qcode::{
 
 use rustc_hash::FxHashSet;
 
-use crate::{AnalysisManager, CallGraph, CallGraphAnalysis, Pass, PipelineEnv};
+use crate::{AnalysisManager, CallGraph, CallGraphAnalysis, CallingConvention, Pass, PipelineEnv};
 
 use super::{
     add_input, append_outputs, called_function_set_from_graph,
@@ -115,13 +115,33 @@ impl RegPurityReason {
 /// `sp` is the stack-pointer varnode — [`PipelineEnv::sp_varnode`] in the
 /// pipeline, [`ArchConfig::sp_varnode`](crate::ArchConfig::sp_varnode) for a
 /// caller that has no env. `None` (hand-written IR) simply leaves the
-/// stack-pointer-aware part of the register channel inert.
+/// stack-pointer-aware part of the register channel inert. `abi` is the platform
+/// calling convention the channel models unresolved indirect callees with (see
+/// [`indirect_leaf`]); `None` leaves them contributing nothing.
 pub fn reg_purity(
     ctx: &Context,
     fid: FunctionId,
     sp: Option<VarnodeId>,
+    abi: Option<&CallingConvention>,
 ) -> Result<(), RegPurityReason> {
-    RegPurityGates::compute(ctx, sp).purity(ctx, fid)
+    RegPurityGates::compute(ctx, sp, abi).purity(ctx, fid)
+}
+
+/// The register interface every unresolved indirect (`CallInd`) callee is
+/// modelled with: the platform-ABI clobber leaf, the *same* interface an
+/// unprototyped external gets (`external_sig::apply_abi_fallback_signature`).
+///
+/// An indirect callee the analysis cannot name is exactly an unprototyped
+/// callee: nothing is known about it beyond "it obeys the platform ABI", which
+/// is the ruling that licenses the external fallback. Modelling it that way is
+/// what gives an indirect call site the return-address pop, the caller-saved
+/// clobber materialization, and an explicit return value — none of which the
+/// old "an indirect call has no interface at all" modelling could express.
+///
+/// `None` when there is no convention to derive it from (hand-written IR / an
+/// unmodelled architecture), which leaves every indirect call exactly as lifted.
+pub(crate) fn indirect_leaf(abi: Option<&CallingConvention>) -> Option<RegisterInterfaceMap> {
+    crate::assumptions::abi_clobber_leaf(abi?)
 }
 
 /// The whole-program facts a [`reg_purity`] query consults — the solved effect
@@ -142,10 +162,14 @@ pub struct RegPurityGates {
 
 impl RegPurityGates {
     /// Solve the summaries and gating sets for `ctx` once, against the
-    /// stack-pointer varnode `sp` (see [`reg_purity`]).
-    pub fn compute(ctx: &Context, sp: Option<VarnodeId>) -> Self {
+    /// stack-pointer varnode `sp` and calling convention `abi` (see
+    /// [`reg_purity`]).
+    pub fn compute(ctx: &Context, sp: Option<VarnodeId>, abi: Option<&CallingConvention>) -> Self {
         let graph = CallGraph::analyze(ctx);
-        let chan = RegChannel { sp };
+        let chan = RegChannel {
+            sp,
+            indirect: indirect_leaf(abi),
+        };
         let summaries = solve_summaries(ctx, &graph, &chan);
         let called = called_function_set_from_graph(ctx, &graph);
         let address_taken = super::address_taken_set(ctx);
@@ -224,9 +248,12 @@ pub(crate) fn scan_register_effects(
     fid: FunctionId,
 ) -> Result<RegisterEffects, RegPurityReason> {
     use crate::calls::argpromote::summary::EffectChannel;
-    let eff = RegChannel { sp: None }
-        .scan(ctx, fid)
-        .ok_or(RegPurityReason::NoBody)?;
+    let eff = RegChannel {
+        sp: None,
+        indirect: None,
+    }
+    .scan(ctx, fid)
+    .ok_or(RegPurityReason::NoBody)?;
     finalize_register_effects(ctx, &eff)
 }
 
@@ -241,8 +268,12 @@ pub(crate) fn materialize_functions(
     graph: &CallGraph,
     targets: &[FunctionId],
     sp: Option<VarnodeId>,
+    abi: Option<&CallingConvention>,
 ) -> FxHashSet<FunctionId> {
-    let chan = RegChannel { sp };
+    let chan = RegChannel {
+        sp,
+        indirect: indirect_leaf(abi),
+    };
     // Whole-program solve reads through `&Context`; every write below is confined
     // to `fid` (its published interface via `function_mut`, its body via
     // `ctx_for`), and `fid` ranges only over the cone's `targets`.
@@ -430,7 +461,7 @@ pub(crate) fn rewrite_call_regpure(
     // including the poison clobber pack and the SP-relative stack-arg loads that
     // `bind_external_args` used to emit (design ruling 7a).
     if FunctionBody::from_id(ctx, callee).is_external() {
-        rewrite_external_call_regpure(ctx, call_id, callee, &map, sp);
+        rewrite_leaf_call_regpure(ctx, call_id, LeafCallee::External(callee), &map, sp);
         return;
     }
     let Some(call_block) = ctx.get_insn(call_id).parent().map(|b| b.id) else {
@@ -498,18 +529,49 @@ pub(crate) fn rewrite_call_regpure(
     }
 }
 
-/// Pass 3 for a **bodyless external** materialized callee (design ruling 7a).
+/// Which kind of **bodyless** callee a leaf call site binds against — the two
+/// shapes [`rewrite_leaf_call_regpure`] serves.
+#[derive(Clone, Copy)]
+enum LeafCallee {
+    /// A bodyless external (imported) function, resolved by name. Its site is a
+    /// `Call` that becomes [`CallTag::RegPure`](qcode::value::insn::CallTag).
+    External(FunctionId),
+    /// An unresolved indirect target: nothing is known about it beyond the
+    /// platform ABI, so it is bound against the clobber leaf
+    /// ([`indirect_leaf`]). Its site stays a `CallInd` through the same pointer.
+    Indirect,
+}
+
+/// The aggregate type of `map`'s output pack — one `Int` field per output
+/// register, in `map.outputs` order. Structurally interned, so recomputing it is
+/// how a bound site is recognized (see [`indirect_site_is_bound`]).
+fn output_pack_type(ctx: &Context, map: &RegisterInterfaceMap) -> TypeId {
+    let field_types: Vec<TypeId> = map
+        .outputs
+        .iter()
+        .map(|&r| {
+            let size = Varnode::from_id(ctx, r).size();
+            ctx.shared.types.get_or_make_int(size)
+        })
+        .collect();
+    ctx.shared.types.get_or_make_aggregate(field_types)
+}
+
+/// Pass 3 for a **bodyless** callee — a resolved external (design ruling 7a) or
+/// an unresolved indirect target bound against the ABI clobber leaf.
 /// Mirrors [`rewrite_call_regpure`] for bodied callees but owns the whole
 /// rewrite: register args become explicit regpure operands; the result is typed
 /// as the pack aggregate (return ∪ clobbers); the continuation replays the return
 /// register(s) from the pack and stores **poison** into every clobber register
-/// (a static alias/dataflow device — externals have no runtime semantics here).
-/// It also keeps emitting the SP-relative stack-arg loads `bind_external_args`
-/// did (implicit RAM, left in the body — the call is `RegPure`, not `Pure`).
-fn rewrite_external_call_regpure(
+/// (a static alias/dataflow device — a bodyless callee has no runtime semantics
+/// here). It also keeps emitting the SP-relative stack-arg loads
+/// `bind_external_args` did (implicit RAM, left in the body — the call is
+/// `RegPure`, not `Pure`); an indirect site has no `ExternInterface` and so no
+/// stack slots.
+fn rewrite_leaf_call_regpure(
     ctx: &mut Context,
     call_id: InstructionId,
-    callee: FunctionId,
+    callee: LeafCallee,
     map: &RegisterInterfaceMap,
     sp: Option<VarnodeId>,
 ) {
@@ -534,19 +596,24 @@ fn rewrite_external_call_regpure(
     // hand in `reg_summary::RegChannel::materialized_effects` (the `sp` field
     // exists only for it). The two sides are coupled by convention — keep them
     // in step until the lowering reports its own register effects.
-    let stack_slots: Vec<(i64, usize)> = FunctionBody::from_id(ctx, callee)
-        .extern_interface()
-        .map(|iface| {
-            iface
-                .args
-                .iter()
-                .filter_map(|arg| match arg.slot {
-                    qcode::value::ExternSlot::Stack { offset, size } => Some((offset, size)),
-                    qcode::value::ExternSlot::Reg(..) => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let stack_slots: Vec<(i64, usize)> = match callee {
+        LeafCallee::External(callee) => FunctionBody::from_id(ctx, callee)
+            .extern_interface()
+            .map(|iface| {
+                iface
+                    .args
+                    .iter()
+                    .filter_map(|arg| match arg.slot {
+                        qcode::value::ExternSlot::Stack { offset, size } => Some((offset, size)),
+                        qcode::value::ExternSlot::Reg(..) => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // The clobber leaf is register-only (`abi_unknown_proto` places every
+        // argument in a register), so an indirect site has no stack slots.
+        LeafCallee::Indirect => Vec::new(),
+    };
     let ptr_width = sp.map(|s| Varnode::from_id(&*ctx, s).size()).unwrap_or(8);
     let default_space = ctx.shared.default_space;
 
@@ -583,25 +650,31 @@ fn rewrite_external_call_regpure(
     };
 
     // The pack aggregate type: one field per output register (return ∪ clobbers).
-    let field_types: Vec<TypeId> = map
-        .outputs
-        .iter()
-        .map(|&r| {
-            let size = Varnode::from_id(&*ctx, r).size();
-            ctx.shared.types.get_or_make_int(size)
-        })
-        .collect();
-    let ret_ty = ctx.shared.types.get_or_make_aggregate(field_types);
+    let ret_ty = output_pack_type(ctx, map);
 
-    ctx.replace_instruction_mnemonic(
-        call_id,
-        Mnemonic::Call(qcode::value::insn::Call {
+    // The bound site. An external's `Call` flips to `RegPure`; an indirect site
+    // keeps its `CallInd` through the same pointer and gains the explicit args.
+    // Either way the *result type* becomes the pack — which is what makes the
+    // rewrite recognizable from the site alone (see `indirect_site_is_bound`).
+    let bound = match callee {
+        LeafCallee::External(callee) => Mnemonic::Call(qcode::value::insn::Call {
             target: qcode::value::insn::Callee::Real(callee),
             args,
             clobbers: vec![],
             tag: qcode::value::insn::CallTag::RegPure,
         }),
-    );
+        LeafCallee::Indirect => {
+            let Mnemonic::CallInd(call) = ctx.get_insn(call_id).mnemonic() else {
+                debug_assert!(false, "indirect leaf rewrite on a non-CallInd site");
+                return;
+            };
+            Mnemonic::CallInd(qcode::value::insn::CallInd {
+                ptr: call.ptr,
+                args,
+            })
+        }
+    };
+    ctx.replace_instruction_mnemonic(call_id, bound);
     Instruction::from_id_mut(ctx, call_id).set_type(ret_ty);
 
     // --- outputs: replay the return register(s) from the pack; poison clobbers ---
@@ -668,12 +741,14 @@ fn restore_sp_after_call(b: &mut qcode::builder::Builder<'_, '_>, sp: VarnodeId,
 }
 
 /// Rewrite every direct `Opaque` call to a materialized function into a regpure
-/// call (pass 3). Returns the set of *caller* functions changed.
+/// call, and bind every unresolved indirect call against the ABI clobber leaf
+/// (pass 3). Returns the set of *caller* functions changed.
 pub(crate) fn regpure_all_sites(
     cone: &mut crate::ConeMut,
     graph: &CallGraph,
     targets: &[FunctionId],
     sp: Option<VarnodeId>,
+    abi: Option<&CallingConvention>,
 ) -> FxHashSet<FunctionId> {
     let mut changed = FxHashSet::default();
     for callee in targets.iter().copied() {
@@ -696,106 +771,86 @@ pub(crate) fn regpure_all_sites(
             }
         }
     }
-    changed.extend(
-        sp.map(|sp| restore_sp_after_indirect_calls(cone, targets, sp))
-            .unwrap_or_default(),
-    );
+    if let Some(map) = indirect_leaf(abi) {
+        changed.extend(regpure_indirect_sites(cone, targets, &map, sp));
+    }
     changed
 }
 
-/// Materialize the return-address pop after every unresolved indirect call.
+/// Bind every unresolved indirect call in `targets` against the platform-ABI
+/// clobber leaf `map` — the same materialization a bodyless external gets
+/// ([`rewrite_leaf_call_regpure`]), because an unresolved indirect callee *is*
+/// an unprototyped callee.
 ///
-/// A `CallInd` target is bodyless from the caller's point of view: it has no
-/// interface at all ([`RegChannel::indirect_call_effects`] is empty), so nothing
-/// carries the callee's `ret` increment back to the caller and every post-call
-/// SP-relative reference is one pointer too low — the same hole a bodyless
-/// external has. `sp_pop_present` keeps the rewrite idempotent.
-fn restore_sp_after_indirect_calls(
+/// This is what gives an indirect site its return-address pop (SP is never in
+/// the leaf's outputs, so `interface_covers_sp` lets the fixup through), its
+/// caller-saved poison clobbers, and an explicit return value in place of an
+/// opaque post-call register read.
+///
+/// **Idempotence comes from the site itself**, exactly as the direct path's
+/// `Opaque` → `RegPure` tag flip does: a bound site carries the leaf's pack
+/// aggregate as its result type, which a freshly lifted `CallInd` (typed
+/// `Int(0)` by the builder) never does. No neighbouring instruction is
+/// inspected — the structural "is there a pop-shaped store in the continuation?"
+/// guard this replaces matched SLEIGH's genuine `pop`/`ret`/`add $8,%rsp`
+/// sequences too, and silently dropped the fixup for any indirect call whose
+/// continuation happened to contain one.
+fn regpure_indirect_sites(
     cone: &mut crate::ConeMut,
     targets: &[FunctionId],
-    sp: VarnodeId,
+    map: &RegisterInterfaceMap,
+    sp: Option<VarnodeId>,
 ) -> FxHashSet<FunctionId> {
     let mut changed = FxHashSet::default();
-    let ptr_width = Varnode::from_id(cone.ctx(), sp).size();
+    let pack = output_pack_type(cone.ctx(), map);
     for fid in targets.iter().copied() {
-        let sites: Vec<qcode::value::BlockId> = FunctionBody::from_id(cone.ctx(), fid)
+        let sites: Vec<InstructionId> = FunctionBody::from_id(cone.ctx(), fid)
             .blocks()
-            .filter(|b| {
-                b.iter()
-                    .last()
-                    .is_some_and(|i| matches!(i.mnemonic(), Mnemonic::CallInd(_)))
-            })
-            .map(|b| b.id)
+            .filter_map(|b| b.iter().last())
+            .filter(|insn| matches!(insn.mnemonic(), Mnemonic::CallInd(_)))
+            .map(|insn| insn.id)
             .collect();
-        for block in sites {
+        for call_id in sites {
             let ctx = cone.ctx_for(fid);
-            let Some(cont) = replay_block(ctx, block) else {
-                continue;
-            };
-            if sp_pop_present(ctx, cont, sp, ptr_width) {
+            if indirect_site_is_bound(ctx, call_id, pack) {
                 continue;
             }
-            let mut b = ctx.builder(cont);
-            b.set_insert_point_to_start();
-            restore_sp_after_call(&mut b, sp, ptr_width);
+            rewrite_leaf_call_regpure(ctx, call_id, LeafCallee::Indirect, map, sp);
             changed.insert(fid);
         }
     }
     changed
 }
 
-/// Whether `block` already opens with the `store(SP <- load(SP) + ptr_width)`
-/// sequence [`restore_sp_after_call`] emits — the idempotence guard for the
-/// indirect-call fixup, which (unlike the direct one) has no `Opaque`→`RegPure`
-/// tag flip to make it self-limiting.
-pub(crate) fn sp_pop_present(
-    ctx: &Context,
-    block: qcode::value::BlockId,
-    sp: VarnodeId,
-    ptr_width: usize,
-) -> bool {
-    use qcode::value::LocalValueId as L;
-    let func = block.func;
-    let is_sp_load = |v: L| {
-        matches!(v.qualify(func), ValueId::Instruction(l)
-            if matches!(ctx.get_insn(l).mnemonic(), Mnemonic::Load(ld) if ld.ptr == L::Varnode(sp)))
-    };
-    let is_ptr_width =
-        |v: L| matches!(v, L::Literal(id) if ctx.get_literal_value(id) == ptr_width as u64);
-    BasicBlock::from_id(ctx, block).iter().any(|insn| {
-        let Mnemonic::Store(s) = insn.mnemonic() else {
-            return false;
-        };
-        if s.ptr != L::Varnode(sp) {
-            return false;
-        }
-        let ValueId::Instruction(add) = s.src.qualify(func) else {
-            return false;
-        };
-        let Mnemonic::Binop(bin) = ctx.get_insn(add).mnemonic() else {
-            return false;
-        };
-        matches!(
-            bin.op,
-            qcode::value::insn::Binop::Int(qcode::value::insn::IntBinop::Add)
-        ) && is_sp_load(bin.lhs)
-            && is_ptr_width(bin.rhs)
-    })
+/// Whether the indirect call `call_id` has already been bound against the
+/// clobber leaf whose output pack is `pack`.
+///
+/// Site state, not pattern matching: [`rewrite_leaf_call_regpure`] retypes the
+/// site to the pack aggregate, and the aggregate is structurally interned, so
+/// recomputing it identifies a bound site exactly. The builder types a lifted
+/// `CallInd` `Int(0)`, which is never an aggregate.
+fn indirect_site_is_bound(ctx: &Context, call_id: InstructionId, pack: TypeId) -> bool {
+    ctx.get_insn(call_id).type_id() == pack
 }
 
 /// Compatibility driver for the unit tests: materialize every eligible function
 /// (pass 2) then flip its direct call sites to regpure (pass 3). Returns `true`
 /// if anything changed.
 ///
-/// `sp` is the stack-pointer varnode; in the pipeline the two passes below take
-/// theirs from [`PipelineEnv::sp_varnode`].
-pub fn argpromote_registers(ctx: &mut Context, sp: Option<VarnodeId>) -> bool {
+/// `sp` is the stack-pointer varnode and `abi` the platform calling convention;
+/// in the pipeline the two passes below take theirs from
+/// [`PipelineEnv::sp_varnode`] and [`PipelineEnv::cfg`].
+pub fn argpromote_registers(
+    ctx: &mut Context,
+    sp: Option<VarnodeId>,
+    abi: Option<&CallingConvention>,
+) -> bool {
     let graph = CallGraph::analyze(ctx);
     let targets = ctx.function_ids();
     let mut cone = crate::ConeMut::full(ctx);
-    let mut changed = materialize_functions(&mut cone, &graph, &targets, sp);
+    let mut changed = materialize_functions(&mut cone, &graph, &targets, sp, abi);
     let graph = CallGraph::analyze(cone.ctx());
-    changed.extend(regpure_all_sites(&mut cone, &graph, &targets, sp));
+    changed.extend(regpure_all_sites(&mut cone, &graph, &targets, sp, abi));
     !changed.is_empty()
 }
 
@@ -857,6 +912,7 @@ impl Pass for ArgPromoteMaterialize {
             &graph,
             &targets,
             env.sp_varnode,
+            Some(&env.cfg.abi),
         ))
         .preserving_global::<CallGraphAnalysis>()
         .preserving_global::<crate::AddressAnalysis>())
@@ -875,6 +931,7 @@ impl Pass for ArgPromoteMaterialize {
             graph,
             &targets,
             env.sp_varnode,
+            Some(&env.cfg.abi),
         ))
         .preserving_global::<CallGraphAnalysis>()
         .preserving_global::<crate::AddressAnalysis>())
@@ -906,6 +963,7 @@ impl Pass for ArgPromoteRegpureCalls {
             &graph,
             &targets,
             env.sp_varnode,
+            Some(&env.cfg.abi),
         ))
         .preserving_global::<CallGraphAnalysis>()
         .preserving_global::<crate::AddressAnalysis>())
@@ -924,6 +982,7 @@ impl Pass for ArgPromoteRegpureCalls {
             graph,
             &targets,
             env.sp_varnode,
+            Some(&env.cfg.abi),
         ))
         .preserving_global::<CallGraphAnalysis>()
         .preserving_global::<crate::AddressAnalysis>())

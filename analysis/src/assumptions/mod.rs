@@ -7,6 +7,7 @@ mod ordinal_imports;
 
 pub use arg_frame::{assume_args_disjoint_caller_frame, verify_args_disjoint_caller_frame};
 pub use calling_convention::assume_calling_convention;
+pub(crate) use external_sig::abi_clobber_leaf;
 pub use external_sig::{apply_all_external_signatures, apply_external_signature};
 pub use mem_protections::{MemoryProtections, establish_memory_protections};
 pub use no_return::{

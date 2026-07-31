@@ -66,6 +66,13 @@ impl RegEffects {
 /// which point the stack pointer needs no named slot here at all.
 pub(crate) struct RegChannel {
     pub(crate) sp: Option<VarnodeId>,
+    /// The interface an unresolved indirect (`CallInd`) callee is modelled with:
+    /// the platform-ABI clobber leaf
+    /// ([`abi_clobber_leaf`](crate::assumptions::abi_clobber_leaf)), the same one
+    /// an unprototyped external gets. `None` when the architecture has no
+    /// modelled convention (hand-written IR), which leaves indirect calls
+    /// contributing nothing — see [`RegChannel::indirect_call_effects`].
+    pub(crate) indirect: Option<RegisterInterfaceMap>,
 }
 
 impl RegChannel {
@@ -243,13 +250,32 @@ impl EffectChannel for RegChannel {
         Some(self.materialized_effects(ctx, fid, map))
     }
 
-    /// A `CallInd` keeps its intrinsic clobbers-all modelling in the promoted
-    /// body (mem2reg treats it as reading and clobbering the register file), so
-    /// it contributes no interface effects of its own — v1-compatible. The RAM
-    /// channel must *not* copy this: an unknown callee's memory effects have no
-    /// in-body fallback there.
+    /// An unresolved `CallInd` target is exactly an *unprototyped* callee, so it
+    /// carries the same platform-ABI clobber leaf an unprototyped external gets
+    /// (`self.indirect`): it reads every argument-passing register and writes the
+    /// return register(s) ∪ every caller-saved register.
+    ///
+    /// This is not a hypothesis layered on top of the IR — it *mirrors* what
+    /// `registers::regpure_indirect_sites` materializes into the body at every
+    /// indirect call site (a `load(register, R)` per input, an
+    /// `extract`/poison `store(register, R)` per output). The summary must
+    /// therefore contain it, or the enclosing function's frozen interface would
+    /// omit register traffic its own body performs — bug-2-external one level up.
+    /// The earlier empty-effects modelling claimed an indirect call clobbers
+    /// *nothing*, which let a caller forward caller-saved registers across it.
+    ///
+    /// With no modelled convention (`indirect == None`, e.g. hand-written IR)
+    /// this stays empty — never ⊤, matching the pre-ABI-leaf behaviour. The RAM
+    /// channel must *not* copy any of this: an unknown callee's memory effects
+    /// have no in-body fallback there.
     fn indirect_call_effects(&self, _ctx: &Context, _fid: FunctionId) -> Option<RegEffects> {
-        Some(RegEffects::default())
+        Some(match &self.indirect {
+            Some(map) => RegEffects {
+                reads: map.inputs.iter().copied().collect(),
+                writes: map.outputs.iter().copied().collect(),
+            },
+            None => RegEffects::default(),
+        })
     }
 
     fn transfer(
@@ -326,7 +352,14 @@ mod tests {
 
     fn solve(tc: &qcode::testing::TestContext) -> EffectSummaries<RegChannel> {
         let graph = CallGraph::analyze(&tc.ctx);
-        solve_summaries(&tc.ctx, &graph, &RegChannel { sp: None })
+        solve_summaries(
+            &tc.ctx,
+            &graph,
+            &RegChannel {
+                sp: None,
+                indirect: None,
+            },
+        )
     }
 
     /// A leaf function's summary is exactly its own syntactic register traffic.
@@ -556,7 +589,10 @@ mod tests {
 
         let mut tc = qcode::testing::TestContext::new();
         let fid = FunctionBody::make(&mut tc.ctx, "fixed".into()).unwrap().id;
-        let channel = RegChannel { sp: None };
+        let channel = RegChannel {
+            sp: None,
+            indirect: None,
+        };
         let (r0, r1) = (tc.r0, tc.r1);
 
         let solved = RegisterChannelState::Solved(RegisterEffectSets {
@@ -609,7 +645,10 @@ mod tests {
         );
         let _ = (callee_entry, caller_entry, caller_cont);
         let graph = CallGraph::analyze(&tc.ctx);
-        let channel = RegChannel { sp: None };
+        let channel = RegChannel {
+            sp: None,
+            indirect: None,
+        };
         let full = solve_summaries(&tc.ctx, &graph, &channel)
             .get(caller)
             .clone();
@@ -665,7 +704,10 @@ mod tests {
         );
         let _ = (callee_entry, caller_entry, caller_cont);
         let graph = CallGraph::analyze(&tc.ctx);
-        let channel = RegChannel { sp: None };
+        let channel = RegChannel {
+            sp: None,
+            indirect: None,
+        };
         let summaries = solve_summaries(&tc.ctx, &graph, &channel);
         let full = summaries.get(caller).clone();
         let semantic = summaries.get(callee).as_ref().unwrap();
@@ -747,7 +789,10 @@ mod tests {
         );
         let _ = (entry, written, preserved);
         let graph = CallGraph::analyze(&tc.ctx);
-        let channel = RegChannel { sp: None };
+        let channel = RegChannel {
+            sp: None,
+            indirect: None,
+        };
         let summaries = solve_summaries(&tc.ctx, &graph, &channel);
         let effects = summaries.get(f).as_ref().unwrap();
 
