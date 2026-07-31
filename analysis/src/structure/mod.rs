@@ -18,6 +18,7 @@ mod emit;
 mod lower;
 mod lower_expr;
 mod refine;
+mod strings;
 mod structuring;
 mod switch;
 pub mod tokens;

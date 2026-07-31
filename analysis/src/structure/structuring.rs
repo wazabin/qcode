@@ -1006,7 +1006,7 @@ mod tests {
         );
 
         let program = decompile_function(&ctx, f).unwrap();
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         assert!(
             c.contains("goto *dst"),
             "the indirect transfer must survive structuring:\n{c}"
@@ -1109,7 +1109,7 @@ mod tests {
                 deopted.goto_count()
             );
             // The tail's body is now printed on both paths.
-            let c = emit_c(&ctx, &deopted);
+            let c = emit_c(&ctx, &deopted, None);
             assert!(
                 c.matches("out = 0x9").count() >= 2,
                 "the shared tail should appear on each path:\n{c}"
@@ -1180,7 +1180,7 @@ mod tests {
         );
 
         let program = structure_regions(&ctx, f);
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
 
         // Each arm's body sits inside its case: the store appears between the
         // arm's `=>` and its closing brace, not after the switch under a label.
@@ -1240,7 +1240,7 @@ mod tests {
             program.goto_count(),
             0,
             "if/else should erase gotos:\n{}",
-            emit_c(&ctx, &program)
+            emit_c(&ctx, &program, None)
         );
         // Top level contains an `If` node with both arms populated.
         let has_if = program.stmts.iter().any(
@@ -1281,7 +1281,7 @@ mod tests {
         );
 
         let program = decompile_function(&ctx, f).unwrap();
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         assert!(
             !c.contains("merge:"),
             "unreferenced join label should be pruned:\n{c}"
@@ -1318,7 +1318,7 @@ mod tests {
             program.goto_count(),
             0,
             "if-then should erase gotos:\n{}",
-            emit_c(&ctx, &program)
+            emit_c(&ctx, &program, None)
         );
         let if_then = program
             .stmts
@@ -1393,10 +1393,10 @@ mod tests {
             program.goto_count(),
             0,
             "loop should structure without gotos:\n{}",
-            emit_c(&ctx, &program)
+            emit_c(&ctx, &program, None)
         );
         // Header-tested: refines to a pre-tested `while (cond)`.
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         assert!(
             program
                 .stmts
@@ -1440,10 +1440,10 @@ mod tests {
             program.goto_count(),
             0,
             "self-looping block should structure without gotos:\n{}",
-            emit_c(&ctx, &program)
+            emit_c(&ctx, &program, None)
         );
         // Latch-tested: refines to a post-tested `do { … } while (cond)`.
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         assert!(
             program
                 .stmts
@@ -1486,8 +1486,8 @@ mod tests {
             "
         );
 
-        let first = emit_c(&ctx, &decompile_function(&ctx, f).unwrap());
-        let second = emit_c(&ctx, &decompile_function(&ctx, f).unwrap());
+        let first = emit_c(&ctx, &decompile_function(&ctx, f).unwrap(), None);
+        let second = emit_c(&ctx, &decompile_function(&ctx, f).unwrap(), None);
         assert_eq!(first, second, "structuring should be deterministic");
         assert!(
             first.contains("0x1") && first.contains("0x2"),
@@ -1522,7 +1522,7 @@ mod tests {
         );
 
         let program = decompile_function(&ctx, f).unwrap();
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         // Both edges assign the join parameter before it is used.
         assert!(c.contains("v = 0x1"), "then edge's phi copy missing:\n{c}");
         assert!(c.contains("v = 0x2"), "else edge's phi copy missing:\n{c}");
@@ -1561,7 +1561,7 @@ mod tests {
         );
 
         let program = decompile_function(&ctx, f).unwrap();
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         assert!(c.contains("i = 0x0"), "counter should be initialized:\n{c}");
         assert!(
             c.contains("i = i + 0x1"),
@@ -1603,7 +1603,7 @@ mod tests {
         );
 
         let program = decompile_function(&ctx, f).unwrap();
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         // Neither exit's body may be lost, however the loop is (or isn't) structured.
         assert!(
             c.contains("0xdead"),
@@ -1645,7 +1645,7 @@ mod tests {
         );
 
         let program = decompile_function(&ctx, f).unwrap();
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         assert!(
             has_loop(&program.stmts),
             "the loop should stay structured, not fall back to flat:\n{c}"
@@ -1707,8 +1707,8 @@ mod tests {
         let deep = structure_regions_limited(&ctx, f, 2, &HashSet::default());
         let flat = lower_function(&ctx, f);
         assert_eq!(
-            emit_c(&ctx, &deep),
-            emit_c(&ctx, &flat),
+            emit_c(&ctx, &deep, None),
+            emit_c(&ctx, &flat, None),
             "an over-deep cascade should fall back to flat lowering"
         );
         let shallow = structure_regions_limited(&ctx, f, MAX_REGION_DEPTH, &HashSet::default());
@@ -1750,7 +1750,7 @@ mod tests {
             program.goto_count(),
             0,
             "nested loops should structure without gotos:\n{}",
-            emit_c(&ctx, &program)
+            emit_c(&ctx, &program, None)
         );
         assert!(
             has_loop(&program.stmts),

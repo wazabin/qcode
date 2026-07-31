@@ -22,6 +22,7 @@ use super::{
         deref_location, instruction_declared_signed, instruction_name, lower_condition,
         lower_defining_expr, lower_expr_rooted,
     },
+    strings::StringPool,
     tokens::{LineBuf, TokenKind, TokenLine},
 };
 
@@ -29,22 +30,59 @@ use super::{
 ///
 /// When the program knows its source function, the body is wrapped in a
 /// `fn name(args) -> rets {` … `}` header and indented one level beneath it.
-pub fn emit_tokens(ctx: &Context, program: &Program) -> Vec<TokenLine> {
+///
+/// `binary` is the loaded image the program was lifted from, when the caller
+/// still holds it. It is only read to reconstruct string constants out of
+/// read-only memory (see [`strings`](super::strings)); passing `None` renders
+/// every such argument as the bare address it is in the IR.
+pub fn emit_tokens(
+    ctx: &Context,
+    program: &Program,
+    binary: Option<&dyn binfmt::BinaryFormat>,
+) -> Vec<TokenLine> {
     let roots = compute_roots(ctx, program);
     let hoisted = hoisted_roots(ctx, program, &roots);
-    let mut out = Vec::new();
+    let strings = StringPool::new(ctx, binary);
+    // The body is rendered first: which rodata objects need declaring is only
+    // known once every call argument has been through the pool, and the
+    // declarations belong above the function that uses them.
+    let mut body = Vec::new();
     match program.function {
         Some(function_id) => {
-            out.push(header_line(ctx, program, function_id));
-            emit_hoisted_decls(ctx, &roots, &hoisted, 1, &mut out);
-            emit_stmts(ctx, program, &program.stmts, 1, &roots, &hoisted, &mut out);
-            out.push(brace_line("}", 0));
+            body.push(header_line(ctx, program, function_id));
+            emit_hoisted_decls(ctx, &roots, &hoisted, 1, &mut body);
+            emit_stmts(
+                ctx,
+                program,
+                &program.stmts,
+                1,
+                &roots,
+                &hoisted,
+                &strings,
+                &mut body,
+            );
+            body.push(brace_line("}", 0));
         }
         None => {
-            emit_hoisted_decls(ctx, &roots, &hoisted, 0, &mut out);
-            emit_stmts(ctx, program, &program.stmts, 0, &roots, &hoisted, &mut out);
+            emit_hoisted_decls(ctx, &roots, &hoisted, 0, &mut body);
+            emit_stmts(
+                ctx,
+                program,
+                &program.stmts,
+                0,
+                &roots,
+                &hoisted,
+                &strings,
+                &mut body,
+            );
         }
     }
+
+    let mut out = strings.declarations();
+    if !out.is_empty() {
+        out.push(LineBuf::default().into_line(0, None));
+    }
+    out.append(&mut body);
     out
 }
 
@@ -239,9 +277,16 @@ fn emit_typed_param(ctx: &Context, param: BlockParamRef<'_, '_>, buf: &mut LineB
 }
 
 /// Renders `program` as pseudo-C source text (indentation via spaces).
-pub fn emit_c(ctx: &Context, program: &Program) -> String {
+///
+/// `binary` is the loaded image, used only for string-constant reconstruction;
+/// see [`emit_tokens`].
+pub fn emit_c(
+    ctx: &Context,
+    program: &Program,
+    binary: Option<&dyn binfmt::BinaryFormat>,
+) -> String {
     let mut out = String::new();
-    for line in emit_tokens(ctx, program) {
+    for line in emit_tokens(ctx, program, binary) {
         out.push_str(&"    ".repeat(line.indent));
         out.push_str(&line.text());
         out.push('\n');
@@ -536,15 +581,25 @@ fn emit_stmts(
     indent: usize,
     roots: &HashSet<InstructionId>,
     hoisted: &HashSet<InstructionId>,
+    strings: &StringPool,
     out: &mut Vec<TokenLine>,
 ) {
     let mut line_indent = indent;
     for stmt in stmts {
         if matches!(stmt, Stmt::Label(_)) {
-            emit_stmt(ctx, program, stmt, indent, roots, hoisted, out);
+            emit_stmt(ctx, program, stmt, indent, roots, hoisted, strings, out);
             line_indent = indent + 1;
         } else {
-            emit_stmt(ctx, program, stmt, line_indent, roots, hoisted, out);
+            emit_stmt(
+                ctx,
+                program,
+                stmt,
+                line_indent,
+                roots,
+                hoisted,
+                strings,
+                out,
+            );
         }
     }
 }
@@ -557,6 +612,7 @@ fn emit_stmt(
     indent: usize,
     roots: &HashSet<InstructionId>,
     hoisted: &HashSet<InstructionId>,
+    strings: &StringPool,
     out: &mut Vec<TokenLine>,
 ) {
     match stmt {
@@ -575,7 +631,7 @@ fn emit_stmt(
             if emit_named_return_tuple(ctx, program, *id, indent, roots, out) {
                 return;
             }
-            let mut buf = statement(ctx, *id, roots, hoisted);
+            let mut buf = statement(ctx, *id, roots, hoisted, strings);
             // The statement's operand expressions were lowered with `Some(roots)`,
             // so `buf.insns` holds every genuinely inlined operand plus any root
             // referenced by name. Drop the named roots (each is its own line) and
@@ -643,7 +699,7 @@ fn emit_stmt(
             head.punct("{");
             out.push(head.into_line(indent, None));
 
-            emit_stmts(ctx, program, then, indent + 1, roots, hoisted, out);
+            emit_stmts(ctx, program, then, indent + 1, roots, hoisted, strings, out);
 
             if els.is_empty() {
                 out.push(brace_line("}", indent));
@@ -657,7 +713,7 @@ fn emit_stmt(
                 mid.space();
                 mid.punct("{");
                 out.push(mid.into_line(indent, None));
-                emit_stmts(ctx, program, els, indent + 1, roots, hoisted, out);
+                emit_stmts(ctx, program, els, indent + 1, roots, hoisted, strings, out);
                 out.push(brace_line("}", indent));
             }
         }
@@ -671,7 +727,7 @@ fn emit_stmt(
             head.space();
             head.punct("{");
             out.push(head.into_line(indent, None));
-            emit_stmts(ctx, program, body, indent + 1, roots, hoisted, out);
+            emit_stmts(ctx, program, body, indent + 1, roots, hoisted, strings, out);
             out.push(brace_line("}", indent));
         }
         Stmt::DoWhile { cond, body } => {
@@ -680,7 +736,7 @@ fn emit_stmt(
             head.space();
             head.punct("{");
             out.push(head.into_line(indent, None));
-            emit_stmts(ctx, program, body, indent + 1, roots, hoisted, out);
+            emit_stmts(ctx, program, body, indent + 1, roots, hoisted, strings, out);
             let mut tail = LineBuf::default();
             tail.punct("}");
             tail.space();
@@ -702,7 +758,7 @@ fn emit_stmt(
             head.space();
             head.punct("{");
             out.push(head.into_line(indent, None));
-            emit_stmts(ctx, program, body, indent + 1, roots, hoisted, out);
+            emit_stmts(ctx, program, body, indent + 1, roots, hoisted, strings, out);
             out.push(brace_line("}", indent));
         }
         Stmt::Break => {
@@ -755,7 +811,16 @@ fn emit_stmt(
                     arm.note_insn(insn);
                 }
                 out.push(arm.into_line(indent + 1, None));
-                emit_stmts(ctx, program, &case.body, indent + 2, roots, hoisted, out);
+                emit_stmts(
+                    ctx,
+                    program,
+                    &case.body,
+                    indent + 2,
+                    roots,
+                    hoisted,
+                    strings,
+                    out,
+                );
                 out.push(brace_line("}", indent + 1));
             }
 
@@ -767,7 +832,16 @@ fn emit_stmt(
             arm.space();
             arm.punct("{");
             out.push(arm.into_line(indent + 1, None));
-            emit_stmts(ctx, program, default, indent + 2, roots, hoisted, out);
+            emit_stmts(
+                ctx,
+                program,
+                default,
+                indent + 2,
+                roots,
+                hoisted,
+                strings,
+                out,
+            );
             out.push(brace_line("}", indent + 1));
 
             out.push(brace_line("}", indent));
@@ -860,6 +934,7 @@ fn statement(
     id: InstructionId,
     roots: &HashSet<InstructionId>,
     hoisted: &HashSet<InstructionId>,
+    strings: &StringPool,
 ) -> LineBuf {
     let insn = Instruction::from_id(ctx, id);
     let qualify = |value: LocalValueId| value.qualify(id.func);
@@ -888,7 +963,7 @@ fn statement(
                 .map(|target| FunctionRef::from_id(ctx, target).name().to_string())
                 .unwrap_or_else(|| format!("minted_{}", c.target.minted().unwrap_or_default()));
             buf.push_function(name, TokenKind::Label, target);
-            call_args(ctx, id.func, &c.args, roots, &mut buf);
+            call_args(ctx, id.func, target, &c.args, roots, strings, &mut buf);
             buf.punct(";");
         }
         // A tail call transfers control to the callee and returns whatever it
@@ -905,7 +980,7 @@ fn statement(
                 .map(|target| FunctionRef::from_id(ctx, target).name().to_string())
                 .unwrap_or_else(|| format!("minted_{}", t.target.minted().unwrap_or_default()));
             buf.push_function(name, TokenKind::Label, target);
-            call_args(ctx, id.func, &t.args, roots, &mut buf);
+            call_args(ctx, id.func, target, &t.args, roots, strings, &mut buf);
             buf.punct(";");
         }
         // An indirect branch whose successors were never resolved reaches the
@@ -929,7 +1004,9 @@ fn statement(
             buf.push("*", TokenKind::Operator);
             lower_expr_rooted(ctx, qualify(c.ptr), roots).write_tokens(&mut buf);
             buf.punct(")");
-            call_args(ctx, id.func, &c.args, roots, &mut buf);
+            // An indirect callee has no prototype to bind arguments to, so no
+            // string reconstruction is possible here.
+            call_args(ctx, id.func, None, &c.args, roots, strings, &mut buf);
             buf.punct(";");
         }
         // An SSA result is defined exactly once, so its assignment is also its
@@ -989,11 +1066,19 @@ fn bind_result(
     assign(buf);
 }
 
+/// Renders a call's parenthesized argument list.
+///
+/// `callee` is the resolved target, when there is one: an argument that binds to
+/// a `char *` parameter of its C prototype and is a literal address into
+/// read-only memory renders as the name of a reconstructed rodata object rather
+/// than as the address (see [`strings`](super::strings)).
 fn call_args(
     ctx: &Context,
     function: FunctionId,
+    callee: Option<FunctionId>,
     args: &[LocalValueId],
     roots: &HashSet<InstructionId>,
+    strings: &StringPool,
     buf: &mut LineBuf,
 ) {
     buf.punct("(");
@@ -1002,7 +1087,11 @@ fn call_args(
             buf.punct(",");
             buf.space();
         }
-        lower_expr_rooted(ctx, arg.qualify(function), roots).write_tokens(buf);
+        let value = arg.qualify(function);
+        match strings.arg_name(ctx, callee, i, value) {
+            Some(name) => buf.push_value(name, TokenKind::Variable, Some(value)),
+            None => lower_expr_rooted(ctx, value, roots).write_tokens(buf),
+        }
     }
     buf.punct(")");
 }
@@ -1087,7 +1176,7 @@ mod tests {
             }),
         );
 
-        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        let c = emit_c(&ctx, &lower_function(&ctx, f), None);
         assert!(
             c.starts_with("fn f(uint32_t x, uint64_t y)"),
             "function arguments should carry fixed-width C types:\n{c}"
@@ -1116,7 +1205,7 @@ mod tests {
             }),
         );
 
-        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        let c = emit_c(&ctx, &lower_function(&ctx, f), None);
         assert!(
             c.starts_with("fn f(uint64_t RSP, uint64_t RSP_val_0)"),
             "RAM snapshot params should follow the register-input prefix:\n{c}"
@@ -1141,7 +1230,7 @@ mod tests {
             "
         );
 
-        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        let c = emit_c(&ctx, &lower_function(&ctx, f), None);
         assert!(
             c.contains("uint32_t sum = 0x1 + 0x2;"),
             "a named SSA root should be declared at its definition:\n{c}"
@@ -1170,7 +1259,7 @@ mod tests {
             "
         );
 
-        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        let c = emit_c(&ctx, &lower_function(&ctx, f), None);
         assert!(
             c.contains("int32_t d = x + 0x2;"),
             "a shared sign-extended value should be declared signed:\n{c}"
@@ -1209,7 +1298,7 @@ mod tests {
             "
         );
 
-        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        let c = emit_c(&ctx, &lower_function(&ctx, f), None);
         assert!(
             c.contains("low_out = (int32_t)")
                 && c.contains("high_out = (uint32_t)")
@@ -1248,7 +1337,7 @@ mod tests {
             }),
         );
 
-        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        let c = emit_c(&ctx, &lower_function(&ctx, f), None);
         assert!(
             c.contains("RAX: EAX") && !c.contains("RAX: (uint64_t)"),
             "the typed return field should provide the widening context:\n{c}"
@@ -1274,7 +1363,7 @@ mod tests {
         );
 
         let program = lower_function(&ctx, f);
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
 
         // The load and the add are single-use, so they fold into the store; no
         // intermediate assignments are emitted.
@@ -1313,7 +1402,7 @@ mod tests {
                 return at i64 0;
             "
         );
-        let c = emit_c(&ctx, &decompile_function(&ctx, f).unwrap());
+        let c = emit_c(&ctx, &decompile_function(&ctx, f).unwrap(), None);
         // The load is named (a root because of the intervening store) and the
         // condition uses that name rather than re-dereferencing memory. The
         // byte-wide load through `pp` carries its access width as a pointer cast.
@@ -1349,7 +1438,7 @@ mod tests {
                 return at i64 0;
             "
         );
-        let c = emit_c(&ctx, &decompile_function(&ctx, f).unwrap());
+        let c = emit_c(&ctx, &decompile_function(&ctx, f).unwrap(), None);
         assert!(
             !c.contains("(int32_t)x") && c.contains("x < 0x5"),
             "same-width signed operand should stay bare:\n{c}"
@@ -1378,7 +1467,7 @@ mod tests {
                 return at i64 0;
             "
         );
-        let c = emit_c(&ctx, &decompile_function(&ctx, f).unwrap());
+        let c = emit_c(&ctx, &decompile_function(&ctx, f).unwrap(), None);
         assert!(
             !c.contains("(int32_t)") && c.contains("x < 0x5"),
             "unsigned compare should stay bare:\n{c}"
@@ -1404,7 +1493,7 @@ mod tests {
                 return at i64 0;
             "
         );
-        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        let c = emit_c(&ctx, &lower_function(&ctx, f), None);
         assert!(
             c.contains("z = x;") && !c.contains("(int64_t)") && !c.contains("(int32_t)x"),
             "a direct signed widening should be implicit:\n{c}"
@@ -1435,7 +1524,7 @@ mod tests {
         );
 
         let program = lower_function(&ctx, f);
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
 
         // The old value of x must be saved to a temp before the store to x
         // clobbers it — that load may not fold past the intervening store.
@@ -1475,7 +1564,7 @@ mod tests {
         );
 
         let program = lower_function(&ctx, f);
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         // Byte accesses through pointer `p`, word store through `qq`.
         assert!(
             c.contains("*(uint8_t *)p") && c.contains("*(uint32_t *)qq"),
@@ -1501,7 +1590,7 @@ mod tests {
         );
 
         let program = lower_function(&ctx, f);
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
 
         assert!(
             c.contains("a = (0x1 + 0x2) * 0x5;"),
@@ -1535,7 +1624,7 @@ mod tests {
         );
 
         let program = decompile_function(&ctx, f).unwrap();
-        let lines = emit_tokens(&ctx, &program);
+        let lines = emit_tokens(&ctx, &program, None);
 
         // Depth 2: one level for the `fn` header, one for the enclosing `if`.
         assert!(
@@ -1568,7 +1657,7 @@ mod tests {
         // The flat lowering always labels every block and indents its body; test
         // it directly rather than relying on a structuring fallback.
         let program = lower_function(&ctx, f);
-        let lines = emit_tokens(&ctx, &program);
+        let lines = emit_tokens(&ctx, &program, None);
 
         // Everything sits one level in from the `fn` header: the label at depth
         // 1, its block body at depth 2.
@@ -1605,7 +1694,7 @@ mod tests {
         );
 
         let program = lower_function(&ctx, f);
-        let lines = emit_tokens(&ctx, &program);
+        let lines = emit_tokens(&ctx, &program, None);
 
         // The single compound store line must carry all three folded-in
         // instructions (the load, the add, and the store itself).
@@ -1659,7 +1748,7 @@ mod tests {
         );
 
         let program = decompile_function(&ctx, f).unwrap();
-        let lines = emit_tokens(&ctx, &program);
+        let lines = emit_tokens(&ctx, &program, None);
 
         // The `if (x == 0x5)` header folds in the comparison and the load, both
         // of which must be recoverable from the line's instruction set.
@@ -1694,7 +1783,7 @@ mod tests {
         );
 
         let program = lower_function(&ctx, f);
-        let lines = emit_tokens(&ctx, &program);
+        let lines = emit_tokens(&ctx, &program, None);
         let kinds: Vec<TokenKind> = lines
             .iter()
             .flat_map(|l| l.tokens.iter().map(|t| t.kind))

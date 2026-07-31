@@ -596,7 +596,7 @@ mod tests {
         );
 
         let program = decompile_function(&ctx, f).unwrap();
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         assert!(has_switch(&program.stmts), "expected a switch:\n{c}");
         assert!(
             c.contains("-1 =>") && !c.contains("0xffffffff"),
@@ -644,7 +644,7 @@ mod tests {
         );
 
         let program = decompile_function(&ctx, f).unwrap();
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         assert!(
             !has_switch(&program.stmts),
             "overlapping cases must not fold:\n{c}"
@@ -697,7 +697,7 @@ mod tests {
         );
 
         let program = decompile_function(&ctx, f).unwrap();
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         assert!(
             !has_switch(&program.stmts),
             "an inconsistent tree must not fold to a switch:\n{c}"
@@ -754,7 +754,7 @@ mod tests {
         );
 
         let program = decompile_function(&ctx, f).unwrap();
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         // No jump may dangle, and no case body may be lost.
         assert_no_dangling_gotos(&c);
         for needle in ["0x10", "0x20", "0x30", "0x0"] {
@@ -800,7 +800,7 @@ mod tests {
         );
 
         let program = decompile_function(&ctx, f).unwrap();
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
 
         assert!(has_switch(&program.stmts), "expected a switch node:\n{c}");
         assert_eq!(
@@ -856,7 +856,7 @@ mod tests {
         );
 
         let program = decompile_function(&ctx, f).unwrap();
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
 
         assert!(has_switch(&program.stmts), "expected a switch node:\n{c}");
         assert_eq!(
@@ -906,7 +906,7 @@ mod tests {
         assert!(
             !has_switch(&program.stmts),
             "two cases should stay if/else:\n{}",
-            emit_c(&ctx, &program)
+            emit_c(&ctx, &program, None)
         );
     }
 }

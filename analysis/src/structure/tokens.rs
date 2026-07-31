@@ -15,6 +15,9 @@ pub enum TokenKind {
     Type,
     /// A numeric literal.
     Number,
+    /// A quoted C string literal (the initializer of a reconstructed rodata
+    /// object — see [`strings`](super::strings)).
+    String,
     /// A variable / SSA temporary / register name.
     Variable,
     /// A called function or label name (jump target).

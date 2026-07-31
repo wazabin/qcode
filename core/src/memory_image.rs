@@ -203,6 +203,16 @@ impl binfmt::BinaryFormat for MemoryImage {
         self.segment_at(addr).is_some_and(|s| s.writable)
     }
 
+    /// The mirror of [`is_known_writable`](Self::is_known_writable): a mapped
+    /// segment whose recorded flag says "not writable" is proven read-only. The
+    /// flags come from the container format's `mapped_regions`, so this is only
+    /// as authoritative as the format that filled them.
+    ///
+    /// [`is_known_writable`]: binfmt::BinaryFormat::is_known_writable
+    fn is_known_read_only(&self, addr: u64) -> bool {
+        self.segment_at(addr).is_some_and(|s| !s.writable)
+    }
+
     fn mapped_regions(&self) -> Vec<(u64, Vec<u8>, bool, bool)> {
         self.segments
             .iter()

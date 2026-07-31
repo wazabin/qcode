@@ -334,7 +334,7 @@ mod tests {
         );
 
         let program = lower_function(&ctx, f);
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
 
         // The scrutinee is a real expression, and the dispatch is one statement.
         assert!(c.contains("match idx"), "expected a dispatch on idx:\n{c}");
@@ -377,7 +377,7 @@ mod tests {
             "
         );
 
-        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        let c = emit_c(&ctx, &lower_function(&ctx, f), None);
         assert!(
             c.contains(".RDX"),
             "the projection should name its field:\n{c}"
@@ -416,7 +416,7 @@ mod tests {
         );
         let _ = callee;
 
-        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        let c = emit_c(&ctx, &lower_function(&ctx, f), None);
         assert!(c.contains("callee("), "expected the call:\n{c}");
         assert!(
             !c.contains("= callee("),
@@ -451,7 +451,7 @@ mod tests {
         );
 
         let program = crate::structure::decompile_function(&ctx, f).expect("decompiles");
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
 
         // If `acc` is defined inside a loop body and read after it, its
         // declaration must appear before the loop, and its definition site must
@@ -486,7 +486,7 @@ mod tests {
             "
         );
 
-        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        let c = emit_c(&ctx, &lower_function(&ctx, f), None);
         assert!(
             c.contains("goto *dst"),
             "the indirect transfer must survive lowering:\n{c}"
@@ -518,7 +518,7 @@ mod tests {
         );
         let _ = helper;
 
-        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        let c = emit_c(&ctx, &lower_function(&ctx, f), None);
         assert!(
             c.contains("return helper("),
             "a tail call should name its callee:\n{c}"
@@ -558,7 +558,7 @@ mod tests {
         // the out-of-function continuations.
         assert!(program.goto_count() >= 3, "expected several gotos");
 
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         // The conditional renders the loaded variable as a real C expression,
         // not an opaque temp or a stringified predicate.
         assert!(
@@ -599,7 +599,7 @@ mod tests {
         );
 
         let program = lower_function(&ctx, f);
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         // The true-edge copy is guarded by the branch condition; the false-edge
         // copy runs on fall-through.
         assert!(
@@ -634,7 +634,7 @@ mod tests {
         );
 
         let program = lower_function(&ctx, f);
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         assert!(
             c.contains("phi_tmp0 = a;") || c.contains("phi_tmp0 = b;"),
             "the swap cycle should save one value into a temp:\n{c}"
@@ -677,7 +677,7 @@ mod tests {
         );
 
         let program = lower_function(&ctx, f);
-        let c = emit_c(&ctx, &program);
+        let c = emit_c(&ctx, &program, None);
         assert!(!c.contains("phi_tmp"), "acyclic copies need no temp:\n{c}");
         // The single-use increment folds into the copy, so the back edge reads
         // `a = b; b = b + 0x1;` — and that order is mandatory.
