@@ -94,6 +94,12 @@ fn try_match<'a, 'str: 'a>(
                 insn.mnemonic(),
                 Mnemonic::Call(_) | Mnemonic::CallInd(_) | Mnemonic::BranchInd(_)
             ) {
+                qcode::pass_log!(
+                    debug,
+                    "{fid:?}: declined — {:?} is a call/indirect branch, which could \
+                     observe or mutate the region",
+                    insn.id
+                );
                 return None;
             }
         }
@@ -164,13 +170,39 @@ fn try_match<'a, 'str: 'a>(
         let Some((base, idx, c)) =
             affine_strided_lane(&numbering, a.ptr, a.size, |v| root_of(v).is_some())
         else {
+            // The overwhelmingly common decline: the address is not `base + i*esz`
+            // over a value with an entry-param root. A buffer pointer that arrives
+            // by memory (`load(@SP + k)`, an unpromoted incoming stack argument)
+            // has no root, so no store here ever looks strided.
+            qcode::pass_log!(
+                debug,
+                "{fid:?}: store {:?} is not an affine strided lane over a rooted base",
+                a.id
+            );
             continue;
         };
         if !matches!(idx, ValueId::BlockParam(_)) {
+            qcode::pass_log!(
+                debug,
+                "{fid:?}: store {:?} indexes by {idx:?}, not a block param",
+                a.id
+            );
             continue;
         }
-        let Some(r) = root_of(base) else { continue };
+        let Some(r) = root_of(base) else {
+            qcode::pass_log!(
+                debug,
+                "{fid:?}: store {:?} has base {base:?} with no entry-param root",
+                a.id
+            );
+            continue;
+        };
         if lane.is_some() {
+            qcode::pass_log!(
+                debug,
+                "{fid:?}: declined — more than one strided region store ({:?})",
+                a.id
+            );
             return None; // more than one strided store — not the canonical shape
         }
         lane = Some(Lane {
@@ -184,6 +216,13 @@ fn try_match<'a, 'str: 'a>(
             space: a.space,
         });
     }
+    let Some(lane) = lane else {
+        qcode::pass_log!(
+            debug,
+            "{fid:?}: declined — no strided region store to build a carried array from"
+        );
+        return None;
+    };
     let Lane {
         store_id: lane_store_id,
         base_root,
@@ -193,8 +232,12 @@ fn try_match<'a, 'str: 'a>(
         body,
         esz,
         space: region_space,
-    } = lane?;
+    } = lane;
     if esz == 0 || c_lane % esz as i64 != 0 {
+        qcode::pass_log!(
+            debug,
+            "{fid:?}: declined — lane offset {c_lane} is not a multiple of element size {esz}"
+        );
         return None;
     }
     // v1 works in bytes, so require a byte-addressed region.
@@ -232,9 +275,21 @@ fn try_match<'a, 'str: 'a>(
     }
 
     // --- Loop structure (from the shared recognizer) ---
-    let lp = loops.iter().find(|l| l.body == body)?;
+    let Some(lp) = loops.iter().find(|l| l.body == body) else {
+        qcode::pass_log!(
+            debug,
+            "{fid:?}: declined — the lane store's block {body:?} is not a recognized loop body"
+        );
+        return None;
+    };
     let (preheader, header, exit, rotated) = (lp.preheader, lp.header, lp.exit, lp.rotated);
-    let ind = lp.unit_induction(host, index)?;
+    let Some(ind) = lp.unit_induction(host, index) else {
+        qcode::pass_log!(
+            debug,
+            "{fid:?}: declined — index {index:?} is not a unit induction variable"
+        );
+        return None;
+    };
     let s = ind.start;
     let n = ind.count;
     // The seed store runs once, before the loop.
@@ -254,10 +309,19 @@ fn try_match<'a, 'str: 'a>(
     let store_hi = (n - 1) + store_delta;
     let expected_lo = if seeded { 1 } else { 0 };
     if store_lo != expected_lo || store_hi < store_lo {
+        qcode::pass_log!(
+            debug,
+            "{fid:?}: declined — written lanes [{store_lo}, {store_hi}] do not tile the \
+             region from {expected_lo}"
+        );
         return None;
     }
     let count = (store_hi + 1) as usize;
     if count == 0 || count.saturating_mul(esz) > (1 << 20) {
+        qcode::pass_log!(
+            debug,
+            "{fid:?}: declined — region of {count} x {esz}B is empty or over the 1MiB cap"
+        );
         return None;
     }
 
