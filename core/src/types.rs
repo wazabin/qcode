@@ -1414,6 +1414,14 @@ impl<'de> serde::Deserialize<'de> for TypeManager {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let reprs = Vec::<TypeRepr>::deserialize(deserializer)?;
         let mut manager = TypeManager::new();
+        // Function-return types are the one kind whose fields can be rewritten
+        // after registration ([`edit_function_return`] replaces in place to keep
+        // the id stable), so unlike every other aggregate below their fields may
+        // name types built *later*. Register each with no fields first — reserving
+        // its id in order — and install the real ones in a second pass, once every
+        // type exists. Without this a snapshot whose return envelope was edited to
+        // reference a later type cannot be loaded at all.
+        let mut pending_returns: Vec<(FunctionId, Vec<AggregateField>)> = Vec::new();
         for repr in reprs {
             match repr {
                 TypeRepr::Int { size } => {
@@ -1432,8 +1440,9 @@ impl<'de> serde::Deserialize<'de> for TypeManager {
                 }
                 TypeRepr::FunctionReturn { owner, fields } => {
                     manager
-                        .create_function_return(owner, fields)
+                        .create_function_return(owner, Vec::new())
                         .map_err(serde::de::Error::custom)?;
+                    pending_returns.push((owner, fields));
                 }
                 TypeRepr::Struct { name, size, fields } => {
                     manager.get_or_make_struct(name, size, fields);
@@ -1462,6 +1471,13 @@ impl<'de> serde::Deserialize<'de> for TypeManager {
                     manager.get_or_make_code_pointer(size);
                 }
             }
+        }
+        // Second pass: every id is now reserved, so a return type's fields can
+        // safely name any type in the table regardless of registration order.
+        for (owner, fields) in pending_returns {
+            manager
+                .edit_function_return(owner, fields)
+                .map_err(serde::de::Error::custom)?;
         }
         Ok(manager)
     }

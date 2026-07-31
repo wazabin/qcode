@@ -71,6 +71,7 @@ mod ram_summary;
 mod reg_summary;
 mod registers;
 mod retail;
+mod stack_args;
 pub(crate) use crate::calls::effect_engine as summary;
 #[cfg(test)]
 mod tests;

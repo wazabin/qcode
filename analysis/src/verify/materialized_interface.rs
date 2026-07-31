@@ -23,7 +23,7 @@ use qcode::{context::Context, value::FunctionId};
 /// A materialized function's root params must start with its `inputs` mapping:
 /// `param[i]` binds register `inputs[i]` and carries that register's width.
 ///
-/// Containment, not equality — the RAM channel (`argpromote`)
+/// Containment, not equality — the RAM channel (`argpromote`, `promote_stack_args`)
 /// appends by-value memory params *after* the register block, so the root is a
 /// superset. Only the leading register prefix is constrained.
 pub fn verify_materialized_interfaces(ctx: &Context) -> Vec<String> {
