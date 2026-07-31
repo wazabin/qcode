@@ -4692,6 +4692,63 @@ mod tests {
         assert!(sp_load, "the SP-relative stack RAM load stays in the body");
     }
 
+    /// Build an external with `outputs`, call it from `g`, run pass 3 with `r3`
+    /// as the stack pointer, and report whether the continuation got the
+    /// synthetic return-address pop.
+    fn external_call_pops_sp(sp_in_outputs: bool) -> bool {
+        let mut tc = qcode::testing::TestContext::new();
+        let r3 = tc.r3; // the stack pointer in this fixture
+        let mut outputs = vec![tc.r0];
+        if sp_in_outputs {
+            outputs.push(r3);
+        }
+        let ext = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("ext".into())).id;
+        {
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, ext);
+            let returns = outputs.len();
+            f.set_register_effects(RegisterChannelState::Materialized(RegisterInterfaceMap {
+                inputs: vec![],
+                outputs,
+                returns,
+                projections: Vec::new(),
+            }));
+        }
+        let (_g, _g_call, g_cont) = caller_of(&mut tc, ext);
+
+        let graph = crate::CallGraph::analyze(&tc.ctx);
+        let targets = tc.ctx.function_ids();
+        regpure_all_sites(
+            &mut crate::ConeMut::full(&mut tc.ctx),
+            &graph,
+            &targets,
+            Some(r3),
+        );
+        let width = qcode::value::Varnode::from_id(&tc.ctx, r3).size();
+        crate::calls::argpromote::registers::sp_pop_present(&tc.ctx, g_cont, r3, width)
+    }
+
+    /// A bodyless callee never performs the `ret` that undoes the CALL's push,
+    /// and SP is callee-saved so it is not in the external's output set — the
+    /// call site must materialize the pop itself.
+    #[test]
+    fn external_call_site_restores_sp() {
+        assert!(
+            external_call_pops_sp(false),
+            "an external whose interface does not carry SP must get the +ptr_width fixup"
+        );
+    }
+
+    /// The guard: a callee whose interface *does* report SP (a bodied callee's
+    /// return pack carries the `ret` increment) must NOT get the fixup, or the
+    /// pop is counted twice.
+    #[test]
+    fn callee_returning_sp_gets_no_sp_fixup() {
+        assert!(
+            !external_call_pops_sp(true),
+            "a callee whose outputs include SP must not get a second pop"
+        );
+    }
+
     // ---- ExternalArgmemConfinement registration ----------------------------
 
     /// Stamp `RSP`'s incoming block param as originating from the SP register

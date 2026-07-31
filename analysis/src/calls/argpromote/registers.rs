@@ -632,6 +632,39 @@ fn rewrite_external_call_regpure(
         };
         b.push_store(value, ValueId::Varnode(r), space);
     }
+
+    // --- the return-address pop ------------------------------------------------
+    // SLEIGH's CALL semantics decrement SP by one pointer and store the return
+    // address; a *bodied* callee's `ret` re-increments it and that increment
+    // travels back through the return pack's SP slot. A bodyless callee has no
+    // body to do it and no SP slot to carry it (SP is callee-saved, so it is
+    // never in an external's ABI output set), which left every post-call
+    // SP-relative reference in the caller one pointer too low. Materialize the
+    // pop at the call site instead.
+    if let Some(sp) = sp.filter(|&sp| !interface_covers_sp(map, sp)) {
+        restore_sp_after_call(&mut b, sp, ptr_width);
+    }
+}
+
+/// True when `map` already accounts for the callee's effect on `sp` — either as
+/// a return-pack slot (a bodied callee's pack carries the `ret` increment) or as
+/// a linked projection. Such a call site must **not** get the synthetic pop, or
+/// the increment is counted twice.
+fn interface_covers_sp(map: &RegisterInterfaceMap, sp: VarnodeId) -> bool {
+    map.outputs.contains(&sp) || map.projections.iter().any(|p| p.register == sp)
+}
+
+/// Emit `store(SP <- load(SP) + ptr_width)` at the builder's insert point: the
+/// return-address pop a bodyless callee never performs. See the call sites for
+/// why this is materialized in the caller.
+fn restore_sp_after_call(b: &mut qcode::builder::Builder<'_, '_>, sp: VarnodeId, ptr_width: usize) {
+    let sp_space = Varnode::from_id(b.shr(), sp).space().id;
+    let cur = b
+        .push_load::<false>(ValueId::Varnode(sp), ptr_width, sp_space)
+        .id();
+    let delta = b.shr().get_const(ptr_width as u64, ptr_width);
+    let popped = b.push_add(cur, delta).id();
+    b.push_store(popped, ValueId::Varnode(sp), sp_space);
 }
 
 /// Rewrite every direct `Opaque` call to a materialized function into a regpure
@@ -663,7 +696,91 @@ pub(crate) fn regpure_all_sites(
             }
         }
     }
+    changed.extend(
+        sp.map(|sp| restore_sp_after_indirect_calls(cone, targets, sp))
+            .unwrap_or_default(),
+    );
     changed
+}
+
+/// Materialize the return-address pop after every unresolved indirect call.
+///
+/// A `CallInd` target is bodyless from the caller's point of view: it has no
+/// interface at all ([`RegChannel::indirect_call_effects`] is empty), so nothing
+/// carries the callee's `ret` increment back to the caller and every post-call
+/// SP-relative reference is one pointer too low — the same hole a bodyless
+/// external has. `sp_pop_present` keeps the rewrite idempotent.
+fn restore_sp_after_indirect_calls(
+    cone: &mut crate::ConeMut,
+    targets: &[FunctionId],
+    sp: VarnodeId,
+) -> FxHashSet<FunctionId> {
+    let mut changed = FxHashSet::default();
+    let ptr_width = Varnode::from_id(cone.ctx(), sp).size();
+    for fid in targets.iter().copied() {
+        let sites: Vec<qcode::value::BlockId> = FunctionBody::from_id(cone.ctx(), fid)
+            .blocks()
+            .filter(|b| {
+                b.iter()
+                    .last()
+                    .is_some_and(|i| matches!(i.mnemonic(), Mnemonic::CallInd(_)))
+            })
+            .map(|b| b.id)
+            .collect();
+        for block in sites {
+            let ctx = cone.ctx_for(fid);
+            let Some(cont) = replay_block(ctx, block) else {
+                continue;
+            };
+            if sp_pop_present(ctx, cont, sp, ptr_width) {
+                continue;
+            }
+            let mut b = ctx.builder(cont);
+            b.set_insert_point_to_start();
+            restore_sp_after_call(&mut b, sp, ptr_width);
+            changed.insert(fid);
+        }
+    }
+    changed
+}
+
+/// Whether `block` already opens with the `store(SP <- load(SP) + ptr_width)`
+/// sequence [`restore_sp_after_call`] emits — the idempotence guard for the
+/// indirect-call fixup, which (unlike the direct one) has no `Opaque`→`RegPure`
+/// tag flip to make it self-limiting.
+pub(crate) fn sp_pop_present(
+    ctx: &Context,
+    block: qcode::value::BlockId,
+    sp: VarnodeId,
+    ptr_width: usize,
+) -> bool {
+    use qcode::value::LocalValueId as L;
+    let func = block.func;
+    let is_sp_load = |v: L| {
+        matches!(v.qualify(func), ValueId::Instruction(l)
+            if matches!(ctx.get_insn(l).mnemonic(), Mnemonic::Load(ld) if ld.ptr == L::Varnode(sp)))
+    };
+    let is_ptr_width =
+        |v: L| matches!(v, L::Literal(id) if ctx.get_literal_value(id) == ptr_width as u64);
+    BasicBlock::from_id(ctx, block).iter().any(|insn| {
+        let Mnemonic::Store(s) = insn.mnemonic() else {
+            return false;
+        };
+        if s.ptr != L::Varnode(sp) {
+            return false;
+        }
+        let ValueId::Instruction(add) = s.src.qualify(func) else {
+            return false;
+        };
+        let Mnemonic::Binop(bin) = ctx.get_insn(add).mnemonic() else {
+            return false;
+        };
+        matches!(
+            bin.op,
+            qcode::value::insn::Binop::Int(qcode::value::insn::IntBinop::Add)
+        ) && is_sp_load(bin.lhs)
+            && is_ptr_width(bin.rhs)
+    })
 }
 
 /// Compatibility driver for the unit tests: materialize every eligible function
