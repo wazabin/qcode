@@ -9,14 +9,6 @@ pub enum ErrorTy {
         available: usize,
     },
 
-    ArgumentCountMismatch {
-        expected: usize,
-        actual: usize,
-    },
-
-    /// Could not determine the size of an expression
-    UnknownSize,
-
     /// Unknown name in an expression
     UnknownIdentifier(Box<str>, &'static str),
 
@@ -31,18 +23,7 @@ pub enum ErrorTy {
     /// Attempted to set a name that already exists in the current scope
     NameAlreadyExists(Box<str>),
 
-    UnknownMacro(Box<str>),
-
     UnknownAddress(u64),
-
-    /// A macro definition contains multiple exports
-    MultipleExports,
-
-    /// The export statement is not the last statement in a macro definition
-    ExportNotLast,
-
-    /// Attempted to use a function as an expression, but it is a statement
-    FunctionStatement,
 
     /// A macro argument is not const
     NonConstArgument,
@@ -116,14 +97,6 @@ impl Error {
         )
     }
 
-    pub fn argument_count_mismatch(expected: usize, actual: usize, span: (usize, usize)) -> Self {
-        Self::new(ErrorTy::ArgumentCountMismatch { expected, actual }, span)
-    }
-
-    pub fn unknown_size(span: (usize, usize)) -> Self {
-        Self::new(ErrorTy::UnknownSize, span)
-    }
-
     pub fn unknown_identifier(name: &str, ty: &'static str, span: (usize, usize)) -> Self {
         Self::new(ErrorTy::UnknownIdentifier(name.into(), ty), span)
     }
@@ -138,22 +111,6 @@ impl Error {
 
     pub fn name_already_exists(name: &str, span: (usize, usize)) -> Self {
         Self::new(ErrorTy::NameAlreadyExists(name.into()), span)
-    }
-
-    pub fn unknown_macro(name: &str, span: (usize, usize)) -> Self {
-        Self::new(ErrorTy::UnknownMacro(name.into()), span)
-    }
-
-    pub fn multiple_exports(span: (usize, usize)) -> Self {
-        Self::new(ErrorTy::MultipleExports, span)
-    }
-
-    pub fn export_not_last(span: (usize, usize)) -> Self {
-        Self::new(ErrorTy::ExportNotLast, span)
-    }
-
-    pub fn function_is_a_statement(span: (usize, usize)) -> Self {
-        Self::new(ErrorTy::FunctionStatement, span)
     }
 
     pub fn missing_argument(name: &str, span: (usize, usize)) -> Self {
@@ -172,12 +129,6 @@ impl Display for Error {
                 format!("Range {range:?} is out of bounds for available size {available}")
             }
 
-            ErrorTy::ArgumentCountMismatch { expected, actual } => {
-                format!("Expected {expected} arguments but got {actual}")
-            }
-
-            ErrorTy::UnknownSize => "Could not determine the size of this expression".to_string(),
-
             ErrorTy::UnknownIdentifier(name, ty) => format!("Unknown {ty}: {name}"),
 
             ErrorTy::SizeMismatch { expected, actual } => {
@@ -188,18 +139,6 @@ impl Display for Error {
 
             ErrorTy::NameAlreadyExists(name) => {
                 format!("A name '{name}' already exists in the current scope")
-            }
-
-            ErrorTy::UnknownMacro(name) => format!("Unknown macro: {name}"),
-
-            ErrorTy::MultipleExports => "A macro definition contains multiple exports".to_string(),
-
-            ErrorTy::ExportNotLast => {
-                "The export statement is not the last statement in a macro definition".to_string()
-            }
-
-            ErrorTy::FunctionStatement => {
-                "Attempted to use a function as an expression, but it is a statement".to_string()
             }
 
             ErrorTy::MissingArgument(name) => format!("Missing argument: {name}"),
