@@ -49,10 +49,12 @@ pub(crate) fn is_reg_space<'a, 'str: 'a>(
     src: impl qcode::value::util::base_ref::AsShared<'a, 'str>,
     space_id: impl Into<LocalMemorySpaceId>,
 ) -> bool {
-    space_id
-        .into()
-        .shared()
-        .is_some_and(|space_id| matches!(Space::from_id(src, space_id).ty, SpaceType::Register))
+    space_id.into().shared().is_some_and(|space_id| {
+        matches!(
+            Space::from_id(src.as_shared(), space_id).ty,
+            SpaceType::Register
+        )
+    })
 }
 
 /// The byte intervals a resolved external `target` clobbers (the outputs of its

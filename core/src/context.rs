@@ -9,7 +9,7 @@ use crate::{
     assumption::{Certainty, KnownContradiction, PassName, Proposition, Truth, Violation},
     error::{Error, ErrorTy, Result},
     pass_scope,
-    space::{LocalMemorySpaceId, MemorySpaceId, Space, SpaceId},
+    space::{LocalMemorySpaceId, MemorySpaceId, Space, SpaceId, SpaceStore},
     types::TypeManager,
     value::{
         BasicBlock, BlockParamRef, FunctionBody, FunctionId, FunctionRef, Instruction, ModuleView,
@@ -201,6 +201,21 @@ pub struct Shared<'str> {
     /// starts empty, the pass reinstalling it).
     #[serde(skip)]
     pub(crate) assumed_call_convention: Option<crate::assumption::AssumedCallEffect>,
+}
+
+/// Lets [`Space::from_id`] resolve against a bare `&Shared`, matching the
+/// pre-existing `AsShared` call shape.
+impl SpaceStore for Shared<'_> {
+    fn spaces(&self) -> &Registry<SpaceId, Space> {
+        &self.spaces
+    }
+}
+
+/// Lets [`Space::from_id`] resolve against a `&Context` directly.
+impl SpaceStore for Context<'_> {
+    fn spaces(&self) -> &Registry<SpaceId, Space> {
+        &self.shared.spaces
+    }
 }
 
 impl<'str> Shared<'str> {

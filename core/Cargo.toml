@@ -13,6 +13,7 @@ testing = []
 binfmt.workspace = true
 inventory.workspace = true
 jstd.workspace = true
+pcode-types.workspace = true
 pest.workspace = true
 qcode_macro.workspace = true
 qcode_parser.workspace = true
