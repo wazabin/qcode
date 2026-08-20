@@ -11,7 +11,6 @@ testing = []
 
 [dependencies]
 binfmt.workspace = true
-common.workspace = true
 inventory.workspace = true
 jstd.workspace = true
 pest.workspace = true
