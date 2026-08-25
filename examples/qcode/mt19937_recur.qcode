@@ -1,0 +1,30 @@
+# Pure scalar core of the MT19937 seeding recurrence (the array writes elided):
+#   mt[i] = 1812433253 * (mt[i-1] ^ (mt[i-1] >> 30)) + i,   i = 1..624
+# carried as (i, prev); returns prev at i == 624.
+#
+# A non-linear recurrence whose update READS THE DRIVER i (the `+ i`):
+#   loop_to_recursion -> tail-recursive mt_recur_rec(i, prev)
+#   accumulator_elim  -> DECLINES (prev demoted to a driver), like sum_up/factorial
+#
+# The REAL MT init also writes the array mt[0..624], making it impure (a `fn`,
+# not a `lambda`) and an element-depends-on-previous-and-index loop: that is a
+# `scan`, not a recursion. Neither pass here is the tool for it; the Scan
+# combinator is.
+lambda mt_recur:
+<entry @seed:i64>
+    goto <head @i=1 @prev=@seed>;
+
+<head @i:i64 @prev:i64>
+    %done = @i == 624;
+    if %done goto <exit @r=@prev> else goto <body @j=@i @p=@prev>;
+
+<body @j:i64 @p:i64>
+    %sh = @p >> 30;
+    %xo = @p ^ %sh;
+    %ml = %xo * 1812433253;
+    %next = %ml + @j;
+    %j1 = @j + 1;
+    goto <head @i=%j1 @prev=%next>;
+
+<exit @r:i64>
+    return @r;
