@@ -314,12 +314,16 @@ impl<'storage, 'str, 'ctx> FlatEmitter<'storage, 'str, 'ctx> {
                     .filter(|target| target.space == SPACE_CONST)
             {
                 let target = Self::local_target(index, target.offset, pcode.ops.len())?;
-                labels.entry(target).or_insert_with(|| {
-                    self.builder.get_or_make_local_label(Cow::Owned(format!(
-                        "pcode_{:x}_{target}",
-                        self.address
-                    )))
-                });
+                // A label at the end of instruction p-code is the machine
+                // instruction's fall-through, not an empty local block.
+                if target < pcode.ops.len() {
+                    labels.entry(target).or_insert_with(|| {
+                        self.builder.get_or_make_local_label(Cow::Owned(format!(
+                            "pcode_{:x}_{target}",
+                            self.address
+                        )))
+                    });
+                }
             }
         }
 
@@ -334,7 +338,7 @@ impl<'storage, 'str, 'ctx> FlatEmitter<'storage, 'str, 'ctx> {
             }
             self.open_continuation();
             self.builder.set_address(self.address);
-            self.emit_op(index, op, &labels, pcode.ops.len())?;
+            self.emit_op(index, op, &labels, pcode.ops.len(), next)?;
             self.builder.clear_address();
         }
         if !self.builder.is_terminated() {
@@ -360,7 +364,7 @@ impl<'storage, 'str, 'ctx> FlatEmitter<'storage, 'str, 'ctx> {
         let target = isize::try_from(relative)
             .ok()
             .and_then(|relative| op.checked_add_signed(relative))
-            .filter(|target| *target < len);
+            .filter(|target| *target <= len);
         target.ok_or(LiftError::InvalidLocalBranch { op, relative })
     }
 
@@ -415,6 +419,7 @@ impl<'storage, 'str, 'ctx> FlatEmitter<'storage, 'str, 'ctx> {
         op: &PcodeOp,
         labels: &HashMap<usize, BlockId>,
         len: usize,
+        next: BlockId,
     ) -> Result<(), LiftError> {
         use Opcode::*;
         let unary = |this: &mut Self, f: fn(&mut Builder<'str, 'ctx>, ValueId) -> ValueId| {
@@ -539,8 +544,8 @@ impl<'storage, 'str, 'ctx> FlatEmitter<'storage, 'str, 'ctx> {
                 let value = self.builder.push_pcode_op(id, args, None, size).id();
                 self.write(op.output, value)
             }
-            Branch => self.branch(index, op, labels, len),
-            CBranch => self.cbranch(index, op, labels, len),
+            Branch => self.branch(index, op, labels, len, next),
+            CBranch => self.cbranch(index, op, labels, len, next),
             BranchInd => {
                 let target = self.input(op, 0)?;
                 self.builder.push_branchind(target);
@@ -638,6 +643,7 @@ impl<'storage, 'str, 'ctx> FlatEmitter<'storage, 'str, 'ctx> {
         op: &PcodeOp,
         labels: &HashMap<usize, BlockId>,
         len: usize,
+        next: BlockId,
     ) -> Result<(), LiftError> {
         let target = op.inputs.first().ok_or(LiftError::InvalidArity {
             opcode: op.opcode,
@@ -645,7 +651,8 @@ impl<'storage, 'str, 'ctx> FlatEmitter<'storage, 'str, 'ctx> {
             actual: 0,
         })?;
         let block = if target.space == SPACE_CONST {
-            labels[&Self::local_target(index, target.offset, len)?]
+            let target = Self::local_target(index, target.offset, len)?;
+            if target == len { next } else { labels[&target] }
         } else {
             *self
                 .branches
@@ -662,6 +669,7 @@ impl<'storage, 'str, 'ctx> FlatEmitter<'storage, 'str, 'ctx> {
         op: &PcodeOp,
         labels: &HashMap<usize, BlockId>,
         len: usize,
+        next: BlockId,
     ) -> Result<(), LiftError> {
         let target = op.inputs.first().ok_or(LiftError::InvalidArity {
             opcode: op.opcode,
@@ -671,7 +679,8 @@ impl<'storage, 'str, 'ctx> FlatEmitter<'storage, 'str, 'ctx> {
         let condition = self.input(op, 1)?;
         let condition = self.ensure_bool(condition);
         let target = if target.space == SPACE_CONST {
-            labels[&Self::local_target(index, target.offset, len)?]
+            let target = Self::local_target(index, target.offset, len)?;
+            if target == len { next } else { labels[&target] }
         } else {
             *self
                 .branches
@@ -720,6 +729,19 @@ mod tests {
             .unwrap();
         // COPY to r0 plus the explicit machine-instruction fall-through.
         assert_eq!(ctx.instructions().count(), 2);
+    }
+
+    #[test]
+    fn lifts_terminal_local_branch_to_instruction_fallthrough() {
+        let spec = sleigh_precompile::x64::spec();
+        let instruction = Decoder::new(spec)
+            .decode_one(0x1000, b"\x0f\xb0\x1d\x00\xf1\x9a\xff", &spec.new_context())
+            .unwrap();
+        let lifter = SleighLifter::new(spec);
+        let mut ctx = lifter.new_context();
+        lifter
+            .lift_instruction(&mut ctx, &instruction, None)
+            .unwrap();
     }
 
     #[test]

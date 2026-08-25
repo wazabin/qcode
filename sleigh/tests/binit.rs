@@ -982,11 +982,18 @@ mod engine {
         None
     }
 
-    /// SHLD/SHRD leave the destination operand undefined when the shift count
+    /// SHLD/SHRD leave their destination operand undefined when the shift count
     /// exceeds the operand bit-width (Intel SDM). This is only reachable for
-    /// 16-bit operands, whose count masks to at most 31. Returns the destination
-    /// register (canonical 64-bit, lowercase) whose comparison should be skipped.
-    fn shld_shrd_undefined_dest(tc: &DbTestCase, pair: &DbStateResult) -> Option<String> {
+    /// 16-bit operands, whose count masks to at most 31.
+    enum UndefinedShldShrdDestination {
+        Register(String),
+        Memory,
+    }
+
+    fn shld_shrd_undefined_dest(
+        tc: &DbTestCase,
+        pair: &DbStateResult,
+    ) -> Option<UndefinedShldShrdDestination> {
         let insn = &tc.instruction;
         let mnemonic = insn.split_whitespace().next().unwrap_or("");
         if !matches!(mnemonic, "shld" | "shrd") {
@@ -997,17 +1004,26 @@ mod engine {
             return None;
         }
         // Only 16-bit destinations can carry a (5-bit-masked) count above their width.
-        let dest = canonical_reg16(operands[0])?;
+        let is_word_destination = canonical_reg16(operands[0]).is_some()
+            || operands[0].trim_start().starts_with("word ptr");
+        if !is_word_destination {
+            return None;
+        }
         let raw_count = if operands[2].eq_ignore_ascii_case("cl") {
             (pair.initial.regs.get("rcx").copied().unwrap_or(0) as u64) & 0xff
         } else {
             parse_signed_imm(operands[2])?
         };
-        if (raw_count & 0x1f) > 16 {
-            Some(dest)
-        } else {
-            None
+        if (raw_count & 0x1f) <= 16 {
+            return None;
         }
+        canonical_reg16(operands[0])
+            .map(UndefinedShldShrdDestination::Register)
+            .or_else(|| {
+                operands[0]
+                    .contains("ptr")
+                    .then_some(UndefinedShldShrdDestination::Memory)
+            })
     }
 
     /// Maps a 16-bit register operand to its canonical 64-bit name (lowercase),
@@ -1264,7 +1280,10 @@ mod engine {
 
                 // shld/shrd leave the destination undefined when the shift count
                 // exceeds the operand bit-width (only reachable for 16-bit operands).
-                if shld_shrd_undefined.as_deref() == Some(name.as_str()) {
+                if matches!(
+                    &shld_shrd_undefined,
+                    Some(UndefinedShldShrdDestination::Register(dest)) if dest == name
+                ) {
                     continue;
                 }
 
@@ -1304,6 +1323,12 @@ mod engine {
                 let Some(&raw) = final_state.regs.get(memory_name) else {
                     continue;
                 };
+                if matches!(
+                    shld_shrd_undefined,
+                    Some(UndefinedShldShrdDestination::Memory)
+                ) {
+                    continue;
+                }
                 let actual = emu
                     .inspect_memory(ctx.shared.default_space, address, 8)
                     .and_then(|bytes| bytes.try_into().ok())
