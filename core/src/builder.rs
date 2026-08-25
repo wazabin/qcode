@@ -14,25 +14,27 @@
 //!
 //! # Typical usage
 //!
-//! ```rust,ignore
-//! use qcode_core::{context::Context, builder::Builder};
+//! ```rust,no_run
+//! use qcode::context::Context;
 //!
 //! let mut ctx = Context::new();
 //!
 //! // Create a builder positioned at machine address 0x1000.
-//! let mut b = (&mut ctx).builder_at(0x1000);
+//! let source = ctx.builder_at(0x1000).current_block();
+//! let target = ctx.get_or_make_block(0x1010, source.func);
+//! let b = ctx.builder(source);
 //!
 //! // Emit instructions …
 //!
-//! // Terminate the block with an unconditional branch to 0x1010.
+//! // Terminate the block with an unconditional branch to `target`.
 //! // This consumes the builder, so there is no need to call drop explicitly.
-//! b.finalize(0x1010);
+//! b.finalize(target);
 //! ```
 //!
 //! # Namespaces
 //!
 //! The builder maintains a *local namespace*: a map from string names to
-//! [`ValueId`]s. This is used by the [`qcode!`](qcode_macro::qcode) macro and
+//! [`ValueId`]s. This is used by the [`qcode!`](wazabin_qcode_macro::qcode) macro and
 //! the parser to resolve identifiers within a single block. Names in the
 //! namespace do not need to match the IR-level name hints stored on values.
 
@@ -2491,7 +2493,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
 #[cfg(test)]
 mod tests {
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
     use crate::{context::Context, value::ModuleView};

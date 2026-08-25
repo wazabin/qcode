@@ -395,7 +395,7 @@ mod tests {
     use crate::value::QCodeMut;
     use std::borrow::Cow;
 
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
     use crate::value::{BasicBlock, FunctionBody, LocalTempSpaceId, Temp, ValueId};

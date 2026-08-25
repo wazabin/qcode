@@ -12,7 +12,7 @@ win32 = ["cabi/win32"]
 
 [dependencies]
 jstd.workspace = true
-binfmt.workspace = true
+wazabin-binary.workspace = true
 qcode.workspace = true
 cabi.workspace = true
 serde.workspace = true
@@ -39,7 +39,7 @@ clang.workspace = true
 
 [dev-dependencies]
 qcode = { workspace = true, features = ["testing"] }
-qcode_macro.workspace = true
+wazabin-qcode-macro.workspace = true
 env_logger.workspace = true
 
 [[example]]

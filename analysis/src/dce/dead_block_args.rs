@@ -581,7 +581,7 @@ fn filter_kept(args: &[LocalValueId], drop: &HashSet<usize>) -> Vec<LocalValueId
 mod tests {
     use super::*;
     use qcode::value::{BasicBlock, FunctionRef};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     /// All block ids of `fun`, used to drive the standalone sweep in tests.
     fn block_ids(ctx: &Context, fun: qcode::value::FunctionId) -> Vec<BlockId> {

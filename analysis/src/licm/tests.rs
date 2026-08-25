@@ -8,7 +8,7 @@ use qcode::{
         insn::{Binop, IntBinop, Mnemonic},
     },
 };
-use qcode_macro::qcode;
+use wazabin_qcode_macro::qcode;
 
 use super::Licm;
 use crate::test_util::run_function_pass;

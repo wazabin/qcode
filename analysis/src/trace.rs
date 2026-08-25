@@ -272,7 +272,7 @@ mod tests {
         context::Context,
         value::{BasicBlock, FunctionBody},
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     struct SimpleTrace(Vec<u64>);
     impl Trace for SimpleTrace {

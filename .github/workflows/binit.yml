@@ -1,0 +1,68 @@
+name: Binit differential test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Override these repository variables when dependencies are hosted elsewhere.
+  BINIT_REPOSITORY: ${{ vars.BINIT_REPOSITORY || format('{0}/binit', github.repository_owner) }}
+  BINARY_REPOSITORY: ${{ vars.BINARY_REPOSITORY || format('{0}/wazabin-binary', github.repository_owner) }}
+  CABI_REPOSITORY: ${{ vars.CABI_REPOSITORY || format('{0}/wazabin-cabi', github.repository_owner) }}
+  JSTD_REPOSITORY: ${{ vars.JSTD_REPOSITORY || format('{0}/jstd', github.repository_owner) }}
+  PCODE_TYPES_REPOSITORY: ${{ vars.PCODE_TYPES_REPOSITORY || format('{0}/wazabin-pcode', github.repository_owner) }}
+  SLEIGH_REPOSITORY: ${{ vars.SLEIGH_REPOSITORY || format('{0}/wazabin-sleigh', github.repository_owner) }}
+  X86DB_DSN: postgresql://x86db:x86db@localhost:5432/x86db
+
+jobs:
+  binit-smoke:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: x86db
+          POSTGRES_PASSWORD: x86db
+          POSTGRES_DB: x86db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U x86db -d x86db"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out local path dependencies and Binit schema
+        run: |
+          git clone --depth=1 "https://github.com/${BINARY_REPOSITORY}.git" ../wazabin-binary
+          git clone --depth=1 "https://github.com/${CABI_REPOSITORY}.git" ../wazabin-cabi
+          git clone --depth=1 "https://github.com/${JSTD_REPOSITORY}.git" ../jstd
+          git clone --depth=1 "https://github.com/${PCODE_TYPES_REPOSITORY}.git" ../wazabin-pcode
+          git clone --depth=1 "https://github.com/${SLEIGH_REPOSITORY}.git" ../wazabin-sleigh
+          git clone --depth=1 "https://github.com/${BINIT_REPOSITORY}.git" ../binit
+      - name: Create Binit schema and load the Aegis smoke fixture
+        env:
+          PGPASSWORD: x86db
+        run: |
+          psql -h localhost -U x86db -d x86db -v ON_ERROR_STOP=1 -f ../binit/db/schema.sql
+          psql -h localhost -U x86db -d x86db -v ON_ERROR_STOP=1 \
+            -f sleigh/tests/fixtures/binit-smoke.sql
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Replay the fixture through QCode
+        env:
+          PCODE_FUZZ_OUTPUT: ${{ runner.temp }}/wazabin-binit-mismatches.csv
+          PCODE_SLEIGH_COVERAGE_OUTPUT: ${{ runner.temp }}/sleigh-constructor-coverage.json
+        run: cargo test -p wazabin-qcode-sleigh --test binit binit_smoke -- --ignored
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sleigh-constructor-coverage
+          path: ${{ runner.temp }}/sleigh-constructor-coverage.json
+          if-no-files-found: error

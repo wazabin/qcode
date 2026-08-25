@@ -248,7 +248,7 @@ impl<'str, 'ctx> Renameable<'str, 'ctx> for VarnodeMutRef<'str, 'ctx> {
 
 #[cfg(test)]
 mod tests {
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use crate::{
         context::Context,

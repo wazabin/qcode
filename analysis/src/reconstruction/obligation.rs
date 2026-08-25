@@ -540,7 +540,7 @@ mod tests {
 
     mod enumeration {
         use super::*;
-        use qcode_macro::qcode;
+        use wazabin_qcode_macro::qcode;
 
         /// Two indirect transfers, in addressed blocks reached from `<entry>`.
         fn both_kinds() -> Context<'static> {

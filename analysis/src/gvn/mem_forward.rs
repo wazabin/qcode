@@ -1007,7 +1007,7 @@ mod tests {
     use qcode::testing::TestContext;
     use qcode::value::QCodeMut;
     use qcode::value::{BasicBlock, FunctionBody, ModuleView, TempSpace};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     /// GVN's affine numbering is a read-only snapshot built before the
     /// dominator walk. If an earlier block forwards and deletes one of the

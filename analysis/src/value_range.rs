@@ -888,7 +888,7 @@ fn translate(range: ValueRange, delta: u64, mask: u64) -> Option<ValueRange> {
 
 #[cfg(test)]
 mod tests {
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
 

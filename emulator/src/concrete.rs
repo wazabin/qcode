@@ -2645,8 +2645,8 @@ mod tests {
     use qcode::space::{Space, SpaceType};
     use qcode::value::QCodeMut;
     use qcode::value::TempSpace;
-    use qcode_macro::qcode;
     use std::sync::{Arc, Mutex};
+    use wazabin_qcode_macro::qcode;
 
     /// Reading a poison value is a hard error (`PoisonRead`); propagating it as
     /// an unread operand never reaches `get_value`.

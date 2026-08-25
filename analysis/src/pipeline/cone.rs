@@ -242,7 +242,7 @@ impl<'ctx, 'str> ConeMut<'ctx, 'str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     fn two_function_ctx() -> (Context<'static>, FunctionId, FunctionId) {
         let mut ctx = Context::new();

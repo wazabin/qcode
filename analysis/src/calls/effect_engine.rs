@@ -232,8 +232,8 @@ pub(crate) fn solve_summaries_with_fixed<C: EffectChannel>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qcode_macro::qcode;
     use rustc_hash::FxHashSet;
+    use wazabin_qcode_macro::qcode;
 
     /// Toy channel pinning engine behavior independently of any real channel:
     /// effects = the set of function IDs whose body was scanned (identity

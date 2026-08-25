@@ -188,7 +188,7 @@ mod tests {
             insn::{Instruction, InstructionId, Mnemonic, Range},
         },
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     #[test]
     fn test_gvn_function_does_not_forward_loads_across_loop_header() {

@@ -307,7 +307,7 @@ pub(crate) fn is_replaced_by_goto(insn: &InstructionRef<'_, '_>) -> bool {
 mod tests {
     use super::*;
     use crate::structure::emit_c;
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     /// A `switch` terminator lowers to a real multi-way statement, not one goto
     /// per successor. Cases reaching the same block share an arm, which is what

@@ -135,7 +135,7 @@ impl MnemonicKind for FloatToInt {
 
 #[cfg(test)]
 mod tests {
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use crate::context::Context;
     use crate::value::insn::{Instruction, Mnemonic};

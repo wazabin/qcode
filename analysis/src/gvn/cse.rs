@@ -232,7 +232,7 @@ mod tests {
     use super::*;
     use crate::gvn::{gvn, gvn_function};
     use qcode::value::{BasicBlock, Instruction, InstructionId, insn::Binary};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     #[test]
     fn test_normalize() {

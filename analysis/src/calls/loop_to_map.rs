@@ -495,7 +495,7 @@ mod tests {
         context::Context,
         value::{BasicBlock, FunctionBody},
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use crate::AliasResult;
     use crate::gvn::gvn_function;

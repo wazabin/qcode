@@ -37,11 +37,12 @@ use jstd::registry::{self, Registry};
 /// [`Builder`](crate::builder::Builder) when constructing IR, or to analysis
 /// passes when transforming it.
 ///
-/// ```rust,ignore
-/// use qcode_core::context::Context;
+/// ```rust
+/// use qcode::context::Context;
 ///
-/// let mut ctx = Context::new();
-/// // ctx.shared.default_space is the RAM space created by new()
+/// let ctx = Context::new();
+/// // `ctx.shared.default_space` is the RAM space created by `new`.
+/// let _ram = ctx.shared.default_space;
 /// ```
 ///
 /// # Lifetime parameter `'str`
@@ -348,9 +349,9 @@ impl<'str> Shared<'str> {
 }
 
 /// The operating system of a loaded binary, inferred from its container format.
-/// The enum now lives in the leaf `binfmt` crate (next to the container
+/// The enum now lives in the leaf `wazabin_binary` crate (next to the container
 /// parsers); re-exported here so `qcode::context::TargetOs` keeps resolving.
-pub use binfmt::TargetOs;
+pub use wazabin_binary::TargetOs;
 
 impl<'str> Context<'str> {
     /// Creates a new, empty context with a single default RAM space.
@@ -490,7 +491,11 @@ impl<'str> Context<'str> {
     /// A *known* value for the containing region (a proven fact, or a user
     /// override seeded as known) wins over the raw segment flags, so the user can
     /// force a region executable or non-executable from the Assumptions panel.
-    pub fn assume_executable(&mut self, binary: &dyn binfmt::BinaryFormat, addr: u64) -> bool {
+    pub fn assume_executable(
+        &mut self,
+        binary: &dyn wazabin_binary::BinaryFormat,
+        addr: u64,
+    ) -> bool {
         let bounds = binary.segment_bounds(addr);
         if let Some((start, end)) = bounds
             && let Some(known) = self.known(Proposition::ExecutableMemory { start, end })
@@ -2375,7 +2380,7 @@ mod tests {
         BasicBlock, FunctionBody, ValueId,
         insn::{Binary, Binop, Call, Callee, IntBinop, Load, Mnemonic},
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     fn make_fn_with_blocks(ctx: &mut Context<'static>, name: &'static str, n: usize) -> FunctionId {
         // The function must exist before its blocks so they are born into its arena.
@@ -3160,7 +3165,7 @@ mod tests {
         let mut image = crate::memory_image::MemoryImage::default();
         image.add_segment(0x1000, vec![0u8; 4], true, false); // code
         image.add_segment(0x2000, vec![0u8; 4], false, true); // data
-        let binary: &dyn binfmt::BinaryFormat = &image;
+        let binary: &dyn wazabin_binary::BinaryFormat = &image;
 
         // Default r/x while protections unknown: everything is permissive, even
         // unmapped (the lifter reads bytes from the format, not the image).
@@ -3197,7 +3202,7 @@ mod tests {
         let mut image = crate::memory_image::MemoryImage::default();
         image.add_segment(0x1000, vec![0u8; 4], true, false); // code
         image.add_segment(0x2000, vec![0u8; 4], false, true); // data
-        let binary: &dyn binfmt::BinaryFormat = &image;
+        let binary: &dyn wazabin_binary::BinaryFormat = &image;
         ctx.mark_protections_known();
 
         // Force the data region executable and the code region non-executable.
@@ -3867,7 +3872,7 @@ mod tests {
         #[test]
         fn mints_a_conventional_function_when_no_stub_exists() {
             let mut ctx = Context::new();
-            qcode_macro::qcode!(
+            wazabin_qcode_macro::qcode!(
                 ctx,
                 "
                 fn f:
@@ -3939,7 +3944,7 @@ mod tests {
             let mut ctx = Context::new();
             // entry -> {tail@2000, retained@1008}; both retained@1008 and the tail
             // entry@2000 branch into the mid-tail landing@2008.
-            qcode_macro::qcode!(
+            wazabin_qcode_macro::qcode!(
                 ctx,
                 "
                 fn f:
@@ -4092,7 +4097,7 @@ mod tests {
             let mut ctx = Context::new();
             // split target (tail@2000) reached via the FAILURE arm; the fall-through
             // success arm (cont@1008) is left untouched.
-            qcode_macro::qcode!(
+            wazabin_qcode_macro::qcode!(
                 ctx,
                 "
                 fn f:
@@ -4142,7 +4147,7 @@ mod tests {
             let mut ctx = Context::new();
             // tail@2000 conditionally branches to two other moved blocks
             // (arm_a@2008, arm_b@2010); all three relocate into g together.
-            qcode_macro::qcode!(
+            wazabin_qcode_macro::qcode!(
                 ctx,
                 "
                 fn f:
@@ -4184,7 +4189,7 @@ mod tests {
         #[test]
         fn moved_tail_internal_branch_remaps_target() {
             let mut ctx = Context::new();
-            qcode_macro::qcode!(
+            wazabin_qcode_macro::qcode!(
                 ctx,
                 "
                 fn f:

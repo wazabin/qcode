@@ -99,7 +99,7 @@ mod tests {
     use super::*;
     use qcode::context::Context;
     use qcode::value::BasicBlock;
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     #[test]
     fn callback_param_typed_code_pointer() {

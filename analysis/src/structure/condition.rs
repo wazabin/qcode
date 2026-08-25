@@ -265,7 +265,7 @@ fn unstructured(block: &BlockRef<'_, '_>) -> BlockExit {
 mod tests {
     use super::*;
     use qcode::{context::Context, value::BasicBlock};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     #[test]
     fn return_block_has_no_successors_to_structure() {

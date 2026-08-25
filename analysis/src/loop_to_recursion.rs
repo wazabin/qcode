@@ -463,7 +463,7 @@ mod tests {
     use super::*;
     use qcode::{context::Context, value::FunctionBody};
     use qcode_emulator::{SizedValue, StandaloneEmulator};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use crate::test_util::run_function_pass;
 

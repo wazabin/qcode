@@ -145,7 +145,7 @@ mod tests {
         types::TypeRepr,
         value::{FunctionBody, Instruction, insn::Mnemonic},
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     fn run(ctx: &mut Context) -> bool {
         let env = PipelineEnv::headless(ctx);

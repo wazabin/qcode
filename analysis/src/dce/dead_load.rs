@@ -1167,7 +1167,7 @@ pub fn remove_dead_load_insns_body<'a, 'str>(
 
 #[cfg(test)]
 mod tests {
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
     use qcode::{

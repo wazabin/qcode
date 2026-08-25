@@ -401,7 +401,7 @@ mod tests {
         block_param::BlockParamId,
         insn::{InstructionId, Mnemonic},
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     #[test]
     fn mint_slots_are_infallible_ordered_and_persist_across_outcomes() {

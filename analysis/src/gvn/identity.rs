@@ -559,7 +559,7 @@ mod tests {
     use crate::AliasResult;
     use crate::gvn::gvn_function;
     use qcode::{context::Context, value::BasicBlock};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     /// `(a + b) - ((a & b) << 1)` is the add/and/shift form of `a ^ b` and must
     /// collapse to a single xor, leaving the add/and/shift math dead.

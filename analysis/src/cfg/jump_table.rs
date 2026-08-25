@@ -5,7 +5,7 @@
 //! address computation feeding the indirect jump, bounds the table index with
 //! the value-range analysis ([`crate::value_range`]), reads each table entry
 //! straight out of the binary's initialized memory (through the pipeline's
-//! shared [`binfmt::BinaryFormat`] handle, `env.binary`), and connects
+//! shared [`wazabin_binary::BinaryFormat`] handle, `env.binary`), and connects
 //! the block to every resolved target with a real CFG edge.
 //!
 //! Two table encodings are handled:
@@ -145,7 +145,7 @@ impl HandleJumpTables {
     fn run_indexed(
         &self,
         cone: &mut crate::ConeMut,
-        binary: Option<&dyn binfmt::BinaryFormat>,
+        binary: Option<&dyn wazabin_binary::BinaryFormat>,
         targets: &[FunctionId],
         addresses: &mut AddressIndex,
         obligations: &ObligationSink,
@@ -201,7 +201,7 @@ impl HandleJumpTables {
     #[cfg(test)]
     fn resolve_function(
         ctx: &mut Context,
-        binary: &dyn binfmt::BinaryFormat,
+        binary: &dyn wazabin_binary::BinaryFormat,
         fun_id: FunctionId,
     ) -> Result<bool, String> {
         let mut addresses = AddressIndex::analyze(ctx);
@@ -219,7 +219,7 @@ impl HandleJumpTables {
     /// complete topology-mutation operation.
     fn resolve_function_indexed(
         ctx: &mut Context,
-        binary: &dyn binfmt::BinaryFormat,
+        binary: &dyn wazabin_binary::BinaryFormat,
         addresses: &mut AddressIndex,
         fun_id: FunctionId,
         obligations: &ObligationSink,
@@ -634,7 +634,10 @@ impl BranchOutcome {
 
 /// If `block_id` ends in an indirect branch whose table the pass can resolve,
 /// produce one [`Edit`] per case target; otherwise report why it did not.
-fn resolve_block(mut block: BlockMutRef, binary: &dyn binfmt::BinaryFormat) -> BranchOutcome {
+fn resolve_block(
+    mut block: BlockMutRef,
+    binary: &dyn wazabin_binary::BinaryFormat,
+) -> BranchOutcome {
     // A block still terminated by `BranchInd` is re-resolved every round, even
     // once the lifter has connected its targets in the clean IR: those edges let
     // function-splitting follow the switch, but the terminator itself is only
@@ -840,7 +843,7 @@ fn resolve_block(mut block: BlockMutRef, binary: &dyn binfmt::BinaryFormat) -> B
 /// path rewrites the `BranchInd` into a direct `Branch`.
 fn resolve_constant_load(
     block: &mut BlockMutRef,
-    binary: &dyn binfmt::BinaryFormat,
+    binary: &dyn wazabin_binary::BinaryFormat,
     ptr: ValueId,
 ) -> Option<Vec<Edit>> {
     let ctx = block.ctx();
@@ -1069,7 +1072,7 @@ crate::register_module_pass!(HandleJumpTables);
 
 #[cfg(test)]
 mod tests {
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
 
@@ -1081,7 +1084,7 @@ mod tests {
     /// The test-side binary image (`MemoryImage` implements [`BinaryFormat`]),
     /// handed to the pass exactly as `env.binary` would be.
     ///
-    /// [`BinaryFormat`]: binfmt::BinaryFormat
+    /// [`BinaryFormat`]: wazabin_binary::BinaryFormat
     fn image() -> qcode::memory_image::MemoryImage {
         qcode::memory_image::MemoryImage::default()
     }
@@ -1338,7 +1341,7 @@ mod tests {
     /// Run the pass over one function and return the obligations it reported.
     fn resolve_function_reporting(
         ctx: &mut Context,
-        binary: &dyn binfmt::BinaryFormat,
+        binary: &dyn wazabin_binary::BinaryFormat,
         fun_id: FunctionId,
     ) -> Vec<Obligation> {
         let sink = ObligationSink::default();

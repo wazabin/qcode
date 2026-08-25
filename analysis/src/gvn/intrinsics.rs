@@ -90,7 +90,7 @@ mod tests {
         context::Context,
         value::{LocalValueId, insn::Mnemonic},
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     /// Live (still-parented) instructions only — the arena retains removed ones.
     fn live_intrinsic_named(ctx: &Context, name: &str) -> bool {

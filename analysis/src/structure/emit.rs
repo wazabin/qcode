@@ -38,7 +38,7 @@ use super::{
 pub fn emit_tokens(
     ctx: &Context,
     program: &Program,
-    binary: Option<&dyn binfmt::BinaryFormat>,
+    binary: Option<&dyn wazabin_binary::BinaryFormat>,
 ) -> Vec<TokenLine> {
     let roots = compute_roots(ctx, program);
     let hoisted = hoisted_roots(ctx, program, &roots);
@@ -283,7 +283,7 @@ fn emit_typed_param(ctx: &Context, param: BlockParamRef<'_, '_>, buf: &mut LineB
 pub fn emit_c(
     ctx: &Context,
     program: &Program,
-    binary: Option<&dyn binfmt::BinaryFormat>,
+    binary: Option<&dyn wazabin_binary::BinaryFormat>,
 ) -> String {
     let mut out = String::new();
     for line in emit_tokens(ctx, program, binary) {
@@ -1151,7 +1151,7 @@ mod tests {
     use super::*;
     use crate::structure::{decompile_function, lower_function, tokens::TokenKind};
     use qcode::value::{FunctionBody, RegisterChannelState, RegisterInterfaceMap};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     #[test]
     fn function_arguments_include_their_recovered_width() {

@@ -79,7 +79,7 @@ crate::register_function_pass!(CppDemangle);
 mod tests {
     use qcode::context::Context;
     use qcode::value::{FunctionBody, Renameable};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
     use crate::test_util::run_function_pass;

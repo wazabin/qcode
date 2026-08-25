@@ -270,7 +270,7 @@ fn callee:
     /// constant stores across the call, folding away input-dependent values.
     #[test]
     fn indirect_tailbranch_is_unbounded() {
-        use qcode_macro::qcode;
+        use wazabin_qcode_macro::qcode;
         let mut ctx = Context::new();
         qcode!(
             ctx,
@@ -389,7 +389,7 @@ fn callee:
     /// default — the cone restricts the stamping loop, not just the iteration.
     #[test]
     fn partial_cone_stamps_only_in_cone_functions() {
-        use qcode_macro::qcode;
+        use wazabin_qcode_macro::qcode;
 
         let mut ctx = Context::new();
         qcode!(

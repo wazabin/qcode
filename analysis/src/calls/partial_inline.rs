@@ -615,7 +615,7 @@ mod tests {
         types::TypeId,
         value::{BasicBlock, BlockId, FunctionBody, Instruction, VarnodeId, insn::Call},
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
 

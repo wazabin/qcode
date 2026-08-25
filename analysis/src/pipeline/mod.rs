@@ -72,7 +72,7 @@ use crate::{
 /// A shared handle to the loaded binary, threaded from the lift entry points
 /// into every [`PipelineEnv`] the driver builds. `None` for headless/textual
 /// runs; reloaded snapshots wrap the deserialized `MemoryImage`.
-pub type BinaryHandle = std::sync::Arc<dyn binfmt::BinaryFormat>;
+pub type BinaryHandle = std::sync::Arc<dyn wazabin_binary::BinaryFormat>;
 
 /// The [`cabi::AbiTarget`] a binary's prototype tables are keyed by: its
 /// container-format OS mapped to a [`cabi::Platform`], at `bits` pointer width.

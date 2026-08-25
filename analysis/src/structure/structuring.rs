@@ -968,7 +968,7 @@ fn exit_blocks(ctx: &Context, nodes: &[BlockId], node_set: &HashSet<BlockId>) ->
 mod tests {
     use super::*;
     use crate::structure::{ast::Stmt, emit_c, lower_function};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     /// Whether any loop node appears anywhere in the statement tree.
     fn has_loop(stmts: &[Stmt]) -> bool {

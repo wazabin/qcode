@@ -473,7 +473,7 @@ mod tests {
         testing::TestContext,
         value::{BasicBlock, FunctionBody, Value, ValueId},
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     struct CountStateClones(Rc<Cell<usize>>);
 

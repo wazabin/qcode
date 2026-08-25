@@ -1,103 +1,52 @@
-//! Core IR for the harbinger-lifter binary analysis framework.
+//! Typed SSA-style p-code IR for binary analysis.
 //!
-//! `qcode-core` provides a typed, SSA-style intermediate representation (IR)
-//! used to model the semantics of lifted machine code. It is modelled after
-//! GHIDRA's p-code IR. Values however have more variety. On top of GHIDRA's
-//! [`Varnode`] (a named memory location), qcode also has [`Instruction`]
-//! (an SSA value computed by an operation), [`BasicBlock`]
-//! (a control-flow node), [`FunctionBody`] and [`Literal`] (a constant value).
+//! `qcode` models the semantics of lifted machine code. It is inspired by
+//! Ghidra's p-code, with additional first-class values for instructions, basic
+//! blocks, functions, and literals. The crate contains the IR, its builder,
+//! the QCode text-format lowering API, and integrity checks; optimization and
+//! recovery passes live separately in [`qcode_analysis`].
 //!
-//! # Core Concepts
+//! # Getting started
 //!
-//! ## Memory spaces
+//! A [`Context`] owns a QCode module. Create one, then construct IR with a
+//! [`Builder`] or parse QCode source through [`lower::lower_str`].
 //!
-//! A [`Space`] is a named, uniformly-addressed memory region — RAM, ROM, or a
-//! register file. Every varnode belongs to exactly one space. The context is
-//! initialised with a default RAM space; additional spaces (e.g. a register
-//! space) can be added with [`Space::new`].
+//! ```rust
+//! use qcode::context::Context;
 //!
-//! ## Values
-//!
-//! All IR entities are addressed through [`ValueId`], a cheap `Copy`
-//! discriminated union:
-//!
-//! |           Variant        |                  Description                  |
-//! |--------------------------|-----------------------------------------------|
-//! | [`ValueId::Literal`]     | An integer constant, possibly with a label    |
-//! | [`ValueId::Instruction`] | An SSA value produced by an [`Instruction`]   |
-//! | [`ValueId::Varnode`]     | A named memory location (register, global, …) |
-//! | [`ValueId::BasicBlock`]  | A control-flow node / label                   |
-//! | [`ValueId::Function`]    | A lifted or external function                 |
-//!
-//! All values are owned by a [`Context`]. Shared leaves live in its interners;
-//! function-owned instructions, blocks, and parameters live in a
-//! [`FunctionBody`]. IDs are inspected through typed context accessors and
-//! reference constructors, which borrow the context for their lifetime.
-//!
-//! ## Context
-//!
-//! [`Context`] is the module owner: shared spaces and interners, published
-//! function interfaces, and the lockstep function-body registry. Create one
-//! with [`Context::new`] and pass `&mut` references to the [`Builder`] and
-//! module analysis passes.
-//!
-//! ## Builder
-//!
-//! [`Builder`] is the API for constructing IR. It provides methods to create
-//! instructions, blocks, and functions, and to manipulate the control flow
-//! graph. A builder is always tied to a specific context and block. You can
-//! obtain one from an existing block or directly from the context:
-//!
-//! ```rust,ignore
-//! use qcode_core::{context::Context, builder::Builder};
-//!
-//! let mut ctx = Context::new();
-//!
-//! // Start a new block at machine address 0x1000
-//! let mut builder = (&mut ctx).builder_at(0x1000);
-//!
-//! // Emit a load from memory
-//! let ptr = /* some ValueId */;
-//! let value = builder.push_load(ptr, 8, ctx.shared.default_space);
-//!
-//! // Terminate the block: emit an unconditional branch to 0x1010
-//! builder.finalize(0x1010);
+//! let _context = Context::new();
 //! ```
 //!
-//! Alternatively, use the [`qcode!`](qcode_macro::qcode) proc-macro for a
-//! convenient text-format DSL when writing tests or exploring the IR.
+//! # Core concepts
 //!
-//! ## Lifetime parameters
+//! - A [`Space`] is a uniformly addressed memory region, such as RAM or a
+//!   register file.
+//! - A [`ValueId`] identifies every IR value: literals, SSA instructions,
+//!   varnodes, blocks, and functions.
+//! - A [`FunctionBody`] owns a function's instructions, blocks, and block
+//!   parameters; module-wide values are owned by the [`Context`].
+//! - A [`Builder`] emits instructions and constructs control flow in a block.
 //!
-//! Two lifetime parameters appear throughout this crate:
+//! Reference types such as [`InstructionRef`], [`BlockRef`], and
+//! [`FunctionRef`] borrow their owning context, so they cannot outlive the IR
+//! arena.
 //!
-//! - `'str` — the lifetime of interned string data (names, space names).
-//!   Typically tied to a `&'str str` borrowed from the binary image or from a
-//!   string literal.
-//! - `'ctx` — the lifetime of a borrow of the [`Context`]. Reference types
-//!   like [`InstructionRef`], [`BlockRef`], and [`FunctionRef`] carry `'ctx`
-//!   to ensure they do not outlive the arena.
+//! # QCode source
 //!
-//! [`Space`]:                   crate::space::Space
-//! [`Space::new`]:              crate::space::Space::new
-//! [`ValueId`]:                 crate::value::ValueId
-//! [`ValueId::Literal`]:        crate::value::ValueId::Literal
-//! [`ValueId::Instruction`]:    crate::value::ValueId::Instruction
-//! [`ValueId::Varnode`]:        crate::value::ValueId::Varnode
-//! [`ValueId::BasicBlock`]:     crate::value::ValueId::BasicBlock
-//! [`ValueId::Function`]:       crate::value::ValueId::Function
-//! [`Instruction`]:             crate::value::Instruction
-//! [`InstructionRef`]:          crate::value::InstructionRef
-//! [`BlockRef`]:                crate::value::BlockRef
-//! [`FunctionRef`]:             crate::value::FunctionRef
-//! [`ValueRef`]:                crate::value::ValueRef
-//! [`Varnode`]:                 crate::value::Varnode
-//! [`BasicBlock`]:              crate::value::BasicBlock
-//! [`FunctionBody`]:            crate::value::FunctionBody
-//! [`Literal`]:                 crate::value::literal::Literal
-//! [`Context`]:                 crate::context::Context
-//! [`Context::new`]:            crate::context::Context::new
-//! [`Builder`]:                 crate::builder::Builder
+//! [`lower::lower_str`] parses QCode source at runtime. For source literals,
+//! the re-exported [`qcode!`] macro performs the same lowering and binds names
+//! declared in the source into the surrounding Rust scope.
+//!
+//! [`qcode_analysis`]: https://docs.rs/qcode_analysis
+//! [`Space`]: crate::space::Space
+//! [`ValueId`]: crate::value::ValueId
+//! [`FunctionBody`]: crate::value::FunctionBody
+//! [`Context`]: crate::context::Context
+//! [`Builder`]: crate::builder::Builder
+//! [`InstructionRef`]: crate::value::InstructionRef
+//! [`BlockRef`]: crate::value::BlockRef
+//! [`FunctionRef`]: crate::value::FunctionRef
+//! [`qcode!`]: macro@qcode
 
 pub mod address_index;
 mod arena_integrity;
@@ -116,6 +65,7 @@ pub mod types;
 pub mod value;
 
 pub use arena_integrity::{verify_body_arena_integrity, verify_body_arena_integrity_scoped};
+pub use wazabin_qcode_macro::qcode;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

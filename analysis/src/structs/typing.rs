@@ -475,7 +475,7 @@ crate::register_function_pass!(StructTyping);
 #[cfg(test)]
 mod tests {
     use qcode::value::{FunctionBody, ValueId};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
     use crate::test_util::run_function_pass;

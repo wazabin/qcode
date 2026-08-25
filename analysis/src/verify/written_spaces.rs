@@ -180,7 +180,7 @@ fn check_callee(
 mod tests {
     use super::*;
     use qcode::value::FunctionId;
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     #[test]
     fn stale_bound_is_flagged_and_none_passes() {

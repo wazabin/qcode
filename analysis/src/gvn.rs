@@ -339,7 +339,7 @@ crate::register_function_pass!(Gvn);
 #[cfg(test)]
 mod registration_tests {
     use qcode::context::Context;
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::Gvn;
     use crate::{

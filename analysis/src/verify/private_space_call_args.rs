@@ -81,7 +81,7 @@ mod tests {
     use qcode::space::{LocalMemorySpaceId, MemorySpaceId};
     use qcode::value::insn::{Call, CallTag, Callee};
     use qcode::value::{ArgMemKind, BasicBlock, ExternArgmem, FunctionBody, QCodeMut, TempSpace};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     /// Build a caller with a private (temp) shadow-typed pointer value, and give
     /// its single call `args = [shadow_ptr]` targeting `target`.

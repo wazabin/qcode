@@ -710,7 +710,7 @@ mod tests {
     use qcode::context::Context;
     use qcode::value::{FunctionBody, Instruction};
     use qcode_emulator::{SizedValue, StandaloneEmulator};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use crate::test_util::run_function_pass;
 

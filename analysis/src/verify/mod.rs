@@ -209,7 +209,7 @@ crate::register_module_pass!(Verify);
 mod tests {
     use super::*;
     use qcode::value::{BasicBlock, BlockId, FunctionBody};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     /// A module with `f` corrupted (its goto targets a removed block) and `g` clean.
     fn corrupted_f() -> (Context<'static>, FunctionId, FunctionId) {

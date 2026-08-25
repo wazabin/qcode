@@ -1020,7 +1020,7 @@ mod tests {
     use qcode::space::SpaceId;
     use qcode::value::QCodeMut;
     use qcode::value::insn::{Call, CallTag, Callee};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     #[test]
     fn persisted_memory_state_rebuilds_fixed_leaf() {

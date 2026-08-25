@@ -194,8 +194,8 @@ mod tests {
             insn::{InstructionId, Mnemonic},
         },
     };
-    use qcode_macro::qcode;
     use rustc_hash::FxHashSet as HashSet;
+    use wazabin_qcode_macro::qcode;
 
     /// Store instruction ids in `block`, in program order.
     fn store_ids(ctx: &Context, block: BlockId) -> Vec<InstructionId> {

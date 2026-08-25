@@ -775,7 +775,7 @@ mod tests {
         value::{BasicBlock, FunctionBody, Instruction},
     };
     use qcode_emulator::{SizedValue, StandaloneEmulator};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     /// Run [`mba_simplify`] on `fid` over a `BodyMut` borrowing the body in
     /// place — the pass surface is pass-scoped — leaving the rewritten body in `ctx`.

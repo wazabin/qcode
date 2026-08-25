@@ -598,7 +598,7 @@ mod tests {
         },
     };
     use qcode_emulator::{SizedValue, StandaloneEmulator};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     fn return_value(ctx: &Context, fun: FunctionId) -> ValueId {
         let root = FunctionBody::from_id(ctx, fun).root().expect("root").id;

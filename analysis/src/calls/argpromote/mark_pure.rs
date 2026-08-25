@@ -303,7 +303,7 @@ mod tests {
     /// justified). Matches the pre-engine behaviour.
     #[test]
     fn recursion_never_flags_pure() {
-        use qcode_macro::qcode;
+        use wazabin_qcode_macro::qcode;
         let mut tc = TestContext::new();
         qcode!(
             tc.ctx,

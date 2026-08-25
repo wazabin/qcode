@@ -2,7 +2,7 @@
 //!
 //! The `qcode!` proc-macro parses QCode and *emits Rust code* that builds the IR
 //! at the call site — it cannot run at runtime. This module is the runtime twin:
-//! it walks the same [`qcode_parser`] AST and drives the [`Builder`] directly, so
+//! it walks the same [`wazabin_qcode_parser`] AST and drives the [`Builder`] directly, so
 //! tools (a CLI, the macro itself) share a single lowering implementation.
 //!
 //! It lives in `qcode` core (not a separate crate) so the `qcode!` macro can
@@ -27,7 +27,7 @@ use crate::{
         insn::{Callee, IntrinsicId},
     },
 };
-use qcode_parser::ast::{
+use wazabin_qcode_parser::ast::{
     Atom, Callee as ParsedCallee, CastOp, ExprNode, ExtractField, FnDecl, FnKind, GepField, Label,
     Program, ProgramKind, Statement, StructDecl, StructFieldType, TypedAtom,
 };
@@ -78,7 +78,7 @@ pub fn lower_str_with_externals(
     source: &str,
     externals: HashMap<String, ValueId>,
 ) -> Result<Symbols, String> {
-    let program = qcode_parser::qcode_from_str(source).map_err(|e| e.to_string())?;
+    let program = wazabin_qcode_parser::qcode_from_str(source).map_err(|e| e.to_string())?;
     lower_program_with_externals(ctx, &program, externals)
 }
 

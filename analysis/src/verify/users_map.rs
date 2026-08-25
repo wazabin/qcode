@@ -82,7 +82,7 @@ mod tests {
     use super::*;
     use qcode::context::Context;
     use qcode::value::QCodeMut;
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     /// A well-formed function built through the normal helpers verifies clean,
     /// including a value used twice (`@a` feeds both adds).

@@ -1013,7 +1013,7 @@ mod tests {
         context::Context,
         value::{BasicBlock, FunctionBody},
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
     use crate::test_util::run_function_pass;

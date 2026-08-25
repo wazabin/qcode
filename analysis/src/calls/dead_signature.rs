@@ -470,7 +470,7 @@ mod tests {
         types::{AggregateField, TypeId},
         value::{BasicBlock, BlockId, VarnodeId, insn::Call},
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
 

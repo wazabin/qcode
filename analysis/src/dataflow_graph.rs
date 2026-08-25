@@ -461,7 +461,7 @@ pub fn value_label(ctx: &Context, value: ValueId) -> String {
 #[cfg(test)]
 mod tests {
     use qcode::{context::Context, value::ValueId};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
 

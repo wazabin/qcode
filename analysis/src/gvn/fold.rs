@@ -746,7 +746,7 @@ mod tests {
         BasicBlock, FunctionBody,
         insn::{Sext, Zext},
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     #[test]
     #[should_panic(expected = "type error in binop constant folding")]

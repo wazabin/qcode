@@ -515,7 +515,7 @@ mod tests {
     use super::*;
     use crate::structure::{decompile_function, emit_c};
     use qcode::context::Context;
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     fn has_switch(stmts: &[Stmt]) -> bool {
         stmts.iter().any(|s| matches!(s, Stmt::Switch { .. }))

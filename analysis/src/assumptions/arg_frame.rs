@@ -357,7 +357,7 @@ mod tests {
         testing::TestContext,
         value::{BasicBlock, BlockId, insn::Call},
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
 

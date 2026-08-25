@@ -563,7 +563,7 @@ mod tests {
             insn::{Binary, InstructionId, Mnemonic},
         },
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::{
         prune_unreachable_in, simplify_cfg, try_bypass_empty_block_in, try_fold_cbranch_in,

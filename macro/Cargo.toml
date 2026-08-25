@@ -1,10 +1,15 @@
 [package]
-name = "qcode_macro"
+name = "wazabin-qcode-macro"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "Compile-time QCode DSL for constructing p-code IR in tests and examples"
+description = "Procedural macro for embedding QCode source in Rust"
+readme = "readme.md"
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/wazabin-qcode-macro"
+keywords = ["binary-analysis", "macro", "pcode", "reverse-engineering"]
+categories = ["development-tools", "parsing"]
 
 [lib]
 proc-macro = true
@@ -14,4 +19,4 @@ proc-macro-crate = "3.5"
 proc-macro2 = "1.0"
 quote = "1.0"
 syn = { version = "2.0", features = ["full"] }
-qcode_parser.workspace = true
+wazabin-qcode-parser.workspace = true

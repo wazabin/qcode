@@ -269,7 +269,7 @@ pub(crate) fn exit_view<'a, 'str: 'a>(
 #[cfg(test)]
 mod tests {
     use qcode::value::QCodeMut;
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
     use qcode::{

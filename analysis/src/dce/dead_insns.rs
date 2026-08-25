@@ -483,7 +483,7 @@ mod tests {
     /// is bypassed by rerouting its preheader straight to the exit.
     #[test]
     fn dead_counted_loop_is_bypassed() {
-        use qcode_macro::qcode;
+        use wazabin_qcode_macro::qcode;
         let mut ctx = Context::new();
         qcode!(
             ctx,
@@ -527,7 +527,7 @@ mod tests {
     /// are otherwise unused.
     #[test]
     fn loop_with_side_effect_is_kept() {
-        use qcode_macro::qcode;
+        use wazabin_qcode_macro::qcode;
         let mut ctx = Context::new();
         qcode!(
             ctx,

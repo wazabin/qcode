@@ -346,7 +346,7 @@ mod tests {
     use crate::CallGraph;
     use qcode::value::FunctionBody;
     use qcode::value::RegisterChannelState;
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::super::summary::{EffectSummaries, solve_summaries, solve_summaries_with_fixed};
 

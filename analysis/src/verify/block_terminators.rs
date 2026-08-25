@@ -103,7 +103,7 @@ fn verify_switch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     /// A well-formed dispatch, including an arm that passes a block argument.
     #[test]

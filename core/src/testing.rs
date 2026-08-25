@@ -115,7 +115,7 @@ impl TestContext {
 /// and hand the result to the env through this.
 pub fn image_binary(
     image: crate::memory_image::MemoryImage,
-) -> std::sync::Arc<dyn binfmt::BinaryFormat> {
+) -> std::sync::Arc<dyn wazabin_binary::BinaryFormat> {
     std::sync::Arc::new(image)
 }
 

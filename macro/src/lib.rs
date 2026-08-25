@@ -1,12 +1,12 @@
 //! The `qcode!` macro.
 //!
-//! At compile time it parses the QCode source (via [`qcode_parser`]) and emits
-//! Rust code that, at run time, lowers the same source into the caller's
-//! `Context` through [`qcode_lower`] — the single shared lowering implementation
-//! used by tools and the CLI. The macro's only extra job is to bind each declared
-//! name (functions, blocks, SSA values, varnodes, block params) to a Rust `let`
-//! so callers can reference them after the invocation, and to forward any
-//! `{capture}` atoms from the surrounding Rust scope.
+//! At compile time, this crate parses QCode source with
+//! [`wazabin_qcode_parser`] and validates its syntax. At run time, the emitted
+//! code lowers that source into the caller's `qcode::Context` through
+//! `qcode::lower::lower_str_with_externals`. It also binds each declared name
+//! (functions, blocks, SSA values, varnodes, and block parameters) to a Rust
+//! `let`, so callers can reference it after the invocation. `{capture}` atoms
+//! are resolved from the surrounding Rust scope.
 
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
@@ -17,7 +17,7 @@ use syn::{
     parse_macro_input,
 };
 
-use qcode_parser::ast::{
+use wazabin_qcode_parser::ast::{
     Atom, ExprNode, FnDecl, Label, Program, ProgramKind, Statement, TupleField, TypedAtom,
 };
 
@@ -64,7 +64,7 @@ fn push_unique(set: &mut Vec<String>, name: &str) {
 
 fn compile(expr: &Expr, source: &str) -> syn::Result<proc_macro2::TokenStream> {
     let err = |e: String| syn::Error::new(proc_macro2::Span::call_site(), e);
-    let program = qcode_parser::qcode_from_str(source).map_err(|e| err(e.to_string()))?;
+    let program = wazabin_qcode_parser::qcode_from_str(source).map_err(|e| err(e.to_string()))?;
 
     let mut names = Names::default();
     collect_program(&program, &mut names);

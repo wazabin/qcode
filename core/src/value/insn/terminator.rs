@@ -399,7 +399,7 @@ impl MnemonicKind for BadInsn {
 #[cfg(test)]
 mod tests {
     use crate::value::QCodeMut;
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use crate::{
         context::Context,

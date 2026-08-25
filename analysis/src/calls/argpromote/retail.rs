@@ -175,7 +175,7 @@ crate::register_module_pass!(RetailApply);
 mod tests {
     use super::*;
     use qcode::value::insn::Mnemonic;
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     fn materialize(tc: &mut qcode::testing::TestContext, fid: FunctionId) {
         FunctionBody::from_id_mut(&mut tc.ctx, fid).set_register_effects(

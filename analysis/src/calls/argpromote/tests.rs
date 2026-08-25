@@ -7,7 +7,7 @@ mod tests {
         BasicBlock, BlockId, FunctionBody, Instruction, LocalValueId, Value, Varnode, VarnodeId,
         insn::{Binop, Call, InstructionId, IntBinop, Mnemonic},
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::super::*;
     use super::super::{mark_pure::*, ram::*, registers::*};

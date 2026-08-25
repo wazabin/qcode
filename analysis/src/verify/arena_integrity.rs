@@ -22,7 +22,7 @@ mod tests {
         context::Context,
         value::{BasicBlock, BlockId, FunctionBody},
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     #[test]
     fn aggregate_verifier_stops_before_traversing_removed_target() {

@@ -1,10 +1,15 @@
 [package]
-name = "qcode_parser"
+name = "wazabin-qcode-parser"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "Pest-based parser for the QCode text format"
+description = "Parser for the QCode text format"
+readme = "README.md"
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/wazabin-qcode-parser"
+keywords = ["binary-analysis", "parser", "pcode", "reverse-engineering"]
+categories = ["parsing"]
 
 [dependencies]
 pest.workspace = true

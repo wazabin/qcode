@@ -1,7 +1,7 @@
 //! A serializable snapshot of a binary's initialized memory.
 //!
 //! [`MemoryImage`] is the persistence/test form of the byte surface: it
-//! implements [`binfmt::BinaryFormat`], so a snapshot (built from a live
+//! implements [`wazabin_binary::BinaryFormat`], so a snapshot (built from a live
 //! format's `mapped_regions()` at save time) or a test-seeded image can be
 //! `Arc`-wrapped and handed to the pipeline as `PipelineEnv.binary`, exactly
 //! like a live ELF/PE handle. During a live lift the bytes stay in the loader's
@@ -157,7 +157,7 @@ impl MemoryImage {
 /// `MemoryImage` in an `Arc` and hands it to `PipelineEnv.binary`, so passes
 /// read initialized memory through one trait regardless of whether a live
 /// container format is behind it.
-impl binfmt::BinaryFormat for MemoryImage {
+impl wazabin_binary::BinaryFormat for MemoryImage {
     fn load_address(&self) -> u64 {
         self.segments.first().map(|s| s.start).unwrap_or(0)
     }
@@ -181,9 +181,9 @@ impl binfmt::BinaryFormat for MemoryImage {
     /// (mirrors [`Blob`]'s placeholder). Consumers of `PipelineEnv.binary`
     /// read bytes and permissions, never the architecture.
     ///
-    /// [`Blob`]: binfmt::blob::Blob
-    fn architecture(&self) -> binfmt::Arch {
-        binfmt::Arch::X86_64
+    /// [`Blob`]: wazabin_binary::blob::Blob
+    fn architecture(&self) -> wazabin_binary::Arch {
+        wazabin_binary::Arch::X86_64
     }
 
     fn segment_bounds(&self, addr: u64) -> Option<(u64, u64)> {
@@ -208,7 +208,7 @@ impl binfmt::BinaryFormat for MemoryImage {
     /// flags come from the container format's `mapped_regions`, so this is only
     /// as authoritative as the format that filled them.
     ///
-    /// [`is_known_writable`]: binfmt::BinaryFormat::is_known_writable
+    /// [`is_known_writable`]: wazabin_binary::BinaryFormat::is_known_writable
     fn is_known_read_only(&self, addr: u64) -> bool {
         self.segment_at(addr).is_some_and(|s| !s.writable)
     }

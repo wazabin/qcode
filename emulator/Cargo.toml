@@ -14,4 +14,4 @@ qcode.workspace = true
 rustc-hash.workspace = true
 
 [dev-dependencies]
-qcode_macro.workspace = true
+wazabin-qcode-macro.workspace = true

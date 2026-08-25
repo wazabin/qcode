@@ -4,7 +4,7 @@ use qcode::{
     testing::TestContext,
     value::{BasicBlock, BlockId, Varnode},
 };
-use qcode_macro::qcode;
+use wazabin_qcode_macro::qcode;
 
 use crate::gvn::gvn;
 

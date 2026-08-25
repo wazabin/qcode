@@ -4,19 +4,24 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Typed SSA-style p-code IR for binary analysis, modelled after Ghidra's p-code"
+readme = "readme.md"
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/qcode"
+keywords = ["binary-analysis", "ghidra", "ir", "pcode", "reverse-engineering"]
+categories = ["development-tools::debugging", "compilers"]
 
 [features]
 testing = []
 
 [dependencies]
-binfmt.workspace = true
+wazabin-binary.workspace = true
 inventory.workspace = true
 jstd.workspace = true
 pcode-types.workspace = true
 pest.workspace = true
-qcode_macro.workspace = true
-qcode_parser.workspace = true
+wazabin-qcode-macro.workspace = true
+wazabin-qcode-parser.workspace = true
 serde.workspace = true
 log.workspace = true
 rustc-hash.workspace = true

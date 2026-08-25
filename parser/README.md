@@ -1,9 +1,8 @@
-# qcode_parser
+# wazabin-qcode-parser
 
-Pest-based parser for the QCode text format.
+Parser and AST for the QCode text format. Most users should depend on `qcode`
+and use `qcode::lower::lower_str`; this crate is useful when a tool needs to
+parse and inspect QCode syntax before lowering it.
 
-## Overview
-
-Contains the QCode grammar and produces parse trees from QCode source text.
-Used by `qcode_macro` at compile time and directly when parsing QCode from files
-or strings at runtime.
+It is also used by `wazabin-qcode-macro` to validate QCode literals at compile
+time.

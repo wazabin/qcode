@@ -2517,7 +2517,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
 
 #[cfg(test)]
 mod tests {
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
 

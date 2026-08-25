@@ -215,7 +215,7 @@ mod tests {
     use super::*;
     use qcode::context::Context;
     use qcode::value::{BlockId, FunctionId, FunctionRef, ModuleView};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     fn engine(ctx: &Context, f: FunctionId) -> Congruence {
         let blocks: Vec<BlockId> = FunctionRef::from_id(ctx, f)

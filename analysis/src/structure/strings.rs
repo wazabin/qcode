@@ -38,13 +38,13 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use binfmt::BinaryFormat;
 use cabi::CType;
 use qcode::{
     context::Context,
     space::Space,
     value::{ArgMemKind, FunctionRef, LiteralRef, ValueId, function::FunctionId},
 };
+use wazabin_binary::BinaryFormat;
 
 use super::tokens::{LineBuf, TokenKind, TokenLine};
 
@@ -235,7 +235,7 @@ mod tests {
     use super::*;
     use crate::structure::{emit_c, lower_function};
     use qcode::{context::Context, memory_image::MemoryImage, value::FunctionBody};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     /// Where the read-only copy of the test string lives.
     const RO_ADDR: u64 = 0x401178;

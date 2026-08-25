@@ -134,7 +134,7 @@ mod tests {
     use crate::AliasResult;
     use crate::gvn::gvn_function;
     use qcode::{context::Context, value::BasicBlock};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     /// `sborrow(a, b) != ((a - b) s< 0)` is the x86 signed-less-than idiom and
     /// must collapse to a single `a s< b`, leaving the flag math dead.

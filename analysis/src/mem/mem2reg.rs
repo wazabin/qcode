@@ -2446,7 +2446,7 @@ mod tests {
     use qcode::value::{
         BasicBlock, FunctionBody, Instruction, LocalValueId, TempRef, insn::Mnemonic,
     };
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
 

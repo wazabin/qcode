@@ -481,7 +481,7 @@ register_function_pass!(LoopToScan);
 
 #[cfg(test)]
 mod tests {
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
     use qcode::{context::Context, value::FunctionBody};

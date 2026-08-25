@@ -914,7 +914,7 @@ mod tests {
 
     use super::*;
     use crate::value::insn::{Binary, Binop, IntBinop, LocalInsnId};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     #[test]
     fn simultaneous_operand_substitution_does_not_chain_local_ids() {
@@ -1099,9 +1099,9 @@ mod tests {
     }
 
     #[test]
-    fn qcode_macro_block_with_params() {
+    fn wazabin_qcode_macro_block_with_params() {
         use crate::context::Context;
-        use qcode_macro::qcode;
+        use wazabin_qcode_macro::qcode;
 
         let mut ctx = Context::new();
         qcode!(
@@ -1141,7 +1141,7 @@ mod tests {
     #[test]
     fn block_display_uses_qcode_param_syntax() {
         use crate::context::Context;
-        use qcode_macro::qcode;
+        use wazabin_qcode_macro::qcode;
 
         let mut ctx = Context::new();
         qcode!(

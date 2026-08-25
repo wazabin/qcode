@@ -157,7 +157,7 @@ mod tests {
     use qcode::assumption::{Certainty, Proposition};
     use qcode::context::Context;
     use qcode::value::{FunctionBody, ValueId, insn::Mnemonic};
-    use qcode_macro::qcode;
+    use wazabin_qcode_macro::qcode;
 
     use super::*;
     use crate::structs::typing::StructTyping;

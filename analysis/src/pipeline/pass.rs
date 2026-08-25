@@ -73,7 +73,7 @@ pub struct PipelineEnv {
     /// the deserialized `MemoryImage` instead. `Arc<dyn ...>` (the trait
     /// carries `Send + Sync` bounds) so `&PipelineEnv` stays `Sync` for the
     /// parallel driver.
-    pub binary: Option<std::sync::Arc<dyn binfmt::BinaryFormat>>,
+    pub binary: Option<std::sync::Arc<dyn wazabin_binary::BinaryFormat>>,
     /// Function-independent register/varnode alias base, built once on first use and
     /// shared by reference across the per-function GVN/LICM/DCE/mem2reg runs (see
     /// [`PipelineEnv::alias_base`]). A `OnceLock` (not `RefCell`) so `&PipelineEnv`
@@ -95,7 +95,7 @@ impl PipelineEnv {
     pub fn new(
         ctx: &Context,
         cfg: ArchConfig,
-        binary: Option<std::sync::Arc<dyn binfmt::BinaryFormat>>,
+        binary: Option<std::sync::Arc<dyn wazabin_binary::BinaryFormat>>,
     ) -> Self {
         let sp_varnode = cfg.sp_varnode(ctx);
         let mut env = Self::from_parts(cfg, sp_varnode);
