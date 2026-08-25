@@ -10,8 +10,9 @@ use std::collections::{HashMap, HashSet};
 use qcode::{
     context::Context,
     value::{
-        BlockId, BlockParamRef, FunctionRef, Instruction, InstructionId, LocalValueId, Value,
-        ValueId, ValueRef, Varnode, VarnodeId, function::FunctionId, insn::Mnemonic,
+        BlockId, BlockParamRef, FunctionBody, FunctionRef, Instruction, InstructionId,
+        LocalValueId, Value, ValueId, ValueRef, Varnode, VarnodeId, function::FunctionId,
+        insn::Mnemonic,
     },
 };
 
@@ -89,6 +90,46 @@ pub fn emit_tokens(
 /// Bare declarations for the values whose definition sits in a scope some reader
 /// of them has already left. Their defining statement then assigns without
 /// re-declaring.
+/// Infer the pointee type of an SSA address from its direct load/store users.
+/// Mixed-width accesses stay untyped; a consistent cell is emitted as `T *`.
+fn inferred_pointee(ctx: &Context, id: InstructionId) -> Option<qcode::types::TypeId> {
+    let value = ValueId::Instruction(id);
+    let mut pointee = None;
+    for user in ctx.users(value) {
+        let insn = Instruction::from_id(ctx, user);
+        let candidate = match insn.mnemonic() {
+            Mnemonic::Load(load) if load.ptr.qualify(user.func) == value => Some(insn.type_id()),
+            Mnemonic::Store(store) if store.ptr.qualify(user.func) == value => {
+                Some(ctx.type_of(store.src.qualify(user.func)))
+            }
+            _ => None,
+        };
+        if let Some(candidate) = candidate {
+            if pointee.is_some_and(|old| old != candidate) {
+                return None;
+            }
+            pointee = Some(candidate);
+        }
+    }
+    pointee
+}
+
+fn emit_inferred_decl_type(ctx: &Context, id: InstructionId, buf: &mut LineBuf) {
+    if let Some(pointee) = inferred_pointee(ctx, id) {
+        emit_c_type(ctx, pointee, ctx.shared.types.size_of(pointee), buf);
+        buf.space();
+        buf.punct("*");
+    } else if instruction_declared_signed(ctx, id) {
+        buf.push(
+            format!("int{}_t", Instruction::from_id(ctx, id).size() * 8),
+            TokenKind::Type,
+        );
+    } else {
+        let insn = Instruction::from_id(ctx, id);
+        emit_c_type(ctx, insn.type_id(), insn.size(), buf);
+    }
+}
+
 fn emit_hoisted_decls(
     ctx: &Context,
     roots: &HashSet<InstructionId>,
@@ -100,14 +141,7 @@ fn emit_hoisted_decls(
     ids.sort_unstable_by_key(|id| (id.func, usize::from(id.local)));
     for id in ids {
         let mut buf = LineBuf::default();
-        if instruction_declared_signed(ctx, id) {
-            buf.push(
-                format!("int{}_t", Instruction::from_id(ctx, id).size() * 8),
-                TokenKind::Type,
-            );
-        } else {
-            emit_uint_type(Instruction::from_id(ctx, id).size(), &mut buf);
-        }
+        emit_inferred_decl_type(ctx, id, &mut buf);
         buf.space();
         buf.push_value(
             instruction_name(ctx, id, roots),
@@ -133,7 +167,11 @@ fn header_line(ctx: &Context, program: &Program, function_id: FunctionId) -> Tok
 
     buf.punct("(");
     if let Some(registers) = registers {
-        emit_typed_regs(ctx, &registers.inputs, &mut buf);
+        let input_types: Vec<_> = function
+            .root()
+            .map(|root| root.params().map(|param| param.type_id()).collect())
+            .unwrap_or_default();
+        emit_typed_regs(ctx, &registers.inputs, &input_types, &mut buf);
         if let Some(root) = function.root() {
             for (extra_index, param) in root.params().skip(registers.inputs.len()).enumerate() {
                 if !registers.inputs.is_empty() || extra_index > 0 {
@@ -150,28 +188,36 @@ fn header_line(ctx: &Context, program: &Program, function_id: FunctionId) -> Tok
         .map(|registers| &registers.outputs[..registers.returns])
         .filter(|outputs| !outputs.is_empty())
     {
-        buf.space();
-        buf.punct("->");
-        buf.space();
-        buf.punct("{");
-        let returned = returned_field_types(ctx, program, outputs.len());
-        for (i, &id) in outputs.iter().enumerate() {
-            if i > 0 {
-                buf.punct(",");
-                buf.space();
-            }
-            // Prefer the type of the value actually returned in this slot: the
-            // interface records only a register varnode, which carries a width
-            // but no type, so a returned code pointer would otherwise print as
-            // a plain integer of the same width.
-            match returned.as_ref().and_then(|types| types.get(i).copied()) {
-                Some(type_id) => {
-                    emit_c_type(ctx, type_id, Varnode::from_id(ctx, id).size(), &mut buf)
+        // Poison is internal ABI-clobber bookkeeping, not a decompiled result.
+        let visible = visible_return_indices(ctx, function_id, outputs.len());
+        if !visible.is_empty() {
+            buf.space();
+            buf.punct("->");
+            buf.space();
+            buf.punct("{");
+            let returned = returned_field_types(ctx, program, outputs.len());
+            for (emitted_index, &index) in visible.iter().enumerate() {
+                if emitted_index > 0 {
+                    buf.punct(",");
+                    buf.space();
                 }
-                None => emit_uint_type(Varnode::from_id(ctx, id).size(), &mut buf),
+                let id = outputs[index];
+                // Prefer the type of the value actually returned in this slot: the
+                // interface records only a register varnode, which carries no
+                // type, so a returned code pointer would otherwise print as a
+                // plain integer of the same width.
+                match returned
+                    .as_ref()
+                    .and_then(|types| types.get(index).copied())
+                {
+                    Some(type_id) => {
+                        emit_c_type(ctx, type_id, Varnode::from_id(ctx, id).size(), &mut buf)
+                    }
+                    None => emit_uint_type(Varnode::from_id(ctx, id).size(), &mut buf),
+                }
             }
+            buf.punct("}");
         }
-        buf.punct("}");
     }
 
     buf.space();
@@ -184,14 +230,23 @@ fn header_line(ctx: &Context, program: &Program, function_id: FunctionId) -> Tok
 /// Register effects recover each argument's width but not its signedness, so
 /// use the corresponding unsigned fixed-width C type rather than inventing a
 /// signed source-level type.
-fn emit_typed_regs(ctx: &Context, regs: &[VarnodeId], buf: &mut LineBuf) {
+fn emit_typed_regs(
+    ctx: &Context,
+    regs: &[VarnodeId],
+    param_types: &[qcode::types::TypeId],
+    buf: &mut LineBuf,
+) {
     for (i, &id) in regs.iter().enumerate() {
         if i > 0 {
             buf.punct(",");
             buf.space();
         }
         let register = Varnode::from_id(ctx, id);
-        emit_uint_type(register.size(), buf);
+        if let Some(&type_id) = param_types.get(i) {
+            emit_c_type(ctx, type_id, ctx.shared.types.size_of(type_id), buf);
+        } else {
+            emit_uint_type(register.size(), buf);
+        }
         buf.space();
         buf.push(register.to_string(), TokenKind::Variable);
     }
@@ -201,24 +256,33 @@ fn emit_uint_type(size: usize, buf: &mut LineBuf) {
     buf.push(format!("uint{}_t", size * 8), TokenKind::Type);
 }
 
-/// Whether `type_id` is a code pointer, whose C spelling is `code_t *` rather
-/// than an integer of the same width.
-fn is_code_pointer(ctx: &Context, type_id: qcode::types::TypeId) -> bool {
-    matches!(
-        ctx.shared.types.get(type_id).repr(),
-        qcode::types::TypeRepr::CodePointer { .. }
-    )
-}
-
 /// Pushes the C spelling of `type_id` with no declarator name, so a pointer
 /// renders as `code_t*`. Falls back to the unsigned type for `size` when the
 /// qcode type carries nothing beyond its width.
 fn emit_c_type(ctx: &Context, type_id: qcode::types::TypeId, size: usize, buf: &mut LineBuf) {
-    if is_code_pointer(ctx, type_id) {
-        buf.push("code_t", TokenKind::Type);
-        buf.punct("*");
-    } else {
-        emit_uint_type(size, buf);
+    match ctx.shared.types.get(type_id).repr() {
+        qcode::types::TypeRepr::CodePointer { .. } => {
+            buf.push("code_t", TokenKind::Type);
+            buf.punct("*");
+        }
+        qcode::types::TypeRepr::SpaceAddress { .. } => {
+            buf.push("void", TokenKind::Type);
+            buf.space();
+            buf.punct("*");
+        }
+        qcode::types::TypeRepr::StructPointer { pointee, .. } => {
+            match ctx.shared.types.get(pointee).repr() {
+                qcode::types::TypeRepr::Struct { name, .. } => {
+                    buf.keyword("struct");
+                    buf.space();
+                    buf.push(name, TokenKind::Type);
+                }
+                _ => emit_c_type(ctx, pointee, ctx.shared.types.size_of(pointee), buf),
+            }
+            buf.space();
+            buf.punct("*");
+        }
+        _ => emit_uint_type(size, buf),
     }
 }
 
@@ -256,17 +320,51 @@ fn returned_field_types(
     })
 }
 
+/// Return-pack positions that are meaningful decompiler outputs.
+///
+/// A poison in any return arm means that position is an ABI clobber on at least
+/// one path. Omit it from every rendered return so headers and initializers
+/// remain aligned.
+fn visible_return_indices(ctx: &Context, function_id: FunctionId, outputs: usize) -> Vec<usize> {
+    let mut visible = vec![true; outputs];
+    for block in FunctionBody::from_id(ctx, function_id).blocks() {
+        let Some(return_id) = block
+            .iter()
+            .find(|insn| matches!(insn.mnemonic(), Mnemonic::Return(_)))
+            .map(|insn| insn.id)
+        else {
+            continue;
+        };
+        let Mnemonic::Return(ret) = Instruction::from_id(ctx, return_id).mnemonic() else {
+            unreachable!("return instruction changed while rendering")
+        };
+        let Some(ValueId::Instruction(tuple_id)) =
+            ret.value.map(|value| value.qualify(function_id))
+        else {
+            continue;
+        };
+        let Mnemonic::Tuple(tuple) = Instruction::from_id(ctx, tuple_id).mnemonic() else {
+            continue;
+        };
+        if tuple.fields.len() != outputs {
+            continue;
+        }
+        for (index, field) in tuple.fields.iter().enumerate() {
+            if field.qualify(function_id).is_poison() {
+                visible[index] = false;
+            }
+        }
+    }
+    visible
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, visible)| visible.then_some(index))
+        .collect()
+}
+
 fn emit_typed_param(ctx: &Context, param: BlockParamRef<'_, '_>, buf: &mut LineBuf) {
-    let code_pointer = is_code_pointer(ctx, param.type_id());
-    if code_pointer {
-        buf.push("code_t", TokenKind::Type);
-    } else {
-        emit_uint_type(param.size(), buf);
-    }
+    emit_c_type(ctx, param.type_id(), param.size(), buf);
     buf.space();
-    if code_pointer {
-        buf.punct("*");
-    }
     buf.push(
         param
             .name()
@@ -627,6 +725,13 @@ fn emit_stmt(
             if !roots.contains(id) {
                 return;
             }
+            // A store of poison models an ABI-clobbered register. It is vital to
+            // analysis but has no source-level statement to decompile.
+            if matches!(Instruction::from_id(ctx, *id).mnemonic(), Mnemonic::Store(store)
+                if store.src.qualify(id.func).is_poison())
+            {
+                return;
+            }
             let block = Instruction::from_id(ctx, *id).block().map(|b| b.id);
             if emit_named_return_tuple(ctx, program, *id, indent, roots, out) {
                 return;
@@ -881,6 +986,7 @@ fn emit_named_return_tuple(
     if outputs.len() != tuple.fields.len() {
         return false;
     }
+    let visible = visible_return_indices(ctx, function_id, outputs.len());
 
     let mut head = LineBuf::default();
     head.keyword("return");
@@ -892,7 +998,9 @@ fn emit_named_return_tuple(
         Instruction::from_id(ctx, return_id).block().map(|b| b.id),
     ));
 
-    for (index, (&output, &field)) in outputs.iter().zip(&tuple.fields).enumerate() {
+    for (emitted_index, &index) in visible.iter().enumerate() {
+        let output = outputs[index];
+        let field = tuple.fields[index];
         let mut line = LineBuf::default();
         line.push(
             Varnode::from_id(ctx, output).to_string(),
@@ -915,7 +1023,7 @@ fn emit_named_return_tuple(
             expr = *inner;
         }
         expr.write_tokens(&mut line);
-        if index + 1 != outputs.len() {
+        if emitted_index + 1 != visible.len() {
             line.punct(",");
         }
         out.push(line.into_line(indent + 1, None));
@@ -1016,11 +1124,7 @@ fn statement(
             // re-declaring here would shadow it inside this scope, which is the
             // very thing the hoist exists to avoid.
             if !hoisted.contains(&id) {
-                if instruction_declared_signed(ctx, id) {
-                    buf.push(format!("int{}_t", insn.size() * 8), TokenKind::Type);
-                } else {
-                    emit_uint_type(insn.size(), &mut buf);
-                }
+                emit_inferred_decl_type(ctx, id, &mut buf);
                 buf.space();
             }
             buf.push_value(
@@ -1056,7 +1160,18 @@ fn bind_result(
     if ctx.users(ValueId::Instruction(id)).is_empty() {
         return;
     }
-    emit_uint_type(Instruction::from_id(ctx, id).size(), buf);
+    match visible_call_result_types(ctx, id).as_deref() {
+        Some([]) => return,
+        Some([type_id]) => emit_c_type(ctx, *type_id, ctx.shared.types.size_of(*type_id), buf),
+        Some(types) => emit_uint_type(
+            types
+                .iter()
+                .map(|&type_id| ctx.shared.types.size_of(type_id))
+                .sum(),
+            buf,
+        ),
+        None => emit_uint_type(Instruction::from_id(ctx, id).size(), buf),
+    }
     buf.space();
     buf.push_value(
         instruction_name(ctx, id, roots),
@@ -1064,6 +1179,28 @@ fn bind_result(
         Some(ValueId::Instruction(id)),
     );
     assign(buf);
+}
+
+/// The types of the non-clobber fields in a direct call's result pack.
+///
+/// External calls append ABI clobbers to their physical return pack, and bodied
+/// callees can carry the same poison slots in their returns. Neither belongs in
+/// a source-facing call-result type.
+fn visible_call_result_types(
+    ctx: &Context,
+    call_id: InstructionId,
+) -> Option<Vec<qcode::types::TypeId>> {
+    let Mnemonic::Call(call) = Instruction::from_id(ctx, call_id).mnemonic() else {
+        return None;
+    };
+    let target = call.target.real()?;
+    let registers = FunctionRef::from_id(ctx, target).effects().materialized()?;
+    let visible = visible_return_indices(ctx, target, registers.returns);
+    let call_type = Instruction::from_id(ctx, call_id).type_id();
+    visible
+        .into_iter()
+        .map(|index| ctx.shared.types.field_type(call_type, index))
+        .collect()
 }
 
 /// Renders a call's parenthesized argument list.
@@ -1150,7 +1287,9 @@ fn label_of(program: &Program, block: BlockId) -> String {
 mod tests {
     use super::*;
     use crate::structure::{decompile_function, lower_function, tokens::TokenKind};
-    use qcode::value::{FunctionBody, RegisterChannelState, RegisterInterfaceMap};
+    use qcode::value::{
+        FunctionBody, LocalValueId, QCodeMut, RegisterChannelState, RegisterInterfaceMap,
+    };
     use wazabin_qcode_macro::qcode;
 
     #[test]
@@ -1308,6 +1447,143 @@ mod tests {
         assert!(
             !c.contains("range("),
             "scalar ranges must not leak into emitted C:\n{c}"
+        );
+    }
+
+    #[test]
+    fn poison_return_slots_are_omitted_from_decompiled_output() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 RAX;
+            varnode i64 RCX;
+
+            fn f:
+            <entry>
+                %answer = i64 0x2a + i64 0x0;
+                %clobber = i64 0x0 + i64 0x0;
+                %result = pack(RAX=%answer, RCX=%clobber);
+                return %result at i64 0;
+            "
+        );
+        let poison = ctx.get_poison(ctx.shared.types.get_or_make_int(8));
+        ctx.replace_instruction_mnemonic(
+            result,
+            Mnemonic::Tuple(qcode::value::insn::Tuple {
+                fields: vec![
+                    LocalValueId::Instruction(answer.localize(f)),
+                    poison.localize(f),
+                ],
+            }),
+        );
+        FunctionBody::from_id_mut(&mut ctx, f).set_register_effects(
+            RegisterChannelState::Materialized(RegisterInterfaceMap {
+                inputs: vec![],
+                outputs: vec![RAX, RCX],
+                returns: 2,
+                projections: Vec::new(),
+            }),
+        );
+
+        let c = emit_c(&ctx, &lower_function(&ctx, f), None);
+        assert!(
+            c.starts_with("fn f() -> {uint64_t}"),
+            "poison must not appear in the return type:\n{c}"
+        );
+        assert!(
+            c.contains("return {") && c.contains("RAX:"),
+            "poison must not appear in the return initializer:\n{c}"
+        );
+        assert!(
+            !c.contains("RCX:") && !c.contains("poison"),
+            "decompiled output must not expose poison:\n{c}"
+        );
+    }
+
+    #[test]
+    fn call_result_type_omits_callee_poison_slots() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 RAX;
+            varnode i64 RCX;
+
+            fn callee:
+            <callee_entry>
+                %answer = i64 0x2a + i64 0x0;
+                %clobber = i64 0x0 + i64 0x0;
+                %result = pack(RAX=%answer, RCX=%clobber);
+                return %result at i64 0;
+
+            fn caller:
+            <caller_entry>
+                call fn callee();
+            <caller_cont>
+                return at i64 0;
+            "
+        );
+        let poison = ctx.get_poison(ctx.shared.types.get_or_make_int(8));
+        ctx.replace_instruction_mnemonic(
+            result,
+            Mnemonic::Tuple(qcode::value::insn::Tuple {
+                fields: vec![
+                    LocalValueId::Instruction(answer.localize(callee)),
+                    poison.localize(callee),
+                ],
+            }),
+        );
+        FunctionBody::from_id_mut(&mut ctx, callee).set_register_effects(
+            RegisterChannelState::Materialized(RegisterInterfaceMap {
+                inputs: vec![],
+                outputs: vec![RAX, RCX],
+                returns: 2,
+                projections: Vec::new(),
+            }),
+        );
+
+        let caller_entry = FunctionBody::from_id(&ctx, caller).root().unwrap().id;
+        let call_id = qcode::value::BasicBlock::from_id(&ctx, caller_entry)
+            .iter()
+            .find(|insn| matches!(insn.mnemonic(), Mnemonic::Call(_)))
+            .unwrap()
+            .id;
+        let return_id = FunctionBody::from_id(&ctx, caller)
+            .blocks()
+            .flat_map(|block| block.iter())
+            .find(|insn| matches!(insn.mnemonic(), Mnemonic::Return(_)))
+            .unwrap()
+            .id;
+        let return_block = Instruction::from_id(&ctx, return_id).block().unwrap().id;
+        let pack_type =
+            ctx.shared
+                .types
+                .get_or_make_aggregate(vec![ctx.shared.types.get_or_make_int(8); 2]);
+        Instruction::from_id_mut(&mut ctx, call_id).set_type(pack_type);
+        let Mnemonic::Return(return_) = Instruction::from_id(&ctx, return_id).mnemonic() else {
+            unreachable!("selected return is not a return")
+        };
+        let return_ptr = return_.ptr;
+        ctx.remove_instruction(return_id);
+        let rax_space = Varnode::from_id(&ctx, RAX).space().id;
+        let rcx_space = Varnode::from_id(&ctx, RCX).space().id;
+        let mut builder = ctx.builder(return_block);
+        // This is the normal post-call clobber replay. It must stay in the IR,
+        // but it must not leak into the decompiled caller.
+        builder.push_store(poison, ValueId::Varnode(RCX), rcx_space);
+        let answer = builder.push_extract(ValueId::Instruction(call_id), 0).id();
+        builder.push_store(answer, ValueId::Varnode(RAX), rax_space);
+        builder.push_return_local(return_ptr);
+
+        let c = emit_c(&ctx, &lower_function(&ctx, caller), None);
+        assert!(
+            c.contains("uint64_t") && c.contains("= callee();"),
+            "the call result should contain only the real return value:\n{c}"
+        );
+        assert!(
+            !c.contains("uint128_t") && !c.contains("poison") && !c.contains("RCX ="),
+            "the call result and its clobber replay must not expose poison:\n{c}"
         );
     }
 
@@ -1565,10 +1841,15 @@ mod tests {
 
         let program = lower_function(&ctx, f);
         let c = emit_c(&ctx, &program, None);
-        // Byte accesses through pointer `p`, word store through `qq`.
+        // The consistently byte-accessed named pointer carries its width in its
+        // declaration, so its uses need no repeated cast. The anonymous `qq`
+        // address still needs an explicit word-width cast.
         assert!(
-            c.contains("*(uint8_t *)p") && c.contains("*(uint32_t *)qq"),
-            "loads/stores should carry their access width:\n{c}"
+            c.contains("uint8_t * p")
+                && c.contains("*p")
+                && !c.contains("*(uint8_t *)p")
+                && c.contains("*(uint32_t *)qq"),
+            "loads/stores should carry their access width without redundant casts:\n{c}"
         );
     }
 

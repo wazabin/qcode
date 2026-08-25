@@ -644,6 +644,37 @@ impl Numbering {
         }
     }
 
+    /// Whether `target == lhs + rhs` in the precomputed wrapping affine model.
+    /// This query is shared by transformations that rebuild an SSA expression
+    /// from values currently materialized in named storage.
+    pub(crate) fn is_sum(&self, target: ValueId, lhs: ValueId, rhs: ValueId) -> bool {
+        let Some(NormalForm::Affine {
+            width,
+            constant,
+            terms,
+        }) = self.forms.get(&target)
+        else {
+            return false;
+        };
+        let mask = mask_for(*width);
+        let decompose = |v| match self.forms.get(&v) {
+            Some(NormalForm::Affine {
+                width: w,
+                constant,
+                terms,
+            }) if w == width => Some((*constant, terms.clone())),
+            Some(NormalForm::Mask { .. } | NormalForm::Opaque(_)) | None => Some((0, vec![(v, 1)])),
+            _ => None,
+        };
+        let Some((lc, lt)) = decompose(lhs) else {
+            return false;
+        };
+        let Some((rc, rt)) = decompose(rhs) else {
+            return false;
+        };
+        lc.wrapping_add(rc) & mask == *constant && merge_terms(lt, rt, mask) == *terms
+    }
+
     /// Record the arithmetic view of `id` so consumers can compose it.
     pub(super) fn record_form(&mut self, id: ValueId, form: NormalForm) {
         self.forms.insert(id, form);

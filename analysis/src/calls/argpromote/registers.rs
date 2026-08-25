@@ -270,6 +270,17 @@ pub(crate) fn materialize_functions(
     sp: Option<VarnodeId>,
     abi: Option<&CallingConvention>,
 ) -> FxHashSet<FunctionId> {
+    // The architectural stack pointer is an address, not an integer. Install
+    // that fact before materialization so the by-value entry parameter and all
+    // pointer-preserving stack arithmetic inherit a `void *`-like RAM address
+    // type instead of `uintN_t`.
+    if let Some(sp) = sp {
+        let size = Varnode::from_id(cone.ctx(), sp).size();
+        let ram = cone.ctx().shared.default_space;
+        let ty = cone.ctx().shared.types.get_or_make_space_address(size, ram);
+        cone.set_varnode_type(sp, ty);
+    }
+
     let chan = RegChannel {
         sp,
         indirect: indirect_leaf(abi),

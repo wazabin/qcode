@@ -166,7 +166,7 @@ impl<'str> SubPass<'str> for Cse {
 /// variant rank breaks ties between equal indices of different variants (e.g.
 /// `Literal(5)` vs `Instruction(5)`), which would otherwise leave `a + b` and
 /// `b + a` un-normalized.
-pub(super) fn value_id_key(v: ValueId) -> (u8, usize) {
+pub(crate) fn value_id_key(v: ValueId) -> (u8, usize) {
     match v {
         ValueId::Literal(x) => (0, x.into()),
         ValueId::Instruction(x) => (1, usize::from(x.local)),

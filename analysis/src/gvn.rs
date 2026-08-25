@@ -22,17 +22,19 @@ use qcode::{
 pub(crate) mod affine;
 mod array_project;
 pub(crate) mod congruence;
-mod cse;
+pub(crate) mod cse;
 mod emulate_map;
 mod flag_idiom;
 mod fold;
 mod identity;
 mod intrinsics;
-mod mem_forward;
 mod memory;
 mod narrow;
 mod pure_call;
+mod variable_reads;
 mod walk;
+
+pub use variable_reads::{VariableReads, variable_reads_function};
 
 use cse::Cse;
 use flag_idiom::FlagIdiom;
@@ -132,7 +134,7 @@ fn gvn_passes<'str>() -> Vec<Box<dyn SubPass<'str>>> {
 /// the oracle consistent with the pointers [`gvn_function`] reasons about: without
 /// it, GVN folds these adds into fresh literals the precomputed oracle has never
 /// seen, so loop-carried stack stores become invisible to
-/// [`MemForward::prune_loop_carried`](mem_forward::MemForward::prune_loop_carried)
+/// [`MemoryState::prune_loop_carried`](crate::memory_state::MemoryState::prune_loop_carried)
 /// and are wrongly forwarded across loop back-edges.
 ///
 /// Folding only — no CSE or load/store forwarding. Returns `true` if anything

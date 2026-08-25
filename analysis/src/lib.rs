@@ -43,9 +43,13 @@ pub use dataflow_graph::{
 };
 
 pub mod gvn;
-pub use gvn::{Narrow, constant_fold_function, gvn, gvn_function, narrow_function};
+pub use gvn::{
+    Narrow, VariableReads, constant_fold_function, gvn, gvn_function, narrow_function,
+    variable_reads_function,
+};
 
 pub mod mem;
+pub(crate) mod memory_state;
 pub use mem::{MemLiveness, compute_memory_liveness, mem2reg};
 
 pub mod value_range;

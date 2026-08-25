@@ -1,6 +1,6 @@
 //! Byte-level store-to-load forwarding for GVN.
 //!
-//! [`MemForward`] is the single block-state object that subsumes every memory
+//! [`MemoryState`] is the single block-state object that subsumes every memory
 //! forwarding case the GVN block walk used to handle inline:
 //!
 //! - **Exact forward** — a same-width store/load of the same location.
@@ -43,13 +43,16 @@ use qcode::{
     },
 };
 
-use super::affine::Numbering;
+use crate::gvn::affine::Numbering;
 
 /// One byte of forwarded memory: it equals byte `src_off` of value `src`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Cell {
     src: ValueId,
     src_off: usize,
+    /// Pointer spelling that established this byte. Kept so clients can
+    /// rematerialize the current memory value as a load.
+    origin: Option<ValueId>,
 }
 
 /// A maximal run of consecutive load bytes backed by one source value.
@@ -162,8 +165,18 @@ fn cross_base_disjoint<'ctx, 'str: 'ctx>(
     }
 }
 
+/// A currently available, byte-exact value and a pointer from which it may be
+/// reloaded at the current program point.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct StoredLocation {
+    pub(crate) value: ValueId,
+    pub(crate) ptr: ValueId,
+    pub(crate) space: LocalMemorySpaceId,
+    pub(crate) size: usize,
+}
+
 #[derive(Clone, Default)]
-pub(super) struct MemForward {
+pub(crate) struct MemoryState {
     /// Per-byte forwarding, grouped by base identity: each base maps a signed
     /// byte offset to the [`Cell`] holding it. Grouping (rather than a flat
     /// `(Base, i64)` key) lets the pruning walks evaluate their per-*base*
@@ -173,7 +186,45 @@ pub(super) struct MemForward {
     byte_map: HashMap<Base, HashMap<i64, Cell>>,
 }
 
-impl MemForward {
+impl MemoryState {
+    /// Whole values currently materialized in memory. Partial and mixed-source
+    /// byte runs are deliberately omitted: callers that rematerialize a value
+    /// need one ordinary load with the value's original width.
+    pub(crate) fn stored_locations(&self) -> Vec<StoredLocation> {
+        let mut out = Vec::new();
+        for (&base, cells) in &self.byte_map {
+            for (&start, cell) in cells {
+                if cell.src_off != 0 {
+                    continue;
+                }
+                let Some(ptr) = cell.origin else { continue };
+                let mut size = 1usize;
+                while cells.get(&(start + size as i64)).is_some_and(|next| {
+                    next.src == cell.src && next.src_off == size && next.origin == Some(ptr)
+                }) {
+                    size += 1;
+                }
+                let location = StoredLocation {
+                    value: cell.src,
+                    ptr,
+                    space: base.space(),
+                    size,
+                };
+                if !out.contains(&location) {
+                    out.push(location);
+                }
+            }
+        }
+        out.sort_unstable_by_key(|l| {
+            (
+                crate::gvn::cse::value_id_key(l.value),
+                crate::gvn::cse::value_id_key(l.ptr),
+                l.size,
+            )
+        });
+        out
+    }
+
     /// Record that, after this load executes, `value` is held at `load`'s
     /// location. Called for every load (forwarded or not) so a later identical
     /// load can reuse the result.
@@ -194,6 +245,7 @@ impl MemForward {
                 Cell {
                     src: value,
                     src_off: i,
+                    origin: Some(load.ptr.qualify(func)),
                 },
             );
         }
@@ -274,6 +326,7 @@ impl MemForward {
                 Cell {
                     src: store_src,
                     src_off: i,
+                    origin: Some(store_ptr),
                 },
             );
         }
@@ -284,6 +337,7 @@ impl MemForward {
                     Cell {
                         src: zero,
                         src_off: i,
+                        origin: Some(store_ptr),
                     },
                 );
             }
@@ -966,7 +1020,7 @@ impl MemForward {
 }
 
 #[cfg(test)]
-impl MemForward {
+impl MemoryState {
     /// Insert a single forwarded byte (test-only; production code inserts through
     /// the per-base entry directly).
     fn insert_cell(&mut self, base: Base, off: i64, cell: Cell) {
@@ -1045,7 +1099,7 @@ mod tests {
             None,
             "numbering must reject a decomposition whose base is no longer live"
         );
-        let resolved = MemForward::default().resolve_loaded_ptr(
+        let resolved = MemoryState::default().resolve_loaded_ptr(
             ModuleView::new(&tc.ctx),
             ValueId::Instruction(ptr),
             space,
@@ -1083,8 +1137,8 @@ mod tests {
 
     /// Borrow `fid`'s body in place and run `f` against its
     /// `(&mut FunctionBody, ContextView)` — the only surface
-    /// [`MemForward::record_store`]/[`MemForward::try_load`] speak now that the
-    /// `&mut Context` module twins are gone. The `MemForward` state under test is
+    /// [`MemoryState::record_store`]/[`MemoryState::try_load`] speak now that the
+    /// `&mut Context` module twins are gone. The `MemoryState` state under test is
     /// owned by the caller (captured by `f`), so it outlives the borrow and can be
     /// inspected afterwards.
     fn with_body<R>(
@@ -1141,11 +1195,35 @@ mod tests {
         let base = Base::Pinned(space);
         let start = start as i64;
         let src = ValueId::Varnode(tc.r1);
-        let mut mf = MemForward::default();
+        let mut mf = MemoryState::default();
         // bytes 0,1 = src[0],src[1]  (contiguous) ; byte 2 = src[3] (jump)
-        mf.insert_cell(base, start, Cell { src, src_off: 0 });
-        mf.insert_cell(base, start + 1, Cell { src, src_off: 1 });
-        mf.insert_cell(base, start + 2, Cell { src, src_off: 3 });
+        mf.insert_cell(
+            base,
+            start,
+            Cell {
+                src,
+                src_off: 0,
+                origin: None,
+            },
+        );
+        mf.insert_cell(
+            base,
+            start + 1,
+            Cell {
+                src,
+                src_off: 1,
+                origin: None,
+            },
+        );
+        mf.insert_cell(
+            base,
+            start + 2,
+            Cell {
+                src,
+                src_off: 3,
+                origin: None,
+            },
+        );
 
         let segs = mf.segments(base, start, start + 3).expect("fully covered");
         assert_eq!(segs.len(), 2, "discontiguous src_off splits the run");
@@ -1172,7 +1250,7 @@ mod tests {
         let wide_store = store_to(&tc, fid, tc.r0_lo32, wide);
         let byte_store = store_to(&tc, fid, tc.r0_byte0, byte);
         let nb = Numbering::default();
-        let mut mf = MemForward::default();
+        let mut mf = MemoryState::default();
         with_body(&mut tc, fid, |body, cx| {
             mf.record_store(body, cx, fid, &wide_store, Some(&aliases), &nb);
             mf.record_store(body, cx, fid, &byte_store, Some(&aliases), &nb);
@@ -1202,9 +1280,25 @@ mod tests {
         let r0_start = r0_start as i64;
         let r1_start = r1_start as i64;
         let src = ValueId::Varnode(tc.r2);
-        let mut mf = MemForward::default();
-        mf.insert_cell(base, r0_start, Cell { src, src_off: 0 });
-        mf.insert_cell(base, r1_start, Cell { src, src_off: 0 });
+        let mut mf = MemoryState::default();
+        mf.insert_cell(
+            base,
+            r0_start,
+            Cell {
+                src,
+                src_off: 0,
+                origin: None,
+            },
+        );
+        mf.insert_cell(
+            base,
+            r1_start,
+            Cell {
+                src,
+                src_off: 0,
+                origin: None,
+            },
+        );
 
         // Simulate a call clobbering only r0 by retaining via the same predicate.
         let regs = [tc.r0_lo32];
@@ -1285,7 +1379,7 @@ mod tests {
         );
         let nb = precompute_forms(qcode::value::ModuleView::new(&tc.ctx), fid);
 
-        let mut mf = MemForward::default();
+        let mut mf = MemoryState::default();
         with_body(&mut tc, fid, |body, cx| {
             mf.record_store(body, cx, root.func, &slot_store, Some(&aliases), &nb);
         });
@@ -1298,6 +1392,7 @@ mod tests {
             Cell {
                 src: val,
                 src_off: 0,
+                origin: None,
             },
         );
 
@@ -1338,7 +1433,7 @@ mod tests {
         };
         let base = Base::Pinned(space);
         let start = start as i64;
-        let mut mf = MemForward::default();
+        let mut mf = MemoryState::default();
         with_body(&mut tc, fid, |body, cx| {
             mf.record_store(body, cx, fid, &store, Some(&aliases), &Numbering::default());
         });
@@ -1457,7 +1552,7 @@ mod tests {
         // A dummy instruction id to insert before; none is created here because
         // an exact forward materializes nothing.
         let dummy = qcode::value::InstructionId::default();
-        let mut mf = MemForward::default();
+        let mut mf = MemoryState::default();
         let forwarded = with_body(&mut tc, block_id.func, |body, cx| {
             mf.record_store(body, cx, block_id.func, &store, Some(&aliases), &nb);
             mf.try_load(body, cx, block_id, dummy, &load, Some(&aliases), &nb)
@@ -1490,9 +1585,25 @@ mod tests {
         let pinned = Base::Pinned(ram.into());
         let src = ValueId::Varnode(tc.r2);
 
-        let mut mf = MemForward::default();
-        mf.insert_cell(symbolic, 0, Cell { src, src_off: 0 });
-        mf.insert_cell(pinned, 0x40, Cell { src, src_off: 0 });
+        let mut mf = MemoryState::default();
+        mf.insert_cell(
+            symbolic,
+            0,
+            Cell {
+                src,
+                src_off: 0,
+                origin: None,
+            },
+        );
+        mf.insert_cell(
+            pinned,
+            0x40,
+            Cell {
+                src,
+                src_off: 0,
+                origin: None,
+            },
+        );
 
         mf.prune_clobbered_by_call(qcode::value::ModuleView::new(&tc.ctx), block, None);
 
@@ -1573,8 +1684,16 @@ mod tests {
 
         let pinned = Base::Pinned(ram.into());
         let src = ValueId::Varnode(tc.r2);
-        let mut mf = MemForward::default();
-        mf.insert_cell(pinned, 0x40, Cell { src, src_off: 0 });
+        let mut mf = MemoryState::default();
+        mf.insert_cell(
+            pinned,
+            0x40,
+            Cell {
+                src,
+                src_off: 0,
+                origin: None,
+            },
+        );
         mf.prune_clobbered_by_call(
             qcode::value::ModuleView::new(&tc.ctx),
             block,
@@ -1653,9 +1772,25 @@ mod tests {
         let caller_scratch_cell = Base::Symbolic(caller_scratch, ValueId::Varnode(tc.r2));
         let src = ValueId::Varnode(tc.r2);
 
-        let mut mf = MemForward::default();
-        mf.insert_cell(ram_cell, 0, Cell { src, src_off: 0 });
-        mf.insert_cell(caller_scratch_cell, 0, Cell { src, src_off: 0 });
+        let mut mf = MemoryState::default();
+        mf.insert_cell(
+            ram_cell,
+            0,
+            Cell {
+                src,
+                src_off: 0,
+                origin: None,
+            },
+        );
+        mf.insert_cell(
+            caller_scratch_cell,
+            0,
+            Cell {
+                src,
+                src_off: 0,
+                origin: None,
+            },
+        );
 
         mf.prune_clobbered_by_call(qcode::value::ModuleView::new(&tc.ctx), block, None);
 
@@ -1730,8 +1865,16 @@ mod tests {
 
         let cell = Base::Pinned(shadow);
         let src = ValueId::Varnode(tc.r2);
-        let mut mf = MemForward::default();
-        mf.insert_cell(cell, 0, Cell { src, src_off: 0 });
+        let mut mf = MemoryState::default();
+        mf.insert_cell(
+            cell,
+            0,
+            Cell {
+                src,
+                src_off: 0,
+                origin: None,
+            },
+        );
         mf.prune_clobbered_by_call(
             qcode::value::ModuleView::new(&tc.ctx),
             block,

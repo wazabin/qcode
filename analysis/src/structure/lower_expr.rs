@@ -91,10 +91,35 @@ pub(crate) fn deref_location(ctx: &Context, ptr: ValueId, size: usize, roots: Ro
     match ptr {
         ValueId::Varnode(_) => lower(ctx, ptr, roots),
         _ => Expr::bare(ExprKind::Deref {
-            size: Some(size),
+            // A computed address whose direct memory users all agree on this
+            // width is declared as `uintN_t *`; casting every dereference back
+            // to that same pointer type is redundant (`*p`, not
+            // `*(uintN_t *)p`). Keep the cast for mixed-width addresses.
+            size: (!(matches!(ptr, ValueId::Instruction(id) if roots.is_some_and(|roots| roots.contains(&id)))
+                && pointer_has_access_width(ctx, ptr, size)))
+            .then_some(size),
             ptr: Box::new(lower(ctx, ptr, roots)),
         }),
     }
+}
+
+fn pointer_has_access_width(ctx: &Context, ptr: ValueId, size: usize) -> bool {
+    let mut saw_access = false;
+    for user in ctx.users(ptr) {
+        let mnemonic = Instruction::from_id(ctx, user).mnemonic();
+        let access_size = match mnemonic {
+            Mnemonic::Load(load) if load.ptr.qualify(user.func) == ptr => Some(load.size),
+            Mnemonic::Store(store) if store.ptr.qualify(user.func) == ptr => Some(store.size),
+            _ => None,
+        };
+        if let Some(access_size) = access_size {
+            saw_access = true;
+            if access_size != size {
+                return false;
+            }
+        }
+    }
+    saw_access
 }
 
 /// Whether a statement root introduces a name for its result.

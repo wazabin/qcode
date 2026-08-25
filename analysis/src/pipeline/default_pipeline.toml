@@ -433,6 +433,15 @@ repeat_until = "no_change"
 # keeps a register base live for a RAM snapshot (for example `RSP` beside the
 # independent `RSP_val_0` return-address parameter). Prune the newly dead,
 # architecture-approved signature slots now that this dependency is gone.
+# Prefer reads of the final stored variables over algebraically reconstructed
+# SSA values. This deliberately runs after canonicalization: it is the selective
+# presentation-oriented inverse of mem2reg/GVN, and a later GVN would immediately
+# forward the introduced reads away again.
+[[stage]]
+name = "variable-reads"
+scope = "function"
+passes = ["variable_reads", "dce"]
+
 [[stage]]
 name = "final-dead-signature"
 scope = "module"

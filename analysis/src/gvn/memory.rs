@@ -1,6 +1,6 @@
 //! Memory sub-pass: alias-aware store→load forwarding.
 //!
-//! A thin [`SubPass`] adapter over [`MemForward`], which holds the byte-level
+//! A thin [`SubPass`] adapter over [`MemoryState`], which holds the byte-level
 //! forwarding state. Unlike pure CSE state, forwarded memory does not flow
 //! freely down the dominator tree: it is pruned at loop headers (a loop-body
 //! store may overwrite it on a later iteration), after calls (clobbered
@@ -18,8 +18,8 @@ use qcode::value::{
 use super::affine::Numbering;
 use std::any::Any;
 
-use super::mem_forward::MemForward;
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
+use crate::memory_state::MemoryState;
 
 use crate::{ContextView, FunctionBody};
 
@@ -30,16 +30,16 @@ pub(super) struct MemoryForwarding;
 
 /// The function-pass [`SubPass`] impl (body-local): reads route through
 /// `cx.body_view(body)`, forwards through [`Editor::replace`], and the
-/// [`MemForward`] rebuild/record helpers mutate the checked-out body.
+/// [`MemoryState`] rebuild/record helpers mutate the checked-out body.
 impl<'str> SubPass<'str> for MemoryForwarding {
     fn init_state(&self) -> Box<dyn Any> {
-        Box::new(MemForward::default())
+        Box::new(MemoryState::default())
     }
 
     fn clone_state(&self, state: &dyn Any) -> Box<dyn Any> {
         Box::new(
             state
-                .downcast_ref::<MemForward>()
+                .downcast_ref::<MemoryState>()
                 .expect("memory state")
                 .clone(),
         )
@@ -56,7 +56,7 @@ impl<'str> SubPass<'str> for MemoryForwarding {
         numbering: &Numbering,
         is_shared: bool,
     ) {
-        let state = state.downcast_mut::<MemForward>().expect("memory state");
+        let state = state.downcast_mut::<MemoryState>().expect("memory state");
         if is_shared {
             state.clear();
         }
@@ -72,7 +72,7 @@ impl<'str> SubPass<'str> for MemoryForwarding {
         ic: &InsnCtx,
         ed: &mut Editor,
     ) -> Claim {
-        let state = state.downcast_mut::<MemForward>().expect("memory state");
+        let state = state.downcast_mut::<MemoryState>().expect("memory state");
         match ic.mnemonic {
             Mnemonic::Store(store) => {
                 state.record_store(body, cx, ic.insn_id.func, store, ic.aliases, ic.numbering);
@@ -168,7 +168,7 @@ impl<'str> SubPass<'str> for MemoryForwarding {
         aliases: Option<&AliasResult>,
         _numbering: &Numbering,
     ) {
-        let state = state.downcast_mut::<MemForward>().expect("memory state");
+        let state = state.downcast_mut::<MemoryState>().expect("memory state");
         state.prune_clobbered_by_call(cx.body_view(body), block_id, aliases);
     }
 }
