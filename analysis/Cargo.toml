@@ -38,6 +38,7 @@ bincode.workspace = true
 clang.workspace = true
 
 [dev-dependencies]
+harbinger = { version = "0.1.0", path = "../../wazabin" }
 qcode = { workspace = true, features = ["testing"] }
 wazabin-qcode-macro.workspace = true
 env_logger.workspace = true

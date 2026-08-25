@@ -26,7 +26,8 @@ use qcode::{
 };
 use rustc_hash::FxHashMap as HashMap;
 use sleigh::{
-    CompiledSpec, Instruction, InstructionPcode, Opcode, PcodeOp, SPACE_CONST, SpaceId, Varnode,
+    CompiledSpec, Decoder, Instruction, InstructionPcode, Opcode, PcodeOp, SPACE_CONST, SpaceId,
+    Varnode,
 };
 
 /// Failure while converting flat p-code to QCode.
@@ -161,6 +162,41 @@ impl<'spec> SleighLifter<'spec> {
     /// Creates a QCode module initialized for this specification.
     pub fn new_context(&self) -> Context<'static> {
         self.base.clone()
+    }
+
+    /// Decodes one instruction from `bytes` and lowers its flat p-code into
+    /// `ctx`.
+    ///
+    /// This is the byte-oriented entry point for clients that need only the
+    /// SLEIGH-to-QCode boundary, not a binary container or recursive discovery
+    /// engine. Bulk lifters should retain an address index and use
+    /// [`decode_and_lift_indexed`](Self::decode_and_lift_indexed).
+    pub fn decode_and_lift(
+        &self,
+        ctx: &mut Context<'static>,
+        address: u64,
+        bytes: &[u8],
+        function: Option<FunctionId>,
+    ) -> Result<BlockId, LiftError> {
+        let mut addresses = AddressIndex::analyze(ctx);
+        self.decode_and_lift_indexed(ctx, &mut addresses, address, bytes, function)
+    }
+
+    /// Decodes one instruction from `bytes` and lowers it while reusing
+    /// `addresses` across a lifting session.
+    pub fn decode_and_lift_indexed(
+        &self,
+        ctx: &mut Context<'static>,
+        addresses: &mut AddressIndex,
+        address: u64,
+        bytes: &[u8],
+        function: Option<FunctionId>,
+    ) -> Result<BlockId, LiftError> {
+        let decode_context = self.spec.new_context();
+        let instruction = Decoder::new(self.spec)
+            .decode_one(address, bytes, &decode_context)
+            .map_err(|error| LiftError::Sleigh(error.to_string()))?;
+        self.lift_instruction_indexed(ctx, addresses, &instruction, function)
     }
 
     /// Lowers a decoded instruction's flat p-code into `ctx`.
@@ -729,6 +765,19 @@ mod tests {
             .unwrap();
         // COPY to r0 plus the explicit machine-instruction fall-through.
         assert_eq!(ctx.instructions().count(), 2);
+    }
+
+    #[test]
+    fn decodes_and_lifts_bytes_without_a_product_disassembler() {
+        let spec = sleigh_precompile::x64::spec();
+        let lifter = SleighLifter::new(spec);
+        let mut ctx = lifter.new_context();
+
+        lifter
+            .decode_and_lift(&mut ctx, 0x1000, b"\x48\x89\xd8", None)
+            .unwrap();
+
+        assert!(ctx.instructions().count() > 1);
     }
 
     #[test]

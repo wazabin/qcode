@@ -444,6 +444,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "harbinger"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "jstd",
+ "lazy_static",
+ "log",
+ "pollster",
+ "qcode",
+ "qcode_analysis",
+ "sleigh-precompile",
+ "wazabin-binary",
+ "wazabin-sleigh",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -575,6 +591,12 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "lazy_static"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
@@ -883,6 +905,7 @@ dependencies = [
  "clang",
  "cpp_demangle",
  "env_logger",
+ "harbinger",
  "inventory",
  "jstd",
  "log",
