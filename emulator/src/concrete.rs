@@ -1646,7 +1646,13 @@ impl StandaloneEmulator {
                             zero_result.bits,
                             *size,
                         )),
-                        Self::f80_is_denormal(value.as_bits()),
+                        // Narrowing an extended-precision register to f32/f64
+                        // does not raise the denormal-operand exception. A
+                        // denormal source too small for the destination is
+                        // reported as underflow and inexact instead. DE is for
+                        // a denormal *memory* operand, handled by the widening
+                        // arm below.
+                        false,
                     )?;
                     return Ok(Some(SizedValue::from_bits(result.bits, *size)));
                 }
