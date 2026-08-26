@@ -171,12 +171,23 @@ pub(super) fn from_f32_bits(raw: u32) -> u128 {
 pub(super) fn to_float_contextual(raw: u128, size: usize, control: u16) -> Result {
     let round = round_from_control(control);
     let mut loses_info = false;
+    // A masked invalid conversion — an unsupported f80 encoding, for instance —
+    // stores the destination format's QNaN floating-point indefinite, whose
+    // sign bit is set. APFloat produces a positive quiet NaN instead.
+    let indefinite = |size: usize| match size {
+        4 => 0xffc0_0000u128,
+        _ => 0xfff8_0000_0000_0000u128,
+    };
     match size {
         4 => {
             let value: rustc_apfloat::StatusAnd<Single> =
                 value(raw).convert_r(round, &mut loses_info);
             Result {
-                bits: value.value.to_bits(),
+                bits: if value.status.contains(Status::INVALID_OP) {
+                    indefinite(4)
+                } else {
+                    value.value.to_bits()
+                },
                 status: value.status,
             }
         }
@@ -184,7 +195,11 @@ pub(super) fn to_float_contextual(raw: u128, size: usize, control: u16) -> Resul
             let value: rustc_apfloat::StatusAnd<Double> =
                 value(raw).convert_r(round, &mut loses_info);
             Result {
-                bits: value.value.to_bits(),
+                bits: if value.status.contains(Status::INVALID_OP) {
+                    indefinite(8)
+                } else {
+                    value.value.to_bits()
+                },
                 status: value.status,
             }
         }
