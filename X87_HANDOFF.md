@@ -152,11 +152,17 @@ Each has four hardware states with TOP 0 and TOP 3.
 | 11685 | `FNSTENV [RBX]` | full tag word for zero/infinity at TOP 0/3 |
 | 11686 | `FNSAVE [RBX]` | full tag word/save image for zero/infinity at TOP 0/3 |
 
-All 84 rows were captured by Aegis and now replay cleanly in QCode.
-`11678`–`11686` fixed comparison/status preservation, FXAM classification,
-FST/FSTP occupancy, defined C1 clearing, and synthesized full environment
-tags. `11677` exposed and fixed raw p-code lowering for bit-range writes into
-private-memory loads (the MMX packed-lane form).
+All 84 physical-file rows through 11686 were captured by Aegis and replay
+cleanly in QCode. `11678`–`11686` fixed comparison/status preservation, FXAM
+classification, FST/FSTP occupancy, defined C1 clearing, and synthesized full
+environment tags. `11677` exposed and fixed raw p-code lowering for bit-range
+writes into private-memory loads (the MMX packed-lane form).
+
+The arithmetic hardware corpus is IDs **11687–11697**: 346 captured and
+QCode-replay-clean states covering FADD/FSUB/FMUL/FDIV, FRNDINT, FILD,
+FISTP/FISTTP, f32 FLD/FSTP, and FCOM. It sweeps RC and PC where applicable,
+uses TOP 0 and 3, and includes infinity/zero invalid operations, divide by
+zero, qNaN comparison, f32 denormal loads, and exact f80↔f32 boundaries.
 
 The first alias case found the MMX TOP-clearing behavior described above. This
 is why physical overlap cases are valuable; retain and expand them rather than
@@ -174,17 +180,20 @@ The concrete emulator now has a contextual f80 path in
 `emulator/src/concrete.rs`'s `StandaloneEmulator`. It recognizes contexts
 with named `FPUControlWord` and `FPUStatusWord` varnodes and applies:
 
-- `RC` to f80 add/sub/mul/div, integer-to-f80 conversion, and `round`;
-- `PC` to normal finite arithmetic/conversion results by rounding the raw f80
-  significand in place, preserving the extended exponent range;
+- `RC` to f80 add/sub/mul/div, FRNDINT, FISTP, and f80→f32/f64 stores;
+- `PC` to normal finite arithmetic results by rounding the raw f80
+  significand in place, preserving the extended exponent range (FILD itself
+  remains an exact extended conversion);
 - APFloat invalid, divide-by-zero, overflow, underflow, and inexact status to
-  the matching x87 sticky bits.
+  the matching x87 sticky bits, plus denormal-operand and C1 rounded-up state;
+- x87's masked-invalid indefinite QNaN result for invalid arithmetic.
 
 The current explicit policy is **non-trapping**: results are always produced;
 unmasked exceptions additionally set ES. Architectural exception delivery is
 not modelled yet, so do not add hardware corpus cases that expect a trap.
-Denormal-operand detection and all exceptional precision-control corner cases
-remain to be covered.
+The corpus covers f32 denormal loads and the principal masked invalid/divide
+cases. Additional exceptional precision-control and unmasked-trap cases remain
+follow-up work.
 
 `DomainValue` remains context-free and generic float operations still flow
 through `emulator/src/lib.rs`; only f80 instructions in a context exposing the
