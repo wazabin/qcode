@@ -270,6 +270,29 @@ pub(super) fn div_contextual(lhs: u128, rhs: u128, control: u16) -> Result {
     arithmetic(value(lhs).div_r(value(rhs), round), control, round)
 }
 
+/// FSCALE: multiply by 2 raised to the truncated integer value of `factor`.
+/// The scale is exact for a finite result, so only the destination rounding
+/// applies. A NaN, infinite or zero source is returned by APFloat unchanged.
+pub(super) fn scale_contextual(raw: u128, factor: u128, control: u16) -> Result {
+    let round = round_from_control(control);
+    let source = value(raw);
+    // x87 truncates the scale operand toward zero, whatever the rounding
+    // control says, and clamps far beyond the representable exponent range.
+    let mut exact = false;
+    let steps = value(factor)
+        .to_i128_r(32, Round::TowardZero, &mut exact)
+        .value
+        .clamp(-0x8000, 0x7fff) as i32;
+    arithmetic(
+        rustc_apfloat::StatusAnd {
+            status: Status::OK,
+            value: source.scalbn_r(steps, round),
+        },
+        control,
+        round,
+    )
+}
+
 pub(super) fn round_to_integral_contextual(raw: u128, control: u16) -> Result {
     let round = round_from_control(control);
     result(value(raw).round_to_integral(round))

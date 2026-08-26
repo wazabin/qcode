@@ -1342,6 +1342,28 @@ impl StandaloneEmulator {
         };
 
         let value = match name.as_ref() {
+            // FSCALE reads its scale from ST(1) and rounds under the x87
+            // control word, so it is interpreted here rather than as a
+            // generic packed lane operation.
+            "fscale" if lhs.size == 10 && rhs.size == 10 => {
+                let (control, status_register) = match Self::x87_context(ctx) {
+                    Some((control, status)) => (
+                        self.read_varnode_u128(ctx, control).unwrap_or(0x037f) as u16,
+                        status,
+                    ),
+                    None => return Ok(None),
+                };
+                let result = float80::scale_contextual(lhs.as_bits(), rhs.as_bits(), control);
+                self.record_x87_status(
+                    ctx,
+                    control,
+                    status_register,
+                    result.status,
+                    None,
+                    Self::f80_is_denormal(lhs.as_bits()),
+                )?;
+                return Ok(Some(SizedValue::from_f80_bits(result.bits)));
+            }
             "pavgb" => average(1),
             "pavgw" => average(2),
             // Unsigned 16x16 multiply per word lane, keeping the high half.
