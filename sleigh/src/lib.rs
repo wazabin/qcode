@@ -295,6 +295,7 @@ impl<'spec> SleighLifter<'spec> {
             ctx.builder(entry),
             &self.storage,
             self.unique_space,
+            pcode,
             branches,
             calls,
             address,
@@ -304,31 +305,47 @@ impl<'spec> SleighLifter<'spec> {
     }
 }
 
-struct FlatEmitter<'storage, 'str, 'ctx> {
+struct FlatEmitter<'str, 'ctx> {
     builder: Builder<'str, 'ctx>,
-    storage: &'storage HashMap<Varnode, VarnodeId>,
-    unique_space: SpaceId,
-    unique: HashMap<u64, ValueId>,
+    storage: HashMap<Varnode, ValueId>,
     branches: HashMap<u64, BlockId>,
     calls: HashMap<u64, FunctionId>,
     address: u64,
     fallthrough: usize,
 }
 
-impl<'storage, 'str, 'ctx> FlatEmitter<'storage, 'str, 'ctx> {
+impl<'str, 'ctx> FlatEmitter<'str, 'ctx> {
     fn new(
-        builder: Builder<'str, 'ctx>,
-        storage: &'storage HashMap<Varnode, VarnodeId>,
+        mut builder: Builder<'str, 'ctx>,
+        base_storage: &HashMap<Varnode, VarnodeId>,
         unique_space: SpaceId,
+        pcode: &InstructionPcode,
         branches: HashMap<u64, BlockId>,
         calls: HashMap<u64, FunctionId>,
         address: u64,
     ) -> Self {
+        // Flat p-code varnodes are mutable locations, not SSA values. Give
+        // every unique varnode its own body-local QCode temporary space: this
+        // emits loads and stores and keeps even overlapping p-code varnodes
+        // isolated as required by their storage identity.
+        let mut storage: HashMap<Varnode, ValueId> = base_storage
+            .iter()
+            .map(|(&varnode, &id)| (varnode, ValueId::Varnode(id)))
+            .collect();
+        for varnode in pcode
+            .ops
+            .iter()
+            .flat_map(|op| op.output.iter().chain(op.inputs.iter()))
+            .filter(|varnode| varnode.space == unique_space)
+        {
+            storage
+                .entry(*varnode)
+                .or_insert_with(|| ValueId::Temp(builder.make_temp(varnode.size)));
+        }
+
         Self {
             builder,
             storage,
-            unique_space,
-            unique: HashMap::default(),
             branches,
             calls,
             address,
@@ -337,9 +354,6 @@ impl<'storage, 'str, 'ctx> FlatEmitter<'storage, 'str, 'ctx> {
     }
 
     fn emit(&mut self, pcode: &InstructionPcode, next: BlockId) -> Result<(), LiftError> {
-        // A raw op can introduce at most one unique result. Reserving once
-        // keeps temporary tracking allocation-free for normal instructions.
-        self.unique.reserve(pcode.ops.len());
         let mut labels = HashMap::default();
         labels.reserve(pcode.ops.len());
         for (index, op) in pcode.ops.iter().enumerate() {
@@ -417,19 +431,12 @@ impl<'storage, 'str, 'ctx> FlatEmitter<'storage, 'str, 'ctx> {
         if varnode.space == SPACE_CONST {
             return Ok(self.builder.shr().get_const(varnode.offset, varnode.size));
         }
-        if varnode.space == self.unique_space {
-            return self
-                .unique
-                .get(&varnode.offset)
-                .copied()
-                .ok_or(LiftError::UnknownVarnode(varnode));
-        }
-        let id = self
+        let value = self
             .storage
             .get(&varnode)
             .copied()
             .ok_or(LiftError::UnknownVarnode(varnode))?;
-        Ok(self.builder.ensure_local(ValueId::Varnode(id)))
+        Ok(self.builder.ensure_local(value))
     }
 
     fn write(&mut self, output: Option<Varnode>, value: ValueId) -> Result<(), LiftError> {
@@ -439,10 +446,8 @@ impl<'storage, 'str, 'ctx> FlatEmitter<'storage, 'str, 'ctx> {
         if output.space == SPACE_CONST {
             return Err(LiftError::UnknownVarnode(output));
         }
-        if let Some(&id) = self.storage.get(&output) {
-            self.builder.push_copy(value, ValueId::Varnode(id));
-        } else if output.space == self.unique_space {
-            self.unique.insert(output.offset, value);
+        if let Some(&destination) = self.storage.get(&output) {
+            self.builder.push_copy(value, destination);
         } else {
             return Err(LiftError::UnknownVarnode(output));
         }
@@ -737,6 +742,7 @@ impl<'storage, 'str, 'ctx> FlatEmitter<'storage, 'str, 'ctx> {
 #[cfg(test)]
 mod tests {
     use super::SleighLifter;
+    use qcode_emulator::Emulator;
     use sleigh::{Compiler, Decoder, SourceDb};
 
     #[test]
@@ -826,6 +832,91 @@ mod tests {
             lifter
                 .lift_instruction(&mut ctx, &instruction, None)
                 .unwrap();
+        }
+    }
+
+    #[test]
+    fn lifts_x64_unsized_unary_and_carry_literals() {
+        let spec = sleigh_precompile::x64::spec();
+        let lifter = SleighLifter::new(spec);
+        for bytes in [
+            b"\x48\x0f\xb3\xd8".as_slice(), // BTR RAX,RBX
+            b"\x0f\x06",                    // CLTS
+            b"\x48\xf7\xd8",                // NEG RAX
+        ] {
+            let instruction = Decoder::new(spec)
+                .decode_one(0x1000, bytes, &spec.new_context())
+                .unwrap();
+            let mut ctx = lifter.new_context();
+            lifter
+                .lift_instruction(&mut ctx, &instruction, None)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn emulates_loop_carried_unique_pcode_temporaries() {
+        let spec = sleigh_precompile::x64::spec();
+        let lifter = SleighLifter::new(spec);
+        for (bytes, inputs, output_name, expected) in [
+            (
+                b"\x66\xf3\x0f\xbc\xc3".as_slice(),
+                &[("BX", 0)][..],
+                "AX",
+                16,
+            ),
+            (b"\x48\x0f\xbd\xc3", &[("RBX", 1)], "RAX", 0),
+            (
+                b"\xc4\xe2\x63\xf5\xc1",
+                &[("EBX", 1), ("ECX", 0x8000_0000)],
+                "EAX",
+                0x8000_0000,
+            ),
+            (
+                b"\xc4\xe2\x62\xf5\xc1",
+                &[("EBX", 0x8000_0000), ("ECX", 0x8000_0000)],
+                "EAX",
+                1,
+            ),
+        ] {
+            let instruction = Decoder::new(spec)
+                .decode_one(0x1000, bytes, &spec.new_context())
+                .unwrap();
+            let output_id = spec
+                .registers()
+                .find(|register| register.name() == output_name)
+                .unwrap()
+                .id;
+            let mut ctx = lifter.new_context();
+            lifter
+                .lift_instruction(&mut ctx, &instruction, None)
+                .unwrap();
+
+            let mut emulator = Emulator::from_address(&ctx, 0x1000);
+            for &(name, value) in inputs {
+                let id = spec
+                    .registers()
+                    .find(|register| register.name() == name)
+                    .unwrap()
+                    .id;
+                emulator.set_register(id, value).unwrap();
+            }
+            for _ in 0..1000 {
+                if emulator.block().address() == Some(0x1000 + bytes.len() as u64) {
+                    break;
+                }
+                emulator.step().unwrap();
+            }
+            assert_eq!(
+                emulator.block().address(),
+                Some(0x1000 + bytes.len() as u64),
+                "{instruction} did not reach its fall-through block"
+            );
+            assert_eq!(
+                emulator.read_register(output_id),
+                Some(expected),
+                "{instruction}"
+            );
         }
     }
 
