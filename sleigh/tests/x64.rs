@@ -755,6 +755,31 @@ mod tests {
         assert_eq!(emu.read_register(x64::FPUSTATUSWORD), Some(0));
     }
 
+    /// PACKSSWB narrows each signed word to a byte, clamping to 0x7f/0x80.
+    /// MM0 supplies the low four output bytes and MM1 the high four.
+    #[test]
+    fn test_packsswb_saturates_each_signed_word_lane() {
+        let insn = x64::Disassembler::from_bytes(0x1000, b"\x0f\x63\xc1")
+            .next()
+            .unwrap();
+        assert_eq!(insn.to_string(), "PACKSSWB MM0, MM1");
+
+        let mut ctx = x64::make_context();
+        x64::lift(&mut ctx, &insn, None).unwrap();
+        let mut emu = Emulator::from_address(&ctx, 0x1000);
+        // Lanes, low to high: in range, above range, below range, in range.
+        let dst = 0x0005_8000_0100_fffbu128;
+        let src = 0x8000_0000_0000_0000u128;
+        write_x87_slot(&mut emu, &ctx, 0, dst);
+        write_x87_slot(&mut emu, &ctx, 1, src);
+        emu.set_register(x64::FPUSTATUSWORD, 0).unwrap();
+        emu.set_register(x64::FPUTAGWORD, 0xffff).unwrap();
+        emu.run_block().unwrap();
+
+        let packed = read_x87_slot(&mut emu, &ctx, 0) & 0xffff_ffff_ffff_ffff;
+        assert_eq!(packed, 0x8000_0000_0580_7ffb);
+    }
+
     #[test]
     fn test_fxsave_uses_an_abridged_physical_tag_byte() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\x0f\xae\x07")
