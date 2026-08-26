@@ -780,6 +780,32 @@ mod tests {
         assert_eq!(packed, 0x8000_0000_0580_7ffb);
     }
 
+    /// C1 reports that an inexact result was rounded away from zero. Under
+    /// RC=up and PC=single, 1.0 + 2^-64 rounds up to the next single-precision
+    /// value, so C1 and PE must both be set.
+    #[test]
+    fn test_fadd_sets_c1_when_the_result_rounds_up() {
+        let insn = x64::Disassembler::from_bytes(0x1000, b"\xd8\xc1")
+            .next()
+            .unwrap();
+        assert_eq!(insn.to_string(), "FADD ST0, ST1");
+
+        let mut ctx = x64::make_context();
+        x64::lift(&mut ctx, &insn, None).unwrap();
+        let mut emu = Emulator::from_address(&ctx, 0x1000);
+        let one = 0x3fff_8000_0000_0000_0000u128;
+        let tiny = 0x3fbf_8000_0000_0000_0000u128;
+        write_x87_slot(&mut emu, &ctx, 0, one);
+        write_x87_slot(&mut emu, &ctx, 1, tiny);
+        emu.set_register(x64::FPUCONTROLWORD, 0x087f).unwrap();
+        emu.set_register(x64::FPUSTATUSWORD, 0).unwrap();
+        emu.set_register(x64::FPUTAGWORD, 0xffff).unwrap();
+        emu.run_block().unwrap();
+
+        assert_eq!(read_x87_slot(&mut emu, &ctx, 0), one + (1u128 << 40));
+        assert_eq!(emu.read_register(x64::FPUSTATUSWORD), Some(0x220));
+    }
+
     #[test]
     fn test_fxsave_uses_an_abridged_physical_tag_byte() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\x0f\xae\x07")
