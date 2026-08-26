@@ -195,10 +195,14 @@ New data producers must emit physical fields directly.
 
 ## Immediate next-agent task
 
+Read [`X87_NEXT_BATCH_HANDOFF.md`](X87_NEXT_BATCH_HANDOFF.md) first. It
+tracks the hardware-captured MMX/x87 rows awaiting replay and defines the next
+Binit/Aegis-only memory, conversion, condition, and stack-boundary batch.
+
 The environment restore corpus is complete: `11698`–`11700`, 12 hardware
 states, strict-replay-clean. Read
 [`X87_ENVIRONMENT_RESTORE_HANDOFF.md`](X87_ENVIRONMENT_RESTORE_HANDOFF.md)
-first for its state and transport invariants before expanding this area.
+for its state and transport invariants before expanding this area.
 
 Do not start another arithmetic admission batch until a follow-up design covers
 exceptional precision-control or trap policy; the current arithmetic/control
