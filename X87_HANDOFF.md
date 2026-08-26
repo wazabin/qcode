@@ -172,9 +172,20 @@ relying only on unit tests.
 fields. This was a local DB data migration, not a committed SQL migration.
 New data producers must emit physical fields directly.
 
-## What to do next
+## Immediate next-agent task
 
-### 1. x87 control word and exception status (highest priority)
+**Implement hardware-backed environment restore coverage.** Read and follow
+[`X87_ENVIRONMENT_RESTORE_HANDOFF.md`](X87_ENVIRONMENT_RESTORE_HANDOFF.md)
+before changing a generator, SLEIGH, Aegis, or QCode. It defines the required
+restore rows, raw image layouts, state matrix, capture gate, and replay gate.
+
+The arithmetic/control-word work below is complete for its current 346-state
+hardware corpus. Do not start another arithmetic admission batch before the
+restore corpus is captured and replay-clean.
+
+## Follow-up work
+
+### x87 control word and exception status
 
 The concrete emulator now has a contextual f80 path in
 `emulator/src/concrete.rs`'s `StandaloneEmulator`. It recognizes contexts
@@ -199,9 +210,11 @@ follow-up work.
 through `emulator/src/lib.rs`; only f80 instructions in a context exposing the
 x87 words take this concrete contextual path.
 
-Only admit arithmetic/conversion differential rows after this work has tests.
+The baseline arithmetic/conversion admission is IDs 11687–11697; follow-up
+exceptional precision-control and trap-policy rows should be added only after
+the environment restore corpus is clean.
 
-### 2. Full environment-memory transport
+### Environment-memory transport
 
 The bounded raw-byte transport is implemented as `scratch_memory`: exactly 512
 bytes (1024 lowercase hex digits), rooted at `mem0`. It is carried through
