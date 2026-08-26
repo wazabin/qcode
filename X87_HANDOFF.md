@@ -2,8 +2,9 @@
 
 This document is the current handoff for x87/MMX SLEIGH, Aegis, Binit, and the
 QCode concrete emulator. The physical-file transport and its initial hardware
-corpus are complete. The next substantial task is x87 arithmetic semantics in
-the emulator, followed by full environment-memory coverage.
+corpus are complete. Arithmetic semantics and the first full environment-memory
+restore corpus are replay-clean; remaining work is exceptional control-word
+behavior, full-tag propagation, and broader physical alias coverage.
 
 ## Do not lose the model
 
@@ -82,8 +83,10 @@ mismatch; do not change it back to direct physical slot copies.
 - physical full-tag helpers; non-rotating `FLD`, `FST*`, `FXCH`, `FFREE*`,
   `FINIT`/`FNINIT`, arithmetic-pop, and environment/save/restore accesses;
 - MMX low-64 R views, high-16 write behavior, physical tag effects, and EMMS;
-- FXSAVE/FXRSTOR abridged physical-tag conversion and logical FXSAVE payload
-  ordering;
+- FXSAVE/FXRSTOR abridged physical-tag conversion, logical FXSAVE payload
+  ordering, and 64-bit FIP/FDP fields in the long-mode image;
+- explicit zero extension of legacy 32-bit FRSTOR/FLDENV FIP/FDP fields into
+  x86-64's pointer registers (without consuming adjacent FOP bytes);
 - MMX operand constructors that clear TOP (`FPUStatusWord & 0xc7ff`).
 
 Useful source regions:
@@ -151,12 +154,28 @@ Each has four hardware states with TOP 0 and TOP 3.
 | 11684 | `FXCH ST1` | defined C1 clearing |
 | 11685 | `FNSTENV [RBX]` | full tag word for zero/infinity at TOP 0/3 |
 | 11686 | `FNSAVE [RBX]` | full tag word/save image for zero/infinity at TOP 0/3 |
+| 11698 | `FXRSTOR [RBX]` | 4 images: TOP 0/3, logical f80 slots, physical abridged tags |
+| 11699 | `FRSTOR [RBX]` | 4 images: TOP 0/3, explicit physical full tags, logical f80 slots |
+| 11700 | `FLDENV [RBX]` | 4 images: TOP 0/3, explicit physical full tags, payload preservation |
 
-All 84 physical-file rows through 11686 were captured by Aegis and replay
-cleanly in QCode. `11678`–`11686` fixed comparison/status preservation, FXAM
-classification, FST/FSTP occupancy, defined C1 clearing, and synthesized full
-environment tags. `11677` exposed and fixed raw p-code lowering for bit-range
-writes into private-memory loads (the MMX packed-lane form).
+All 12 restore states in `11698`–`11700` were captured by Aegis and replay
+cleanly in strict QCode. They include +0/-0, normal, denormal, both infinities,
+qNaN, an unsupported f80 encoding, and an empty physical slot; every image has
+RC=up, PC=single, sticky/C1 condition state, and distinct FIP/FDP. `11698`
+separates logical FXSAVE payload order from physical abridged tags. `11699` and
+`11700` supply full tag pairs directly rather than deriving classes from f80
+payloads.
+
+The corpus exposed two pointer-width issues in SLEIGH: long-mode FXSAVE/
+FXRSTOR FIP/FDP are 64-bit fields at +8/+16, while legacy FRSTOR/FLDENV FIP/FDP
+are 32-bit fields and must be explicitly zero-extended. A bare `*:4` assignment
+to a 64-bit SLEIGH register widened the *memory load* and consumed adjacent
+FOP/selector bytes; use `zext(*:4 ...)` for the legacy forms.
+
+`11678`–`11686` fixed comparison/status preservation, FXAM classification,
+FST/FSTP occupancy, defined C1 clearing, and synthesized full environment
+tags. `11677` exposed and fixed raw p-code lowering for bit-range writes into
+private-memory loads (the MMX packed-lane form).
 
 The arithmetic hardware corpus is IDs **11687–11697**: 346 captured and
 QCode-replay-clean states covering FADD/FSUB/FMUL/FDIV, FRNDINT, FILD,
@@ -174,14 +193,14 @@ New data producers must emit physical fields directly.
 
 ## Immediate next-agent task
 
-**Implement hardware-backed environment restore coverage.** Read and follow
+The environment restore corpus is complete: `11698`–`11700`, 12 hardware
+states, strict-replay-clean. Read
 [`X87_ENVIRONMENT_RESTORE_HANDOFF.md`](X87_ENVIRONMENT_RESTORE_HANDOFF.md)
-before changing a generator, SLEIGH, Aegis, or QCode. It defines the required
-restore rows, raw image layouts, state matrix, capture gate, and replay gate.
+first for its state and transport invariants before expanding this area.
 
-The arithmetic/control-word work below is complete for its current 346-state
-hardware corpus. Do not start another arithmetic admission batch before the
-restore corpus is captured and replay-clean.
+Do not start another arithmetic admission batch until a follow-up design covers
+exceptional precision-control or trap policy; the current arithmetic/control
+word corpus is the existing 346-state baseline.
 
 ## Follow-up work
 
@@ -223,14 +242,12 @@ QCode seed/snapshot/comparison/CSV diagnostics. It is intentionally exclusive
 with the legacy `mem0_value`/`mem1_value` words. Aegis kernel images must be
 rebuilt before hardware capture because `CpuState` changed.
 
-Add hardware rows, at TOP 0 and 3 with distinct physical R payloads, for:
-
-- FXSAVE payload and FXRSTOR payload input;
-- FSAVE/FNSAVE and FRSTOR (including full tags);
-- FNSTENV/FSTENV and FLDENV.
-
-Keep the FXSAVE rule in mind: the memory payload is logical order even though
-the Binit state itself stays physical.
+Hardware restore rows are now `11698`–`11700`: FXRSTOR and FRSTOR use
+logical-order memory payloads at TOP 0/3; FRSTOR and FLDENV carry deliberately
+supplied physical full-tag words. FLDENV confirms that its environment-only
+restore leaves the supplied physical payload file intact. Keep the FXSAVE rule
+in mind: memory payload is logical order even though the Binit state stays
+physical.
 
 ### 3. Expand physical alias cases
 

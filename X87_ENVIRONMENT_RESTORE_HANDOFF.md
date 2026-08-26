@@ -1,15 +1,15 @@
 # x87 environment restore handoff
 
-## Goal
+## Result and future-expansion gate
 
-The next task is to add a **hardware-captured, QCode-replay-clean restore
-corpus** for x87 environment images. The physical x87/MMX transport, bounded
-raw scratch-memory transport, and arithmetic corpus are already in place; do
-not redesign them.
+The initial **hardware-captured, QCode-replay-clean restore corpus** is
+complete: IDs **11698–11700**, four states per instruction (12 total). The
+physical x87/MMX transport, bounded raw scratch-memory transport, and arithmetic
+corpus are already in place; do not redesign them.
 
-The immediate deliverable is a Binit generator analogous to
-`binit/generator/admit_x87_arithmetic_cases.py`, followed by Aegis capture and
-strict QCode replay for:
+The completed Binit generator,
+`binit/generator/admit_x87_environment_restore_cases.py`, follows the arithmetic
+generator's pattern and was captured/replayed for:
 
 1. `FXRSTOR [RBX]` (`0f ae 0b`), including the FXSAVE header and all eight
    16-byte ST/MM payload slots;
@@ -138,8 +138,13 @@ PCODE_FUZZ_OUTPUT=/tmp/x87-env-qcode.csv \
 - Physical transport and save-side corpus: IDs **11666–11686**, clean.
 - Arithmetic/conversion corpus: IDs **11687–11697**, 346 hardware states,
   clean in strict QCode replay.
-- Relevant committed changes: Binit `1003b12`; QCode `c5c7b6a` and
-  `16da489`.
+- Environment restore corpus: IDs **11698** (`FXRSTOR [RBX]`), **11699**
+  (`FRSTOR [RBX]`), and **11700** (`FLDENV [RBX]`), four TOP-0/TOP-3 image
+  states each, all clean in strict QCode replay.
+- The restore capture found that long-mode FXSAVE/FXRSTOR FIP/FDP are 64-bit,
+  while legacy FRSTOR/FLDENV's 32-bit FIP/FDP must be explicitly zero-extended
+  in SLEIGH to avoid reading adjacent FOP/selector bytes.
+- Relevant prior changes: Binit `1003b12`; QCode `c5c7b6a` and `16da489`.
 
 Do not `git clean`, reset, or update the SLEIGH submodule blindly. QCode uses
 `/home/jack/dev/binary/wazabin-sleigh/precompile/open_sleigh`, not a separate
