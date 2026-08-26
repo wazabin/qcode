@@ -364,7 +364,13 @@ mod tests {
     use harbinger::format::elf::ElfBinary;
 
     fn load_fixture_elf(name: &str) -> ElfBinary {
-        let path = std::path::PathBuf::from(env!("FIXTURES_DIR")).join(name);
+        let fixtures_dir = std::env::var_os("FIXTURES_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../../target/integration-fixtures")
+            });
+        let path = fixtures_dir.join(name);
         let bytes = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
         ElfBinary::parse(&bytes).unwrap_or_else(|e| panic!("failed to parse {name} ELF: {e}"))
