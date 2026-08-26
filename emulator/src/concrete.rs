@@ -1309,6 +1309,79 @@ impl StandaloneEmulator {
         interpreter.get_value(id)
     }
 
+    /// Interpret the packed-integer SLEIGH user-ops that x86's MMX/SSE
+    /// constructors leave as `pcodeop` applications. Returns `None` for every
+    /// other user-op so the generic interpreter stays the implementation.
+    ///
+    /// `pavgb`/`pavgw` are applied by the spec to one lane at a time, so they
+    /// are scalar here. `pmaddwd`/`pmulhuw` receive a whole vector and are
+    /// width-generic, covering the 8-byte MMX and 16-byte XMM forms alike.
+    fn interpret_packed_pcode_op(
+        &mut self,
+        ctx: &Context<'_>,
+        insn: &InstructionRef<'_, '_>,
+    ) -> Result<Option<SizedValue>, EmulatorErrorKind> {
+        let Mnemonic::PCodeOp(op) = insn.mnemonic() else {
+            return Ok(None);
+        };
+        let name = ctx.shared.pcode_ops[op.id].clone();
+        let [lhs, rhs] = op.args.as_slice() else {
+            return Ok(None);
+        };
+        let func = insn.id.func;
+        let lhs = self.scalar_value(ctx, lhs.qualify(func))?;
+        let rhs = self.scalar_value(ctx, rhs.qualify(func))?;
+
+        // Unsigned rounded average of one lane: (a + b + 1) >> 1, computed
+        // wide enough that the carry out of the lane is kept.
+        let average = |width: usize| -> Option<SizedValue> {
+            (lhs.size as usize == width && rhs.size as usize == width).then(|| {
+                let sum = lhs.as_bits() + rhs.as_bits() + 1;
+                SizedValue::from_bits(sum >> 1, width)
+            })
+        };
+
+        let value = match name.as_ref() {
+            "pavgb" => average(1),
+            "pavgw" => average(2),
+            // Unsigned 16x16 multiply per word lane, keeping the high half.
+            "pmulhuw" => Self::packed_lanes(&lhs, &rhs, 2, |a, b| ((a * b) >> 16) & 0xffff),
+            // Signed 16x16 multiplies summed in pairs into each dword lane.
+            "pmaddwd" => Self::packed_lanes(&lhs, &rhs, 4, |a, b| {
+                let word = |v: u128, half: u32| i64::from(((v >> (half * 16)) & 0xffff) as u16 as i16);
+                let product = word(a, 0) * word(b, 0) + word(a, 1) * word(b, 1);
+                u128::from(product as u32)
+            }),
+            _ => None,
+        };
+        Ok(value)
+    }
+
+    /// Apply `lane` to each `width`-byte lane of two equally sized vectors.
+    /// Returns `None` unless both operands share a width that divides evenly
+    /// into lanes.
+    fn packed_lanes(
+        lhs: &SizedValue,
+        rhs: &SizedValue,
+        width: usize,
+        lane: impl Fn(u128, u128) -> u128,
+    ) -> Option<SizedValue> {
+        let size = lhs.size as usize;
+        if size != rhs.size as usize || size == 0 || size % width != 0 {
+            return None;
+        }
+        let bits = width * 8;
+        let mask = (1u128 << bits) - 1;
+        let mut out = 0u128;
+        for index in 0..size / width {
+            let shift = index * bits;
+            let a = (lhs.as_bits() >> shift) & mask;
+            let b = (rhs.as_bits() >> shift) & mask;
+            out |= (lane(a, b) & mask) << shift;
+        }
+        Some(SizedValue::from_bits(out, size))
+    }
+
     fn x87_context(ctx: &Context<'_>) -> Option<(VarnodeId, VarnodeId)> {
         let ValueId::Varnode(control) = ctx.get_named("FPUControlWord")? else {
             return None;
@@ -1911,6 +1984,14 @@ impl StandaloneEmulator {
             }
 
             _ => {
+                if let Some(value) = self
+                    .interpret_packed_pcode_op(ctx, &insn)
+                    .map_err(|kind| self.make_error(ctx, kind))?
+                {
+                    self.insn_values.insert(id, value);
+                    self.idx += 1;
+                    return Ok(StepEvent::Normal);
+                }
                 if let Some(value) = self
                     .interpret_x87_float(ctx, &insn)
                     .map_err(|kind| self.make_error(ctx, kind))?
