@@ -19,7 +19,7 @@ mod engine {
         value::{insn::Mnemonic, varnode::register::RegisterId},
     };
     use qcode_emulator::{Emulator, EmulatorError, EmulatorErrorKind};
-    use sleigh::{CompiledSpec, Decoder, SymbolKind};
+    use sleigh::{CompiledSpec, Decoder, Opcode, SymbolKind, Varnode};
     use sleigh_precompile::x64;
     use wazabin_qcode_sleigh::SleighLifter;
 
@@ -38,15 +38,17 @@ mod engine {
     const MEM1_ADDR: u64 = 0x6666_6601_0200;
     const MEM0_PAGE_ADDR: u64 = MEM0_ADDR & !0xfff;
     const MEM0_PAGE_SIZE: usize = 0x1000;
+    /// Fixed raw byte transport rooted at MEM0_ADDR. It covers FXSAVE's full
+    /// legacy image and the existing mem1 word at offset 0x100.
+    const SCRATCH_MEMORY_SIZE: usize = 512;
     const MEMORY_WORDS: &[(&str, u64)] = &[("mem0_value", MEM0_ADDR), ("mem1_value", MEM1_ADDR)];
     const MAX_EMULATED_STEPS: usize = 10_000;
     const SCALAR_REGISTERS: &[&str] = &[
         "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "R8", "R9", "RBP", "RSP",
     ];
-    /// MMX aliases x87 physical registers, but the Binit protocol exposes its
-    /// eight 64-bit MMX views. Aegis restores/captures that shared file with
-    /// FXSAVE/FXRSTOR around each one-instruction test.
-    const MMX_REGISTERS: &[&str] = &["MM0", "MM1", "MM2", "MM3", "MM4", "MM5", "MM6", "MM7"];
+    /// MMX is the low-64 view of the eight physical x87 slots. The SLEIGH
+    /// model intentionally has no independent MM register varnodes.
+    const X87_PHYSICAL_REGISTERS: usize = 8;
     const CSV_FIELDNAMES: &[&str] = &[
         "tool",
         "test_case_id",
@@ -355,11 +357,136 @@ mod engine {
     // PostgreSQL-based corpus runner (x86db)
     // -------------------------------------------------------------------------
 
-    /// DB-native state: register/flag values keyed by name (lowercase).
-    /// The "flag" key holds the raw RFLAGS word.
+    /// DB-native state. Ordinary registers use signed JSON-compatible words;
+    /// x87 stack entries retain their raw 80-bit little-endian encodings.
     #[derive(Clone, Debug)]
     struct DbState {
         regs: HashMap<String, i64>,
+        f80: HashMap<String, u128>,
+        scratch_memory: Option<[u8; SCRATCH_MEMORY_SIZE]>,
+    }
+
+    const X87_CONTROL_FIELDS: &[(&str, &str)] = &[
+        ("x87_control", "FPUControlWord"),
+        ("x87_status", "FPUStatusWord"),
+        ("x87_tag", "FPUTagWord"),
+        ("x87_opcode", "FPULastInstructionOpcode"),
+        ("x87_ip", "FPUInstructionPointer"),
+        ("x87_dp", "FPUDataPointer"),
+    ];
+
+    fn parse_f80(value: &str) -> Option<u128> {
+        let value = value.strip_prefix("0x").unwrap_or(value);
+        if value.len() != 20 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let mut result = 0u128;
+        for index in 0..10 {
+            let byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+            result |= u128::from(byte) << (index * 8);
+        }
+        Some(result)
+    }
+
+    fn format_f80(value: u128) -> String {
+        (0..10)
+            .map(|index| format!("{:02x}", (value >> (index * 8)) as u8))
+            .collect()
+    }
+
+    fn parse_scratch_memory(value: &str) -> Option<[u8; SCRATCH_MEMORY_SIZE]> {
+        if value.len() != SCRATCH_MEMORY_SIZE * 2
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        let mut bytes = [0; SCRATCH_MEMORY_SIZE];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+        }
+        Some(bytes)
+    }
+
+    fn format_scratch_memory(value: &[u8; SCRATCH_MEMORY_SIZE]) -> String {
+        value.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn x87_top(status: u64) -> usize {
+        ((status >> 11) & 7) as usize
+    }
+
+    /// Binit's x87 transport is canonical physical R0..R7 only. Hand-written
+    /// logical fixtures must use binit.db.logical_x87_to_physical_state before
+    /// reaching this replay boundary.
+    fn x87_physical_slot_index(name: &str) -> Option<usize> {
+        name.strip_prefix("x87_r")?
+            .parse::<usize>()
+            .ok()
+            .filter(|&index| index < X87_PHYSICAL_REGISTERS)
+    }
+
+    fn x87_space(ctx: &Context<'_>) -> Result<qcode::space::SpaceId, String> {
+        ctx.shared
+            .named_spaces
+            .get("x87")
+            .copied()
+            .ok_or_else(|| "x86-64 SLEIGH spec has no x87 physical-file space".to_string())
+    }
+
+    fn write_x87_slot(
+        emu: &mut Emulator<'_>,
+        ctx: &Context<'_>,
+        slot: usize,
+        value: u128,
+    ) -> Result<(), String> {
+        let mut bytes = [0; 10];
+        bytes.copy_from_slice(&value.to_le_bytes()[..10]);
+        emu.write_memory(x87_space(ctx)?, (slot * 10) as u64, &bytes)
+            .map_err(|error| error.to_string())
+    }
+
+    fn read_x87_slot(
+        emu: &mut Emulator<'_>,
+        ctx: &Context<'_>,
+        slot: usize,
+    ) -> Result<u128, String> {
+        let bytes = emu
+            .read_memory(x87_space(ctx)?, (slot * 10) as u64, 10)
+            .map_err(|error| error.to_string())?;
+        let mut wide = [0; 16];
+        wide[..10].copy_from_slice(&bytes);
+        Ok(u128::from_le_bytes(wide))
+    }
+
+    fn mmx_index(name: &str) -> Option<usize> {
+        name.strip_prefix("mm")
+            .or_else(|| name.strip_prefix("MM"))
+            .and_then(|index| index.parse::<usize>().ok())
+            .filter(|&index| index < X87_PHYSICAL_REGISTERS)
+    }
+
+    fn abridged_physical_to_full_tag(tag: u8) -> u16 {
+        (0..X87_PHYSICAL_REGISTERS).fold(0, |full, physical| {
+            full | if tag & (1 << physical) == 0 {
+                3 << (physical * 2)
+            } else {
+                0
+            }
+        })
+    }
+
+    fn full_to_abridged_physical_tag(tag: u16) -> u8 {
+        (0..X87_PHYSICAL_REGISTERS).fold(0, |abridged, physical| {
+            abridged | u8::from((tag >> (physical * 2)) & 3 != 3) << physical
+        })
+    }
+
+    fn x87_control_register(field: &str) -> Option<&'static str> {
+        X87_CONTROL_FIELDS
+            .iter()
+            .find_map(|&(name, register)| (name == field).then_some(register))
     }
 
     struct DbStateResult {
@@ -627,19 +754,44 @@ mod engine {
         }
 
         fn parse_state(json: &serde_json::Value) -> DbState {
-            let regs = json
-                .as_object()
-                .map(|obj| {
-                    obj.iter()
-                        .filter_map(|(k, v)| {
-                            v.as_i64()
-                                .or_else(|| v.as_u64().map(|n| n as i64))
-                                .map(|n| (k.clone(), n))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            DbState { regs }
+            let mut regs = HashMap::new();
+            let mut f80 = HashMap::new();
+            let mut scratch_memory = None;
+            if let Some(object) = json.as_object() {
+                assert!(
+                    !(object.contains_key("scratch_memory")
+                        && (object.contains_key("mem0_value")
+                            || object.contains_key("mem1_value"))),
+                    "scratch_memory cannot be mixed with mem0_value or mem1_value"
+                );
+                for (name, value) in object {
+                    let is_legacy_logical = name
+                        .strip_prefix("x87_st")
+                        .and_then(|index| index.parse::<usize>().ok())
+                        .is_some_and(|index| index < X87_PHYSICAL_REGISTERS);
+                    assert!(
+                        !is_legacy_logical,
+                        "Binit state uses legacy logical {name}; convert it with logical_x87_to_physical_state"
+                    );
+                    if name == "scratch_memory" {
+                        scratch_memory = value.as_str().and_then(parse_scratch_memory);
+                        assert!(scratch_memory.is_some(), "invalid scratch_memory encoding");
+                    } else if x87_physical_slot_index(name).is_some() {
+                        if let Some(value) = value.as_str().and_then(parse_f80) {
+                            f80.insert(name.clone(), value);
+                        }
+                    } else if let Some(value) =
+                        value.as_i64().or_else(|| value.as_u64().map(|n| n as i64))
+                    {
+                        regs.insert(name.clone(), value);
+                    }
+                }
+            }
+            DbState {
+                regs,
+                f80,
+                scratch_memory,
+            }
         }
 
         // Combine initial states with final states.
@@ -827,6 +979,20 @@ mod engine {
                 );
             }
         }
+        let mut f80_names: Vec<_> = state.f80.keys().collect();
+        f80_names.sort();
+        for name in f80_names {
+            normalized.insert(
+                name.clone(),
+                serde_json::Value::String(format_f80(state.f80[name])),
+            );
+        }
+        if let Some(scratch_memory) = &state.scratch_memory {
+            normalized.insert(
+                "scratch_memory".to_string(),
+                serde_json::Value::String(format_scratch_memory(scratch_memory)),
+            );
+        }
         serde_json::Value::Object(normalized).to_string()
     }
 
@@ -910,14 +1076,21 @@ mod engine {
         ctx: &qcode::context::Context<'_>,
         include_mem0: bool,
         include_mem1: bool,
+        include_scratch_memory: bool,
+        include_x87: bool,
     ) -> Result<DbState, String> {
         let mut regs = HashMap::new();
-        for &name in SCALAR_REGISTERS.iter().chain(MMX_REGISTERS) {
+        let mut f80 = HashMap::new();
+        for &name in SCALAR_REGISTERS {
             let id = x64_register(name).ok_or_else(|| format!("unknown register {name}"))?;
             let value = emu
                 .read_register(id)
                 .ok_or_else(|| format!("could not read register {name}"))?;
             regs.insert(name.to_ascii_lowercase(), value as i64);
+        }
+        for physical in 0..X87_PHYSICAL_REGISTERS {
+            let value = read_x87_slot(emu, ctx, physical)?;
+            regs.insert(format!("mm{physical}"), value as i64);
         }
 
         let mut rflags = 0;
@@ -935,6 +1108,41 @@ mod engine {
             regs.insert("rip".to_string(), rip as i64);
         }
 
+        if include_x87 {
+            for &(field, name) in X87_CONTROL_FIELDS {
+                let id =
+                    x64_register(name).ok_or_else(|| format!("unknown x87 register {name}"))?;
+                let mut value = emu
+                    .read_register(id)
+                    .ok_or_else(|| format!("could not read x87 register {name}"))?;
+                if field == "x87_tag" {
+                    value = u64::from(full_to_abridged_physical_tag(value as u16));
+                }
+                regs.insert(field.to_string(), value as i64);
+            }
+            regs.insert(
+                "x87_top".to_string(),
+                x87_top(regs.get("x87_status").copied().unwrap_or(0) as u64) as i64,
+            );
+            for physical in 0..X87_PHYSICAL_REGISTERS {
+                let value = read_x87_slot(emu, ctx, physical)?;
+                f80.insert(format!("x87_r{physical}"), value);
+            }
+        }
+
+        if include_scratch_memory {
+            let bytes = emu
+                .inspect_memory(ctx.shared.default_space, MEM0_ADDR, SCRATCH_MEMORY_SIZE)
+                .ok_or_else(|| format!("could not read scratch memory at {MEM0_ADDR:#x}"))?;
+            let scratch_memory: [u8; SCRATCH_MEMORY_SIZE] = bytes
+                .try_into()
+                .map_err(|_| "scratch memory has unexpected length".to_string())?;
+            return Ok(DbState {
+                regs,
+                f80,
+                scratch_memory: Some(scratch_memory),
+            });
+        }
         for (name, address, include) in [
             ("mem0_value", MEM0_ADDR, include_mem0),
             ("mem1_value", MEM1_ADDR, include_mem1),
@@ -949,7 +1157,11 @@ mod engine {
                 .ok_or_else(|| format!("could not read memory at {address:#x}"))?;
             regs.insert(name.to_string(), value as i64);
         }
-        Ok(DbState { regs })
+        Ok(DbState {
+            regs,
+            f80,
+            scratch_memory: None,
+        })
     }
 
     /// Returns a fixture-limitation reason when the instruction in this state
@@ -1116,7 +1328,15 @@ mod engine {
                 || final_state.regs.contains_key("mem0_value");
             let include_mem1 = pair.initial.regs.contains_key("mem1_value")
                 || final_state.regs.contains_key("mem1_value");
-
+            let include_scratch_memory =
+                pair.initial.scratch_memory.is_some() || final_state.scratch_memory.is_some();
+            let include_x87 = !pair.initial.f80.is_empty()
+                || !final_state.f80.is_empty()
+                || pair.initial.regs.contains_key("x87_top")
+                || final_state.regs.contains_key("x87_top")
+                || X87_CONTROL_FIELDS.iter().any(|&(field, _)| {
+                    pair.initial.regs.contains_key(field) || final_state.regs.contains_key(field)
+                });
             // Mismatches that stem from the harness's modeling limits (rather than a
             // wazabin bug) are reclassified so they are recorded distinctly from real
             // state mismatches.
@@ -1151,6 +1371,13 @@ mod engine {
                 DbMismatch::backend_error(tc, state_index, pair, final_state, error)
             })?;
 
+            if let Some(scratch_memory) = &pair.initial.scratch_memory {
+                emu.write_memory(ctx.shared.default_space, MEM0_ADDR, scratch_memory)
+                    .map_err(|error| {
+                        DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                    })?;
+            }
+
             for &(memory_name, address) in MEMORY_WORDS {
                 if !pair.initial.regs.contains_key(memory_name)
                     && !final_state.regs.contains_key(memory_name)
@@ -1164,20 +1391,32 @@ mod engine {
                     })?;
             }
 
-            // Aegis executes from CpuState::zero(). Seed the same scalar baseline
-            // because qcode's emulator stores register bytes lazily.
-            for &name in SCALAR_REGISTERS.iter().chain(MMX_REGISTERS) {
-                let id =
-                    x64_register(name).expect("scalar/MMX register is present in the x64 spec");
+            // Aegis executes from CpuState::zero(). Seed the same scalar and
+            // physical x87/MMX baseline because emulator storage is lazy.
+            for &name in SCALAR_REGISTERS {
+                let id = x64_register(name).expect("scalar register is present in the x64 spec");
                 emu.set_register(id, 0).map_err(|error| {
                     DbMismatch::backend_error(tc, state_index, pair, final_state, error)
                 })?;
             }
+            emu.write_memory(
+                x87_space(&ctx).map_err(|error| {
+                    DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                })?,
+                0,
+                &[0; X87_PHYSICAL_REGISTERS * 10],
+            )
+            .map_err(|error| {
+                DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+            })?;
 
             // Set initial general-purpose registers.
             for (name, &raw) in &pair.initial.regs {
                 if name == "flag"
                     || name == "rip"
+                    || mmx_index(name).is_some()
+                    || name == "x87_top"
+                    || x87_control_register(name).is_some()
                     || MEMORY_WORDS
                         .iter()
                         .any(|&(memory_name, _)| name == memory_name)
@@ -1192,6 +1431,75 @@ mod engine {
                     )
                 };
                 emu.set_register(id, raw as u64).map_err(|error| {
+                    DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                })?;
+            }
+
+            if include_x87 {
+                let initial_top =
+                    x87_top(pair.initial.regs.get("x87_status").copied().unwrap_or(0) as u64);
+                if let Some(&explicit_top) = pair.initial.regs.get("x87_top") {
+                    if explicit_top as usize != initial_top {
+                        return Err(Box::new(DbMismatch::backend_error(
+                            tc,
+                            state_index,
+                            pair,
+                            final_state,
+                            format!(
+                                "x87_top ({explicit_top}) conflicts with x87_status.TOP ({initial_top})"
+                            ),
+                        )));
+                    }
+                }
+                for &(field, register) in X87_CONTROL_FIELDS {
+                    let Some(&raw) = pair.initial.regs.get(field) else {
+                        continue;
+                    };
+                    let id = x64_register(register).ok_or_else(|| {
+                        DbMismatch::backend_error(
+                            tc,
+                            state_index,
+                            pair,
+                            final_state,
+                            format!("x87 register {register} missing from x64 spec"),
+                        )
+                    })?;
+                    let value = if field == "x87_tag" {
+                        u64::from(abridged_physical_to_full_tag(raw as u8))
+                    } else {
+                        raw as u64
+                    };
+                    emu.set_register(id, value).map_err(|error| {
+                        DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                    })?;
+                }
+                for (name, &value) in &pair.initial.f80 {
+                    let Some(physical) = x87_physical_slot_index(name) else {
+                        return Err(Box::new(DbMismatch::backend_error(
+                            tc,
+                            state_index,
+                            pair,
+                            final_state,
+                            format!("invalid physical x87 state key {name}"),
+                        )));
+                    };
+                    write_x87_slot(&mut emu, &ctx, physical, value).map_err(|error| {
+                        DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                    })?;
+                }
+            }
+
+            // MMX is the low-64 view of physical R0..R7 and can be present in
+            // states that do not otherwise request x87 comparison.
+            for (name, &raw) in &pair.initial.regs {
+                let Some(physical) = mmx_index(name) else {
+                    continue;
+                };
+                let mut slot = read_x87_slot(&mut emu, &ctx, physical).map_err(|error| {
+                    DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                })?;
+                slot = (slot & !u128::from(u64::MAX)) | u128::from(raw as u64);
+                write_x87_slot(&mut emu, &ctx, physical, slot).map_err(|error| {
                     DbMismatch::backend_error(tc, state_index, pair, final_state, error)
                 })?;
             }
@@ -1246,6 +1554,8 @@ mod engine {
                             &ctx,
                             include_mem0,
                             include_mem1,
+                            include_scratch_memory,
+                            include_x87,
                         )
                         .map_err(|error| {
                             DbMismatch::backend_error(tc, state_index, pair, final_state, error)
@@ -1256,6 +1566,117 @@ mod engine {
                                 "rip": {
                                     "actual": format!("{actual:#x}"),
                                     "expected": format!("{expected:#x}"),
+                                }
+                            }),
+                        ));
+                    }
+                    continue;
+                }
+                if name == "x87_top" {
+                    let status_id = x64_register("FPUStatusWord").ok_or_else(|| {
+                        DbMismatch::backend_error(
+                            tc,
+                            state_index,
+                            pair,
+                            final_state,
+                            "x87 status register missing from x64 spec",
+                        )
+                    })?;
+                    let actual = x87_top(emu.read_register(status_id).ok_or_else(|| {
+                        DbMismatch::backend_error(
+                            tc,
+                            state_index,
+                            pair,
+                            final_state,
+                            "could not read x87 status register",
+                        )
+                    })?);
+                    if actual != raw as usize {
+                        let actual_state = snapshot_state(
+                            &mut emu,
+                            &ctx,
+                            include_mem0,
+                            include_mem1,
+                            include_scratch_memory,
+                            include_x87,
+                        )
+                        .map_err(|error| {
+                            DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                        })?;
+                        return Err(classify(
+                            actual_state,
+                            serde_json::json!({
+                                "x87_top": { "actual": actual, "expected": raw }
+                            }),
+                        ));
+                    }
+                    continue;
+                }
+                if let Some(register) = x87_control_register(name) {
+                    let id = x64_register(register).ok_or_else(|| {
+                        DbMismatch::backend_error(
+                            tc,
+                            state_index,
+                            pair,
+                            final_state,
+                            format!("x87 register {register} missing from x64 spec"),
+                        )
+                    })?;
+                    let mut actual = emu.read_register(id).ok_or_else(|| {
+                        DbMismatch::backend_error(
+                            tc,
+                            state_index,
+                            pair,
+                            final_state,
+                            format!("could not read x87 register {register}"),
+                        )
+                    })?;
+                    if name == "x87_tag" {
+                        actual = u64::from(full_to_abridged_physical_tag(actual as u16));
+                    }
+                    if actual != raw as u64 {
+                        let actual_state = snapshot_state(
+                            &mut emu,
+                            &ctx,
+                            include_mem0,
+                            include_mem1,
+                            include_scratch_memory,
+                            include_x87,
+                        )
+                        .map_err(|error| {
+                            DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                        })?;
+                        return Err(classify(
+                            actual_state,
+                            serde_json::json!({
+                                (name): { "actual": format!("{actual:#x}"), "expected": format!("{:#x}", raw as u64) }
+                            }),
+                        ));
+                    }
+                    continue;
+                }
+                if let Some(physical) = mmx_index(name) {
+                    let actual = read_x87_slot(&mut emu, &ctx, physical).map_err(|error| {
+                        DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                    })? as u64;
+                    if actual != raw as u64 {
+                        let actual_state = snapshot_state(
+                            &mut emu,
+                            &ctx,
+                            include_mem0,
+                            include_mem1,
+                            include_scratch_memory,
+                            include_x87,
+                        )
+                        .map_err(|error| {
+                            DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                        })?;
+                        return Err(classify(
+                            actual_state,
+                            serde_json::json!({
+                                (name): {
+                                    "actual": format!("{actual:#x}"),
+                                    "expected": format!("{:#x}", raw as u64),
                                 }
                             }),
                         ));
@@ -1303,8 +1724,15 @@ mod engine {
                     )
                 })?;
                 if actual != expected {
-                    let actual_state = snapshot_state(&mut emu, &ctx, include_mem0, include_mem1)
-                        .map_err(|error| {
+                    let actual_state = snapshot_state(
+                        &mut emu,
+                        &ctx,
+                        include_mem0,
+                        include_mem1,
+                        include_scratch_memory,
+                        include_x87,
+                    )
+                    .map_err(|error| {
                         DbMismatch::backend_error(tc, state_index, pair, final_state, error)
                     })?;
                     return Err(classify(
@@ -1313,6 +1741,85 @@ mod engine {
                             (name): {
                                 "actual": format!("{actual:#x}"),
                                 "expected": format!("{expected:#x}"),
+                            }
+                        }),
+                    ));
+                }
+            }
+
+            for (name, &expected) in &final_state.f80 {
+                let Some(physical) = x87_physical_slot_index(name) else {
+                    return Err(Box::new(DbMismatch::backend_error(
+                        tc,
+                        state_index,
+                        pair,
+                        final_state,
+                        format!("invalid physical x87 state key {name}"),
+                    )));
+                };
+                let actual = read_x87_slot(&mut emu, &ctx, physical).map_err(|error| {
+                    DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                })?;
+                if actual != expected {
+                    let actual_state = snapshot_state(
+                        &mut emu,
+                        &ctx,
+                        include_mem0,
+                        include_mem1,
+                        include_scratch_memory,
+                        include_x87,
+                    )
+                    .map_err(|error| {
+                        DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                    })?;
+                    return Err(classify(
+                        actual_state,
+                        serde_json::json!({
+                            (name): { "actual": format_f80(actual), "expected": format_f80(expected) }
+                        }),
+                    ));
+                }
+            }
+
+            if let Some(expected) = &final_state.scratch_memory {
+                let actual = emu
+                    .inspect_memory(ctx.shared.default_space, MEM0_ADDR, SCRATCH_MEMORY_SIZE)
+                    .ok_or_else(|| {
+                        DbMismatch::backend_error(
+                            tc,
+                            state_index,
+                            pair,
+                            final_state,
+                            format!("could not read scratch memory at {MEM0_ADDR:#x}"),
+                        )
+                    })?;
+                if actual != expected {
+                    let actual_state = snapshot_state(
+                        &mut emu,
+                        &ctx,
+                        include_mem0,
+                        include_mem1,
+                        include_scratch_memory,
+                        include_x87,
+                    )
+                    .map_err(|error| {
+                        DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                    })?;
+                    let changed_offsets: Vec<_> = actual
+                        .iter()
+                        .zip(expected)
+                        .enumerate()
+                        .filter_map(|(offset, (actual, expected))| {
+                            (actual != expected).then_some(offset)
+                        })
+                        .collect();
+                    return Err(classify(
+                        actual_state,
+                        serde_json::json!({
+                            "scratch_memory": {
+                                "changed_offsets": changed_offsets,
+                                "expected": format_scratch_memory(expected),
+                                "actual": actual.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
                             }
                         }),
                     ));
@@ -1344,8 +1851,15 @@ mod engine {
                     })?;
                 let expected = raw as u64;
                 if actual != expected {
-                    let actual_state = snapshot_state(&mut emu, &ctx, include_mem0, include_mem1)
-                        .map_err(|error| {
+                    let actual_state = snapshot_state(
+                        &mut emu,
+                        &ctx,
+                        include_mem0,
+                        include_mem1,
+                        include_scratch_memory,
+                        include_x87,
+                    )
+                    .map_err(|error| {
                         DbMismatch::backend_error(tc, state_index, pair, final_state, error)
                     })?;
                     return Err(classify(
@@ -1384,8 +1898,15 @@ mod engine {
                     )
                 })?;
                 if actual != expected_bit {
-                    let actual_state = snapshot_state(&mut emu, &ctx, include_mem0, include_mem1)
-                        .map_err(|error| {
+                    let actual_state = snapshot_state(
+                        &mut emu,
+                        &ctx,
+                        include_mem0,
+                        include_mem1,
+                        include_scratch_memory,
+                        include_x87,
+                    )
+                    .map_err(|error| {
                         DbMismatch::backend_error(tc, state_index, pair, final_state, error)
                     })?;
                     return Err(classify(
@@ -1608,13 +2129,143 @@ mod engine {
                 states: vec![DbStateResult {
                     initial: DbState {
                         regs: HashMap::from([("rbx".into(), 1)]),
+                        f80: HashMap::new(),
+                        scratch_memory: None,
                     },
                     final_state: Some(DbState {
                         regs: HashMap::from([("rax".into(), 1)]),
+                        f80: HashMap::new(),
+                        scratch_memory: None,
                     }),
                 }],
             };
             run_db_case(&tc).unwrap();
+        }
+
+        #[test]
+        fn bounded_scratch_memory_is_seeded_and_compared() {
+            let mut initial_scratch = [0; SCRATCH_MEMORY_SIZE];
+            initial_scratch[32] = 0xa5;
+            let mut expected_scratch = initial_scratch;
+            expected_scratch[..8].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+            let tc = DbTestCase {
+                id: 0,
+                instruction_id: 0,
+                instruction: "mov qword ptr [rbx], rax".into(),
+                opcode: "488903".into(),
+                undefined_flags: HashSet::new(),
+                states: vec![DbStateResult {
+                    initial: DbState {
+                        regs: HashMap::from([
+                            ("rbx".into(), MEM0_ADDR as i64),
+                            ("rax".into(), 0x1122_3344_5566_7788u64 as i64),
+                        ]),
+                        f80: HashMap::new(),
+                        scratch_memory: Some(initial_scratch),
+                    },
+                    final_state: Some(DbState {
+                        regs: HashMap::new(),
+                        f80: HashMap::new(),
+                        scratch_memory: Some(expected_scratch),
+                    }),
+                }],
+            };
+            run_db_case(&tc).unwrap();
+        }
+
+        #[test]
+        #[ignore = "Requires a running Binit PostgreSQL database."]
+        fn binit_undefined_flags_are_explicit_undef_assignments() {
+            let mut client = Client::connect(&db_dsn(), NoTls).unwrap();
+            let rows = client
+                .query(
+                    "SELECT tc.id, tc.instruction, tc.opcode, iuf.flag \
+                     FROM test_cases tc \
+                     JOIN instruction_undefined_flags iuf \
+                       ON iuf.instruction_id = tc.instruction_id \
+                     ORDER BY tc.id, iuf.flag",
+                    &[],
+                )
+                .unwrap();
+            let mut cases: BTreeMap<i64, (String, String, Vec<String>)> = BTreeMap::new();
+            for row in rows {
+                let id: i64 = row.get(0);
+                let instruction: String = row.get(1);
+                let opcode: String = row.get(2);
+                let flag: String = row.get(3);
+                let entry = cases
+                    .entry(id)
+                    .or_insert_with(|| (instruction, opcode, Vec::new()));
+                entry.2.push(flag);
+            }
+            assert!(
+                !cases.is_empty(),
+                "the Binit dataset has no instructions with undefined flags"
+            );
+
+            let spec = x64::spec();
+            let undef_id =
+                spec.pcode_ops()
+                    .position(|name| name == "undef")
+                    .expect("the x86 SLEIGH specification defines undef") as u64;
+            // Every Binit case is checked, but report one concise bucket per
+            // mnemonic/flag pair: operand permutations otherwise turn a single
+            // missing SLEIGH flag write into thousands of duplicate diagnostics.
+            let mut missing: BTreeMap<(String, String), Vec<i64>> = BTreeMap::new();
+            for (id, (instruction_text, opcode, undefined_flags)) in cases {
+                let bytes = parse_hex_bytes(&opcode)
+                    .unwrap_or_else(|| panic!("{id} {instruction_text}: invalid opcode {opcode}"));
+                let instruction = Decoder::new(spec)
+                    .decode_one(FIRE_START as u64, &bytes, &spec.new_context())
+                    .unwrap_or_else(|error| panic!("{id} {instruction_text}: {error}"));
+                let pcode = instruction
+                    .pcode_ops()
+                    .unwrap_or_else(|error| panic!("{id} {instruction_text}: {error}"));
+
+                for flag_name in undefined_flags {
+                    let flag = spec
+                        .registers()
+                        .find(|register| register.name().eq_ignore_ascii_case(&flag_name))
+                        .unwrap_or_else(|| {
+                            panic!("{id} {instruction_text}: unknown undefined flag {flag_name}")
+                        });
+                    let flag = Varnode::new(flag.space(), flag.offset() as u64, flag.size());
+                    if !pcode.ops.iter().any(|op| {
+                        op.opcode == Opcode::CallOther
+                            && op.output == Some(flag)
+                            && op.inputs.len() == 1
+                            && op.inputs[0].is_constant()
+                            && op.inputs[0].offset == undef_id
+                    }) {
+                        let mnemonic = instruction_text
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("<empty>")
+                            .to_ascii_uppercase();
+                        missing.entry((mnemonic, flag_name)).or_default().push(id);
+                    }
+                }
+            }
+            let missing = missing
+                .into_iter()
+                .map(|((mnemonic, flag), ids)| {
+                    let examples = ids
+                        .iter()
+                        .take(5)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "{mnemonic}: {flag} missing in {} Binit cases (for example IDs {examples})",
+                        ids.len()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                missing.is_empty(),
+                "Binit undefined-flag writes missing from SLEIGH:\n{missing}"
+            );
         }
 
         #[test]
