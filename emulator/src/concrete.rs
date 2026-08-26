@@ -1616,7 +1616,7 @@ impl StandaloneEmulator {
                 if value.size != 10 {
                     return Ok(None);
                 }
-                let result = float80::to_i128_contextual(value.as_bits(), size * 8);
+                let result = float80::truncate_to_i128(value.as_bits(), size * 8);
                 self.record_x87_status(
                     ctx,
                     control,

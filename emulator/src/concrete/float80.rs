@@ -196,11 +196,27 @@ pub(super) fn to_float_contextual(raw: u128, size: usize, control: u16) -> Resul
 }
 
 pub(super) fn to_i128(raw: u128, width: usize) -> i128 {
-    to_i128_contextual(raw, width).value as i128
+    truncate_to_i128(raw, width).value
 }
 
-pub(super) fn to_i128_contextual(raw: u128, width: usize) -> rustc_apfloat::StatusAnd<i128> {
-    value(raw).to_i128_r(width, Round::TowardZero, &mut true)
+/// Truncate toward zero into a `width`-bit signed integer.
+///
+/// x87 reaches this through SLEIGH's `round(); trunc()` pair, so rounding
+/// control is applied by the preceding round and the truncation itself is
+/// always toward zero. A source that is NaN, infinite, or outside the
+/// destination range stores the *integer indefinite* value — the most negative
+/// integer of that width — rather than APFloat's saturated bound.
+pub(super) fn truncate_to_i128(raw: u128, width: usize) -> rustc_apfloat::StatusAnd<i128> {
+    let mut exact = false;
+    let converted = value(raw).to_i128_r(width, Round::TowardZero, &mut exact);
+    if converted.status.contains(Status::INVALID_OP) && width > 0 {
+        let indefinite = -(1i128 << (width - 1));
+        return rustc_apfloat::StatusAnd {
+            status: converted.status,
+            value: indefinite,
+        };
+    }
+    converted
 }
 
 pub(super) fn add(lhs: u128, rhs: u128) -> u128 {
