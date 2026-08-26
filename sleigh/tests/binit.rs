@@ -76,20 +76,31 @@ mod engine {
             .map(|register| register.id)
     }
 
-    /// Decodes and lifts one instruction using the embedded x86-64 SLEIGH
-    /// specification. Keeping the compiled spec in `sleigh-precompile` makes
-    /// corpus replay practical: source compilation is never on the hot path.
+    /// Decodes and lifts the complete hardware instruction stream.  Binit's
+    /// ordinary rows contain one instruction, but a bounded (at most 15-byte)
+    /// stream is needed to make restored x87 full tags observable through a
+    /// following save instruction.
     fn lift_x64(bytes: &[u8], address: u64) -> Result<Context<'static>, String> {
         let spec: &CompiledSpec = x64::spec();
         let lifter = SleighLifter::new(spec);
         let decode_context = spec.new_context();
-        let instruction = Decoder::new(spec)
-            .decode_one(address, bytes, &decode_context)
-            .map_err(|error| format!("decode failed: {error}"))?;
+        let decoder = Decoder::new(spec);
         let mut context = lifter.new_context();
-        lifter
-            .lift_instruction(&mut context, &instruction, None)
-            .map_err(|error| format!("lift failed: {error}"))?;
+        let function = context.anon_function();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let instruction = decoder
+                .decode_one(address + offset as u64, &bytes[offset..], &decode_context)
+                .map_err(|error| format!("decode failed at byte {offset}: {error}"))?;
+            let length = instruction.len();
+            if length == 0 {
+                return Err(format!("decoded zero-length instruction at byte {offset}"));
+            }
+            lifter
+                .lift_instruction(&mut context, &instruction, Some(function))
+                .map_err(|error| format!("lift failed at byte {offset}: {error}"))?;
+            offset += length;
+        }
         Ok(context)
     }
 
@@ -1044,14 +1055,12 @@ mod engine {
             .unwrap_or_else(|| "unknown panic payload".to_string())
     }
 
-    fn run_to_instruction_boundary(emu: &mut Emulator<'_>) -> Result<(), RunError> {
-        let entry_address = emu.block().address();
+    fn run_to_instruction_boundary(
+        emu: &mut Emulator<'_>,
+        end_address: u64,
+    ) -> Result<(), RunError> {
         for _ in 0..MAX_EMULATED_STEPS {
-            if emu
-                .block()
-                .address()
-                .is_some_and(|address| Some(address) != entry_address)
-            {
+            if emu.block().address().is_some_and(|address| address >= end_address) {
                 return Ok(());
             }
             let Some(insn) = emu.insn() else {
@@ -1517,7 +1526,9 @@ mod engine {
 
             // Keep looping instruction semantics bounded, for example REP forms
             // with very large counters.
-            catch_unwind(AssertUnwindSafe(|| run_to_instruction_boundary(&mut emu)))
+            catch_unwind(AssertUnwindSafe(|| {
+                run_to_instruction_boundary(&mut emu, instruction_addr as u64 + bytes.len() as u64)
+            }))
                 .map_err(|payload| {
                     DbMismatch::backend_error(
                         tc,

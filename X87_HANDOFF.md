@@ -157,9 +157,11 @@ Each has four hardware states with TOP 0 and TOP 3.
 | 11698 | `FXRSTOR [RBX]` | 4 images: TOP 0/3, logical f80 slots, physical abridged tags |
 | 11699 | `FRSTOR [RBX]` | 4 images: TOP 0/3, explicit physical full tags, logical f80 slots |
 | 11700 | `FLDENV [RBX]` | 4 images: TOP 0/3, explicit physical full tags, payload preservation |
+| 11701–11706 | `FRSTOR; operation; FNSAVE` | 24 states: full-tag copy, pop, push, swap, arithmetic, and FCMOV audit |
 
-All 12 restore states in `11698`–`11700` were captured by Aegis and replay
-cleanly in strict QCode. They include +0/-0, normal, denormal, both infinities,
+All 12 restore states in `11698`–`11700` and all 24 full-tag propagation
+states in `11701`–`11706` were captured by Aegis and replay cleanly in strict
+QCode. They include +0/-0, normal, denormal, both infinities,
 qNaN, an unsupported f80 encoding, and an empty physical slot; every image has
 RC=up, PC=single, sticky/C1 condition state, and distinct FIP/FDP. `11698`
 separates logical FXSAVE payload order from physical abridged tags. `11699` and
