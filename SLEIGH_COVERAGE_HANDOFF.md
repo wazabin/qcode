@@ -115,15 +115,18 @@ New admissions:
 | --- | --- | --- | --- |
 | 11656–11658 | `MOVQ`, `EMMS`, `PXOR` MMX smoke | complete (1,803 states) | clean |
 | 11659–11660 | direct `JMP 0`, `JZ 0` | complete (9 states) | clean |
-| 11661–11665 | `PUNPCKLBW`, `PSADBW`, `PSUBD`, `PADDUSW`, `PAVGB` | complete (1,890 states) | `PUNPCKLBW`/`PSUBD` clean; three blockers below |
+| 11661–11665 | `PUNPCKLBW`, `PSADBW`, `PSUBD`, `PADDUSW`, `PAVGB` | complete (1,890 states) | first four clean; `PAVGB` blocker below |
 
-Do not call all of batch 11661–11665 QCode-validated. Case 11662 requires
-user-op `psadbw`, 11664 requires `paddusw`, and 11665 still has a width-less
-p-code expression. Their recorded output is:
+`PSADBW` and `PADDUSW` MMX forms no longer use their SLEIGH user-ops. Their
+unrolled lane macros are ordinary p-code; `PADDUSW` uses the widened
+`sum |= -(sum >> 16)` saturation form. The strict replay is:
 
 ```text
-/tmp/wazabin-mmx-batch-1.csv
+/tmp/wazabin-mmx-saturation.csv
 ```
+
+Do not call all of batch 11661–11665 QCode-validated: case 11665 (`PAVGB`)
+still has a width-less p-code expression.
 
 Aegis changes are in:
 
