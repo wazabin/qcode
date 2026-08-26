@@ -57,12 +57,66 @@ f32/f64 arithmetic and compare/compare-pop, f32 store, dword integer store,
 and reverse register-destination forms. MMX rows include matching `mm0`/`mm1`
 views.
 
-## Immediate task
+## Replay status
 
-Run strict QCode replay for IDs **11707 onward**. Use `qcode-dump` when
-investigating an instruction and fix only hardware-confirmed mismatches in
-small SLEIGH/QCode commits. Do not alter Binit initial states or hardware
-results, and do not add another admission batch before this replay pass.
+The first strict replay pass over IDs 11666-11891 has run. 168 of 199 cases
+are clean; 25 remain. Fixed so far, each confirmed against a hardware capture:
+
+| Fix | Where |
+| --- | --- |
+| FLDL2T/FLDL2E/FLDPI/FLDLG2/FLDLN2 loaded exact 80-bit constants instead of f64 literals widened by `float2float` | SLEIGH |
+| C1 cleared for FABS, FCHS and FSQRT, where it is architecturally defined clear | SLEIGH |
+| MMX shifts share one 64-bit count; PSLLD/PSRAD had used a separate per-lane count from each half of the source | SLEIGH |
+| MMX shift counts clamped to the lane width, since SLEIGH narrows a count to the destination width and would wrap an oversized one | SLEIGH |
+| `zext(imm8)` rather than `imm8:8` for immediate shift counts, which the lifter emits as a 64-bit subpiece of one-byte storage | SLEIGH |
+| The FCOMI family no longer clears C1; it reports only through ZF/PF/CF | SLEIGH |
+| `mmxreg2op_m64` matches the MMX subtable rather than the raw field, unblocking the PADDS/PADDUS/PSUBS/PSUBUS register forms | SLEIGH |
+| FSTENV/FNSTENV write the selector fields at +16 and +24 | SLEIGH |
+| p-code shift amounts are the full unsigned value of input1 and empty the operand when out of range, instead of being masked and wrapped | QCode |
+| `pavgb`, `pavgw`, `pmulhuw`, `pmaddwd` and the eight saturating add/subtract user-ops implemented | QCode |
+| FIST/FISTP/FISTTP store the integer indefinite on an invalid conversion rather than APFloat's saturated bound | QCode |
+
+The p-code shift fix is architecture-independent. A full replay of the whole
+`x86db` corpus confirmed it introduces no regression outside x87/MMX.
+
+## Remaining failures, and what each needs
+
+These need a design decision before implementation and are deliberately left:
+
+- **FCOM vs FUCOM invalid** (`FUCOM`, `FUCOMI`, `FUCOMPP`, `FUCOMIP`, 4 cases).
+  FCOM signals IE on a quiet NaN; FUCOM signals only on a signalling NaN. Both
+  lower to the same p-code float comparison, so the concrete emulator cannot
+  tell them apart and applies FCOM's rule to both. Distinguishing them requires
+  either a separate user-op for the unordered forms or explicit status writes
+  in the FUCOM constructors.
+- **FPREM/FPREM1** (2 cases). Lowered as `x - trunc(x/y)*y`, with no C2
+  incomplete-reduction flag and no quotient bits in C0/C1/C3. Needs the real
+  partial-remainder algorithm.
+- **x87 stack overflow/underflow** (`FLD double ptr`, `FCOMIP`, 2 cases).
+  Hardware sets IE+SF and a C1 direction bit; neither is modelled.
+- **Transcendentals** (`F2XM1`, `FSIN`, `FCOS`, `FPTAN`, `FPATAN`, `FSINCOS`,
+  6 cases). Needs an accuracy model that reproduces hardware bit-for-bit, which
+  is a larger commitment than the other gaps.
+- **MASKMOVQ**. The spec models it as a register write, but the instruction
+  stores to `DS:[RDI]`. Fixing it means giving the constructor a memory effect.
+
+These are ordinary work, just not yet done:
+
+- **PACKSSWB/PACKSSDW** (2 cases). Saturating pack produces zero where a lane
+  should saturate. The lowered QCode reads correct on inspection, so this needs
+  a focused unit test to isolate.
+- **FXTRACT/FSCALE** (`extract_significand`, `extract_exponent`, `fscale`) and
+  **BCD** (`from_bcd`, `to_bcd`, for FBLD/FBSTP), 4 cases. Pure f80 exponent
+  and digit manipulation; the corpus vectors include denormal, infinity, qNaN
+  and unsupported encodings, so each needs its special cases handled.
+- **Denormal-operand flag on f64 stores** (`FST`/`FSTP double ptr`, 2 cases).
+  QCode sets DE where hardware does not; `f80_is_denormal` is misclassifying.
+- **FSQRT inexact** (1 case). PE is never set because sqrt does not take the
+  contextual f80 path, and the generic `float_sqrt` narrows f80 through f64,
+  losing 11 significand bits. Needs a correctly rounded f80 sqrt; APFloat has
+  none.
+- **FADD C1 rounded-up** (1 case). The C1 rounding indicator is cleared where
+  hardware sets it, so `rounded_away_from_zero` is wrong for this vector.
 
 ## Required workflow
 
