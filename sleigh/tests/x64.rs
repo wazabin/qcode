@@ -3,7 +3,31 @@ mod support;
 #[cfg(test)]
 mod tests {
     use super::support::x64;
+    use qcode::context::Context;
     use qcode_emulator::Emulator;
+
+    fn x87_space(ctx: &Context<'_>) -> qcode::space::SpaceId {
+        *ctx.shared
+            .named_spaces
+            .get("x87")
+            .expect("x86-64 SLEIGH spec has an x87 physical-file space")
+    }
+
+    fn write_x87_slot(emu: &mut Emulator<'_>, ctx: &Context<'_>, slot: usize, value: u128) {
+        let mut bytes = [0; 10];
+        bytes.copy_from_slice(&value.to_le_bytes()[..10]);
+        emu.write_memory(x87_space(ctx), (slot * 10) as u64, &bytes)
+            .unwrap();
+    }
+
+    fn read_x87_slot(emu: &mut Emulator<'_>, ctx: &Context<'_>, slot: usize) -> u128 {
+        let bytes = emu
+            .read_memory(x87_space(ctx), (slot * 10) as u64, 10)
+            .unwrap();
+        let mut wide = [0; 16];
+        wide[..10].copy_from_slice(&bytes);
+        u128::from_le_bytes(wide)
+    }
 
     #[test]
     fn test_mov_rcx_ptr_rdx() {
@@ -604,6 +628,173 @@ mod tests {
         );
     }
 
+    /// The concrete interpreter must see x87's control word while evaluating
+    /// the f80 p-code emitted for an actual SLEIGH arithmetic instruction.
+    #[test]
+    fn test_fadd_uses_x87_rounding_and_precision_control() {
+        let insn = x64::Disassembler::from_bytes(0x1000, b"\xd8\xc1")
+            .next()
+            .unwrap();
+        assert_eq!(insn.to_string(), "FADD ST0, ST1");
+
+        let mut ctx = x64::make_context();
+        x64::lift(&mut ctx, &insn, None).unwrap();
+        let mut emu = Emulator::from_address(&ctx, 0x1000);
+        // RC=up and PC=single.  The operand is half a single-precision ULP,
+        // so the PC rounding produces the next single-precision quantum.
+        emu.set_register(x64::FPUCONTROLWORD, 0x087f).unwrap();
+        let one = 0x3fff_8000_0000_0000_0000u128;
+        let half_single_ulp = 0x3fe7_8000_0000_0000_0000u128;
+        write_x87_slot(&mut emu, &ctx, 0, one);
+        write_x87_slot(&mut emu, &ctx, 1, half_single_ulp);
+        emu.run_block().unwrap();
+
+        assert_eq!(read_x87_slot(&mut emu, &ctx, 0), one + (1u128 << 40));
+        assert_ne!(emu.read_register(x64::FPUSTATUSWORD).unwrap() & 0x20, 0);
+    }
+
+    /// `FST ST1` must copy through TOP-derived physical slots, including the
+    /// final high 16 bits of the f80 payload.
+    #[test]
+    fn test_fst_i80_uses_physical_slots_at_nonzero_top() {
+        let insn = x64::Disassembler::from_bytes(0x1000, b"\xdd\xd1")
+            .next()
+            .unwrap();
+        assert_eq!(insn.to_string(), "FST ST1");
+
+        let mut ctx = x64::make_context();
+        x64::lift(&mut ctx, &insn, None).unwrap();
+        let mut emu = Emulator::from_address(&ctx, 0x1000);
+        let source = 0x3fff_8000_0000_0000_0000u128; // x87 +1
+        emu.set_register(x64::FPUSTATUSWORD, 3 << 11).unwrap();
+        write_x87_slot(&mut emu, &ctx, 3, source); // logical ST0
+        write_x87_slot(&mut emu, &ctx, 4, 0); // logical ST1
+        emu.run_block().unwrap();
+
+        assert_eq!(read_x87_slot(&mut emu, &ctx, 4), source);
+    }
+
+    /// `FFREE ST1` must mark the TOP-mapped physical tag pair empty with
+    /// ordinary p-code rather than a value-only user-op.
+    #[test]
+    fn test_ffree_clears_physical_tag_at_nonzero_top() {
+        let insn = x64::Disassembler::from_bytes(0x1000, b"\xdd\xc1")
+            .next()
+            .unwrap();
+        assert_eq!(insn.to_string(), "FFREE ST1");
+
+        let mut ctx = x64::make_context();
+        x64::lift(&mut ctx, &insn, None).unwrap();
+        let mut emu = Emulator::from_address(&ctx, 0x1000);
+        emu.set_register(x64::FPUSTATUSWORD, 3 << 11).unwrap();
+        emu.set_register(x64::FPUTAGWORD, 0).unwrap();
+        emu.run_block().unwrap();
+
+        // ST1 at TOP=3 is physical R4, whose full tag pair occupies bits 8:9.
+        assert_eq!(emu.read_register(x64::FPUTAGWORD), Some(0x0300));
+        let ir = ctx.to_string();
+        assert!(
+            ir.contains("FPUTagWord"),
+            "expected physical tag update:\n{ir}"
+        );
+        assert!(
+            !ir.contains("ffree("),
+            "FFREE must not remain a user-op:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn test_fxch_swaps_top_mapped_payload_and_full_tag_classes() {
+        let insn = x64::Disassembler::from_bytes(0x1000, b"\xd9\xc9")
+            .next()
+            .unwrap();
+        assert_eq!(insn.to_string(), "FXCH ST1");
+
+        let mut ctx = x64::make_context();
+        x64::lift(&mut ctx, &insn, None).unwrap();
+        let mut emu = Emulator::from_address(&ctx, 0x1000);
+        emu.set_register(x64::FPUSTATUSWORD, 3 << 11).unwrap();
+        write_x87_slot(&mut emu, &ctx, 3, 0x1111);
+        write_x87_slot(&mut emu, &ctx, 4, 0x2222);
+        // R3 is zero-class (01); R4 is special-class (10).
+        emu.set_register(x64::FPUTAGWORD, 0x0240).unwrap();
+        emu.run_block().unwrap();
+
+        assert_eq!(read_x87_slot(&mut emu, &ctx, 3), 0x2222);
+        assert_eq!(read_x87_slot(&mut emu, &ctx, 4), 0x1111);
+        assert_eq!(emu.read_register(x64::FPUTAGWORD), Some(0x0180));
+    }
+
+    /// MMX operands are low-64 views of the same physical x87 slots. A write
+    /// updates only its destination payload's high 16 bits and marks the full
+    /// x87 tag word valid; its source slot remains otherwise untouched.
+    #[test]
+    fn test_mmx_writes_share_physical_x87_file() {
+        let insn = x64::Disassembler::from_bytes(0x1000, b"\x0f\x6f\xc1")
+            .next()
+            .unwrap();
+        assert_eq!(insn.to_string(), "MOVQ MM0, MM1");
+
+        let mut ctx = x64::make_context();
+        x64::lift(&mut ctx, &insn, None).unwrap();
+        let mut emu = Emulator::from_address(&ctx, 0x1000);
+        let source_low = 0x1122_3344_5566_7788u128;
+        let source = source_low | (0x1234u128 << 64);
+        write_x87_slot(&mut emu, &ctx, 0, 0);
+        write_x87_slot(&mut emu, &ctx, 1, source);
+        emu.set_register(x64::FPUSTATUSWORD, 3 << 11).unwrap();
+        emu.set_register(x64::FPUTAGWORD, 0xffff).unwrap();
+        emu.run_block().unwrap();
+
+        assert_eq!(
+            read_x87_slot(&mut emu, &ctx, 0),
+            source_low | (0xffffu128 << 64)
+        );
+        assert_eq!(read_x87_slot(&mut emu, &ctx, 1), source);
+        assert_eq!(emu.read_register(x64::FPUTAGWORD), Some(0));
+        assert_eq!(emu.read_register(x64::FPUSTATUSWORD), Some(0));
+    }
+
+    #[test]
+    fn test_fxsave_uses_an_abridged_physical_tag_byte() {
+        let insn = x64::Disassembler::from_bytes(0x1000, b"\x0f\xae\x07")
+            .next()
+            .unwrap();
+        assert_eq!(insn.to_string(), "FXSAVE [RDI]");
+
+        let mut ctx = x64::make_context();
+        x64::lift(&mut ctx, &insn, None).unwrap();
+        let mut emu = Emulator::from_address(&ctx, 0x1000);
+        emu.set_register(x64::RDI, 0x3000).unwrap();
+        emu.set_register(x64::FPUTAGWORD, 0xffff).unwrap();
+        emu.run_block().unwrap();
+
+        assert_eq!(
+            emu.inspect_memory(ctx.shared.default_space, 0x3004, 1),
+            Some(vec![0]),
+            "all eight physical full-tag pairs are empty"
+        );
+    }
+
+    #[test]
+    fn test_emms_empties_shared_x87_tags_without_moving_payloads() {
+        let insn = x64::Disassembler::from_bytes(0x1000, b"\x0f\x77")
+            .next()
+            .unwrap();
+        assert_eq!(insn.to_string(), "EMMS");
+
+        let mut ctx = x64::make_context();
+        x64::lift(&mut ctx, &insn, None).unwrap();
+        let mut emu = Emulator::from_address(&ctx, 0x1000);
+        let payload = 0x3fff_8000_0000_0000_0000u128;
+        write_x87_slot(&mut emu, &ctx, 5, payload);
+        emu.set_register(x64::FPUTAGWORD, 0).unwrap();
+        emu.run_block().unwrap();
+
+        assert_eq!(read_x87_slot(&mut emu, &ctx, 5), payload);
+        assert_eq!(emu.read_register(x64::FPUTAGWORD), Some(0xffff));
+    }
+
     /// x87 compares against a memory operand mix float widths: SLEIGH's
     /// `FICOM m32` builds `local tmp = int2float(m32)` (a 4-byte float) and
     /// feeds it to the `fcom` macro, which compares it against the 10-byte
@@ -627,7 +818,7 @@ mod tests {
 
             let ir = ctx.to_string();
             assert!(
-                ir.contains("i80 %tmp3 = int2float") || ir.contains("i80 %tmp3 = float2float"),
+                ir.contains("= int2float(f80,") || ir.contains("= float2float(f80,"),
                 "{mnemonic}: expected the flat lifter to widen the operand to f80, got:\n{ir}"
             );
         }

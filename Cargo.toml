@@ -32,6 +32,7 @@ pest_derive = "2.8.6"
 pollster = "0.4"
 rumba-core = "=1.0.0"
 rustc-hash = "2"
+rustc_apfloat = "0.2.3"
 serde = { version = "1", features = ["derive"] }
 smallvec = "1"
 toml = "1"

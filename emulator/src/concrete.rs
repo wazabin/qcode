@@ -10,15 +10,19 @@ use qcode::{
         BasicBlock, BlockId, BlockParamId, BlockRef, FunctionBody, FunctionId, Instruction,
         LocalValueId, Value, ValueId, ValueRef, Varnode,
         insn::{
-            Branch, BranchInd, CBranch, Call, CallInd, Callee, Carry, Extract, InstructionId,
-            InstructionRef, IntBinop, LzCount, Mnemonic, PopCount, Range, Return, SBorrow, SCarry,
-            Scan, Sext, Tuple, Unop, Zext,
+            Binary, Binop, Branch, BranchInd, CBranch, Call, CallInd, Callee, Carry, Extract,
+            FloatBinop, FloatToInt, InstructionId, InstructionRef, IntBinop, IntToFloat, LzCount,
+            Mnemonic, PopCount, Range, Return, SBorrow, SCarry, Scan, Sext, Store, Tuple, Unary,
+            Unop, Zext,
         },
         varnode::{VarnodeId, register::RegisterId},
     },
 };
 use std::cmp;
 
+mod float80;
+
+use rustc_apfloat::Status;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::DomainValue;
@@ -166,7 +170,12 @@ impl EmulatedMemory {
         self.zero_filled_spaces.clear();
         for index in 0..space_count {
             let id = SpaceId::from(index);
-            if matches!(Space::from_id(ctx, id).ty, SpaceType::Register) {
+            let space = Space::from_id(ctx, id);
+            // x86's private x87 RAM file is architectural state like the
+            // register space, not process memory. A fresh CPU state has zero
+            // payload bytes there, so instructions such as FXSAVE can read it
+            // before a harness explicitly seeds an f80 slot.
+            if matches!(space.ty, SpaceType::Register) || space.name.as_deref() == Some("x87") {
                 self.zero_filled_spaces.insert(id.into());
             }
         }
@@ -275,17 +284,25 @@ impl SizedValue {
         self.size as usize
     }
 
+    fn from_f80_bits(value: u128) -> Self {
+        Self::from_bits(value, 10)
+    }
+
     fn f64_from_self(&self) -> f64 {
         match self.size as usize {
             0..=4 => f32::from_bits(self.as_u64() as u32) as f64,
-            _ => f64::from_bits(self.as_u64()),
+            8 => f64::from_bits(self.as_u64()),
+            10 => float80::to_f64(self.as_bits()),
+            _ => 0.0,
         }
     }
 
     fn from_f64(value: f64, size: usize) -> Self {
         match size {
             0..=4 => Self::new((value as f32).to_bits() as u64, 4),
-            _ => Self::new(value.to_bits(), 8),
+            8 => Self::new(value.to_bits(), 8),
+            10 => Self::from_f80_bits(float80::from_f64(value)),
+            _ => Self::new(0, size),
         }
     }
 }
@@ -308,8 +325,17 @@ impl DomainValue for SizedValue {
         Self::new(value, 8)
     }
 
+    fn zero(size: usize) -> Self {
+        Self::new(0, size)
+    }
+
     fn is_float_nan(&self) -> Result<Self, EmulatorErrorKind> {
-        Ok(Self::new(bool_to_u64(self.f64_from_self().is_nan()), 1))
+        let is_nan = if self.size == 10 {
+            float80::is_nan(self.as_bits())
+        } else {
+            self.f64_from_self().is_nan()
+        };
+        Ok(Self::new(bool_to_u64(is_nan), 1))
     }
 
     fn int_to_float(&self, size: usize) -> Result<Self, EmulatorErrorKind> {
@@ -317,11 +343,21 @@ impl DomainValue for SizedValue {
         match size {
             4 => Ok(Self::new((signed as f32).to_bits() as u64, 4)),
             8 => Ok(Self::new((signed as f64).to_bits(), 8)),
+            10 => Ok(Self::from_f80_bits(float80::from_i128(signed))),
             _ => Ok(Self::new(0, size)),
         }
     }
 
     fn float_to_float(&self, size: usize) -> Result<Self, EmulatorErrorKind> {
+        if size == 10 {
+            let value = match self.size as usize {
+                0..=4 => float80::from_f32_bits(self.as_u64() as u32),
+                8 => float80::from_f64(f64::from_bits(self.as_u64())),
+                10 => self.as_bits(),
+                _ => 0,
+            };
+            return Ok(Self::from_f80_bits(value));
+        }
         match size {
             4 => Ok(Self::new((self.f64_from_self() as f32).to_bits() as u64, 4)),
             8 => Ok(Self::new(self.f64_from_self().to_bits(), 8)),
@@ -330,7 +366,11 @@ impl DomainValue for SizedValue {
     }
 
     fn float_to_int(&self, size: usize) -> Result<Self, EmulatorErrorKind> {
-        let value = self.f64_from_self() as i64 as u64;
+        let value = if self.size == 10 {
+            float80::to_i128(self.as_bits(), size * 8) as u64
+        } else {
+            self.f64_from_self() as i64 as u64
+        };
         Ok(Self::new(value, size))
     }
 
@@ -429,10 +469,16 @@ impl DomainValue for SizedValue {
     }
 
     fn float_negate(&self) -> Result<Self, EmulatorErrorKind> {
+        if self.size == 10 {
+            return Ok(Self::from_f80_bits(float80::negate(self.as_bits())));
+        }
         Ok(Self::from_f64(-self.f64_from_self(), self.size as usize))
     }
 
     fn float_abs(&self) -> Result<Self, EmulatorErrorKind> {
+        if self.size == 10 {
+            return Ok(Self::from_f80_bits(float80::abs(self.as_bits())));
+        }
         Ok(Self::from_f64(
             self.f64_from_self().abs(),
             self.size as usize,
@@ -615,6 +661,12 @@ impl DomainValue for SizedValue {
 
     fn float_add(&self, other: &Self) -> Result<Self, EmulatorErrorKind> {
         let size = self.widen_size(other);
+        if size == 10 {
+            return Ok(Self::from_f80_bits(float80::add(
+                self.as_bits(),
+                other.as_bits(),
+            )));
+        }
         Ok(Self::from_f64(
             self.f64_from_self() + other.f64_from_self(),
             size,
@@ -623,6 +675,12 @@ impl DomainValue for SizedValue {
 
     fn float_sub(&self, other: &Self) -> Result<Self, EmulatorErrorKind> {
         let size = self.widen_size(other);
+        if size == 10 {
+            return Ok(Self::from_f80_bits(float80::sub(
+                self.as_bits(),
+                other.as_bits(),
+            )));
+        }
         Ok(Self::from_f64(
             self.f64_from_self() - other.f64_from_self(),
             size,
@@ -631,6 +689,12 @@ impl DomainValue for SizedValue {
 
     fn float_mul(&self, other: &Self) -> Result<Self, EmulatorErrorKind> {
         let size = self.widen_size(other);
+        if size == 10 {
+            return Ok(Self::from_f80_bits(float80::mul(
+                self.as_bits(),
+                other.as_bits(),
+            )));
+        }
         Ok(Self::from_f64(
             self.f64_from_self() * other.f64_from_self(),
             size,
@@ -639,6 +703,12 @@ impl DomainValue for SizedValue {
 
     fn float_div(&self, other: &Self) -> Result<Self, EmulatorErrorKind> {
         let size = self.widen_size(other);
+        if size == 10 {
+            return Ok(Self::from_f80_bits(float80::div(
+                self.as_bits(),
+                other.as_bits(),
+            )));
+        }
         Ok(Self::from_f64(
             self.f64_from_self() / other.f64_from_self(),
             size,
@@ -646,31 +716,39 @@ impl DomainValue for SizedValue {
     }
 
     fn float_equal(&self, other: &Self) -> Result<Self, EmulatorErrorKind> {
-        Ok(Self::new(
-            bool_to_u64(self.f64_from_self() == other.f64_from_self()),
-            1,
-        ))
+        let equal = if self.size == 10 {
+            float80::equal(self.as_bits(), other.as_bits())
+        } else {
+            self.f64_from_self() == other.f64_from_self()
+        };
+        Ok(Self::new(bool_to_u64(equal), 1))
     }
 
     fn float_not_equal(&self, other: &Self) -> Result<Self, EmulatorErrorKind> {
-        Ok(Self::new(
-            bool_to_u64(self.f64_from_self() != other.f64_from_self()),
-            1,
-        ))
+        let unequal = if self.size == 10 {
+            !float80::equal(self.as_bits(), other.as_bits())
+        } else {
+            self.f64_from_self() != other.f64_from_self()
+        };
+        Ok(Self::new(bool_to_u64(unequal), 1))
     }
 
     fn float_less(&self, other: &Self) -> Result<Self, EmulatorErrorKind> {
-        Ok(Self::new(
-            bool_to_u64(self.f64_from_self() < other.f64_from_self()),
-            1,
-        ))
+        let less = if self.size == 10 {
+            float80::less(self.as_bits(), other.as_bits())
+        } else {
+            self.f64_from_self() < other.f64_from_self()
+        };
+        Ok(Self::new(bool_to_u64(less), 1))
     }
 
     fn float_less_equal(&self, other: &Self) -> Result<Self, EmulatorErrorKind> {
-        Ok(Self::new(
-            bool_to_u64(self.f64_from_self() <= other.f64_from_self()),
-            1,
-        ))
+        let less_equal = if self.size == 10 {
+            float80::less_equal(self.as_bits(), other.as_bits())
+        } else {
+            self.f64_from_self() <= other.f64_from_self()
+        };
+        Ok(Self::new(bool_to_u64(less_equal), 1))
     }
 }
 
@@ -1122,6 +1200,38 @@ impl StandaloneEmulator {
         Ok(())
     }
 
+    /// Resolve a range of a register varnode used as a store destination.
+    ///
+    /// The flat SLEIGH emitter represents `ST1[8:10] = value` with a `range`
+    /// value so it retains the destination byte offset. As a source, `range`
+    /// means extracted bits; as a register-space store pointer, it is an
+    /// lvalue and must instead mean the base register address plus that offset.
+    /// Treating it as extracted bits writes to an address derived from the old
+    /// high word, leaving the high 16 bits of an i80 register stale.
+    fn register_range_store_address(
+        &self,
+        ctx: &Context<'_>,
+        func: FunctionId,
+        store: &Store,
+    ) -> Option<u64> {
+        let space = store.space.qualify(func);
+        let space_id = space.shared()?;
+        if !matches!(Space::from_id(ctx, space_id).ty, SpaceType::Register) {
+            return None;
+        }
+        let ValueRef::Instruction(range) = ValueRef::new(store.ptr.qualify(func), ctx) else {
+            return None;
+        };
+        let Mnemonic::Range(Range { src, start, .. }) = range.mnemonic() else {
+            return None;
+        };
+        let ValueRef::Varnode(varnode) = ValueRef::new(src.qualify(func), ctx) else {
+            return None;
+        };
+        let varnode = Varnode::from_id(ctx, varnode.id);
+        (varnode.space().id == space_id).then_some(varnode.address() as u64 + *start as u64)
+    }
+
     fn apply_call_continuation(
         &mut self,
         ctx: &Context<'_>,
@@ -1178,6 +1288,154 @@ impl StandaloneEmulator {
                 instruction,
                 EmulatorErrorKind::InterceptError(message),
             )),
+        }
+    }
+
+    /// Evaluate an operand through the scalar interpreter while retaining its
+    /// full f80 payload (the public convenience getter intentionally returns
+    /// only u64 values).
+    fn scalar_value(
+        &mut self,
+        ctx: &Context<'_>,
+        id: ValueId,
+    ) -> Result<SizedValue, EmulatorErrorKind> {
+        let mut interpreter = TempInterpreter {
+            memory: &mut self.memory,
+            insn_values: &mut self.insn_values,
+            block_param_values: &mut self.block_param_values,
+            poison_params: &self.poison_params,
+            ctx,
+        };
+        interpreter.get_value(id)
+    }
+
+    fn x87_context(ctx: &Context<'_>) -> Option<(VarnodeId, VarnodeId)> {
+        let ValueId::Varnode(control) = ctx.get_named("FPUControlWord")? else {
+            return None;
+        };
+        let ValueId::Varnode(status) = ctx.get_named("FPUStatusWord")? else {
+            return None;
+        };
+        Some((control, status))
+    }
+
+    /// x87 defaults to masked exceptions.  We always produce APFloat's default
+    /// result and make every exception sticky.  An unmasked exception sets ES,
+    /// but does not yet transfer control to a hardware exception handler; that
+    /// deliberately non-trapping policy keeps the generic emulator API intact
+    /// until architectural trap delivery is modelled.
+    fn record_x87_status(
+        &mut self,
+        ctx: &Context<'_>,
+        control: u16,
+        status_register: VarnodeId,
+        ap_status: Status,
+    ) -> Result<(), EmulatorErrorKind> {
+        let mut exceptions = 0u16;
+        if ap_status.contains(Status::INVALID_OP) {
+            exceptions |= 1 << 0;
+        }
+        if ap_status.contains(Status::DIV_BY_ZERO) {
+            exceptions |= 1 << 2;
+        }
+        if ap_status.contains(Status::OVERFLOW) {
+            exceptions |= 1 << 3;
+        }
+        if ap_status.contains(Status::UNDERFLOW) {
+            exceptions |= 1 << 4;
+        }
+        if ap_status.contains(Status::INEXACT) {
+            exceptions |= 1 << 5;
+        }
+        if exceptions == 0 {
+            return Ok(());
+        }
+        let old = self.read_varnode_u128(ctx, status_register).unwrap_or(0) as u16;
+        let mut new = old | exceptions;
+        if exceptions & !control & 0x003f != 0 {
+            new |= 1 << 7; // ES: one or more unmasked exceptions are pending.
+        }
+        self.set_varnode(ctx, status_register, u64::from(new))
+    }
+
+    /// Interpret f80 operations with the x87 control/status words in scope.
+    /// Returns `None` for all non-x87 operations so the generic DomainValue
+    /// interpreter remains the implementation for every other architecture.
+    fn interpret_x87_float(
+        &mut self,
+        ctx: &Context<'_>,
+        insn: &InstructionRef<'_, '_>,
+    ) -> Result<Option<SizedValue>, EmulatorErrorKind> {
+        let Some((control_register, status_register)) = Self::x87_context(ctx) else {
+            return Ok(None);
+        };
+        let control = self
+            .read_varnode_u128(ctx, control_register)
+            .unwrap_or(0x037f) as u16;
+        let func = insn.id.func;
+        match insn.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Float(operation),
+                lhs,
+                rhs,
+            }) => {
+                let lhs = self.scalar_value(ctx, lhs.qualify(func))?;
+                let rhs = self.scalar_value(ctx, rhs.qualify(func))?;
+                if lhs.size != 10 || rhs.size != 10 {
+                    return Ok(None);
+                }
+                let result = match operation {
+                    FloatBinop::Add => {
+                        float80::add_contextual(lhs.as_bits(), rhs.as_bits(), control)
+                    }
+                    FloatBinop::Sub => {
+                        float80::sub_contextual(lhs.as_bits(), rhs.as_bits(), control)
+                    }
+                    FloatBinop::Mul => {
+                        float80::mul_contextual(lhs.as_bits(), rhs.as_bits(), control)
+                    }
+                    FloatBinop::Div => {
+                        float80::div_contextual(lhs.as_bits(), rhs.as_bits(), control)
+                    }
+                    // Comparisons don't create an f80 result and retain their
+                    // generic boolean semantics.
+                    FloatBinop::Equal
+                    | FloatBinop::NotEqual
+                    | FloatBinop::Less
+                    | FloatBinop::LessEqual => return Ok(None),
+                    _ => return Ok(None),
+                };
+                self.record_x87_status(ctx, control, status_register, result.status)?;
+                Ok(Some(SizedValue::from_f80_bits(result.bits)))
+            }
+            Mnemonic::Unop(Unary {
+                op: Unop::FloatRound,
+                src,
+            }) => {
+                let value = self.scalar_value(ctx, src.qualify(func))?;
+                if value.size != 10 {
+                    return Ok(None);
+                }
+                let result = float80::round_to_integral_contextual(value.as_bits(), control);
+                self.record_x87_status(ctx, control, status_register, result.status)?;
+                Ok(Some(SizedValue::from_f80_bits(result.bits)))
+            }
+            Mnemonic::IntToFloat(IntToFloat { src, size: 10 }) => {
+                let value = self.scalar_value(ctx, src.qualify(func))?;
+                let result = float80::from_i128_contextual(value.signed_value(), control);
+                self.record_x87_status(ctx, control, status_register, result.status)?;
+                Ok(Some(SizedValue::from_f80_bits(result.bits)))
+            }
+            Mnemonic::FloatToInt(FloatToInt { src, size }) => {
+                let value = self.scalar_value(ctx, src.qualify(func))?;
+                if value.size != 10 {
+                    return Ok(None);
+                }
+                let result = float80::to_i128_contextual(value.as_bits(), size * 8);
+                self.record_x87_status(ctx, control, status_register, result.status)?;
+                Ok(Some(SizedValue::from_bits(result.value as u128, *size)))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1450,6 +1708,35 @@ impl StandaloneEmulator {
             // Whole-array store: the promoted buffer written back to memory in one
             // shot (`store(ram, base <- arr)` at loop exit). A scalar store falls
             // through to the generic interpreter below.
+            Mnemonic::Store(store)
+                if self
+                    .register_range_store_address(ctx, id.func, store)
+                    .is_some() =>
+            {
+                let address = self
+                    .register_range_store_address(ctx, id.func, store)
+                    .expect("guard checked register range store address");
+                let mut tmp = TempInterpreter {
+                    memory: &mut self.memory,
+                    insn_values: &mut self.insn_values,
+                    block_param_values: &mut self.block_param_values,
+                    poison_params: &self.poison_params,
+                    ctx,
+                };
+                let value = tmp.get_value(store.src.qualify(id.func));
+                drop(tmp);
+                let value = value.map_err(|kind| self.make_error(ctx, kind))?;
+                self.memory
+                    .write(
+                        store.space.qualify(id.func),
+                        SizedValue::from_u64(address),
+                        store.size,
+                        value,
+                    )
+                    .map_err(|kind| self.make_error(ctx, kind))?;
+                self.idx += 1;
+            }
+
             Mnemonic::Store(store) if self.is_array_operand(ctx, store.src.qualify(id.func)) => {
                 let (space, ptr, src) = (
                     store.space,
@@ -1513,6 +1800,14 @@ impl StandaloneEmulator {
             }
 
             _ => {
+                if let Some(value) = self
+                    .interpret_x87_float(ctx, &insn)
+                    .map_err(|kind| self.make_error(ctx, kind))?
+                {
+                    self.insn_values.insert(id, value);
+                    self.idx += 1;
+                    return Ok(StepEvent::Normal);
+                }
                 let mut tmp = TempInterpreter {
                     memory: &mut self.memory,
                     insn_values: &mut self.insn_values,
@@ -3265,6 +3560,74 @@ mod tests {
     }
 
     #[test]
+    fn x87_context_uses_rounding_control_and_makes_apfloat_exceptions_sticky() {
+        // Half an f80 ULP at 1.0 rounds back to 1.0 under RC=nearest, but
+        // upward rounding produces the next representable extended value.
+        let one = 0x3fff_8000_0000_0000_0000;
+        let half_ulp = 0x3fbf_8000_0000_0000_0000;
+        assert_eq!(float80::add_contextual(one, half_ulp, 0x037f).bits, one);
+        assert_eq!(float80::add_contextual(one, half_ulp, 0x0b7f).bits, one + 1);
+        // PC=single rounds the f80 significand to 24 bits without narrowing
+        // the exponent.  RC=up selects the next single-precision quantum.
+        let single_half_ulp = 0x3fe7_8000_0000_0000_0000;
+        assert_eq!(
+            float80::add_contextual(one, single_half_ulp, 0x007f).bits,
+            one
+        );
+        assert_eq!(
+            float80::add_contextual(one, single_half_ulp, 0x087f).bits,
+            one + (1u128 << 40)
+        );
+
+        let divide_by_zero = float80::div_contextual(one, 0, 0x037f);
+        assert!(divide_by_zero.status.contains(Status::DIV_BY_ZERO));
+
+        // The concrete interpreter's non-trapping policy keeps a result for
+        // unmasked exceptions, but marks ES in addition to the sticky flag.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i16 FPUControlWord;
+            varnode i16 FPUStatusWord;
+            varnode f80 A;
+            varnode f80 B;
+
+        <block>
+            %a = load(A:10, &A);
+            %b = load(B:10, &B);
+            %result = %a f/ %b;
+            goto <0x1001>;
+        "
+        );
+        let mut emu = Emulator::from_block(&ctx, block);
+        emu.set_varnode(FPUControlWord, 0x037b).unwrap(); // ZE unmasked
+        emu.set_varnode_u128(A, one).unwrap();
+        emu.set_varnode_u128(B, 0).unwrap();
+        emu.run_block().unwrap();
+        assert_eq!(emu.get_value(result.into()).unwrap().size().unwrap(), 10);
+        assert_eq!(emu.read_varnode(FPUStatusWord), Some((1 << 2) | (1 << 7)));
+    }
+
+    #[test]
+    fn float80_arithmetic_preserves_extended_precision_bits() {
+        // x87 80-bit encodings: significand in bits 0..64, exponent/sign in
+        // bits 64..80. 3.0 is not representable by merely treating f80 as an
+        // f64 bit-pattern, which was the former behavior.
+        let one = SizedValue::from_bits(0x3fff_8000_0000_0000_0000, 10);
+        let two = SizedValue::from_bits(0x4000_8000_0000_0000_0000, 10);
+        let three = one.float_add(&two).unwrap();
+
+        assert_eq!(three.as_bits(), 0x4000_c000_0000_0000_0000);
+        assert_eq!(three.size().unwrap(), 10);
+        assert_eq!(two.float_to_float(10).unwrap().as_bits(), two.as_bits());
+        assert_eq!(
+            SizedValue::new(3, 1).int_to_float(10).unwrap().as_bits(),
+            three.as_bits()
+        );
+    }
+
+    #[test]
     fn simple_addition() {
         let mut ctx = Context::new();
 
@@ -3538,6 +3901,30 @@ mod tests {
                 .unwrap(),
             0x3412
         );
+    }
+
+    #[test]
+    fn undef_pcode_op_is_zero_at_its_declared_width() {
+        let mut ctx = Context::new();
+        let op = ctx.shared.pcode_ops.push(Box::from("undef"));
+        let block_id = {
+            let function = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, function)
+        };
+        let target = ctx.get_or_make_block(0x1001, block_id.func);
+        let result = {
+            let mut builder = ctx.builder(block_id);
+            let result = builder.push_pcode_op(op, vec![], None, 1).id;
+            builder.finalize(target);
+            result
+        };
+        let mut emulator = Emulator::from_block(&ctx, block_id);
+
+        emulator.step().unwrap();
+
+        let value = emulator.get_value(result.into()).unwrap();
+        assert_eq!(value.value().unwrap(), 0);
+        assert_eq!(value.size().unwrap(), 1);
     }
 
     #[test]

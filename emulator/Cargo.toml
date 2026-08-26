@@ -12,6 +12,7 @@ qcode.workspace = true
 # by u64 address; the std SipHash default dominated profiles). FxHash is the
 # right tradeoff for trusted, integer-keyed lookups.
 rustc-hash.workspace = true
+rustc_apfloat.workspace = true
 
 [dev-dependencies]
 wazabin-qcode-macro.workspace = true
