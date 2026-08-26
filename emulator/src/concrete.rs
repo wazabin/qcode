@@ -11,9 +11,9 @@ use qcode::{
         LocalValueId, Value, ValueId, ValueRef, Varnode,
         insn::{
             Binary, Binop, Branch, BranchInd, CBranch, Call, CallInd, Callee, Carry, Extract,
-            FloatBinop, FloatToInt, InstructionId, InstructionRef, IntBinop, IntToFloat, LzCount,
-            Mnemonic, PopCount, Range, Return, SBorrow, SCarry, Scan, Sext, Store, Tuple, Unary,
-            Unop, Zext,
+            FloatBinop, FloatToFloat, FloatToInt, InstructionId, InstructionRef, IntBinop,
+            IntToFloat, LzCount, Mnemonic, PopCount, Range, Return, SBorrow, SCarry, Scan, Sext,
+            Store, Tuple, Unary, Unop, Zext,
         },
         varnode::{VarnodeId, register::RegisterId},
     },
@@ -1330,8 +1330,10 @@ impl StandaloneEmulator {
         control: u16,
         status_register: VarnodeId,
         ap_status: Status,
+        rounded_up: Option<bool>,
+        denormal_operand: bool,
     ) -> Result<(), EmulatorErrorKind> {
-        let mut exceptions = 0u16;
+        let mut exceptions = u16::from(denormal_operand) << 1;
         if ap_status.contains(Status::INVALID_OP) {
             exceptions |= 1 << 0;
         }
@@ -1347,15 +1349,48 @@ impl StandaloneEmulator {
         if ap_status.contains(Status::INEXACT) {
             exceptions |= 1 << 5;
         }
-        if exceptions == 0 {
+        if exceptions == 0 && rounded_up.is_none() {
             return Ok(());
         }
         let old = self.read_varnode_u128(ctx, status_register).unwrap_or(0) as u16;
         let mut new = old | exceptions;
+        // C1 records whether an inexact result was rounded away from zero.
+        // It is an operation result, not a sticky exception bit.
+        if ap_status.contains(Status::INEXACT) {
+            if let Some(rounded_up) = rounded_up {
+                new = (new & !(1 << 9)) | (u16::from(rounded_up) << 9);
+            }
+        }
         if exceptions & !control & 0x003f != 0 {
             new |= 1 << 7; // ES: one or more unmasked exceptions are pending.
         }
         self.set_varnode(ctx, status_register, u64::from(new))
+    }
+
+    fn toward_zero_control(control: u16) -> u16 {
+        (control & !0x0c00) | 0x0c00
+    }
+
+    fn rounded_away_from_zero(value: u128, toward_zero: u128, size: usize) -> bool {
+        let magnitude_mask = (1u128 << (size * 8 - 1)) - 1;
+        (value & magnitude_mask) > (toward_zero & magnitude_mask)
+    }
+
+    fn f80_is_denormal(value: u128) -> bool {
+        let exponent = (value >> 64) & 0x7fff;
+        exponent == 0 && value & ((1u128 << 64) - 1) != 0
+    }
+
+    fn scalar_is_denormal(value: SizedValue) -> bool {
+        match value.size as usize {
+            4 => value.as_u64() & 0x7f80_0000 == 0 && value.as_u64() & 0x007f_ffff != 0,
+            8 => {
+                value.as_u64() & 0x7ff0_0000_0000_0000 == 0
+                    && value.as_u64() & 0x000f_ffff_ffff_ffff != 0
+            }
+            10 => Self::f80_is_denormal(value.as_bits()),
+            _ => false,
+        }
     }
 
     /// Interpret f80 operations with the x87 control/status words in scope.
@@ -1384,28 +1419,57 @@ impl StandaloneEmulator {
                 if lhs.size != 10 || rhs.size != 10 {
                     return Ok(None);
                 }
-                let result = match operation {
-                    FloatBinop::Add => {
-                        float80::add_contextual(lhs.as_bits(), rhs.as_bits(), control)
-                    }
-                    FloatBinop::Sub => {
-                        float80::sub_contextual(lhs.as_bits(), rhs.as_bits(), control)
-                    }
-                    FloatBinop::Mul => {
-                        float80::mul_contextual(lhs.as_bits(), rhs.as_bits(), control)
-                    }
-                    FloatBinop::Div => {
-                        float80::div_contextual(lhs.as_bits(), rhs.as_bits(), control)
-                    }
-                    // Comparisons don't create an f80 result and retain their
-                    // generic boolean semantics.
+                let toward_zero = Self::toward_zero_control(control);
+                let (result, zero_result) = match operation {
+                    FloatBinop::Add => (
+                        float80::add_contextual(lhs.as_bits(), rhs.as_bits(), control),
+                        float80::add_contextual(lhs.as_bits(), rhs.as_bits(), toward_zero),
+                    ),
+                    FloatBinop::Sub => (
+                        float80::sub_contextual(lhs.as_bits(), rhs.as_bits(), control),
+                        float80::sub_contextual(lhs.as_bits(), rhs.as_bits(), toward_zero),
+                    ),
+                    FloatBinop::Mul => (
+                        float80::mul_contextual(lhs.as_bits(), rhs.as_bits(), control),
+                        float80::mul_contextual(lhs.as_bits(), rhs.as_bits(), toward_zero),
+                    ),
+                    FloatBinop::Div => (
+                        float80::div_contextual(lhs.as_bits(), rhs.as_bits(), control),
+                        float80::div_contextual(lhs.as_bits(), rhs.as_bits(), toward_zero),
+                    ),
+                    // x87 FCOM treats even a quiet NaN as invalid. Comparisons
+                    // retain their generic boolean result but still update the
+                    // contextual sticky status word.
                     FloatBinop::Equal
                     | FloatBinop::NotEqual
                     | FloatBinop::Less
-                    | FloatBinop::LessEqual => return Ok(None),
+                    | FloatBinop::LessEqual => {
+                        if float80::is_nan(lhs.as_bits()) || float80::is_nan(rhs.as_bits()) {
+                            self.record_x87_status(
+                                ctx,
+                                control,
+                                status_register,
+                                Status::INVALID_OP,
+                                None,
+                                false,
+                            )?;
+                        }
+                        return Ok(None);
+                    }
                     _ => return Ok(None),
                 };
-                self.record_x87_status(ctx, control, status_register, result.status)?;
+                self.record_x87_status(
+                    ctx,
+                    control,
+                    status_register,
+                    result.status,
+                    Some(Self::rounded_away_from_zero(
+                        result.bits,
+                        zero_result.bits,
+                        10,
+                    )),
+                    Self::f80_is_denormal(lhs.as_bits()) || Self::f80_is_denormal(rhs.as_bits()),
+                )?;
                 Ok(Some(SizedValue::from_f80_bits(result.bits)))
             }
             Mnemonic::Unop(Unary {
@@ -1417,23 +1481,70 @@ impl StandaloneEmulator {
                     return Ok(None);
                 }
                 let result = float80::round_to_integral_contextual(value.as_bits(), control);
-                self.record_x87_status(ctx, control, status_register, result.status)?;
+                let zero_result = float80::round_to_integral_contextual(
+                    value.as_bits(),
+                    Self::toward_zero_control(control),
+                );
+                self.record_x87_status(
+                    ctx,
+                    control,
+                    status_register,
+                    result.status,
+                    Some(Self::rounded_away_from_zero(
+                        result.bits,
+                        zero_result.bits,
+                        10,
+                    )),
+                    Self::f80_is_denormal(value.as_bits()),
+                )?;
                 Ok(Some(SizedValue::from_f80_bits(result.bits)))
             }
-            Mnemonic::IntToFloat(IntToFloat { src, size: 10 }) => {
-                let value = self.scalar_value(ctx, src.qualify(func))?;
-                let result = float80::from_i128_contextual(value.signed_value(), control);
-                self.record_x87_status(ctx, control, status_register, result.status)?;
-                Ok(Some(SizedValue::from_f80_bits(result.bits)))
-            }
+            // FILD converts exactly to the extended format.  PC applies to
+            // arithmetic results, not this integer load.
+            Mnemonic::IntToFloat(IntToFloat { size: 10, .. }) => Ok(None),
             Mnemonic::FloatToInt(FloatToInt { src, size }) => {
                 let value = self.scalar_value(ctx, src.qualify(func))?;
                 if value.size != 10 {
                     return Ok(None);
                 }
                 let result = float80::to_i128_contextual(value.as_bits(), size * 8);
-                self.record_x87_status(ctx, control, status_register, result.status)?;
+                self.record_x87_status(
+                    ctx,
+                    control,
+                    status_register,
+                    result.status,
+                    None,
+                    Self::f80_is_denormal(value.as_bits()),
+                )?;
                 Ok(Some(SizedValue::from_bits(result.value as u128, *size)))
+            }
+            Mnemonic::FloatToFloat(FloatToFloat { src, size }) => {
+                let value = self.scalar_value(ctx, src.qualify(func))?;
+                if value.size == 10 && matches!(*size, 4 | 8) {
+                    let result = float80::to_float_contextual(value.as_bits(), *size, control);
+                    let zero_result = float80::to_float_contextual(
+                        value.as_bits(),
+                        *size,
+                        Self::toward_zero_control(control),
+                    );
+                    self.record_x87_status(
+                        ctx,
+                        control,
+                        status_register,
+                        result.status,
+                        Some(Self::rounded_away_from_zero(
+                            result.bits,
+                            zero_result.bits,
+                            *size,
+                        )),
+                        Self::f80_is_denormal(value.as_bits()),
+                    )?;
+                    return Ok(Some(SizedValue::from_bits(result.bits, *size)));
+                }
+                if *size == 10 && Self::scalar_is_denormal(value) {
+                    self.record_x87_status(ctx, control, status_register, Status::OK, None, true)?;
+                }
+                Ok(None)
             }
             _ => Ok(None),
         }
@@ -3577,6 +3688,17 @@ mod tests {
         assert_eq!(
             float80::add_contextual(one, single_half_ulp, 0x087f).bits,
             one + (1u128 << 40)
+        );
+        // f80 stores narrow under RC too: the exact halfway value stores as
+        // 1.0 under nearest-even and as the next f32 under round-up.
+        let one_plus_half_single_ulp = one + (1u128 << 39);
+        assert_eq!(
+            float80::to_float_contextual(one_plus_half_single_ulp, 4, 0x037f).bits,
+            u128::from(1.0f32.to_bits())
+        );
+        assert_eq!(
+            float80::to_float_contextual(one_plus_half_single_ulp, 4, 0x0b7f).bits,
+            u128::from((1.0f32).to_bits() + 1)
         );
 
         let divide_by_zero = float80::div_contextual(one, 0, 0x037f);

@@ -110,10 +110,15 @@ fn arithmetic(
     round: Round,
 ) -> Result {
     let rounded = apply_precision(value.value, control, round);
-    Result {
-        bits: rounded.bits,
-        status: value.status | rounded.status,
-    }
+    let status = value.status | rounded.status;
+    // x87 masked invalid arithmetic writes the architectural indefinite QNaN,
+    // rather than preserving APFloat's operation-specific NaN sign/payload.
+    let bits = if status.contains(Status::INVALID_OP) {
+        0xffff_c000_0000_0000_0000
+    } else {
+        rounded.bits
+    };
+    Result { bits, status }
 }
 
 fn value(bits: u128) -> X87DoubleExtended {
@@ -158,6 +163,36 @@ pub(super) fn from_f32_bits(raw: u32) -> u128 {
             .convert_r(Round::NearestTiesToEven, &mut loses_info)
             .value,
     )
+}
+
+/// Narrow an f80 store using the x87 rounding-control field.  Precision
+/// control governs arithmetic results, not the destination format; conversion
+/// to f32/f64 is rounded directly to that format.
+pub(super) fn to_float_contextual(raw: u128, size: usize, control: u16) -> Result {
+    let round = round_from_control(control);
+    let mut loses_info = false;
+    match size {
+        4 => {
+            let value: rustc_apfloat::StatusAnd<Single> =
+                value(raw).convert_r(round, &mut loses_info);
+            Result {
+                bits: value.value.to_bits(),
+                status: value.status,
+            }
+        }
+        8 => {
+            let value: rustc_apfloat::StatusAnd<Double> =
+                value(raw).convert_r(round, &mut loses_info);
+            Result {
+                bits: value.value.to_bits(),
+                status: value.status,
+            }
+        }
+        _ => Result {
+            bits: raw,
+            status: Status::OK,
+        },
+    }
 }
 
 pub(super) fn to_i128(raw: u128, width: usize) -> i128 {
