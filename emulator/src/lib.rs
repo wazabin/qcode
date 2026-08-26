@@ -162,6 +162,13 @@ pub trait DomainValue: Clone + Copy {
 
     fn from_u64(value: u64) -> Self;
 
+    /// Creates an all-zero value at `size` bytes. Domains that track width
+    /// should override this; the default preserves compatibility for domains
+    /// that only have a machine-word zero representation.
+    fn zero(_size: usize) -> Self {
+        Self::from_u64(0)
+    }
+
     fn is_float_nan(&self) -> std::result::Result<Self, EmulatorErrorKind>;
     fn int_to_float(&self, size: usize) -> std::result::Result<Self, EmulatorErrorKind>;
     fn float_to_float(&self, size: usize) -> std::result::Result<Self, EmulatorErrorKind>;
@@ -481,6 +488,12 @@ pub trait Interpreter {
                 let name = self.ctx().shared.pcode_ops[op.id].clone();
                 match (name.as_ref(), op.args.as_slice()) {
                     ("swap_bytes", [src]) => Some(self.get_value(src.qualify(func))?.byte_swap()?),
+                    // SLEIGH uses this zero-argument user-op as an explicit
+                    // write of an architecturally undefined value. Concrete
+                    // emulation deliberately chooses zero, while retaining
+                    // the p-code op and its destination in the IR for
+                    // analysis consumers.
+                    ("undef", []) => Some(Self::V::zero(insn.size())),
                     _ => return Err(EmulatorErrorKind::UnsupportedPCodeOp(name)),
                 }
             }
