@@ -59,8 +59,9 @@ views.
 
 ## Replay status
 
-The first strict replay pass over IDs 11666-11891 has run. 168 of 199 cases
-are clean; 25 remain. Fixed so far, each confirmed against a hardware capture:
+The first strict replay pass over IDs 11666-11891 has run. 180 of 199 cases
+are clean; 19 remain, and every one of them is listed below. Fixed so far,
+each confirmed against a hardware capture:
 
 | Fix | Where |
 | --- | --- |
@@ -75,6 +76,11 @@ are clean; 25 remain. Fixed so far, each confirmed against a hardware capture:
 | p-code shift amounts are the full unsigned value of input1 and empty the operand when out of range, instead of being masked and wrapped | QCode |
 | `pavgb`, `pavgw`, `pmulhuw`, `pmaddwd` and the eight saturating add/subtract user-ops implemented | QCode |
 | FIST/FISTP/FISTTP store the integer indefinite on an invalid conversion rather than APFloat's saturated bound | QCode |
+| `packsswb`/`packssdw` passed a destination bit range as a macro output parameter, an rvalue there, so no saturated lane was ever written | SLEIGH |
+| FSTENV/FNSTENV write the selector fields at +16 and +24 | SLEIGH |
+| C1 cleared *before* FADD and FSCALE rather than after, so the rounding indicator the operation sets survives | SLEIGH |
+| FSCALE implemented via APFloat's scalbn under the rounding control | QCode |
+| A narrowing f80 store no longer raises the denormal-operand exception, and an invalid one stores the signed indefinite QNaN | QCode |
 
 The p-code shift fix is architecture-independent. A full replay of the whole
 `x86db` corpus confirmed it introduces no regression outside x87/MMX.
@@ -92,7 +98,9 @@ These need a design decision before implementation and are deliberately left:
 - **FPREM/FPREM1** (2 cases). Lowered as `x - trunc(x/y)*y`, with no C2
   incomplete-reduction flag and no quotient bits in C0/C1/C3. Needs the real
   partial-remainder algorithm.
-- **x87 stack overflow/underflow** (`FLD double ptr`, `FCOMIP`, 2 cases).
+- **x87 stack overflow/underflow** (`FLD double ptr`, `FCOMIP`, `FXTRACT`,
+  3 cases; all four FXTRACT vectors are stack overflows, so implementing
+  `extract_significand`/`extract_exponent` alone will not clear it).
   Hardware sets IE+SF and a C1 direction bit; neither is modelled.
 - **Transcendentals** (`F2XM1`, `FSIN`, `FCOS`, `FPTAN`, `FPATAN`, `FSINCOS`,
   6 cases). Needs an accuracy model that reproduces hardware bit-for-bit, which
@@ -102,21 +110,12 @@ These need a design decision before implementation and are deliberately left:
 
 These are ordinary work, just not yet done:
 
-- **PACKSSWB/PACKSSDW** (2 cases). Saturating pack produces zero where a lane
-  should saturate. The lowered QCode reads correct on inspection, so this needs
-  a focused unit test to isolate.
-- **FXTRACT/FSCALE** (`extract_significand`, `extract_exponent`, `fscale`) and
-  **BCD** (`from_bcd`, `to_bcd`, for FBLD/FBSTP), 4 cases. Pure f80 exponent
-  and digit manipulation; the corpus vectors include denormal, infinity, qNaN
-  and unsupported encodings, so each needs its special cases handled.
-- **Denormal-operand flag on f64 stores** (`FST`/`FSTP double ptr`, 2 cases).
-  QCode sets DE where hardware does not; `f80_is_denormal` is misclassifying.
+- **BCD** (`from_bcd`, `to_bcd`, for FBLD/FBSTP), 2 cases. Exact packed-decimal
+  conversion; no accuracy model needed, just the digit handling.
 - **FSQRT inexact** (1 case). PE is never set because sqrt does not take the
   contextual f80 path, and the generic `float_sqrt` narrows f80 through f64,
   losing 11 significand bits. Needs a correctly rounded f80 sqrt; APFloat has
   none.
-- **FADD C1 rounded-up** (1 case). The C1 rounding indicator is cleared where
-  hardware sets it, so `rounded_away_from_zero` is wrong for this vector.
 
 ## Required workflow
 
