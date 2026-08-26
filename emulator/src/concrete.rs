@@ -1346,6 +1346,16 @@ impl StandaloneEmulator {
             "pavgw" => average(2),
             // Unsigned 16x16 multiply per word lane, keeping the high half.
             "pmulhuw" => Self::packed_lanes(&lhs, &rhs, 2, |a, b| ((a * b) >> 16) & 0xffff),
+            // Saturating packed add/subtract. A signed lane clamps to its
+            // width's bounds; an unsigned lane clamps to zero and its maximum.
+            "paddsb" => Self::saturating(&lhs, &rhs, 1, true, false),
+            "paddsw" => Self::saturating(&lhs, &rhs, 2, true, false),
+            "psubsb" => Self::saturating(&lhs, &rhs, 1, true, true),
+            "psubsw" => Self::saturating(&lhs, &rhs, 2, true, true),
+            "paddusb" => Self::saturating(&lhs, &rhs, 1, false, false),
+            "paddusw" => Self::saturating(&lhs, &rhs, 2, false, false),
+            "psubusb" => Self::saturating(&lhs, &rhs, 1, false, true),
+            "psubusw" => Self::saturating(&lhs, &rhs, 2, false, true),
             // Signed 16x16 multiplies summed in pairs into each dword lane.
             "pmaddwd" => Self::packed_lanes(&lhs, &rhs, 4, |a, b| {
                 let word = |v: u128, half: u32| i64::from(((v >> (half * 16)) & 0xffff) as u16 as i16);
@@ -1355,6 +1365,32 @@ impl StandaloneEmulator {
             _ => None,
         };
         Ok(value)
+    }
+
+    /// Saturating packed add (`subtract` false) or subtract, per `width`-byte
+    /// lane. `signed` selects signed bounds over unsigned ones.
+    fn saturating(
+        lhs: &SizedValue,
+        rhs: &SizedValue,
+        width: usize,
+        signed: bool,
+        subtract: bool,
+    ) -> Option<SizedValue> {
+        let bits = width * 8;
+        Self::packed_lanes(lhs, rhs, width, |a, b| {
+            if signed {
+                let sign = |v: u128| (v as i128) - (((v >> (bits - 1)) & 1) as i128) * (1i128 << bits);
+                let (a, b) = (sign(a), sign(b));
+                let value = if subtract { a - b } else { a + b };
+                let max = (1i128 << (bits - 1)) - 1;
+                let min = -(1i128 << (bits - 1));
+                (value.clamp(min, max) as u128) & ((1u128 << bits) - 1)
+            } else if subtract {
+                a.saturating_sub(b)
+            } else {
+                (a + b).min((1u128 << bits) - 1)
+            }
+        })
     }
 
     /// Apply `lane` to each `width`-byte lane of two equally sized vectors.
