@@ -59,63 +59,83 @@ views.
 
 ## Replay status
 
-The first strict replay pass over IDs 11666-11891 has run. 180 of 199 cases
-are clean; 19 remain, and every one of them is listed below. Fixed so far,
-each confirmed against a hardware capture:
+Strict replay over IDs 11666-11891 is **state-clean**: 192 of 199 cases pass
+with zero state mismatches. The seven that remain all fail for the same
+reason — a SLEIGH user-op with no implementation — and are listed below.
 
-| Fix | Where |
-| --- | --- |
-| FLDL2T/FLDL2E/FLDPI/FLDLG2/FLDLN2 loaded exact 80-bit constants instead of f64 literals widened by `float2float` | SLEIGH |
-| C1 cleared for FABS, FCHS and FSQRT, where it is architecturally defined clear | SLEIGH |
-| MMX shifts share one 64-bit count; PSLLD/PSRAD had used a separate per-lane count from each half of the source | SLEIGH |
-| MMX shift counts clamped to the lane width, since SLEIGH narrows a count to the destination width and would wrap an oversized one | SLEIGH |
-| `zext(imm8)` rather than `imm8:8` for immediate shift counts, which the lifter emits as a 64-bit subpiece of one-byte storage | SLEIGH |
-| The FCOMI family no longer clears C1; it reports only through ZF/PF/CF | SLEIGH |
-| `mmxreg2op_m64` matches the MMX subtable rather than the raw field, unblocking the PADDS/PADDUS/PSUBS/PSUBUS register forms | SLEIGH |
-| FSTENV/FNSTENV write the selector fields at +16 and +24 | SLEIGH |
-| p-code shift amounts are the full unsigned value of input1 and empty the operand when out of range, instead of being masked and wrapped | QCode |
-| `pavgb`, `pavgw`, `pmulhuw`, `pmaddwd` and the eight saturating add/subtract user-ops implemented | QCode |
-| FIST/FISTP/FISTTP store the integer indefinite on an invalid conversion rather than APFloat's saturated bound | QCode |
-| `packsswb`/`packssdw` passed a destination bit range as a macro output parameter, an rvalue there, so no saturated lane was ever written | SLEIGH |
-| FSTENV/FNSTENV write the selector fields at +16 and +24 | SLEIGH |
-| C1 cleared *before* FADD and FSCALE rather than after, so the rounding indicator the operation sets survives | SLEIGH |
-| FSCALE implemented via APFloat's scalbn under the rounding control | QCode |
-| A narrowing f80 store no longer raises the denormal-operand exception, and an invalid one stores the signed indefinite QNaN | QCode |
+Fixed in this pass, each confirmed against a hardware capture:
 
-The p-code shift fix is architecture-independent. A full replay of the whole
-`x86db` corpus confirmed it introduces no regression outside x87/MMX.
+### SLEIGH
 
-## Remaining failures, and what each needs
+- FLDL2T/FLDL2E/FLDPI/FLDLG2/FLDLN2 load exact 80-bit constants; they were
+  f64 literals widened by `float2float`, which zeroed the low 11 significand
+  bits of every one.
+- C1 is cleared where it is architecturally defined clear (FABS, FCHS) and
+  *before* the operation where it is a rounding indicator the operation sets
+  (FADD, FSQRT, FSCALE). Clearing after discarded what the operation reported.
+- The FCOMI family no longer clears C1 at all: it reports only through
+  ZF/PF/CF, leaving C0-C3 alone.
+- The ordered and unordered compares are separate. FCOM and FUCOM produced
+  identical p-code, so the interpreter applied FCOM's quiet-NaN rule to both;
+  `fcom`/`fcomi` now signal invalid for a quiet NaN and `fucom`/`fucomi` do
+  not.
+- Stack underflow is modelled: referencing an empty register sets IE and SF
+  and clears C1. A new `fregidx` subtable exports an operand's logical index,
+  since the raw `freg` field is consumed by `fregop`.
+- FLD m32fp/m64fp, FILD m16/m32/m64 and FBLD open-coded `fdec()` and a store,
+  bypassing `fpushv` and its overflow detection.
+- A stack fault takes precedence in FXTRACT, aborting the extraction.
+- The MMX shift family shares one 64-bit count clamped to the lane width;
+  PSLLD and PSRAD had used a separate per-lane count from each half of the
+  source, and an oversized count wrapped instead of emptying the lane.
+- `packsswb`/`packssdw` passed a destination bit range as a macro output
+  parameter — an rvalue there — so no saturated lane was ever written.
+- `mmxreg2op_m64` matched the raw field while its body exported the subtable,
+  leaving it unresolved at lowering.
+- FSTENV/FNSTENV write the selector fields at +16 and +24.
+- FPREM/FPREM1 lower to their own user-ops instead of `x - trunc(x/y)*y`.
 
-These need a design decision before implementation and are deliberately left:
+### QCode
 
-- **FCOM vs FUCOM invalid** (`FUCOM`, `FUCOMI`, `FUCOMPP`, `FUCOMIP`, 4 cases).
-  FCOM signals IE on a quiet NaN; FUCOM signals only on a signalling NaN. Both
-  lower to the same p-code float comparison, so the concrete emulator cannot
-  tell them apart and applies FCOM's rule to both. Distinguishing them requires
-  either a separate user-op for the unordered forms or explicit status writes
-  in the FUCOM constructors.
-- **FPREM/FPREM1** (2 cases). Lowered as `x - trunc(x/y)*y`, with no C2
-  incomplete-reduction flag and no quotient bits in C0/C1/C3. Needs the real
-  partial-remainder algorithm.
-- **x87 stack overflow/underflow** (`FLD double ptr`, `FCOMIP`, `FXTRACT`,
-  3 cases; all four FXTRACT vectors are stack overflows, so implementing
-  `extract_significand`/`extract_exponent` alone will not clear it).
-  Hardware sets IE+SF and a C1 direction bit; neither is modelled.
-- **Transcendentals** (`F2XM1`, `FSIN`, `FCOS`, `FPTAN`, `FPATAN`, `FSINCOS`,
-  6 cases). Needs an accuracy model that reproduces hardware bit-for-bit, which
-  is a larger commitment than the other gaps.
-- **MASKMOVQ**. The spec models it as a register write, but the instruction
-  stores to `DS:[RDI]`. Fixing it means giving the constructor a memory effect.
+- A p-code shift amount is the full unsigned value of input1 and empties the
+  operand when out of range. It had been masked to input0's width, truncated
+  to `u32`, then reduced modulo 128. **This is architecture-independent**; a
+  full replay of the whole corpus confirmed no regression outside x87/MMX.
+- Packed MMX user-ops: `pavgb`, `pavgw`, `pmulhuw`, `pmaddwd`, and the eight
+  saturating add/subtract forms.
+- FIST/FISTP/FISTTP store the integer indefinite on an invalid conversion,
+  not APFloat's saturated bound.
+- A narrowing f80 store no longer raises the denormal-operand exception, and
+  an invalid one stores the *signed* indefinite QNaN.
+- Comparisons are quiet: only a signalling NaN raises invalid.
+- FSCALE via APFloat's `scalbn`; FPREM/FPREM1 with the quotient's low three
+  bits in C0/C3/C1 and C2 for an incomplete reduction; FBLD/FBSTP packed
+  decimal; FXTRACT's significand and exponent.
+- A correctly rounded 80-bit square root computed on the integer significand.
+  APFloat has none, and the generic path routed f80 through f64, losing
+  eleven significand bits.
 
-These are ordinary work, just not yet done:
+## What remains
 
-- **BCD** (`from_bcd`, `to_bcd`, for FBLD/FBSTP), 2 cases. Exact packed-decimal
-  conversion; no accuracy model needed, just the digit handling.
-- **FSQRT inexact** (1 case). PE is never set because sqrt does not take the
-  contextual f80 path, and the generic `float_sqrt` narrows f80 through f64,
-  losing 11 significand bits. Needs a correctly rounded f80 sqrt; APFloat has
-  none.
+Seven cases, all needing a user-op implemented rather than a fix:
+
+- **Transcendentals** — `f2xm1`, `fsin`, `fcos`, `fptan`, `fpatan` (F2XM1,
+  FSIN, FCOS, FPTAN, FPATAN, FSINCOS; 6 cases). These need an accuracy model
+  that reproduces hardware bit-for-bit, which is a different kind of
+  commitment from everything above: FSCALE, FXTRACT and the BCD conversions
+  were implemented because they are *exact*.
+- **MASKMOVQ** (1 case). The spec models it as a register write, but the
+  instruction stores to `DS:[RDI]`. Fixing it means giving the constructor a
+  memory effect, which changes its shape rather than its arithmetic.
+
+Two behaviours are implemented but **not** covered by any hardware capture,
+and are called out at the code rather than assumed correct:
+
+- FPREM/FPREM1's partial-reduction path (C2 set). No corpus vector reaches an
+  exponent span of 64 or more, so the number of exponents consumed per step is
+  not pinned down.
+- FXTRACT's divide-by-zero on a ±0 operand. All four of its vectors are stack
+  overflows, which abort the extraction before that flag could be raised.
 
 ## Required workflow
 
