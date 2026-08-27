@@ -1342,6 +1342,21 @@ impl StandaloneEmulator {
                 .unwrap_or(0x037f) as u16;
             return Ok(match name.as_ref() {
                 "from_bcd" => Some(SizedValue::from_f80_bits(float80::from_bcd(value.as_bits()))),
+                "extract_significand" => Some(SizedValue::from_f80_bits(
+                    float80::extract_significand(value.as_bits()),
+                )),
+                "extract_exponent" => {
+                    let result = float80::extract_exponent(value.as_bits());
+                    self.record_x87_status(
+                        ctx,
+                        control,
+                        status_register,
+                        result.status,
+                        None,
+                        Self::f80_is_denormal(value.as_bits()),
+                    )?;
+                    Some(SizedValue::from_f80_bits(result.bits))
+                }
                 "to_bcd" => {
                     let result = float80::to_bcd(value.as_bits(), control);
                     self.record_x87_status(

@@ -535,6 +535,53 @@ pub(super) fn sqrt_contextual(raw: u128, control: u16) -> Result {
     }
 }
 
+/// FXTRACT's significand: the operand with its exponent forced to zero, so
+/// the result lies in [1, 2) with the operand's sign. A zero, infinity or NaN
+/// is returned unchanged.
+pub(super) fn extract_significand(raw: u128) -> u128 {
+    let source = value(raw);
+    if source.is_zero() || source.is_infinite() || source.is_nan() {
+        return raw;
+    }
+    bits(source.scalbn(-i32::from(source.ilogb())))
+}
+
+/// FXTRACT's exponent: the operand's unbiased base-two exponent as an integer
+/// valued extended float. A denormal reports the exponent of its normalized
+/// form. Zero yields negative infinity and raises divide-by-zero; an infinity
+/// yields positive infinity, and a NaN is returned unchanged.
+pub(super) fn extract_exponent(raw: u128) -> Result {
+    let source = value(raw);
+    if source.is_nan() {
+        return Result {
+            bits: raw,
+            status: Status::OK,
+        };
+    }
+    if source.is_zero() {
+        return Result {
+            bits: 0xffff_8000_0000_0000_0000,
+            status: Status::DIV_BY_ZERO,
+        };
+    }
+    if source.is_infinite() {
+        return Result {
+            bits: 0x7fff_8000_0000_0000_0000,
+            status: Status::OK,
+        };
+    }
+    Result {
+        bits: bits(
+            X87DoubleExtended::from_i128_r(
+                i128::from(source.ilogb()),
+                Round::NearestTiesToEven,
+            )
+            .value,
+        ),
+        status: Status::OK,
+    }
+}
+
 pub(super) fn negate(raw: u128) -> u128 {
     bits(-value(raw))
 }
