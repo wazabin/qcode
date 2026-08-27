@@ -53,11 +53,22 @@ fn apply_precision(value: X87DoubleExtended, control: u16, round: Round) -> Resu
     let exponent = sign_exponent & 0x7fff;
     // Precision control rounds normal finite extended values.  APFloat has
     // already handled exceptional and denormal results before this stage.
-    if exponent == 0 || exponent == 0x7fff {
+    if exponent == 0x7fff {
         return Result {
             bits: raw,
             status: Status::OK,
         };
+    }
+    // A denormal result keeps its extended encoding, but under a narrowed
+    // precision it cannot be represented exactly: the hardware reports both
+    // underflow and inexact while leaving the value alone.
+    if exponent == 0 {
+        let status = if raw as u64 == 0 {
+            Status::OK
+        } else {
+            Status::UNDERFLOW | Status::INEXACT
+        };
+        return Result { bits: raw, status };
     }
     let significand = raw as u64;
     let discarded_bits = 64 - precision;
