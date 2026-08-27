@@ -806,6 +806,39 @@ mod tests {
         assert_eq!(emu.read_register(x64::FPUSTATUSWORD), Some(0x220));
     }
 
+    /// MASKMOVQ stores to DS:[RDI], one byte per set mask-byte high bit. It
+    /// writes no register, so both MMX operands must survive unchanged.
+    #[test]
+    fn test_maskmovq_stores_selected_bytes_without_writing_a_register() {
+        let insn = x64::Disassembler::from_bytes(0x1000, b"\x0f\xf7\xc1")
+            .next()
+            .unwrap();
+        assert_eq!(insn.to_string(), "MASKMOVQ MM0, MM1");
+
+        let mut ctx = x64::make_context();
+        x64::lift(&mut ctx, &insn, None).unwrap();
+        let mut emu = Emulator::from_address(&ctx, 0x1000);
+
+        // Select bytes 0 and 7 only; the rest keep whatever memory held.
+        let data = 0x1122_3344_5566_7788u128 | (0x3fffu128 << 64);
+        let mask = 0x8000_0000_0000_0080u128;
+        let address = 0x4000u64;
+        write_x87_slot(&mut emu, &ctx, 0, data);
+        write_x87_slot(&mut emu, &ctx, 1, mask);
+        emu.set_register(x64::RDI, address).unwrap();
+        emu.set_register(x64::FPUSTATUSWORD, 3 << 11).unwrap();
+        emu.set_register(x64::FPUTAGWORD, 0xffff).unwrap();
+        let space = ctx.shared.default_space;
+        emu.write_memory(space, address, &[0xa5; 8]).unwrap();
+        emu.run_block().unwrap();
+
+        let stored = emu.read_memory(space, address, 8).unwrap();
+        assert_eq!(stored, [0x88, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0x11]);
+        // Neither operand is a destination, high sixteen bits included.
+        assert_eq!(read_x87_slot(&mut emu, &ctx, 0), data);
+        assert_eq!(read_x87_slot(&mut emu, &ctx, 1), mask);
+    }
+
     #[test]
     fn test_fxsave_uses_an_abridged_physical_tag_byte() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\x0f\xae\x07")
