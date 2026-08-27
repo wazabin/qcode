@@ -1342,6 +1342,38 @@ impl StandaloneEmulator {
         };
 
         let value = match name.as_ref() {
+            // FPREM and FPREM1 report the quotient's low three bits in
+            // C0/C3/C1 and an incomplete reduction in C2, so the condition
+            // codes are written here alongside the sticky exceptions.
+            "fprem" | "fprem1" if lhs.size == 10 && rhs.size == 10 => {
+                let Some((control_varnode, status_register)) = Self::x87_context(ctx) else {
+                    return Ok(None);
+                };
+                let control = self
+                    .read_varnode_u128(ctx, control_varnode)
+                    .unwrap_or(0x037f) as u16;
+                let result = float80::remainder(lhs.as_bits(), rhs.as_bits(), name.as_ref() == "fprem1");
+                self.record_x87_status(
+                    ctx,
+                    control,
+                    status_register,
+                    result.status,
+                    None,
+                    Self::f80_is_denormal(lhs.as_bits()),
+                )?;
+                let old = self.read_varnode_u128(ctx, status_register).unwrap_or(0) as u16;
+                // C0, C1, C2 and C3 are all operation results here.
+                let mut new = old & !0x4700;
+                if result.incomplete {
+                    new |= 1 << 10;
+                } else {
+                    new |= u16::from(result.quotient as u8 & 1) << 9;
+                    new |= u16::from((result.quotient >> 1) as u8 & 1) << 14;
+                    new |= u16::from((result.quotient >> 2) as u8 & 1) << 8;
+                }
+                self.set_varnode(ctx, status_register, u64::from(new))?;
+                return Ok(Some(SizedValue::from_f80_bits(result.bits)));
+            }
             // FSCALE reads its scale from ST(1) and rounds under the x87
             // control word, so it is interpreted here rather than as a
             // generic packed lane operation.

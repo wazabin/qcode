@@ -298,6 +298,95 @@ pub(super) fn round_to_integral_contextual(raw: u128, control: u16) -> Result {
     result(value(raw).round_to_integral(round))
 }
 
+/// The result of FPREM/FPREM1: an exact remainder plus the quotient bits the
+/// condition codes report.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Remainder {
+    pub bits: u128,
+    pub status: Status,
+    /// Low three bits of the quotient's magnitude, reported in C0/C3/C1.
+    pub quotient: u64,
+    /// Set when the reduction did not complete, which x87 reports as C2.
+    pub incomplete: bool,
+}
+
+/// FPREM (`ieee` false, quotient truncated toward zero) and FPREM1 (`ieee`
+/// true, quotient rounded to nearest even). The remainder itself is always
+/// exact, so no rounding control applies.
+///
+/// x87 reduces at most 63 binary exponents at a time. Beyond that it performs
+/// a partial reduction and sets C2 so the caller loops. No hardware capture in
+/// the corpus reaches that path, so the exact number of exponents consumed per
+/// partial step is not pinned down here; a vector that exercises it should be
+/// captured before this branch is relied on.
+pub(super) fn remainder(raw: u128, divisor: u128, ieee: bool) -> Remainder {
+    let x = value(raw);
+    let y = value(divisor);
+
+    let indefinite = Remainder {
+        bits: 0xffff_c000_0000_0000_0000,
+        status: Status::INVALID_OP,
+        quotient: 0,
+        incomplete: false,
+    };
+    // A zero divisor or an infinite dividend is invalid, and x87's masked
+    // result is the indefinite QNaN rather than APFloat's NaN.
+    if y.is_zero() || x.is_infinite() {
+        return indefinite;
+    }
+    if x.is_nan() || y.is_nan() {
+        let status = if x.is_signaling() || y.is_signaling() {
+            Status::INVALID_OP
+        } else {
+            Status::OK
+        };
+        return Remainder {
+            status,
+            ..indefinite
+        };
+    }
+    if x.is_zero() || y.is_infinite() {
+        return Remainder {
+            bits: raw,
+            status: Status::OK,
+            quotient: 0,
+            incomplete: false,
+        };
+    }
+
+    let exponent_span = i32::from(x.ilogb()) - i32::from(y.ilogb());
+    if exponent_span >= 64 {
+        // Partial reduction: bring the dividend within reach of one more step.
+        let scaled = y.scalbn(exponent_span - 32);
+        let value = x.c_fmod(scaled);
+        return Remainder {
+            bits: bits(value.value),
+            status: value.status,
+            quotient: 0,
+            incomplete: true,
+        };
+    }
+
+    let value = if ieee { x.ieee_rem(y) } else { x.c_fmod(y) };
+    // The quotient is exact and fits once the span is under 64 exponents.
+    let mut exact = false;
+    let quotient = x
+        .div_r(y, if ieee { Round::NearestTiesToEven } else { Round::TowardZero })
+        .value
+        .to_i128_r(
+            80,
+            if ieee { Round::NearestTiesToEven } else { Round::TowardZero },
+            &mut exact,
+        )
+        .value;
+    Remainder {
+        bits: bits(value.value),
+        status: value.status,
+        quotient: quotient.unsigned_abs() as u64,
+        incomplete: false,
+    }
+}
+
 pub(super) fn negate(raw: u128) -> u128 {
     bits(-value(raw))
 }
