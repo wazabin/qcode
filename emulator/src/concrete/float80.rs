@@ -310,6 +310,13 @@ pub(super) fn is_nan(raw: u128) -> bool {
     value(raw).is_nan()
 }
 
+/// A signalling NaN raises invalid even for a quiet comparison. x87's ordered
+/// compares additionally raise it for a quiet NaN, which the FCOM
+/// constructors express; the unordered FUCOM forms do not.
+pub(super) fn is_signaling_nan(raw: u128) -> bool {
+    value(raw).is_signaling()
+}
+
 pub(super) fn equal(lhs: u128, rhs: u128) -> bool {
     value(lhs) == value(rhs)
 }

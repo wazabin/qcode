@@ -1568,14 +1568,19 @@ impl StandaloneEmulator {
                         float80::div_contextual(lhs.as_bits(), rhs.as_bits(), control),
                         float80::div_contextual(lhs.as_bits(), rhs.as_bits(), toward_zero),
                     ),
-                    // x87 FCOM treats even a quiet NaN as invalid. Comparisons
-                    // retain their generic boolean result but still update the
-                    // contextual sticky status word.
+                    // A comparison is quiet: only a signalling NaN raises
+                    // invalid here. x87's *ordered* compares also raise it for
+                    // a quiet NaN, which the FCOM constructors add explicitly,
+                    // because the p-code is identical for FCOM and FUCOM and
+                    // cannot distinguish them. Comparisons keep their generic
+                    // boolean result and only update the sticky status word.
                     FloatBinop::Equal
                     | FloatBinop::NotEqual
                     | FloatBinop::Less
                     | FloatBinop::LessEqual => {
-                        if float80::is_nan(lhs.as_bits()) || float80::is_nan(rhs.as_bits()) {
+                        if float80::is_signaling_nan(lhs.as_bits())
+                            || float80::is_signaling_nan(rhs.as_bits())
+                        {
                             self.record_x87_status(
                                 ctx,
                                 control,
