@@ -387,6 +387,154 @@ pub(super) fn remainder(raw: u128, divisor: u128, ieee: bool) -> Remainder {
     }
 }
 
+/// The ten-byte packed-decimal indefinite, stored when a value cannot be
+/// represented as eighteen decimal digits.
+const BCD_INDEFINITE: u128 = 0xffff_c000_0000_0000_0000;
+
+/// The largest magnitude eighteen packed decimal digits can hold.
+const BCD_MAX: i128 = 999_999_999_999_999_999;
+
+/// FBLD: eighteen packed decimal digits in bytes 0..9 with the sign in bit 7
+/// of byte 9. Every such value is exactly representable in extended format.
+pub(super) fn from_bcd(raw: u128) -> u128 {
+    let mut magnitude: i128 = 0;
+    let mut scale: i128 = 1;
+    for byte in 0..9 {
+        let packed = ((raw >> (byte * 8)) & 0xff) as i128;
+        magnitude += (packed & 0xf) * scale + (packed >> 4) * scale * 10;
+        scale *= 100;
+    }
+    if (raw >> 79) & 1 == 1 {
+        magnitude = -magnitude;
+    }
+    bits(X87DoubleExtended::from_i128_r(magnitude, Round::NearestTiesToEven).value)
+}
+
+/// FBSTP: round to an integer under the rounding control, then pack it as
+/// eighteen decimal digits. A value that will not fit — including a NaN or an
+/// infinity — stores the packed-decimal indefinite and raises invalid.
+pub(super) fn to_bcd(raw: u128, control: u16) -> Result {
+    let rounded = round_to_integral_contextual(raw, control);
+    let mut exact = false;
+    let converted = value(rounded.bits).to_i128_r(80, Round::TowardZero, &mut exact);
+    let magnitude = converted.value;
+    if converted.status.contains(Status::INVALID_OP) || magnitude.abs() > BCD_MAX {
+        return Result {
+            bits: BCD_INDEFINITE,
+            status: Status::INVALID_OP,
+        };
+    }
+
+    let mut packed = 0u128;
+    let mut remaining = magnitude.unsigned_abs();
+    for byte in 0..9 {
+        let low = remaining % 10;
+        let high = (remaining / 10) % 10;
+        packed |= ((low | (high << 4)) as u128) << (byte * 8);
+        remaining /= 100;
+    }
+    // The sign comes from the operand, so a negative zero stays negative.
+    if (raw >> 79) & 1 == 1 {
+        packed |= 1u128 << 79;
+    }
+    Result {
+        bits: packed,
+        status: rounded.status,
+    }
+}
+
+/// Correctly rounded 80-bit square root.
+///
+/// APFloat has no square root, and routing f80 through f64 loses eleven
+/// significand bits. Compute it on the integer significand instead: shift so
+/// the exponent is even, take an integer square root wide enough for 64
+/// significand bits, and round the remainder under the rounding control.
+pub(super) fn sqrt_contextual(raw: u128, control: u16) -> Result {
+    let round = round_from_control(control);
+    let source = value(raw);
+
+    if source.is_nan() {
+        return Result {
+            bits: if source.is_signaling() {
+                0xffff_c000_0000_0000_0000
+            } else {
+                raw
+            },
+            status: if source.is_signaling() {
+                Status::INVALID_OP
+            } else {
+                Status::OK
+            },
+        };
+    }
+    // sqrt of a negative is invalid; negative zero returns itself.
+    if source.is_negative() && !source.is_zero() {
+        return Result {
+            bits: 0xffff_c000_0000_0000_0000,
+            status: Status::INVALID_OP,
+        };
+    }
+    if source.is_zero() || source.is_infinite() {
+        return Result {
+            bits: raw,
+            status: Status::OK,
+        };
+    }
+
+    // Renormalize so the significand's integer bit is set. `ilogb` gives the
+    // unbiased exponent of the leading bit for denormals too.
+    let leading = i32::from(source.ilogb());
+    let normalized = source.scalbn(-leading);
+    let significand = bits(normalized) as u64;
+
+    // `value == significand * 2^power`, and the significand's integer bit is
+    // bit 63, so power accounts for the 63 fraction bits.
+    let mut power = leading - 63;
+    let mut wide = u128::from(significand);
+    // The root must come out with its integer bit set, and shifting the
+    // radicand by an even amount moves the root by half of it. A significand
+    // in [2^63, 2^64) needs 64; making the power even first doubles it into
+    // [2^64, 2^65), which needs 62. No single shift covers both.
+    let shift = if power & 1 != 0 {
+        wide <<= 1;
+        power -= 1;
+        62
+    } else {
+        64
+    };
+
+    let radicand = wide << shift;
+    let root = radicand.isqrt();
+    let remainder = radicand - root * root;
+
+    let mut significand = root as u64;
+    let mut exponent = power / 2 - shift / 2 + 63;
+    let inexact = remainder != 0;
+    if inexact {
+        let round_up = match round {
+            // (root + 1/2)^2 <= radicand exactly when remainder > root.
+            Round::NearestTiesToEven | Round::NearestTiesToAway => remainder > root,
+            Round::TowardPositive => true,
+            Round::TowardNegative | Round::TowardZero => false,
+        };
+        if round_up {
+            let (next, carry) = significand.overflowing_add(1);
+            if carry {
+                significand = 1 << 63;
+                exponent += 1;
+            } else {
+                significand = next;
+            }
+        }
+    }
+
+    let biased = (exponent + 16383) as u128 & 0x7fff;
+    Result {
+        bits: (biased << 64) | u128::from(significand),
+        status: if inexact { Status::INEXACT } else { Status::OK },
+    }
+}
+
 pub(super) fn negate(raw: u128) -> u128 {
     bits(-value(raw))
 }

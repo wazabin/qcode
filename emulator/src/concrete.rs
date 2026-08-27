@@ -1325,10 +1325,42 @@ impl StandaloneEmulator {
             return Ok(None);
         };
         let name = ctx.shared.pcode_ops[op.id].clone();
+        let func = insn.id.func;
+
+        // The packed-decimal conversions are the only unary user-ops handled
+        // here, and both need the x87 context for rounding and status.
+        if let [src] = op.args.as_slice() {
+            let value = self.scalar_value(ctx, src.qualify(func))?;
+            if value.size != 10 {
+                return Ok(None);
+            }
+            let Some((control_varnode, status_register)) = Self::x87_context(ctx) else {
+                return Ok(None);
+            };
+            let control = self
+                .read_varnode_u128(ctx, control_varnode)
+                .unwrap_or(0x037f) as u16;
+            return Ok(match name.as_ref() {
+                "from_bcd" => Some(SizedValue::from_f80_bits(float80::from_bcd(value.as_bits()))),
+                "to_bcd" => {
+                    let result = float80::to_bcd(value.as_bits(), control);
+                    self.record_x87_status(
+                        ctx,
+                        control,
+                        status_register,
+                        result.status,
+                        None,
+                        false,
+                    )?;
+                    Some(SizedValue::from_bits(result.bits, 10))
+                }
+                _ => None,
+            });
+        }
+
         let [lhs, rhs] = op.args.as_slice() else {
             return Ok(None);
         };
-        let func = insn.id.func;
         let lhs = self.scalar_value(ctx, lhs.qualify(func))?;
         let rhs = self.scalar_value(ctx, rhs.qualify(func))?;
 
@@ -1637,6 +1669,36 @@ impl StandaloneEmulator {
                         10,
                     )),
                     Self::f80_is_denormal(lhs.as_bits()) || Self::f80_is_denormal(rhs.as_bits()),
+                )?;
+                Ok(Some(SizedValue::from_f80_bits(result.bits)))
+            }
+            // FSQRT rounds under the control word and reports inexact and the
+            // C1 rounding indicator, so it takes the contextual path rather
+            // than the generic sqrt, which narrows f80 through f64.
+            Mnemonic::Unop(Unary {
+                op: Unop::FloatSqrt,
+                src,
+            }) => {
+                let value = self.scalar_value(ctx, src.qualify(func))?;
+                if value.size != 10 {
+                    return Ok(None);
+                }
+                let result = float80::sqrt_contextual(value.as_bits(), control);
+                let zero_result = float80::sqrt_contextual(
+                    value.as_bits(),
+                    Self::toward_zero_control(control),
+                );
+                self.record_x87_status(
+                    ctx,
+                    control,
+                    status_register,
+                    result.status,
+                    Some(Self::rounded_away_from_zero(
+                        result.bits,
+                        zero_result.bits,
+                        10,
+                    )),
+                    Self::f80_is_denormal(value.as_bits()),
                 )?;
                 Ok(Some(SizedValue::from_f80_bits(result.bits)))
             }
@@ -3911,6 +3973,45 @@ mod tests {
         emu.run_block().unwrap();
         assert_eq!(emu.get_value(result.into()).unwrap().size().unwrap(), 10);
         assert_eq!(emu.read_varnode(FPUStatusWord), Some((1 << 2) | (1 << 7)));
+    }
+
+    /// The 80-bit square root is computed on the integer significand, so it
+    /// keeps all 64 bits. Routing it through f64 would lose eleven of them.
+    #[test]
+    fn float80_sqrt_is_correctly_rounded_at_extended_precision() {
+        let nearest = 0x037f;
+        let two = 0x4000_8000_0000_0000_0000;
+        let four = 0x4001_8000_0000_0000_0000;
+        let one = 0x3fff_8000_0000_0000_0000;
+
+        // sqrt(2) rounds up into the last significand bit.
+        let root_two = float80::sqrt_contextual(two, nearest);
+        assert_eq!(root_two.bits, 0x3fff_b504_f333_f9de_6484);
+        assert!(root_two.status.contains(Status::INEXACT));
+
+        // Exact roots stay exact and report nothing.
+        for (input, expect) in [(four, two), (one, one), (0, 0)] {
+            let result = float80::sqrt_contextual(input, nearest);
+            assert_eq!(result.bits, expect);
+            assert_eq!(result.status, Status::OK);
+        }
+
+        // sqrt(3) is a case where the integer root does round up, so nearest
+        // and truncation land on different significands.
+        let three = 0x4000_c000_0000_0000_0000;
+        assert_eq!(
+            float80::sqrt_contextual(three, nearest).bits,
+            0x3fff_ddb3_d742_c265_539e
+        );
+        assert_eq!(
+            float80::sqrt_contextual(three, 0x0f7f).bits,
+            0x3fff_ddb3_d742_c265_539d
+        );
+
+        // A negative operand is invalid and yields the indefinite QNaN.
+        let negative = float80::sqrt_contextual(0xbfff_8000_0000_0000_0000, nearest);
+        assert_eq!(negative.bits, 0xffff_c000_0000_0000_0000);
+        assert!(negative.status.contains(Status::INVALID_OP));
     }
 
     #[test]
