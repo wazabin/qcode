@@ -41,6 +41,11 @@ mod engine {
     /// Fixed raw byte transport rooted at MEM0_ADDR. It covers FXSAVE's full
     /// legacy image and the existing mem1 word at offset 0x100.
     const SCRATCH_MEMORY_SIZE: usize = 512;
+
+/// Where binit places a bit-index instruction's memory operand within the
+/// scratch window, so a signed `index s>> 3` reaches seeded bytes either side.
+/// Must match `BIT_INDEX_OPERAND_OFFSET` in binit's `make_test_cases.py`.
+const BIT_INDEX_OPERAND_OFFSET: usize = 256;
     const MEMORY_WORDS: &[(&str, u64)] = &[("mem0_value", MEM0_ADDR), ("mem1_value", MEM1_ADDR)];
     const MAX_EMULATED_STEPS: usize = 10_000;
     const SCALAR_REGISTERS: &[&str] = &[
@@ -1186,6 +1191,10 @@ mod engine {
         }
         // BT/BTC/BTR/BTS with a memory operand and a register bit index access the
         // byte at base + (index s>> 3), which can fall outside the modeled window.
+        // Binit seeds these forms through the 512-byte `scratch_memory` transport
+        // with the operand at its centre, so the whole reachable range is modelled
+        // and the case is a real result; a case still carrying only the 8-byte
+        // `mem0_value` word predates that and cannot be compared.
         if matches!(mnemonic, "bt" | "btc" | "btr" | "bts") && tc.instruction.contains("ptr") {
             let bit_index = tc
                 .instruction
@@ -1195,7 +1204,16 @@ mod engine {
                 .and_then(|reg| pair.initial.regs.get(&reg.to_ascii_lowercase()).copied());
             if let Some(value) = bit_index {
                 let byte_offset = value >> 3; // signed, matches SLEIGH `s>> 3`
-                if !(0..8).contains(&byte_offset) {
+                // Offsets are relative to the operand, which binit places at
+                // BIT_INDEX_OPERAND_OFFSET within the window; the widest operand
+                // reads eight bytes from there.
+                let modeled = if pair.initial.scratch_memory.is_some() {
+                    let centre = BIT_INDEX_OPERAND_OFFSET as i64;
+                    -centre..(SCRATCH_MEMORY_SIZE as i64 - centre - 8)
+                } else {
+                    0..8
+                };
+                if !modeled.contains(&byte_offset) {
                     return Some("bit index addresses memory outside modeled window");
                 }
             }
