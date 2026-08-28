@@ -494,6 +494,12 @@ pub trait Interpreter {
                     // the p-code op and its destination in the IR for
                     // analysis consumers.
                     ("undef", []) => Some(Self::V::zero(insn.size())),
+                    // The LOCK prefix's bus semantics are not observable in a
+                    // single-threaded replay: it orders an access against other
+                    // agents, and constrains nothing about the resulting state.
+                    // The paired markers stay in the IR for analysis consumers
+                    // that care which region is atomic; they produce no value.
+                    ("LOCK" | "UNLOCK", []) => None,
                     _ => return Err(EmulatorErrorKind::UnsupportedPCodeOp(name)),
                 }
             }
