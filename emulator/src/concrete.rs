@@ -1564,12 +1564,13 @@ impl StandaloneEmulator {
         }
         let old = self.read_varnode_u128(ctx, status_register).unwrap_or(0) as u16;
         let mut new = old | exceptions;
-        // C1 records whether an inexact result was rounded away from zero.
-        // It is an operation result, not a sticky exception bit.
-        if ap_status.contains(Status::INEXACT) {
-            if let Some(rounded_up) = rounded_up {
-                new = (new & !(1 << 9)) | (u16::from(rounded_up) << 9);
-            }
+        // C1 records whether an inexact result was rounded away from zero. It
+        // is an operation result, not a sticky exception bit, so an operation
+        // that reports it writes it every time: a result that did not round up
+        // - including an exact one - clears C1 rather than leaving the previous
+        // instruction's answer standing.
+        if let Some(rounded_up) = rounded_up {
+            new = (new & !(1 << 9)) | (u16::from(rounded_up && ap_status.contains(Status::INEXACT)) << 9);
         }
         if exceptions & !control & 0x003f != 0 {
             // ES: one or more unmasked exceptions are pending. B mirrors ES on
