@@ -1572,7 +1572,10 @@ impl StandaloneEmulator {
             }
         }
         if exceptions & !control & 0x003f != 0 {
-            new |= 1 << 7; // ES: one or more unmasked exceptions are pending.
+            // ES: one or more unmasked exceptions are pending. B mirrors ES on
+            // every processor since the 387 - it reported the 8087's BUSY line,
+            // and is now recomputed from the same condition.
+            new |= (1 << 7) | (1 << 15);
         }
         self.set_varnode(ctx, status_register, u64::from(new))
     }
