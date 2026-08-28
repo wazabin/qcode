@@ -205,6 +205,7 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
             })
             .collect();
         let covered_constructors = tables.iter().map(|table| table.covered_constructors).sum();
+        let families = collect_family_coverage(spec, &witnesses);
 
         Ok(ConstructorCoverage {
             architecture: "x86-64",
@@ -219,8 +220,58 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
             decoded_test_cases,
             invalid_opcodes,
             decode_failures,
+            families,
             tables,
         })
+    }
+
+    /// Buckets every constructor in the specification by its `#@family` tag,
+    /// and counts how many of each the corpus reached.
+    ///
+    /// A constructor with no tag is counted under `untagged` rather than
+    /// dropped, so the families still sum to the whole specification.
+    fn collect_family_coverage(
+        spec: &'static CompiledSpec,
+        witnesses: &BTreeMap<(String, usize), ConstructorWitness>,
+    ) -> Vec<FamilyCoverage> {
+        const UNTAGGED: &str = "untagged";
+
+        let families = x64::families();
+        let mut totals: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut covered: BTreeMap<&str, usize> = BTreeMap::new();
+
+        for symbol in spec.symbols() {
+            if !matches!(symbol.kind, SymbolKind::Table) {
+                continue;
+            }
+            let Some(table) = spec.table(symbol.name) else {
+                continue;
+            };
+            for index in 0..table.constructor_count() {
+                let family = families.get(symbol.name, index).unwrap_or(UNTAGGED);
+                *totals.entry(family).or_default() += 1;
+                if witnesses.contains_key(&(symbol.name.to_owned(), index)) {
+                    *covered.entry(family).or_default() += 1;
+                }
+            }
+        }
+
+        totals
+            .into_iter()
+            .map(|(family, total_constructors)| {
+                let covered_constructors = covered.get(family).copied().unwrap_or(0);
+                FamilyCoverage {
+                    family: family.to_owned(),
+                    total_constructors,
+                    covered_constructors,
+                    percentage: if total_constructors == 0 {
+                        0.0
+                    } else {
+                        covered_constructors as f64 * 100.0 / total_constructors as f64
+                    },
+                }
+            })
+            .collect()
     }
 
     fn hex_encode(bytes: &[u8]) -> String {
@@ -553,7 +604,19 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
         decoded_test_cases: usize,
         invalid_opcodes: usize,
         decode_failures: usize,
+        families: Vec<FamilyCoverage>,
         tables: Vec<TableCoverage>,
+    }
+
+    /// Coverage of one instruction family, as tagged by the `#@family` markers
+    /// in the SLEIGH source. Every constructor belongs to at most one family,
+    /// so these partition the constructor count.
+    #[derive(Debug, Serialize)]
+    struct FamilyCoverage {
+        family: String,
+        total_constructors: usize,
+        covered_constructors: usize,
+        percentage: f64,
     }
 
     /// A constructor location in a compiled specification.
@@ -606,6 +669,15 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
                 self.invalid_opcodes,
                 self.decode_failures,
             );
+            for family in &self.families {
+                eprintln!(
+                    "[sleigh-coverage]   {:<32} {}/{} ({:.2}%)",
+                    family.family,
+                    family.covered_constructors,
+                    family.total_constructors,
+                    family.percentage,
+                );
+            }
             for table in self
                 .tables
                 .iter()
