@@ -1,108 +1,112 @@
 # Binit corpus QCode replay status
 
-## The corpus was regenerated — old IDs are gone
+## The corpus is generated — never select cases by ID
 
-Binit's corpus is now built from `generator/data/insn.json`; the
-`admit_x87_*_cases.py` scripts and the ID ranges every earlier revision of this
-document referenced (11666–11891) have been retired, and the generator cleared
-the database. Those IDs now hold unrelated `sub` cases.
+Binit's corpus is built from `generator/data/insn.json`, and regenerating it
+clears the database and reassigns every ID. Any document that names IDs is
+wrong the moment the corpus is rebuilt; an earlier revision of this one pointed
+at 11666-11891, which by then held unrelated `sub` cases.
 
-**Never select replay cases by ID.** IDs are not stable across a regeneration.
-Select by mnemonic:
+Select by mnemonic instead:
 
 ```sql
 select string_agg(id::text, ',' order by id) from test_cases
 where instruction ~* '^(f|maskmov|p(add|sub|cmp|unpck|ack|sll|srl|sra|mul|avg|madd|sad|or|and|xor))';
 ```
 
-The database currently holds 12881 cases / 7.02M captured result states, all
-with hardware results. That selector matches 841 x87/MMX cases / 4.94M states.
+The database currently holds 12881 cases / 7014763 captured result states, all
+with hardware results. Regenerating and recapturing takes minutes:
+`echo yes | uv run --extra generator python generator/make_test_cases.py`, then
+`cd aegis && just run`. Back the database up first - `pg_dump -Fc` is ~84MB -
+because the generator clears it before any capture has happened.
 
 ## Replay status — 2026-08-28
 
-Always replay the **whole** corpus before deciding what to work on. A run over
-the x87/MMX subset alone ranked the work wrongly: every finding it could
-surface was an x87 finding, so the largest item in the corpus — a binit fixture
-gap gating 624 `BTS`/`BTC` cases — was invisible, and the x87 lift failures
-looked like the cheapest available fix when they are worth 8-12 cases each.
+**12665 of 12881 cases clean.** Full corpus, 7014763 states, 12 threads.
 
-Full corpus, 12881 cases / 7021675 states, 12 threads: **11847 OK, 40 state
-mismatches, 10 lift failures, 14 unsupported ops**, plus 967 cases skipped
-after another case with the same instruction had already failed. Case counts
-are a floor, not a verdict: fix one failure and its skipped siblings become new
-signal.
+Always replay the whole corpus before deciding what to work on. Ranking work
+from an x87-only subset put a binit fixture gap worth 624 cases out of view
+entirely and made the x87 lift failures look like the cheapest fix available
+when they were worth 8-12 cases each.
 
-All 40 state mismatches are x87/MMX. Nothing outside x87 regressed — in
-particular the architecture-independent p-code shift-amount fix holds across
-the whole corpus.
+Case counts are a floor, not a verdict, in two ways. A failing case suppresses
+its same-instruction siblings, so fixing one converts several. And the harness
+reports only the *first* differing field, so fixing a field reveals the next
+one underneath: this session closed FOP entirely and the state-mismatch count
+went *up*, because seven instructions moved from `backend_error` to
+`state_mismatch`.
 
-This run included the then-uncommitted `ia.sinc` FOP / B-bit work, which is
-partial: it appears in the failures below rather than being inert.
+| | Session start | Now |
+| --- | ---: | ---: |
+| Cases OK | 11847 | **12665** |
+| Skipped behind a failure | 967 | 164 |
+| State mismatches | 40 | 39 |
+| Lift failures | 10 | **0** |
+| Unsupported ops | 14 | 12 |
+| Fixture limitations | 3 | 1 |
 
-### Priority by cases unblocked
+There are **no lift failures left in the corpus**. Every remaining state
+mismatch is x87.
 
-| Fix | Cases gated |
-| --- | ---: |
-| `BTS` + `BTC` fixture window (binit) | 624 |
-| `PSHUFW` lift failure | 96 |
-| `CRC32` | 40 |
-| `XCHG` LOCK | 32 |
-| any single x87 family | 6-12 |
+## What remains
 
-### Fixture limitations (3) — binit, not lifter bugs
+### The unmasked-exception abort (at least 4 cases)
 
-The harness seeds only the 8-byte `mem0` window and zeroes the rest of the
-page, so these cases diverge on memory the fixture never modelled; the lifted
-QCode is correct. `fixture_limitation_reason` in `sleigh/tests/binit.rs`
-classifies them.
+`fmulp`, `fdivp`, `fdivrp` and `frndint` all differ because an *unmasked*
+exception aborts the instruction on hardware: it produces no result, sets no
+result-derived flag, and does not pop. `record_x87_status` deliberately does
+not model this - "an unmasked exception sets ES, but does not yet transfer
+control to a hardware exception handler; that deliberately non-trapping policy
+keeps the generic emulator API intact until architectural trap delivery is
+modelled". These are the first cases where the simplification is observably
+wrong: TOP has advanced where hardware left it alone, and `frndint` reports a
+precision result hardware never computed.
 
-- `bts`/`btc qword ptr [...], rbx` — a register bit index addresses
-  `base + (index s>> 3)`, outside the modelled 8 bytes. **624 cases.**
-- `cmpxchg16b xmmword ptr [...]` — a 128-bit operand exceeds the 8-byte
-  window. 7 cases.
+This is a design decision, not a flag fix, and it likely reaches beyond x87.
 
-### Lift failures (10)
+### Denormal-operand exceptions (5 cases)
 
-Eight are x87, all `unresolved field reached p-code lowering`: `ffree st(1)`,
-`ffreep st(1)`, `fxch`, `fsub st(0),st(1)`, `fsubr st(0),st(1)`, `fcom dword
-ptr`, `ficomp dword ptr`, `fisub dword ptr`. Same class as the already-fixed
-`mmxreg2op_m64` bug: a constructor matching a raw field whose body exports a
-subtable.
+- **Missing DE** - `fprem`, `fprem1`, `fscale`. Implemented as user-ops, so
+  they never reach `record_x87_status` and report no denormal operand at all.
+- **Spurious DE** - `fist`, `fistp`. Architecturally FIST raises invalid and
+  precision only. The DE comes from the *decomposition*, not the architecture:
+  the constructor is `trunc(round(x))` and it is `round()` - `FloatRound` -
+  that reports the denormal. It cannot simply be silenced there, because
+  `FRNDINT` is the same p-code operation and does raise DE. Either FIST stops
+  going through `round()`, or the conversion path stops inheriting its status.
 
-Two are not:
+### Stack faults not reported (3-4 cases)
 
-- `pshufw mm0, mm1, 0x0` — `invalid bit range [0, 64] for 8-bit storage`.
-  **96 cases.**
-- `call 0x666666661042` — `raw p-code lowering does not support address-of a
-  non-...`.
+`fld st(1)`, `fst st(2)`, `fbstp` (and `fxch`, seen while other fields were
+being fixed) expect IE|SF from referencing an empty register. The machinery
+exists and works - `fpu_stack_underflow_out` plus `fpu_underflow_indefinite`,
+as used by the FCMOV family - these constructors just do not call it.
 
-### Unsupported ops (14)
+### Smaller
 
-Six are the deferred transcendentals below. The other eight: `swapgs`,
-`rdpmc`, `crc32` (40 cases), `invlpg`, `sfence`, `lfence`, `mfence`, and
-`LOCK` on `xchg qword ptr` (32 cases). The fences and `LOCK` are plausibly
-cheap — no observable state in this model; `crc32` is real work.
+- **Missing IE** - `fxtract`, `fyl2x` (2).
+- **C1 not cleared** - `fstp st(1)`, `fisttp` (2). The register-store path
+  still leaves the previous instruction's rounding answer standing.
+- **`fcom dword ptr`** (1) reports DE where hardware reports IE alone; its
+  expected status already has IE, so this is an unsupported operand being
+  classed as a denormal rather than a missing flag.
+- **`x87_r0`/`x87_r1`/`x87_r7`** (18) and **`fxsave` scratch layout** (1) are
+  unanalysed. The register cluster is largely a low significand byte differing
+  by `0x01` under a narrowed precision control.
 
-### State mismatches (40), by cluster
+### Fixture limitation (1) — binit, not a lifter bug
 
-All x87/MMX.
-- **B bit not mirrored** (7) — expected `0x8081`, got `0x81`: `fdiv`, `fdivr`,
-  `fidiv`, `fimul`, `frndint`, `fist`, `fistp`. The uncommitted
-  `fpu_refresh_error_summary` change is not reaching these paths.
-- **FOP wrong** (2) — `fsqrt` and `fidivr` both report a constant `0x111`
-  against expected `0x1fa` / `0x63d`. `fpu_record_opcode` is wired into too few
-  constructors, and computes the wrong value in those it does reach.
-- **FCMOV** (8) — status/tag left at `0x0` where hardware leaves `0x41` / `0x1`
-  across the whole conditional-move family.
-- **Significand LSB** (7) — `x87_r0`/`x87_r1` off by `0x01` in the low
-  significand byte: `fadd`, `faddp`, `fiadd`, `fisubr`, `fsubp`, `fsubrp`,
-  `fcmovnbe`.
-- **C2 partial reduction** (3) — `fprem`, `fprem1`, `fscale` expect `0x2`, get
-  `0x0`. Earlier revisions listed this path as implemented but uncovered by any
-  vector; the regenerated corpus reaches it and it is wrong.
-- **Singles** — `fxsave` scratch-memory layout, `fbld`, `fbstp`, `fstp st(1)`,
-  `fmul`, `fisttp`, `fld st(1)`, `fst st(1)`, and C0 on `fxtract` / `fyl2x` /
-  `fyl2xp1`.
+`cmpxchg16b xmmword ptr [...]` has a 128-bit operand and the harness models an
+8-byte window, so the unmodelled high half drives the divergence. The fix has
+the same shape as the bit-index one already landed: seed it through the
+512-byte `scratch_memory` transport instead.
+
+### Unsupported ops (12)
+
+Six are the deferred transcendentals below. The rest: `swapgs`, `rdpmc`,
+`invlpg`, `sfence`, `lfence`, `mfence`. The three fences are plausibly the same
+no-op argument that settled `LOCK`; the privileged three may have no meaningful
+replay semantics.
 
 ### Transcendentals — deferred indefinitely
 
@@ -112,6 +116,50 @@ bit-for-bit needs an accuracy model, a different kind of commitment from
 everything else here: FSCALE, FXTRACT, the BCD conversions and the 80-bit
 square root were implemented because they are *exact*. Treat these 6 cases as
 permanently out of scope, not as outstanding work.
+
+### Latent, and invisible to the corpus
+
+`imm8:8` appears on 34 lines of `ia.sinc` - `pshufhw`, `pshuflw`, `mpsadbw`,
+`dpps`, `dppd`, `blendps`, `blendpd`, `pblendw`, `roundps/ss/pd/sd`,
+`insertps`, `extractps`. Every one is the bug that broke PSHUFW: an 8-bit field
+cast to 8 bytes. They do not fail today only because the corpus contains 7 XMM
+cases and none of those mnemonics. Correcting the cast alone would only move
+them from `backend_error` to `unsupported_pcode_op` - none of the user-ops is
+implemented - so the real fix is to widen binit to SSE2/SSE4.1 shuffle, blend
+and round forms, recapture, and then lower the whole class against real signal.
+
+## Traps this session hit
+
+Worth knowing before touching the same machinery.
+
+- **Address-of is a disassembly-time fold**, not a p-code operation, and needs
+  a symbol with a static address. It is *not* the way to name a memory
+  operand's address. The `m*` subtables already export it: `m16` is literally
+  `export *:2 Mem`, so `Mem` is the address and `fpu_record_data_pointer(Mem)`
+  is how FDP is recorded. Lowering `&` over a load to a runtime pointer makes
+  the spec uncompilable by Ghidra, and the corpus cannot see the problem
+  because the spec and the lifter then agree with each other.
+- **Raw `mod`, `reg_opcode` and `r_m` do not survive to p-code lowering** -
+  they are consumed by the addressing subtables. `fregidx` exists for exactly
+  this reason, and `modidx`/`regidx`/`rmidx` now do the same job. Reading them
+  directly fails with `unresolved field reached p-code lowering`.
+- **Check the register name.** `fpu_record_opcode` wrote to `FPUOpcode`; the
+  register is `FPULastInstructionOpcode`. The macro had never had any effect,
+  and nothing complained.
+- **The WAIT prefix is not the opcode.** `FSTCW` is `9B D9 /7`; deriving FOP
+  from the first `byte=0x..` in the pattern picks up the `9B`.
+- **Macros must be defined before use**, and a textual sweep that rewrites
+  `FPUStatusWord = FPUStatusWord & 0xfdff;` will also rewrite the body of
+  `fpu_clear_c1` into a call to itself.
+
+## FOP and FDP
+
+`FOP = ((first opcode byte & 7) << 8) | second byte`, where the second byte is
+the modrm byte or the fixed second opcode byte. FIP updates on every x87
+instruction; **FDP and FOP update together and only when an unmasked exception
+is pending**. That gate was confirmed against hardware rather than assumed: for
+`fdiv st(0),st(1)`, FOP holds its stale value in every captured state except
+those whose status has ES set.
 
 ## Workflow
 
@@ -143,11 +191,66 @@ select i.name, count(*) from test_cases c
 group by i.name order by 2 desc;
 ```
 
+A status-word mismatch is rarely one bug. XOR actual against expected and group
+by the differing bits - that is what separated the 19 `x87_status` cases into
+six independent causes, including a denormal-exception cluster that fails in
+*both* directions (three instructions never raise DE, four raise it when
+hardware does not). The bits: C0 `0x0100`, C1 `0x0200`, C2 `0x0400`, TOP
+`0x3800`, C3 `0x4000`, B `0x8000`, and IE/DE/ZE/OE/UE/PE in the low six with
+SF `0x40` and ES `0x80`.
+
+To decide whether a field updates unconditionally or only under some condition,
+group the captured states rather than reasoning from the manual:
+
+```sql
+select (r.final_state->>'x87_status')::bigint status,
+       r.final_state->>'x87_opcode' fop, count(*)
+from test_cases c join test_results r on r.test_case_id = c.id
+where c.id = <case> group by 1, 2 order by 1;
+```
+
 Commit Binit generator/test changes separately from SLEIGH/QCode fixes.
 
 ## History
 
-Fixed in earlier passes, each confirmed against a hardware capture:
+Fixed in earlier passes, each confirmed against a hardware capture.
+
+### This session (11847 -> 12665 cases)
+
+- **binit fixture: the bit-index memory window** (+622). `BT`/`BTC`/`BTR`/`BTS`
+  with a register index reach `base + (index s>> 3)`, tens of bytes outside the
+  8-byte `mem0_value` word, so every such state diverged on memory the fixture
+  never modelled. They now use the 512-byte `scratch_memory` transport with the
+  operand centred in it. The index pool is bounded to +-256 to match, which
+  loses nothing: against a register destination the index is masked to the
+  operand width, and a test asserts the bounded pool still covers every masked
+  residue.
+- **PSHUFW lowered to p-code** (+96), replacing `pshufw(..., imm8:8)` - an
+  8-bit field cast to 8 bytes. Each destination word shifts the source down by
+  `selector * 16`; the source is copied first because the destination may alias
+  it.
+- **CRC32 lowered to p-code** (+40) as the reflected CRC-32C update, one
+  `crc32_byte` macro for all six constructors. The step function was checked in
+  isolation first - CRC-32C of `"123456789"` is `0xe3069283` - before any
+  corpus run.
+- **LOCK/UNLOCK as emulator no-ops** (+31). The markers stay in the IR for
+  analysis consumers; the prefix orders an access against other bus agents and
+  constrains nothing about the resulting state.
+- **FCMOV faults on an empty operand** (8 cases). It references ST(0) and ST(i)
+  whether or not it moves. `FCMOVNBE` also skipped on `CF & ZF` where NBE moves
+  only when both are clear, so it must skip when either is set.
+- **FOP recorded on every x87 instruction**, and written to the register that
+  exists. This also fixed all 8 pre-existing x87 lift failures, which were the
+  earlier FOP calls reading raw modrm fields.
+- **FDP recorded for every memory operand**, from the `Mem` subtable.
+- **Address-of an address literal folds** (`wazabin-pcode`), which was the last
+  `backend_error` in the corpus - `push88(&:8 inst_next)` in CALL.
+- **B mirrors ES** in the emulator. The spec-side change alone could not work:
+  for `FMUL m64fp` and friends the spec never touches the status word at all,
+  and the emulator raises the sticky bits from APFloat.
+- **C1 is written on every operation that reports a rounding direction**, and
+  cleared in FFREE/FFREEP/FBSTP. It is an operation result, not a sticky bit,
+  so an exact result clears it rather than leaving the previous answer.
 
 ### SLEIGH
 
