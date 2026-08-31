@@ -59,26 +59,28 @@ fn apply_precision(value: X87DoubleExtended, control: u16, round: Round) -> Resu
             status: Status::OK,
         };
     }
-    // A denormal result keeps its extended encoding, but under a narrowed
-    // precision it cannot be represented exactly: the hardware reports both
-    // underflow and inexact while leaving the value alone.
-    if exponent == 0 {
-        let status = if raw as u64 == 0 {
-            Status::OK
-        } else {
-            Status::UNDERFLOW | Status::INEXACT
+    // A denormal result is rounded like any other significand rather than
+    // kept: an extended denormal sits far below what 24 or 53 bits of
+    // precision can hold, so it normally rounds away to zero. Hardware
+    // reports underflow alongside the inexact result either way.
+    let denormal = exponent == 0;
+    if denormal && raw as u64 == 0 {
+        return Result {
+            bits: raw,
+            status: Status::OK,
         };
-        return Result { bits: raw, status };
     }
     let significand = raw as u64;
     let discarded_bits = 64 - precision;
     let discarded_mask = (1u64 << discarded_bits) - 1;
     let discarded = significand & discarded_mask;
     if discarded == 0 {
-        return Result {
-            bits: raw,
-            status: Status::OK,
+        let status = if denormal {
+            Status::UNDERFLOW | Status::INEXACT
+        } else {
+            Status::OK
         };
+        return Result { bits: raw, status };
     }
     let retained = significand >> discarded_bits;
     let increment = match round {
@@ -106,6 +108,9 @@ fn apply_precision(value: X87DoubleExtended, control: u16, round: Round) -> Resu
     let rounded = (u128::from(sign_exponent & 0x8000 | exponent) << 64)
         | (u128::from(retained) << discarded_bits);
     let mut status = Status::INEXACT;
+    if denormal {
+        status |= Status::UNDERFLOW;
+    }
     if exponent == 0x7fff {
         status |= Status::OVERFLOW;
     }
