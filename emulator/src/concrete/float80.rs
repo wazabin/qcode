@@ -120,6 +120,17 @@ fn apply_precision(value: X87DoubleExtended, control: u16, round: Round) -> Resu
     }
 }
 
+/// x87's unsupported encodings: a non-zero exponent with the explicit integer
+/// bit clear. An unnormal, and the pseudo-NaN and pseudo-infinity that share
+/// that shape, are not values the FPU will operate on - it reports invalid and
+/// delivers the indefinite rather than computing with them. A zero exponent
+/// with the bit clear is an ordinary denormal and stays valid.
+fn is_unsupported(raw: u128) -> bool {
+    let exponent = (raw >> 64) & 0x7fff;
+    let integer_bit = (raw >> 63) & 1;
+    exponent != 0 && integer_bit == 0
+}
+
 /// The value a masked invalid operation delivers.
 ///
 /// x87 propagates a NaN operand rather than the architectural indefinite: the
@@ -153,9 +164,19 @@ fn arithmetic(
     operands: &[u128],
 ) -> Result {
     let rounded = apply_precision(value.value, control, round);
-    let status = value.status | rounded.status;
+    // APFloat computes with an unsupported encoding rather than rejecting it,
+    // so the invalid it never raises has to be added here.
+    let unsupported = operands.iter().copied().any(is_unsupported);
+    let mut status = value.status | rounded.status;
+    if unsupported {
+        status |= Status::INVALID_OP;
+    }
     // APFloat's operation-specific NaN sign/payload is not what x87 delivers.
-    let bits = if status.contains(Status::INVALID_OP) {
+    let bits = if unsupported {
+        // An unsupported operand outranks NaN propagation: there is no
+        // meaningful payload to carry, so the indefinite is delivered.
+        0xffff_c000_0000_0000_0000
+    } else if status.contains(Status::INVALID_OP) {
         invalid_result(operands)
     } else {
         rounded.bits
