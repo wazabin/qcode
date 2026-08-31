@@ -1399,14 +1399,15 @@ impl StandaloneEmulator {
                 let control = self
                     .read_varnode_u128(ctx, control_varnode)
                     .unwrap_or(0x037f) as u16;
-                let result = float80::remainder(lhs.as_bits(), rhs.as_bits(), name.as_ref() == "fprem1");
+                let result =
+                    float80::remainder(lhs.as_bits(), rhs.as_bits(), name.as_ref() == "fprem1");
                 self.record_x87_status(
                     ctx,
                     control,
                     status_register,
                     result.status,
                     None,
-                    Self::f80_is_denormal(lhs.as_bits()),
+                    Self::f80_is_denormal(lhs.as_bits()) || Self::f80_is_denormal(rhs.as_bits()),
                 )?;
                 let old = self.read_varnode_u128(ctx, status_register).unwrap_or(0) as u16;
                 // C0, C1, C2 and C3 are all operation results here.
@@ -1439,7 +1440,7 @@ impl StandaloneEmulator {
                     status_register,
                     result.status,
                     None,
-                    Self::f80_is_denormal(lhs.as_bits()),
+                    Self::f80_is_denormal(lhs.as_bits()) || Self::f80_is_denormal(rhs.as_bits()),
                 )?;
                 return Ok(Some(SizedValue::from_f80_bits(result.bits)));
             }
@@ -1534,6 +1535,20 @@ impl StandaloneEmulator {
     /// but does not yet transfer control to a hardware exception handler; that
     /// deliberately non-trapping policy keeps the generic emulator API intact
     /// until architectural trap delivery is modelled.
+    ///
+    /// Not trapping would also let an unmasked instruction commit a result
+    /// hardware discards, but that part is handled a level up: the constructors
+    /// guard their own commit with `fpu_raised_unmasked`, so an aborted FMULP
+    /// never reaches its pop and an aborted FRNDINT never reaches the `round`
+    /// whose precision flag this function would record.  Only IE, DE and ZE
+    /// abort there - #P stores the rounded result before trapping and #O/#U
+    /// store an exponent-scaled one, so those still commit and still come
+    /// through here.
+    ///
+    /// What remains unmodelled is delivery, not the abort: hardware defers the
+    /// trap to the next floating-point instruction.  Both agree that the
+    /// faulting instruction leaves x87 state unmodified, which is all the
+    /// register and status comparisons observe.
     fn record_x87_status(
         &mut self,
         ctx: &Context<'_>,
@@ -1763,7 +1778,12 @@ impl StandaloneEmulator {
                     status_register,
                     result.status,
                     None,
-                    Self::f80_is_denormal(value.as_bits()),
+                    // FIST/FISTP/FISTTP convert ST(0), always a register, so
+                    // there is no denormal *memory* operand to report. A
+                    // denormal source is converted like any other value and
+                    // reports precision, not DE. Only invalid and precision
+                    // are architecturally raised here.
+                    false,
                 )?;
                 Ok(Some(SizedValue::from_bits(result.value as u128, *size)))
             }
