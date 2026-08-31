@@ -1407,7 +1407,7 @@ impl StandaloneEmulator {
                     status_register,
                     result.status,
                     None,
-                    Self::f80_is_denormal(lhs.as_bits()) || Self::f80_is_denormal(rhs.as_bits()),
+                    Self::f80_denormal_operands(lhs.as_bits(), rhs.as_bits()),
                 )?;
                 let old = self.read_varnode_u128(ctx, status_register).unwrap_or(0) as u16;
                 // C0, C1, C2 and C3 are all operation results here.
@@ -1440,7 +1440,7 @@ impl StandaloneEmulator {
                     status_register,
                     result.status,
                     None,
-                    Self::f80_is_denormal(lhs.as_bits()) || Self::f80_is_denormal(rhs.as_bits()),
+                    Self::f80_denormal_operands(lhs.as_bits(), rhs.as_bits()),
                 )?;
                 return Ok(Some(SizedValue::from_f80_bits(result.bits)));
             }
@@ -1558,6 +1558,10 @@ impl StandaloneEmulator {
         rounded_up: Option<bool>,
         denormal_operand: bool,
     ) -> Result<(), EmulatorErrorKind> {
+        // A divide by zero is likewise decided by the zero divisor, not by the
+        // dividend, so a denormal dividend goes unreported: hardware raises ZE
+        // alone.
+        let denormal_operand = denormal_operand && !ap_status.contains(Status::DIV_BY_ZERO);
         let mut exceptions = u16::from(denormal_operand) << 1;
         if ap_status.contains(Status::INVALID_OP) {
             exceptions |= 1 << 0;
@@ -1603,6 +1607,17 @@ impl StandaloneEmulator {
     fn rounded_away_from_zero(value: u128, toward_zero: u128, size: usize) -> bool {
         let magnitude_mask = (1u128 << (size * 8 - 1)) - 1;
         (value & magnitude_mask) > (toward_zero & magnitude_mask)
+    }
+
+    /// x87 reports a denormal operand only when the operation actually works
+    /// on it. A NaN operand determines the result on its own, so hardware
+    /// raises invalid or nothing at all and leaves DE clear - the same
+    /// precedence `fpu_signal_denormal2` applies in the specification.
+    fn f80_denormal_operands(lhs: u128, rhs: u128) -> bool {
+        if float80::is_nan(lhs) || float80::is_nan(rhs) {
+            return false;
+        }
+        Self::f80_is_denormal(lhs) || Self::f80_is_denormal(rhs)
     }
 
     fn f80_is_denormal(value: u128) -> bool {
@@ -1702,7 +1717,7 @@ impl StandaloneEmulator {
                         zero_result.bits,
                         10,
                     )),
-                    Self::f80_is_denormal(lhs.as_bits()) || Self::f80_is_denormal(rhs.as_bits()),
+                    Self::f80_denormal_operands(lhs.as_bits(), rhs.as_bits()),
                 )?;
                 Ok(Some(SizedValue::from_f80_bits(result.bits)))
             }
