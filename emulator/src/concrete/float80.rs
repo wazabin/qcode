@@ -120,17 +120,43 @@ fn apply_precision(value: X87DoubleExtended, control: u16, round: Round) -> Resu
     }
 }
 
+/// The value a masked invalid operation delivers.
+///
+/// x87 propagates a NaN operand rather than the architectural indefinite: the
+/// NaN is quieted in place, so its sign and payload survive. When both
+/// operands are NaNs the one with the larger significand wins. The indefinite
+/// is written only for an invalid operation that has no NaN operand at all -
+/// 0*inf, inf-inf, 0/0, inf/inf and the like.
+fn invalid_result(operands: &[u128]) -> u128 {
+    const INDEFINITE: u128 = 0xffff_c000_0000_0000_0000;
+    const QUIET_BIT: u128 = 1 << 62;
+    let mut winner: Option<u128> = None;
+    for &raw in operands {
+        if !value(raw).is_nan() {
+            continue;
+        }
+        winner = match winner {
+            Some(current) if (current as u64) >= (raw as u64) => Some(current),
+            _ => Some(raw),
+        };
+    }
+    match winner {
+        Some(raw) => raw | QUIET_BIT,
+        None => INDEFINITE,
+    }
+}
+
 fn arithmetic(
     value: rustc_apfloat::StatusAnd<X87DoubleExtended>,
     control: u16,
     round: Round,
+    operands: &[u128],
 ) -> Result {
     let rounded = apply_precision(value.value, control, round);
     let status = value.status | rounded.status;
-    // x87 masked invalid arithmetic writes the architectural indefinite QNaN,
-    // rather than preserving APFloat's operation-specific NaN sign/payload.
+    // APFloat's operation-specific NaN sign/payload is not what x87 delivers.
     let bits = if status.contains(Status::INVALID_OP) {
-        0xffff_c000_0000_0000_0000
+        invalid_result(operands)
     } else {
         rounded.bits
     };
@@ -169,7 +195,12 @@ pub(super) fn from_i128(value: i128) -> u128 {
 
 pub(super) fn from_i128_contextual(value: i128, control: u16) -> Result {
     let round = round_from_control(control);
-    arithmetic(X87DoubleExtended::from_i128_r(value, round), control, round)
+    arithmetic(
+        X87DoubleExtended::from_i128_r(value, round),
+        control,
+        round,
+        &[],
+    )
 }
 
 pub(super) fn from_f32_bits(raw: u32) -> u128 {
@@ -256,7 +287,12 @@ pub(super) fn add(lhs: u128, rhs: u128) -> u128 {
 
 pub(super) fn add_contextual(lhs: u128, rhs: u128, control: u16) -> Result {
     let round = round_from_control(control);
-    arithmetic(value(lhs).add_r(value(rhs), round), control, round)
+    arithmetic(
+        value(lhs).add_r(value(rhs), round),
+        control,
+        round,
+        &[lhs, rhs],
+    )
 }
 
 pub(super) fn sub(lhs: u128, rhs: u128) -> u128 {
@@ -265,7 +301,12 @@ pub(super) fn sub(lhs: u128, rhs: u128) -> u128 {
 
 pub(super) fn sub_contextual(lhs: u128, rhs: u128, control: u16) -> Result {
     let round = round_from_control(control);
-    arithmetic(value(lhs).sub_r(value(rhs), round), control, round)
+    arithmetic(
+        value(lhs).sub_r(value(rhs), round),
+        control,
+        round,
+        &[lhs, rhs],
+    )
 }
 
 pub(super) fn mul(lhs: u128, rhs: u128) -> u128 {
@@ -274,7 +315,12 @@ pub(super) fn mul(lhs: u128, rhs: u128) -> u128 {
 
 pub(super) fn mul_contextual(lhs: u128, rhs: u128, control: u16) -> Result {
     let round = round_from_control(control);
-    arithmetic(value(lhs).mul_r(value(rhs), round), control, round)
+    arithmetic(
+        value(lhs).mul_r(value(rhs), round),
+        control,
+        round,
+        &[lhs, rhs],
+    )
 }
 
 pub(super) fn div(lhs: u128, rhs: u128) -> u128 {
@@ -283,7 +329,12 @@ pub(super) fn div(lhs: u128, rhs: u128) -> u128 {
 
 pub(super) fn div_contextual(lhs: u128, rhs: u128, control: u16) -> Result {
     let round = round_from_control(control);
-    arithmetic(value(lhs).div_r(value(rhs), round), control, round)
+    arithmetic(
+        value(lhs).div_r(value(rhs), round),
+        control,
+        round,
+        &[lhs, rhs],
+    )
 }
 
 /// FSCALE: multiply by 2 raised to the truncated integer value of `factor`.
@@ -306,6 +357,7 @@ pub(super) fn scale_contextual(raw: u128, factor: u128, control: u16) -> Result 
         },
         control,
         round,
+        &[raw],
     )
 }
 
