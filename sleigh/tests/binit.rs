@@ -756,10 +756,30 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
         mismatch_reason: &'static str,
     }
 
+    /// Reasons that record a row for the record but are not emulation
+    /// discrepancies: the instruction has no QCode model to disagree with.
+    /// SLEIGH leaves these as `callother`, so there is nothing to compare.
+    const IGNORED_REASONS: &[&str] = &["unsupported"];
+
+    fn is_ignored_reason(reason: &str) -> bool {
+        IGNORED_REASONS.contains(&reason)
+    }
+
+    /// What recording a failed case did, so the caller can tell a real
+    /// discrepancy from an unmodeled instruction or a duplicate.
+    enum MismatchOutcome {
+        Recorded,
+        Ignored,
+        Duplicate,
+    }
+
     struct MismatchCsv {
         writer: csv::Writer<File>,
         failed_instruction_ids: HashSet<i32>,
         mismatch_count: usize,
+        /// Rows written for an ignored reason. Counted apart from
+        /// `mismatch_count` so unmodeled instructions never read as failures.
+        ignored_count: usize,
         /// Written mismatches bucketed by `mismatch_reason` (e.g. "state_mismatch",
         /// "unsupported", "fixture_limitation") so the summary can separate genuine
         /// emulation discrepancies from unmodeled instructions.
@@ -1101,6 +1121,7 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
                 writer,
                 failed_instruction_ids: HashSet::new(),
                 mismatch_count: 0,
+                ignored_count: 0,
                 reason_counts: HashMap::new(),
             }
         }
@@ -1109,18 +1130,23 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
             self.failed_instruction_ids.contains(&instruction_id)
         }
 
-        fn write_mismatch(&mut self, mismatch: DbMismatch) -> bool {
+        fn write_mismatch(&mut self, mismatch: DbMismatch) -> MismatchOutcome {
             if !self.failed_instruction_ids.insert(mismatch.instruction_id) {
-                return false;
+                return MismatchOutcome::Duplicate;
             }
             let reason = mismatch.mismatch_reason;
             self.writer
                 .serialize(mismatch.into_csv_row())
                 .expect("failed to write mismatch CSV row");
             self.writer.flush().expect("failed to flush mismatch CSV");
-            self.mismatch_count += 1;
             *self.reason_counts.entry(reason).or_default() += 1;
-            true
+            if is_ignored_reason(reason) {
+                self.ignored_count += 1;
+                MismatchOutcome::Ignored
+            } else {
+                self.mismatch_count += 1;
+                MismatchOutcome::Recorded
+            }
         }
     }
 
@@ -2112,6 +2138,7 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
             MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::stderr_with_hz(5));
         let total_ok = AtomicUsize::new(0);
         let total_err = AtomicUsize::new(0);
+        let total_ignored = AtomicUsize::new(0);
         let total_skipped = AtomicUsize::new(0);
         let output = std::env::var_os("PCODE_FUZZ_OUTPUT")
             .map(PathBuf::from)
@@ -2135,6 +2162,7 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
                 let dsn = &dsn;
                 let total_ok = &total_ok;
                 let total_err = &total_err;
+                let total_ignored = &total_ignored;
                 let total_skipped = &total_skipped;
                 let mismatches = &mismatches;
                 s.spawn(move || {
@@ -2162,14 +2190,20 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
                                 total_ok.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(mismatch) => {
-                                let written = mismatches
+                                let outcome = mismatches
                                     .lock()
                                     .expect("mismatch mutex was poisoned")
                                     .write_mismatch(*mismatch);
-                                if written {
-                                    total_err.fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    total_skipped.fetch_add(1, Ordering::Relaxed);
+                                match outcome {
+                                    MismatchOutcome::Recorded => {
+                                        total_err.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    MismatchOutcome::Ignored => {
+                                        total_ignored.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    MismatchOutcome::Duplicate => {
+                                        total_skipped.fetch_add(1, Ordering::Relaxed);
+                                    }
                                 }
                             }
                         }
@@ -2182,6 +2216,7 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
 
         let ok = total_ok.load(Ordering::Relaxed);
         let err = total_err.load(Ordering::Relaxed);
+        let ignored = total_ignored.load(Ordering::Relaxed);
         let skipped = total_skipped.load(Ordering::Relaxed);
         let csv = mismatches
             .into_inner()
@@ -2192,9 +2227,27 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
             .get("state_mismatch")
             .copied()
             .unwrap_or(0);
-        let unsupported = csv.reason_counts.get("unsupported").copied().unwrap_or(0);
+        // Ignored reasons are broken out by name: a bare "13 ignored" is only
+        // actionable if it says which unmodeled instructions were waived.
+        let ignored_breakdown = IGNORED_REASONS
+            .iter()
+            .filter_map(|reason| {
+                let count = csv.reason_counts.get(reason).copied()?;
+                Some(format!("{count} {reason}"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        // A run that waived nothing says "0 ignored" rather than "0 ignored ()".
+        let ignored_breakdown = if ignored_breakdown.is_empty() {
+            String::new()
+        } else {
+            format!(" ({ignored_breakdown})")
+        };
         eprintln!(
-            "[db-fuzz] done: {ok} cases OK, {state_mismatches} errors, {unsupported} unsupported instructions, {skipped} cases skipped after a matching error, {mismatch_count} deduplicated mismatches written to {}",
+            "[db-fuzz] done: {ok} cases OK, {state_mismatches} errors, \
+             {ignored} ignored{ignored_breakdown}, \
+             {skipped} cases skipped after a matching case was recorded, \
+             {mismatch_count} deduplicated mismatches written to {}",
             output.display()
         );
         if err > 0 && std::env::var_os("PCODE_FUZZ_FAIL_QUIETLY").is_none() {
