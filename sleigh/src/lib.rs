@@ -1,7 +1,7 @@
 //! Lift decoded [`sleigh::Instruction`]s into QCode.
 //!
 //! This crate is the integration boundary between `wazabin-sleigh` and
-//! `qcode`. It consumes SLEIGH's flat [`sleigh::InstructionPcode`] API rather
+//! `qcode`. It consumes SLEIGH's flat p-code API rather
 //! than its source-shaped AST, keeping both core crates independent.
 //!
 //! Construct a [`SleighLifter`] once per compiled specification. Its
@@ -222,17 +222,18 @@ impl<'spec> SleighLifter<'spec> {
         instruction: &Instruction<'_, '_>,
         function: Option<FunctionId>,
     ) -> Result<BlockId, LiftError> {
-        let pcode = instruction
-            .pcode_ops()
-            .map_err(|error| LiftError::Sleigh(error.to_string()))?;
-        self.lift_pcode_indexed(
-            ctx,
-            addresses,
-            instruction.address(),
-            instruction.len(),
-            &pcode,
-            function,
-        )
+        instruction
+            .pcode_ops_into(|ops| {
+                self.lift_pcode_ops_indexed(
+                    ctx,
+                    addresses,
+                    instruction.address(),
+                    instruction.len(),
+                    ops,
+                    function,
+                )
+            })
+            .map_err(|error| LiftError::Sleigh(error.to_string()))?
     }
 
     /// Lowers already-flattened p-code. This is useful for cached or
@@ -244,6 +245,21 @@ impl<'spec> SleighLifter<'spec> {
         address: u64,
         length: usize,
         pcode: &InstructionPcode,
+        function: Option<FunctionId>,
+    ) -> Result<BlockId, LiftError> {
+        self.lift_pcode_ops_indexed(ctx, addresses, address, length, &pcode.ops, function)
+    }
+
+    /// Lowers a borrowed flat p-code operation sequence. This is kept private
+    /// because callers needing an inspectable intermediate should use
+    /// [`lift_pcode_indexed`](Self::lift_pcode_indexed).
+    fn lift_pcode_ops_indexed(
+        &self,
+        ctx: &mut Context<'static>,
+        addresses: &mut AddressIndex,
+        address: u64,
+        length: usize,
+        pcode: &[PcodeOp],
         function: Option<FunctionId>,
     ) -> Result<BlockId, LiftError> {
         let function = match function {
@@ -258,7 +274,7 @@ impl<'spec> SleighLifter<'spec> {
         // needed for direct inter-instruction control flow.
         let mut branches = HashMap::default();
         let mut calls = HashMap::default();
-        for op in &pcode.ops {
+        for op in pcode {
             match op.opcode {
                 Opcode::Branch | Opcode::CBranch => {
                     if let Some(target) = op
@@ -323,7 +339,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         mut builder: Builder<'str, 'ctx>,
         base_storage: &'spec HashMap<Varnode, VarnodeId>,
         unique_space: SpaceId,
-        pcode: &InstructionPcode,
+        pcode: &[PcodeOp],
         branches: HashMap<u64, BlockId>,
         calls: HashMap<u64, FunctionId>,
         address: u64,
@@ -334,7 +350,6 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         // isolated as required by their storage identity.
         let mut unique_storage = HashMap::default();
         for varnode in pcode
-            .ops
             .iter()
             .flat_map(|op| op.output.iter().chain(op.inputs.iter()))
             .filter(|varnode| varnode.space == unique_space)
@@ -355,20 +370,20 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         }
     }
 
-    fn emit(&mut self, pcode: &InstructionPcode, next: BlockId) -> Result<(), LiftError> {
+    fn emit(&mut self, pcode: &[PcodeOp], next: BlockId) -> Result<(), LiftError> {
         let mut labels = HashMap::default();
-        labels.reserve(pcode.ops.len());
-        for (index, op) in pcode.ops.iter().enumerate() {
+        labels.reserve(pcode.len());
+        for (index, op) in pcode.iter().enumerate() {
             if matches!(op.opcode, Opcode::Branch | Opcode::CBranch)
                 && let Some(target) = op
                     .inputs
                     .first()
                     .filter(|target| target.space == SPACE_CONST)
             {
-                let target = Self::local_target(index, target.offset, pcode.ops.len())?;
+                let target = Self::local_target(index, target.offset, pcode.len())?;
                 // A label at the end of instruction p-code is the machine
                 // instruction's fall-through, not an empty local block.
-                if target < pcode.ops.len() {
+                if target < pcode.len() {
                     labels.entry(target).or_insert_with(|| {
                         self.builder.get_or_make_local_label(Cow::Owned(format!(
                             "pcode_{:x}_{target}",
@@ -379,7 +394,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             }
         }
 
-        for (index, op) in pcode.ops.iter().enumerate() {
+        for (index, op) in pcode.iter().enumerate() {
             if let Some(&target) = labels.get(&index)
                 && self.builder.current_block() != target
             {
@@ -390,7 +405,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             }
             self.open_continuation();
             self.builder.set_address(self.address);
-            self.emit_op(index, op, &labels, pcode.ops.len(), next)?;
+            self.emit_op(index, op, &labels, pcode.len(), next)?;
             self.builder.clear_address();
         }
         if !self.builder.is_terminated() {
