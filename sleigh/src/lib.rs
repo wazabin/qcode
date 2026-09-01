@@ -26,8 +26,8 @@ use qcode::{
 };
 use rustc_hash::FxHashMap as HashMap;
 use sleigh::{
-    CompiledSpec, Decoder, Instruction, InstructionPcode, Opcode, PcodeOp, SPACE_CONST, SpaceId,
-    Varnode,
+    CompiledSpec, Decoder, Instruction, InstructionPcode, LabelId, Opcode, PcodeOp, PcodePlan,
+    PcodeSink, SPACE_CONST, SpaceId, Varnode,
 };
 
 /// Failure while converting flat p-code to QCode.
@@ -222,18 +222,70 @@ impl<'spec> SleighLifter<'spec> {
         instruction: &Instruction<'_, '_>,
         function: Option<FunctionId>,
     ) -> Result<BlockId, LiftError> {
+        let address = instruction.address();
+        let length = instruction.len();
+        let function = self.function_for(ctx, addresses, address, function);
+        // The plan carries every fact needed before the builder borrows the
+        // function body, so no flat p-code vector is built or re-scanned.
         instruction
-            .pcode_ops_into(|ops| {
-                self.lift_pcode_ops_indexed(
-                    ctx,
-                    addresses,
-                    instruction.address(),
-                    instruction.len(),
-                    ops,
-                    function,
-                )
+            .pcode_ops_streamed(|plan| {
+                self.emitter(ctx, addresses, address, length, function, plan)
             })
             .map_err(|error| LiftError::Sleigh(error.to_string()))?
+            .finish()
+    }
+
+    /// Resolves the function an instruction at `address` belongs to.
+    fn function_for(
+        &self,
+        ctx: &mut Context<'static>,
+        addresses: &mut AddressIndex,
+        address: u64,
+        function: Option<FunctionId>,
+    ) -> FunctionId {
+        match function {
+            Some(function) => function,
+            None => FunctionBody::from_addr_or_create_indexed(ctx, addresses, address).id,
+        }
+    }
+
+    /// Creates the emitter for one instruction, resolving all module-owned
+    /// blocks and callees from `plan` before borrowing the function body.
+    fn emitter<'ctx>(
+        &self,
+        ctx: &'ctx mut Context<'static>,
+        addresses: &mut AddressIndex,
+        address: u64,
+        length: usize,
+        function: FunctionId,
+        plan: &PcodePlan,
+    ) -> FlatEmitter<'_, 'static, 'ctx> {
+        let entry = ctx.get_or_make_block_indexed(addresses, address, function);
+        BasicBlock::from_id_mut(ctx, entry).in_function(function);
+
+        let mut branches = HashMap::default();
+        for &target in plan.direct_branches() {
+            let block = ctx.get_or_make_block_indexed(addresses, target, function);
+            branches.insert(target, block);
+        }
+        let mut calls = HashMap::default();
+        for &target in plan.direct_calls() {
+            let callee = FunctionBody::from_addr_or_create_indexed(ctx, addresses, target).id;
+            calls.insert(target, callee);
+        }
+        let next = ctx.get_or_make_block_indexed(addresses, address + length as u64, function);
+
+        FlatEmitter::new(
+            entry,
+            next,
+            ctx.builder(entry),
+            &self.storage,
+            self.unique_space,
+            branches,
+            calls,
+            address,
+            plan,
+        )
     }
 
     /// Lowers already-flattened p-code. This is useful for cached or
@@ -253,6 +305,10 @@ impl<'spec> SleighLifter<'spec> {
     /// Lowers a borrowed flat p-code operation sequence. This is kept private
     /// because callers needing an inspectable intermediate should use
     /// [`lift_pcode_indexed`](Self::lift_pcode_indexed).
+    ///
+    /// Unlike the streamed path this has no plan, so it recovers the same facts
+    /// by scanning the operations: their direct targets, and the operation
+    /// indices local branches resolve to.
     fn lift_pcode_ops_indexed(
         &self,
         ctx: &mut Context<'static>,
@@ -262,168 +318,55 @@ impl<'spec> SleighLifter<'spec> {
         pcode: &[PcodeOp],
         function: Option<FunctionId>,
     ) -> Result<BlockId, LiftError> {
-        let function = match function {
-            Some(function) => function,
-            None => FunctionBody::from_addr_or_create_indexed(ctx, addresses, address).id,
-        };
-        let entry = ctx.get_or_make_block_indexed(addresses, address, function);
-        BasicBlock::from_id_mut(ctx, entry).in_function(function);
-
-        // Resolve all module-owned targets before borrowing the function body
-        // through Builder. This is also the only pass over the flat operations
-        // needed for direct inter-instruction control flow.
-        let mut branches = HashMap::default();
-        let mut calls = HashMap::default();
-        for op in pcode {
-            match op.opcode {
-                Opcode::Branch | Opcode::CBranch => {
-                    if let Some(target) = op
-                        .inputs
-                        .first()
-                        .filter(|target| target.space != SPACE_CONST)
-                    {
-                        let block =
-                            ctx.get_or_make_block_indexed(addresses, target.offset, function);
-                        branches.insert(target.offset, block);
+        let function = self.function_for(ctx, addresses, address, function);
+        let plan = Self::plan_from_ops(pcode)?;
+        let mut emitter = self.emitter(ctx, addresses, address, length, function, &plan.plan);
+        for (index, op) in pcode.iter().enumerate() {
+            if let Some(&label) = plan.labels.get(&index) {
+                emitter.label(label);
+            }
+            match (op.opcode, op.inputs.first()) {
+                (Opcode::Branch | Opcode::CBranch, Some(target)) if target.space == SPACE_CONST => {
+                    let target = Self::local_target(index, target.offset, pcode.len())?;
+                    let condition = (op.opcode == Opcode::CBranch)
+                        .then(|| op.inputs.get(1).copied())
+                        .flatten();
+                    match plan.labels.get(&target) {
+                        Some(&label) => emitter.branch_label(op.opcode, label, condition),
+                        // A branch past the last operation is the machine
+                        // instruction's fall-through, not a local block.
+                        None => emitter.branch_next(op.opcode, condition),
                     }
                 }
-                Opcode::Call => {
-                    if let Some(target) = op
-                        .inputs
-                        .first()
-                        .filter(|target| target.space != SPACE_CONST)
-                    {
-                        let callee = FunctionBody::from_addr_or_create_indexed(
-                            ctx,
-                            addresses,
-                            target.offset,
-                        )
-                        .id;
-                        calls.insert(target.offset, callee);
+                _ => emitter.op(op.opcode, op.output, &op.inputs),
+            }
+        }
+        emitter.finish()
+    }
+
+    /// Rebuilds the plan facts of an already-flattened instruction.
+    fn plan_from_ops(pcode: &[PcodeOp]) -> Result<VectorPlan, LiftError> {
+        let mut plan = PcodePlan::default();
+        let mut labels = HashMap::default();
+        for (index, op) in pcode.iter().enumerate() {
+            let Some(target) = op.inputs.first() else {
+                continue;
+            };
+            match op.opcode {
+                Opcode::Branch | Opcode::CBranch if target.space == SPACE_CONST => {
+                    let target = Self::local_target(index, target.offset, pcode.len())?;
+                    if target < pcode.len() && !labels.contains_key(&target) {
+                        labels.insert(target, plan.declare_label(&format!("pcode_{target}")));
                     }
+                }
+                Opcode::Branch | Opcode::CBranch => plan.declare_direct_branch(target.offset),
+                Opcode::Call if target.space != SPACE_CONST => {
+                    plan.declare_direct_call(target.offset);
                 }
                 _ => {}
             }
         }
-        let next = ctx.get_or_make_block_indexed(addresses, address + length as u64, function);
-
-        let mut emitter = FlatEmitter::new(
-            ctx.builder(entry),
-            &self.storage,
-            self.unique_space,
-            pcode,
-            branches,
-            calls,
-            address,
-        );
-        emitter.emit(pcode, next)?;
-        Ok(entry)
-    }
-}
-
-struct FlatEmitter<'spec, 'str, 'ctx> {
-    builder: Builder<'str, 'ctx>,
-    /// Immutable architectural register locations, shared by every instruction.
-    base_storage: &'spec HashMap<Varnode, VarnodeId>,
-    /// Per-instruction unique-space locations. Unlike register locations these
-    /// must not be shared, because SLEIGH's unique space is instruction-local.
-    unique_storage: HashMap<Varnode, ValueId>,
-    branches: HashMap<u64, BlockId>,
-    calls: HashMap<u64, FunctionId>,
-    address: u64,
-    fallthrough: usize,
-}
-
-impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
-    fn new(
-        mut builder: Builder<'str, 'ctx>,
-        base_storage: &'spec HashMap<Varnode, VarnodeId>,
-        unique_space: SpaceId,
-        pcode: &[PcodeOp],
-        branches: HashMap<u64, BlockId>,
-        calls: HashMap<u64, FunctionId>,
-        address: u64,
-    ) -> Self {
-        // Flat p-code varnodes are mutable locations, not SSA values. Give
-        // every unique varnode its own body-local QCode temporary space: this
-        // emits loads and stores and keeps even overlapping p-code varnodes
-        // isolated as required by their storage identity.
-        let mut unique_storage = HashMap::default();
-        for varnode in pcode
-            .iter()
-            .flat_map(|op| op.output.iter().chain(op.inputs.iter()))
-            .filter(|varnode| varnode.space == unique_space)
-        {
-            unique_storage
-                .entry(*varnode)
-                .or_insert_with(|| ValueId::Temp(builder.make_temp(varnode.size)));
-        }
-
-        Self {
-            builder,
-            base_storage,
-            unique_storage,
-            branches,
-            calls,
-            address,
-            fallthrough: 0,
-        }
-    }
-
-    fn emit(&mut self, pcode: &[PcodeOp], next: BlockId) -> Result<(), LiftError> {
-        let mut labels = HashMap::default();
-        labels.reserve(pcode.len());
-        for (index, op) in pcode.iter().enumerate() {
-            if matches!(op.opcode, Opcode::Branch | Opcode::CBranch)
-                && let Some(target) = op
-                    .inputs
-                    .first()
-                    .filter(|target| target.space == SPACE_CONST)
-            {
-                let target = Self::local_target(index, target.offset, pcode.len())?;
-                // A label at the end of instruction p-code is the machine
-                // instruction's fall-through, not an empty local block.
-                if target < pcode.len() {
-                    labels.entry(target).or_insert_with(|| {
-                        self.builder.get_or_make_local_label(Cow::Owned(format!(
-                            "pcode_{:x}_{target}",
-                            self.address
-                        )))
-                    });
-                }
-            }
-        }
-
-        for (index, op) in pcode.iter().enumerate() {
-            if let Some(&target) = labels.get(&index)
-                && self.builder.current_block() != target
-            {
-                if !self.builder.is_terminated() {
-                    self.builder.push_branch(target);
-                }
-                self.builder.switch_to_block(target);
-            }
-            self.open_continuation();
-            self.builder.set_address(self.address);
-            self.emit_op(index, op, &labels, pcode.len(), next)?;
-            self.builder.clear_address();
-        }
-        if !self.builder.is_terminated() {
-            self.builder.push_branch(next);
-        }
-        Ok(())
-    }
-
-    fn open_continuation(&mut self) {
-        if !self.builder.is_terminated() {
-            return;
-        }
-        let label = self.builder.get_or_make_local_label(Cow::Owned(format!(
-            "pcode_fallthrough_{:x}_{}",
-            self.address, self.fallthrough
-        )));
-        self.fallthrough += 1;
-        self.builder.switch_to_block(label);
+        Ok(VectorPlan { plan, labels })
     }
 
     fn local_target(op: usize, raw: u64, len: usize) -> Result<usize, LiftError> {
@@ -434,8 +377,162 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             .filter(|target| *target <= len);
         target.ok_or(LiftError::InvalidLocalBranch { op, relative })
     }
+}
 
-    fn input(&mut self, op: &PcodeOp, index: usize) -> Result<ValueId, LiftError> {
+/// A plan recovered from already-flattened p-code, with the operation index
+/// each of its labels stands at.
+struct VectorPlan {
+    plan: PcodePlan,
+    labels: HashMap<usize, LabelId>,
+}
+
+/// One operation as it reaches the emitter, borrowed from either a streaming
+/// p-code sink or an already-flattened operation vector.
+struct OpRef<'a> {
+    opcode: Opcode,
+    output: Option<Varnode>,
+    inputs: &'a [Varnode],
+}
+
+/// Emits QCode for one instruction's flat p-code.
+///
+/// The emitter is a [`PcodeSink`]: it never sees a flat p-code vector, and it
+/// takes its whole-instruction facts — the blocks its direct branches and
+/// calls reach — from the plan its owner resolved before borrowing the body.
+struct FlatEmitter<'spec, 'str, 'ctx> {
+    builder: Builder<'str, 'ctx>,
+    /// Immutable architectural register locations, shared by every instruction.
+    base_storage: &'spec HashMap<Varnode, VarnodeId>,
+    /// SLEIGH's unique space, whose varnodes are instruction-local.
+    unique_space: SpaceId,
+    /// Per-instruction unique-space locations. Unlike register locations these
+    /// must not be shared, because SLEIGH's unique space is instruction-local.
+    unique_storage: HashMap<Varnode, ValueId>,
+    branches: HashMap<u64, BlockId>,
+    calls: HashMap<u64, FunctionId>,
+    /// Blocks for the plan's instruction-local labels, made on first mention.
+    labels: Vec<Option<BlockId>>,
+    entry: BlockId,
+    next: BlockId,
+    address: u64,
+    fallthrough: usize,
+    /// A sink cannot fail, so the first failure is latched and the rest of the
+    /// instruction is ignored; its caller discards a partial instruction.
+    error: Option<LiftError>,
+}
+
+impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        entry: BlockId,
+        next: BlockId,
+        builder: Builder<'str, 'ctx>,
+        base_storage: &'spec HashMap<Varnode, VarnodeId>,
+        unique_space: SpaceId,
+        branches: HashMap<u64, BlockId>,
+        calls: HashMap<u64, FunctionId>,
+        address: u64,
+        plan: &PcodePlan,
+    ) -> Self {
+        Self {
+            builder,
+            base_storage,
+            unique_space,
+            unique_storage: HashMap::default(),
+            branches,
+            calls,
+            // A terminal label is the instruction's fall-through, not a block.
+            labels: (0..plan.labels().len())
+                .map(|index| plan.is_terminal(LabelId::from_index(index)).then_some(next))
+                .collect(),
+            entry,
+            next,
+            address,
+            fallthrough: 0,
+            error: None,
+        }
+    }
+
+    /// Closes the instruction and returns its entry block.
+    fn finish(mut self) -> Result<BlockId, LiftError> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+        if !self.builder.is_terminated() {
+            self.builder.push_branch(self.next);
+        }
+        Ok(self.entry)
+    }
+
+    /// Branches to the instruction's fall-through, the target of a local
+    /// branch past the last operation.
+    fn branch_next(&mut self, opcode: Opcode, condition: Option<Varnode>) {
+        let next = self.next;
+        self.branch_to(opcode, next, condition);
+    }
+
+    fn block_for(&mut self, label: LabelId) -> BlockId {
+        if let Some(block) = self.labels[label.index()] {
+            return block;
+        }
+        let block = self.builder.get_or_make_local_label(Cow::Owned(format!(
+            "pcode_{:x}_{}",
+            self.address,
+            label.index()
+        )));
+        self.labels[label.index()] = Some(block);
+        block
+    }
+
+    fn branch_to(&mut self, opcode: Opcode, target: BlockId, condition: Option<Varnode>) {
+        let condition = match (opcode, condition) {
+            (Opcode::CBranch, Some(condition)) => match self.value(condition) {
+                Ok(condition) => Some(self.ensure_bool(condition)),
+                Err(error) => return self.fail(error),
+            },
+            (Opcode::CBranch, None) => {
+                return self.fail(LiftError::InvalidArity {
+                    opcode,
+                    expected: 2,
+                    actual: 1,
+                });
+            }
+            _ => None,
+        };
+        match condition {
+            Some(condition) => {
+                let fallthrough = self.open_fallthrough();
+                self.builder.push_cbranch(condition, target, fallthrough);
+                self.builder.switch_to_block(fallthrough);
+            }
+            None => {
+                self.builder.push_branch(target);
+            }
+        }
+    }
+
+    fn fail(&mut self, error: LiftError) {
+        self.error.get_or_insert(error);
+    }
+
+    fn open_fallthrough(&mut self) -> BlockId {
+        let label = self.builder.get_or_make_local_label(Cow::Owned(format!(
+            "pcode_fallthrough_{:x}_{}",
+            self.address, self.fallthrough
+        )));
+        self.fallthrough += 1;
+        label
+    }
+
+    fn open_continuation(&mut self) {
+        if !self.builder.is_terminated() {
+            return;
+        }
+        let label = self.open_fallthrough();
+        self.builder.switch_to_block(label);
+    }
+
+    fn input(&mut self, op: &OpRef<'_>, index: usize) -> Result<ValueId, LiftError> {
         let value = *op.inputs.get(index).ok_or(LiftError::InvalidArity {
             opcode: op.opcode,
             expected: index + 1,
@@ -448,18 +545,28 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         if varnode.space == SPACE_CONST {
             return Ok(self.builder.shr().get_const(varnode.offset, varnode.size));
         }
-        let value = self
-            .unique_storage
+        let value = self.storage(varnode)?;
+        Ok(self.builder.ensure_local(value))
+    }
+
+    /// Resolves a varnode's QCode location, giving each instruction-local
+    /// unique varnode its own body-local temporary on first use. Flat p-code
+    /// varnodes are mutable locations rather than SSA values, so this keeps
+    /// even overlapping unique varnodes isolated as their storage identity
+    /// requires.
+    fn storage(&mut self, varnode: Varnode) -> Result<ValueId, LiftError> {
+        if varnode.space == self.unique_space {
+            let temp = *self
+                .unique_storage
+                .entry(varnode)
+                .or_insert_with(|| ValueId::Temp(self.builder.make_temp(varnode.size)));
+            return Ok(temp);
+        }
+        self.base_storage
             .get(&varnode)
             .copied()
-            .or_else(|| {
-                self.base_storage
-                    .get(&varnode)
-                    .copied()
-                    .map(ValueId::Varnode)
-            })
-            .ok_or(LiftError::UnknownVarnode(varnode))?;
-        Ok(self.builder.ensure_local(value))
+            .map(ValueId::Varnode)
+            .ok_or(LiftError::UnknownVarnode(varnode))
     }
 
     fn write(&mut self, output: Option<Varnode>, value: ValueId) -> Result<(), LiftError> {
@@ -469,29 +576,12 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         if output.space == SPACE_CONST {
             return Err(LiftError::UnknownVarnode(output));
         }
-        let destination = self
-            .unique_storage
-            .get(&output)
-            .copied()
-            .or_else(|| {
-                self.base_storage
-                    .get(&output)
-                    .copied()
-                    .map(ValueId::Varnode)
-            })
-            .ok_or(LiftError::UnknownVarnode(output))?;
+        let destination = self.storage(output)?;
         self.builder.push_copy(value, destination);
         Ok(())
     }
 
-    fn emit_op(
-        &mut self,
-        index: usize,
-        op: &PcodeOp,
-        labels: &HashMap<usize, BlockId>,
-        len: usize,
-        next: BlockId,
-    ) -> Result<(), LiftError> {
+    fn emit_op(&mut self, op: &OpRef<'_>) -> Result<(), LiftError> {
         use Opcode::*;
         let unary = |this: &mut Self, f: fn(&mut Builder<'str, 'ctx>, ValueId) -> ValueId| {
             let input = this.input(op, 0)?;
@@ -615,8 +705,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
                 let value = self.builder.push_pcode_op(id, args, None, size).id();
                 self.write(op.output, value)
             }
-            Branch => self.branch(index, op, labels, len, next),
-            CBranch => self.cbranch(index, op, labels, len, next),
+            Branch | CBranch => self.direct_branch(op),
             BranchInd => {
                 let target = self.input(op, 0)?;
                 self.builder.push_branchind(target);
@@ -662,7 +751,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
 
     fn bool_binop(
         &mut self,
-        op: &PcodeOp,
+        op: &OpRef<'_>,
         f: fn(&mut Builder<'str, 'ctx>, ValueId, ValueId) -> ValueId,
     ) -> Result<(), LiftError> {
         let lhs = self.input(op, 0)?;
@@ -675,7 +764,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
 
     fn convert(
         &mut self,
-        op: &PcodeOp,
+        op: &OpRef<'_>,
         f: fn(&mut Builder<'str, 'ctx>, ValueId, usize) -> ValueId,
     ) -> Result<(), LiftError> {
         let output = op.output.ok_or(LiftError::InvalidArity {
@@ -688,7 +777,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         self.write(Some(output), value)
     }
 
-    fn input_raw(&self, op: &PcodeOp, index: usize) -> Result<u64, LiftError> {
+    fn input_raw(&self, op: &OpRef<'_>, index: usize) -> Result<u64, LiftError> {
         let value = op.inputs.get(index).ok_or(LiftError::InvalidArity {
             opcode: op.opcode,
             expected: index + 1,
@@ -700,7 +789,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         Ok(value.offset)
     }
 
-    fn space(&self, op: &PcodeOp, index: usize) -> Result<SpaceId, LiftError> {
+    fn space(&self, op: &OpRef<'_>, index: usize) -> Result<SpaceId, LiftError> {
         let raw = self.input_raw(op, index)?;
         usize::try_from(raw)
             .ok()
@@ -708,72 +797,127 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             .ok_or(LiftError::InvalidDirectTarget(op.opcode))
     }
 
-    fn branch(
-        &mut self,
-        index: usize,
-        op: &PcodeOp,
-        labels: &HashMap<usize, BlockId>,
-        len: usize,
-        next: BlockId,
-    ) -> Result<(), LiftError> {
+    /// Emits a branch out of this instruction. Instruction-local targets
+    /// never reach here: they arrive as [`PcodeSink::branch_label`].
+    fn direct_branch(&mut self, op: &OpRef<'_>) -> Result<(), LiftError> {
         let target = op.inputs.first().ok_or(LiftError::InvalidArity {
             opcode: op.opcode,
-            expected: 1,
+            expected: 1 + usize::from(op.opcode == Opcode::CBranch),
             actual: 0,
         })?;
-        let block = if target.space == SPACE_CONST {
-            let target = Self::local_target(index, target.offset, len)?;
-            if target == len { next } else { labels[&target] }
-        } else {
-            *self
-                .branches
-                .get(&target.offset)
-                .ok_or(LiftError::InvalidDirectTarget(op.opcode))?
-        };
-        self.builder.push_branch(block);
+        if target.space == SPACE_CONST {
+            return Err(LiftError::InvalidDirectTarget(op.opcode));
+        }
+        let block = *self
+            .branches
+            .get(&target.offset)
+            .ok_or(LiftError::InvalidDirectTarget(op.opcode))?;
+        let condition = op.inputs.get(1).copied();
+        self.branch_to(op.opcode, block, condition);
         Ok(())
     }
+}
 
-    fn cbranch(
-        &mut self,
-        index: usize,
-        op: &PcodeOp,
-        labels: &HashMap<usize, BlockId>,
-        len: usize,
-        next: BlockId,
-    ) -> Result<(), LiftError> {
-        let target = op.inputs.first().ok_or(LiftError::InvalidArity {
-            opcode: op.opcode,
-            expected: 2,
-            actual: 0,
-        })?;
-        let condition = self.input(op, 1)?;
-        let condition = self.ensure_bool(condition);
-        let target = if target.space == SPACE_CONST {
-            let target = Self::local_target(index, target.offset, len)?;
-            if target == len { next } else { labels[&target] }
-        } else {
-            *self
-                .branches
-                .get(&target.offset)
-                .ok_or(LiftError::InvalidDirectTarget(op.opcode))?
+impl PcodeSink for FlatEmitter<'_, '_, '_> {
+    fn op(&mut self, opcode: Opcode, output: Option<Varnode>, inputs: &[Varnode]) {
+        if self.error.is_some() {
+            return;
+        }
+        self.open_continuation();
+        self.builder.set_address(self.address);
+        let op = OpRef {
+            opcode,
+            output,
+            inputs,
         };
-        let fallthrough = self.builder.get_or_make_local_label(Cow::Owned(format!(
-            "pcode_fallthrough_{:x}_{}",
-            self.address, self.fallthrough
-        )));
-        self.fallthrough += 1;
-        self.builder.push_cbranch(condition, target, fallthrough);
-        self.builder.switch_to_block(fallthrough);
-        Ok(())
+        if let Err(error) = self.emit_op(&op) {
+            self.fail(error);
+        }
+        self.builder.clear_address();
+    }
+
+    fn label(&mut self, label: LabelId) {
+        if self.error.is_some() {
+            return;
+        }
+        let block = self.block_for(label);
+        // A terminal label is the instruction's fall-through: execution
+        // reaches it by falling out of the instruction, not through a block.
+        if block == self.next || self.builder.current_block() == block {
+            return;
+        }
+        if !self.builder.is_terminated() {
+            self.builder.push_branch(block);
+        }
+        self.builder.switch_to_block(block);
+    }
+
+    fn branch_label(&mut self, opcode: Opcode, label: LabelId, condition: Option<Varnode>) {
+        if self.error.is_some() {
+            return;
+        }
+        self.open_continuation();
+        self.builder.set_address(self.address);
+        let target = self.block_for(label);
+        self.branch_to(opcode, target, condition);
+        self.builder.clear_address();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::SleighLifter;
+    use qcode::address_index::AddressIndex;
     use qcode_emulator::Emulator;
     use sleigh::{Compiler, Decoder, SourceDb};
+
+    /// The streamed path and the already-flattened path must lower the same
+    /// instruction to the same QCode.
+    #[test]
+    fn streamed_and_flat_pcode_lift_identically() {
+        let spec = sleigh_precompile::x64::spec();
+        let lifter = SleighLifter::new(spec);
+        for bytes in [
+            b"\x48\x89\xd8".as_slice(),
+            b"\x48\x01\xd8",
+            b"\x74\x05",
+            b"\xe8\x10\x00\x00\x00",
+            b"\xff\xe0",
+            b"\xc3",
+            b"\x0f\xb0\x1d\x00\xf1\x9a\xff",
+            b"\xf7\xf1",
+            b"\x48\x0f\xaf\xc3",
+        ] {
+            let instruction = Decoder::new(spec)
+                .decode_one(0x1000, bytes, &spec.new_context())
+                .unwrap();
+
+            let mut streamed = lifter.new_context();
+            lifter
+                .lift_instruction(&mut streamed, &instruction, None)
+                .unwrap();
+
+            let pcode = instruction.pcode_ops().unwrap();
+            let mut flat = lifter.new_context();
+            let mut addresses = AddressIndex::analyze(&flat);
+            lifter
+                .lift_pcode_indexed(
+                    &mut flat,
+                    &mut addresses,
+                    instruction.address(),
+                    instruction.len(),
+                    &pcode,
+                    None,
+                )
+                .unwrap();
+
+            assert_eq!(
+                streamed.to_string(),
+                flat.to_string(),
+                "{bytes:02x?} lifts differently"
+            );
+        }
+    }
 
     #[test]
     fn lifts_flat_register_copy_from_a_decoded_instruction() {
