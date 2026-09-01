@@ -206,6 +206,7 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
             .collect();
         let covered_constructors = tables.iter().map(|table| table.covered_constructors).sum();
         let families = collect_family_coverage(spec, &witnesses);
+        let missing = collect_missing_constructors(spec, &witnesses);
 
         Ok(ConstructorCoverage {
             architecture: "x86-64",
@@ -222,7 +223,84 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
             decode_failures,
             families,
             tables,
+            missing,
         })
+    }
+
+    /// Renders a constructor's display list as disassembly-like text, leaving
+    /// sub-table and field operands as their symbol names.
+    ///
+    /// A constructor the corpus never reached has no decoded instance to
+    /// print, so this is the only way to name the form that is missing.
+    fn render_display(
+        view: sleigh::introspect::SpecView<'_>,
+        constructor: sleigh::introspect::ConstructorView<'_>,
+    ) -> String {
+        use sleigh::introspect::DisplayPart;
+
+        let mut out = String::new();
+        for part in constructor.display() {
+            match part {
+                DisplayPart::Text(text) => out.push_str(text),
+                DisplayPart::Table(id) => {
+                    out.push_str(view.table(id).map_or("?", |table| table.name()));
+                }
+                DisplayPart::Field(id) => {
+                    out.push_str(view.field(id).map_or("?", |field| field.name()));
+                }
+            }
+        }
+        out.trim().to_owned()
+    }
+
+    /// One constructor in the specification that no corpus encoding decodes to.
+    ///
+    /// The family and table say where the gap sits in the coverage summary;
+    /// the display form says which operand shape to add to Binit's
+    /// `insn.json`; the file and span point back at the specification.
+    #[derive(Debug, Serialize)]
+    struct MissingConstructor {
+        family: String,
+        table: String,
+        display: String,
+        file: String,
+        index: usize,
+        span: (usize, usize),
+    }
+
+    /// Every constructor the corpus leaves unreached, so a coverage gap names
+    /// the forms to add rather than only counting them.
+    fn collect_missing_constructors(
+        spec: &'static CompiledSpec,
+        witnesses: &BTreeMap<(String, usize), ConstructorWitness>,
+    ) -> Vec<MissingConstructor> {
+        const UNTAGGED: &str = "untagged";
+
+        let families = x64::families();
+        let view = spec.introspect();
+        let mut missing = Vec::new();
+        for table in view.tables() {
+            let name = table.name();
+            for index in 0..table.constructor_count() {
+                if witnesses.contains_key(&(name.to_owned(), index)) {
+                    continue;
+                }
+                let constructor = table.constructor(index);
+                let (file, start, end) = constructor.source_span();
+                missing.push(MissingConstructor {
+                    family: families.get(name, index).unwrap_or(UNTAGGED).to_owned(),
+                    table: name.to_owned(),
+                    display: render_display(view, constructor),
+                    // The compiled specification is deserialised without the
+                    // source database that maps a `FileId` back to a path, so
+                    // the file is recorded by its identifier.
+                    file: format!("{file:?}"),
+                    index,
+                    span: (start, end),
+                });
+            }
+        }
+        missing
     }
 
     /// Buckets every constructor in the specification by its `#@family` tag,
@@ -606,6 +684,7 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
         decode_failures: usize,
         families: Vec<FamilyCoverage>,
         tables: Vec<TableCoverage>,
+        missing: Vec<MissingConstructor>,
     }
 
     /// Coverage of one instruction family, as tagged by the `#@family` markers
@@ -690,6 +769,22 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
                     table.total_constructors,
                     table.percentage,
                 );
+            }
+            // The unreached forms are the actionable half of the report: each
+            // line names a constructor the corpus has no encoding for. The
+            // full list goes to the JSON; a summary keeps the log readable.
+            if !self.missing.is_empty() {
+                let mut by_family: BTreeMap<&str, usize> = BTreeMap::new();
+                for constructor in &self.missing {
+                    *by_family.entry(&constructor.family).or_default() += 1;
+                }
+                eprintln!(
+                    "[sleigh-coverage] {} unreached constructors, by family:",
+                    self.missing.len()
+                );
+                for (family, count) in &by_family {
+                    eprintln!("[sleigh-coverage]   {family:<32} {count}");
+                }
             }
         }
 
