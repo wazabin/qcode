@@ -305,19 +305,23 @@ impl<'spec> SleighLifter<'spec> {
     }
 }
 
-struct FlatEmitter<'str, 'ctx> {
+struct FlatEmitter<'spec, 'str, 'ctx> {
     builder: Builder<'str, 'ctx>,
-    storage: HashMap<Varnode, ValueId>,
+    /// Immutable architectural register locations, shared by every instruction.
+    base_storage: &'spec HashMap<Varnode, VarnodeId>,
+    /// Per-instruction unique-space locations. Unlike register locations these
+    /// must not be shared, because SLEIGH's unique space is instruction-local.
+    unique_storage: HashMap<Varnode, ValueId>,
     branches: HashMap<u64, BlockId>,
     calls: HashMap<u64, FunctionId>,
     address: u64,
     fallthrough: usize,
 }
 
-impl<'str, 'ctx> FlatEmitter<'str, 'ctx> {
+impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
     fn new(
         mut builder: Builder<'str, 'ctx>,
-        base_storage: &HashMap<Varnode, VarnodeId>,
+        base_storage: &'spec HashMap<Varnode, VarnodeId>,
         unique_space: SpaceId,
         pcode: &InstructionPcode,
         branches: HashMap<u64, BlockId>,
@@ -328,24 +332,22 @@ impl<'str, 'ctx> FlatEmitter<'str, 'ctx> {
         // every unique varnode its own body-local QCode temporary space: this
         // emits loads and stores and keeps even overlapping p-code varnodes
         // isolated as required by their storage identity.
-        let mut storage: HashMap<Varnode, ValueId> = base_storage
-            .iter()
-            .map(|(&varnode, &id)| (varnode, ValueId::Varnode(id)))
-            .collect();
+        let mut unique_storage = HashMap::default();
         for varnode in pcode
             .ops
             .iter()
             .flat_map(|op| op.output.iter().chain(op.inputs.iter()))
             .filter(|varnode| varnode.space == unique_space)
         {
-            storage
+            unique_storage
                 .entry(*varnode)
                 .or_insert_with(|| ValueId::Temp(builder.make_temp(varnode.size)));
         }
 
         Self {
             builder,
-            storage,
+            base_storage,
+            unique_storage,
             branches,
             calls,
             address,
@@ -432,9 +434,15 @@ impl<'str, 'ctx> FlatEmitter<'str, 'ctx> {
             return Ok(self.builder.shr().get_const(varnode.offset, varnode.size));
         }
         let value = self
-            .storage
+            .unique_storage
             .get(&varnode)
             .copied()
+            .or_else(|| {
+                self.base_storage
+                    .get(&varnode)
+                    .copied()
+                    .map(ValueId::Varnode)
+            })
             .ok_or(LiftError::UnknownVarnode(varnode))?;
         Ok(self.builder.ensure_local(value))
     }
@@ -446,11 +454,18 @@ impl<'str, 'ctx> FlatEmitter<'str, 'ctx> {
         if output.space == SPACE_CONST {
             return Err(LiftError::UnknownVarnode(output));
         }
-        if let Some(&destination) = self.storage.get(&output) {
-            self.builder.push_copy(value, destination);
-        } else {
-            return Err(LiftError::UnknownVarnode(output));
-        }
+        let destination = self
+            .unique_storage
+            .get(&output)
+            .copied()
+            .or_else(|| {
+                self.base_storage
+                    .get(&output)
+                    .copied()
+                    .map(ValueId::Varnode)
+            })
+            .ok_or(LiftError::UnknownVarnode(output))?;
+        self.builder.push_copy(value, destination);
         Ok(())
     }
 

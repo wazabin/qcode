@@ -601,7 +601,11 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         let insn = Instruction::new(type_id, mnemonic);
         // Inlined `FunctionBody::push_insn`, id-less: append to the arena and
         // record each operand's reverse-use, keyed by its body-local form.
-        let args: Vec<LocalValueId> = insn.mnemonic().args().into_iter().collect();
+        // `Mnemonic::args()` uses a two-element SmallVec. Keep that inline
+        // representation: materializing a `Vec` here allocated once for every
+        // emitted QCode instruction, even for the overwhelmingly common unary
+        // and binary operations.
+        let args = insn.mnemonic().args();
         let local = self.body.insns.push(insn);
         for arg in args {
             self.body.users.entry(arg).or_default().push(local);
