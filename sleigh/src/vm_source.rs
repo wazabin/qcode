@@ -21,7 +21,7 @@ use qcode::{
     context::Context,
     value::{FunctionBody, FunctionId},
 };
-use qcode_vm::{CodeError, CodeSource, VmMemory};
+use qcode_vm::{CodeError, CodeSource, Stats, VmMemory};
 use sleigh::{CompiledSpec, Decoder};
 
 use crate::SleighLifter;
@@ -93,8 +93,13 @@ impl CodeSource for SleighCodeSource<'_> {
         memory: &VmMemory,
         index: &mut AddressIndex,
         addr: u64,
+        stats: &mut Stats,
     ) -> Result<(), CodeError> {
+        let fetch_started = std::time::Instant::now();
         let bytes = Self::fetch(memory, addr)?;
+        stats.fetch += fetch_started.elapsed();
+        stats.fetch_bytes += bytes.len() as u64;
+        let lift_started = std::time::Instant::now();
 
         let decode_context = self.lifter.spec().new_context();
         let instruction = Decoder::new(self.lifter.spec())
@@ -110,9 +115,12 @@ impl CodeSource for SleighCodeSource<'_> {
             }
         };
 
-        self.lifter
+        let result = self
+            .lifter
             .lift_instruction_indexed(ctx, index, &instruction, Some(function))
-            .map_err(|error| CodeError::Decode(format!("{error:?}").into()))?;
+            .map_err(|error| CodeError::Decode(format!("{error:?}").into()));
+        stats.decode_lift += lift_started.elapsed();
+        result?;
         Ok(())
     }
 }
@@ -244,7 +252,7 @@ mod tests {
                 "the loop must actually run to completion"
             );
             if best.is_none_or(|(previous, _)| elapsed < previous) {
-                best = Some((elapsed, vm.steps));
+                best = Some((elapsed, vm.stats.steps));
             }
         }
         let (elapsed, steps) = best.expect("at least one run");
@@ -256,6 +264,75 @@ mod tests {
             steps as f64 / elapsed.as_secs_f64() / 1e6,
             f64::from(instructions) / elapsed.as_secs_f64() / 1e6,
         );
+    }
+
+    /// Steady-state throughput at a scale where lifting is fully amortised.
+    ///
+    /// This is the figure comparable to icicle's, whose interpreter and JIT
+    /// were measured on the identical loop at the identical count.
+    /// Ignored by default: it runs for seconds.
+    #[test]
+    #[ignore = "long-running throughput benchmark"]
+    fn steady_state_throughput() {
+        // mov ecx, 1000000 ; loop: dec ecx ; jnz loop
+        let mut vm = machine(&[
+            0xb9, 0x40, 0x42, 0x0f, 0x00, // mov ecx, 1000000
+            0xff, 0xc9, // dec ecx
+            0x75, 0xfc, // jnz -4
+        ]);
+        let instructions = 1_000_000u64 * 2 + 1;
+        let start = std::time::Instant::now();
+        vm.run(u64::MAX);
+        let elapsed = start.elapsed();
+        let ctx = vm.context().clone();
+        assert_eq!(
+            vm.emulator().read_varnode_by_name(&ctx, "ECX"),
+            Some(0),
+            "the loop must run to completion"
+        );
+        eprintln!(
+            "qcode-vm HOT: {instructions} insns in {elapsed:?} ({:.2}M guest-insn/s)\n  {}",
+            instructions as f64 / elapsed.as_secs_f64() / 1e6,
+            vm.stats.report(elapsed),
+        );
+    }
+
+    /// The opposite workload: every instruction is executed exactly once, so
+    /// translation dominates and execution barely features. Together with the
+    /// hot loop this brackets any real program.
+    #[test]
+    #[ignore = "long-running throughput benchmark"]
+    fn cold_translation_throughput() {
+        // A long run of distinct instructions. `inc eax` / `dec eax` pairs keep
+        // the encoding short so the whole run fits in a few pages, while still
+        // being decoded and lifted individually.
+        let count = 20_000usize;
+        let mut code = Vec::with_capacity(count * 2);
+        for index in 0..count {
+            code.extend_from_slice(if index % 2 == 0 {
+                &[0xff, 0xc0] // inc eax
+            } else {
+                &[0xff, 0xc8] // dec eax
+            });
+        }
+        let source = SleighCodeSource::new(spec());
+        let ctx = source.new_context();
+        let mut memory = VmMemory::new();
+        memory
+            .mmu
+            .write_unchecked(0x1000, &code, perm::READ | perm::EXEC);
+        let mut vm = Vm::at_address(ctx, 0x1000, source, memory).expect("entry decodes");
+
+        let start = std::time::Instant::now();
+        vm.run(u64::MAX);
+        let elapsed = start.elapsed();
+        eprintln!(
+            "qcode-vm COLD: {} insns lifted in {elapsed:?} ({:.2}M guest-insn/s)\n  {}",
+            vm.stats.lifts,
+            vm.stats.lifts as f64 / elapsed.as_secs_f64() / 1e6,
+            vm.stats.report(elapsed),
+        );
+        assert!(vm.stats.lifts > 1000, "the run must actually lift code");
     }
 
     #[test]
@@ -285,8 +362,8 @@ mod tests {
                 .map(|b| vm.context().block(b).instruction_ids().len())
                 .sum();
             eprintln!(
-                "optimize={optimize}: steps={} module_insns={insns} cleanup={:?}",
-                vm.steps, vm.cleanup
+                "optimize={optimize}: steps={} module_insns={insns} forwarded={}",
+                vm.stats.steps, vm.stats.forwarded_loads
             );
         }
     }
