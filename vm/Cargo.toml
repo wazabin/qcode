@@ -1,0 +1,12 @@
+[package]
+name = "qcode_vm"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Virtual machine layer over the qcode emulator: MMU, faults, on-demand lifting and snapshots"
+repository.workspace = true
+
+[dependencies]
+qcode.workspace = true
+qcode_emulator.workspace = true
+rustc-hash.workspace = true

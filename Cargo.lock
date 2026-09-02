@@ -542,15 +542,15 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "env_logger",
- "jstd",
  "lazy_static",
  "log",
  "pollster",
  "qcode",
  "qcode_analysis",
- "sleigh-precompile",
  "wazabin-binary",
+ "wazabin-jstd",
  "wazabin-sleigh",
+ "wazabin-sleigh-precompile",
 ]
 
 [[package]]
@@ -685,25 +685,6 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "jstd"
-version = "0.1.0"
-dependencies = [
- "image",
- "jstd_derive",
- "rustc-hash",
- "serde",
-]
-
-[[package]]
-name = "jstd_derive"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -1056,13 +1037,13 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "inventory",
- "jstd",
  "log",
  "pest",
  "rustc-hash",
  "serde",
  "smallvec",
  "wazabin-binary",
+ "wazabin-jstd",
  "wazabin-pcode",
  "wazabin-qcode-macro",
  "wazabin-qcode-parser",
@@ -1079,7 +1060,6 @@ dependencies = [
  "env_logger",
  "harbinger",
  "inventory",
- "jstd",
  "log",
  "pollster",
  "qcode",
@@ -1089,6 +1069,7 @@ dependencies = [
  "serde",
  "toml",
  "wazabin-binary",
+ "wazabin-jstd",
  "wazabin-qcode-macro",
 ]
 
@@ -1100,6 +1081,15 @@ dependencies = [
  "rustc-hash",
  "rustc_apfloat",
  "wazabin-qcode-macro",
+]
+
+[[package]]
+name = "qcode_vm"
+version = "0.1.0"
+dependencies = [
+ "qcode",
+ "qcode_emulator",
+ "rustc-hash",
 ]
 
 [[package]]
@@ -1352,16 +1342,6 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
-
-[[package]]
-name = "sleigh-precompile"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "serde",
- "toml",
- "wazabin-sleigh",
-]
 
 [[package]]
 name = "smallvec"
@@ -1715,11 +1695,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "wazabin-jstd"
+version = "0.1.1"
+dependencies = [
+ "image",
+ "rustc-hash",
+ "serde",
+ "wazabin-jstd-derive",
+]
+
+[[package]]
+name = "wazabin-jstd-derive"
+version = "0.1.1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "wazabin-pcode"
 version = "0.1.0"
 dependencies = [
- "jstd",
  "serde",
+ "wazabin-jstd",
 ]
 
 [[package]]
@@ -1747,26 +1746,37 @@ version = "0.1.0"
 dependencies = [
  "csv",
  "indicatif",
- "jstd",
  "postgres",
  "qcode",
  "qcode_emulator",
  "rustc-hash",
  "serde",
  "serde_json",
- "sleigh-precompile",
+ "wazabin-jstd",
  "wazabin-sleigh",
+ "wazabin-sleigh-precompile",
 ]
 
 [[package]]
 name = "wazabin-sleigh"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
- "jstd",
  "pest",
  "pest_derive",
  "serde",
+ "toml",
+ "wazabin-jstd",
  "wazabin-pcode",
+]
+
+[[package]]
+name = "wazabin-sleigh-precompile"
+version = "0.1.1"
+dependencies = [
+ "bincode",
+ "serde",
+ "toml",
+ "wazabin-sleigh",
 ]
 
 [[package]]
