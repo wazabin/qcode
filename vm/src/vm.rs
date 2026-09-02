@@ -15,7 +15,7 @@
 //! the machine intact and inspectable.
 
 use qcode::{
-    address_index::AddressTarget,
+    address_index::{AddressIndex, AddressTarget},
     context::Context,
     value::{BasicBlock, BlockId},
 };
@@ -47,10 +47,16 @@ pub trait CodeSource {
     /// Returning `Ok(())` asserts that a block starting at `addr` now exists;
     /// the VM re-resolves the address itself rather than trusting a returned id,
     /// so a source is free to lift a whole run of instructions at once.
+    ///
+    /// `index` is the machine's live address lookup, and the implementation must
+    /// keep it current as it adds blocks — every lifting entry point takes one
+    /// for exactly this reason. Rebuilding it per instruction instead is
+    /// quadratic in the size of the module discovered so far.
     fn lift(
         &mut self,
         ctx: &mut Context<'static>,
         memory: &VmMemory,
+        index: &mut AddressIndex,
         addr: u64,
     ) -> Result<(), CodeError>;
 }
@@ -110,15 +116,19 @@ impl<S: CodeSource> Vm<S> {
         mut source: S,
         memory: VmMemory,
     ) -> Result<Self, CodeError> {
-        if block_at(&ctx, addr).is_none() {
-            source.lift(&mut ctx, &memory, addr)?;
+        // Built once here and handed to the machine, which keeps it current
+        // from then on.
+        let mut index = AddressIndex::analyze(&ctx);
+        if resolve(&ctx, &index, addr).is_none() {
+            source.lift(&mut ctx, &memory, &mut index, addr)?;
         }
-        let entry = block_at(&ctx, addr).ok_or_else(|| {
+        let entry = resolve(&ctx, &index, addr).ok_or_else(|| {
             CodeError::Decode(format!("no block at {addr:#x} after lifting").into())
         })?;
         let mut vm = Self::new(ctx, entry, source);
         vm.emu.memory = memory;
         vm.emu.memory.configure_spaces(&vm.ctx);
+        vm.emu.set_address_index(index);
         Ok(vm)
     }
 
@@ -188,6 +198,16 @@ impl<S: CodeSource> Vm<S> {
                                 EmulatorErrorKind::EmptyBlock(block).to_string().into(),
                             ));
                         };
+                        // The address may already be lifted: a branch back into
+                        // known code still gets a fresh placeholder block in the
+                        // branching instruction's own function, and lifting it
+                        // again would collide with the function that owns it.
+                        // Resolving first is what makes loops work.
+                        let before = self.emu.block;
+                        self.reposition(addr);
+                        if self.emu.block != before {
+                            continue;
+                        }
                         if let Some(exit) = self.discover(addr) {
                             return Some(exit);
                         }
@@ -214,9 +234,10 @@ impl<S: CodeSource> Vm<S> {
         None
     }
 
-    /// Points the emulator at whatever block now covers `addr`.
+    /// Points the emulator at whatever block now covers `addr`, reusing the
+    /// emulator's own cached index rather than building one.
     fn reposition(&mut self, addr: u64) {
-        if let Some(block) = block_at(&self.ctx, addr)
+        if let Some(block) = self.emu.block_at_address(&self.ctx, addr)
             && block != self.emu.block
         {
             self.emu.block = block;
@@ -227,12 +248,20 @@ impl<S: CodeSource> Vm<S> {
     /// Lifts `addr` and makes it visible to the emulator. Returns an exit only
     /// if the address could not be supplied.
     fn discover(&mut self, addr: u64) -> Option<VmExit> {
-        if let Err(error) = self.source.lift(&mut self.ctx, &self.emu.memory, addr) {
+        // Moved out, updated in place by the lift, and moved back: the index
+        // stays current without ever being rebuilt, and the borrow checker is
+        // satisfied because nothing borrows the emulator across the lift.
+        let mut index = self
+            .emu
+            .take_address_index()
+            .unwrap_or_else(|| AddressIndex::analyze(&self.ctx));
+        let result = self
+            .source
+            .lift(&mut self.ctx, &self.emu.memory, &mut index, addr);
+        self.emu.set_address_index(index);
+        if let Err(error) = result {
             return Some(VmExit::Unlifted { addr, error });
         }
-        // The emulator caches its address lookup over what was, until now, an
-        // immutable module.
-        self.emu.invalidate_address_index();
         None
     }
 
@@ -258,9 +287,8 @@ impl<S: CodeSource> Vm<S> {
     }
 }
 
-/// Resolves a guest address to a block, without the emulator's cached index.
-fn block_at(ctx: &Context<'_>, addr: u64) -> Option<BlockId> {
-    let index = qcode::address_index::AddressIndex::analyze(ctx);
+/// Resolves a guest address to a block against an existing index.
+fn resolve(ctx: &Context<'_>, index: &AddressIndex, addr: u64) -> Option<BlockId> {
     match index.get(addr) {
         Some(AddressTarget::Block(block)) => Some(block),
         Some(AddressTarget::Function(function)) => {
@@ -293,6 +321,7 @@ mod tests {
             &mut self,
             ctx: &mut Context<'static>,
             memory: &VmMemory,
+            index: &mut AddressIndex,
             addr: u64,
         ) -> Result<(), CodeError> {
             self.calls.push(addr);
@@ -307,7 +336,10 @@ mod tests {
                 return Err(CodeError::Decode("no plan for this address".into()));
             }
             let function = FunctionBody::make_at_addr(ctx, addr, None).id;
-            BasicBlock::make(ctx, function).with_address(addr);
+            let block = BasicBlock::make(ctx, function).with_address(addr).id;
+            index
+                .register(ctx, addr, AddressTarget::Block(block))
+                .map_err(|error| CodeError::Decode(format!("{error:?}").into()))?;
             Ok(())
         }
     }
