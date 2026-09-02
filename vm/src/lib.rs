@@ -6,6 +6,7 @@
 //! rather than aborts, code discovered on demand as the guest reaches it, and
 //! snapshots — so that a guest program can be run rather than merely evaluated.
 
+pub mod flat;
 pub mod memory;
 pub mod optimize;
 pub mod mmu;

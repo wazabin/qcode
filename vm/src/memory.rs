@@ -17,18 +17,21 @@
 
 use qcode::{context::Context, space::MemorySpaceId};
 use qcode_emulator::{
-    DomainMemory, DomainValue, EmulatedMemory, EmulatorErrorKind, EmulatorMemory, SizedValue,
+    DomainMemory, DomainValue, EmulatorErrorKind, EmulatorMemory, SizedValue,
 };
 
-use crate::mmu::{MemFault, Mmu};
+use crate::{
+    flat::FlatSpaces,
+    mmu::{MemFault, Mmu},
+};
 
 /// Memory for a VM run: an [`Mmu`] for the RAM space, flat storage elsewhere.
 #[derive(Default)]
 pub struct VmMemory {
     /// Guest process memory.
     pub mmu: Mmu,
-    /// Register, unique and temporary spaces.
-    flat: EmulatedMemory,
+    /// Register, unique and temporary spaces, densely stored.
+    flat: FlatSpaces,
     /// Which space the MMU backs. Resolved from the context on the first
     /// [`configure_spaces`](EmulatorMemory::configure_spaces); `None` until then,
     /// which routes everything to flat storage rather than guessing.
@@ -81,7 +84,8 @@ impl DomainMemory for VmMemory {
         size: usize,
     ) -> Result<Self::V, EmulatorErrorKind> {
         if !self.is_ram(space) {
-            return self.flat.read(space, addr, size);
+            let bits = self.flat.read_u128(space, addr.value()?, size)?;
+            return Ok(SizedValue::from_bits(bits, size));
         }
         let addr = addr.value()?;
         // A value wider than 16 bytes cannot be held by `SizedValue`; the flat
@@ -108,7 +112,10 @@ impl DomainMemory for VmMemory {
         value: Self::V,
     ) -> Result<(), EmulatorErrorKind> {
         if !self.is_ram(space) {
-            return self.flat.write(space, addr, size, value);
+            return self
+                .flat
+                .entry(space)
+                .write_u128(addr.value()?, size, value.as_bits());
         }
         let addr = addr.value()?;
         let bits = value.as_bits();
@@ -125,7 +132,7 @@ impl EmulatorMemory for VmMemory {
         // The guest's RAM is the specification's default space: the one a bare
         // `Load`/`Store` addresses, and the only one a guest pointer refers to.
         self.ram = Some(MemorySpaceId::Shared(ctx.shared.default_space));
-        self.flat.configure_spaces(ctx);
+        self.flat.configure(ctx);
     }
 
     fn read_bytes(
@@ -151,7 +158,7 @@ impl EmulatorMemory for VmMemory {
         bytes: &[u8],
     ) -> Result<(), EmulatorErrorKind> {
         if !self.is_ram(space) {
-            return self.flat.write_bytes(space, addr, bytes);
+            return self.flat.entry(space).write_bytes(addr, bytes);
         }
         self.mmu
             .write(addr, bytes)

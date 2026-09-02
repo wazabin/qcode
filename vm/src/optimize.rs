@@ -212,7 +212,7 @@ pub fn forward_temp_stores(ctx: &mut Context<'_>, block_id: BlockId) -> Cleanup 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qcode::value::{FunctionBody, QCodeMut};
+    use qcode::value::FunctionBody;
 
     /// Registers and RAM must be left alone even though the shape matches.
     #[test]
