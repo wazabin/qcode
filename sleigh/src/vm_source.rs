@@ -16,7 +16,11 @@
 //! window would invent a fault the guest never takes, so the fetch shrinks to
 //! whatever is readable and lets the decoder decide whether it has enough.
 
-use qcode::{address_index::AddressIndex, context::Context};
+use qcode::{
+    address_index::AddressIndex,
+    context::Context,
+    value::{FunctionBody, FunctionId},
+};
 use qcode_vm::{CodeError, CodeSource, VmMemory};
 use sleigh::{CompiledSpec, Decoder};
 
@@ -30,16 +34,23 @@ pub const MAX_INSTRUCTION_LEN: usize = 16;
 /// Decodes and lifts guest memory on demand.
 pub struct SleighCodeSource<'spec> {
     lifter: SleighLifter<'spec>,
-    /// Retained across lifts so a run does not rebuild the address index for
-    /// every instruction it discovers.
-    index: Option<AddressIndex>,
+    /// The function every lifted instruction is placed in.
+    ///
+    /// Guest code is flat: it has branch targets, not call graphs the lifter can
+    /// know about up front. Letting the lifter create a function per instruction
+    /// instead makes every branch a *cross-function* edge, and a block can only
+    /// belong to one function — so a backward branch into already-lifted code
+    /// would collide with the function that owns that address. One function for
+    /// the whole guest keeps every branch target local, which is what makes
+    /// loops work.
+    function: Option<FunctionId>,
 }
 
 impl<'spec> SleighCodeSource<'spec> {
     pub fn new(spec: &'spec CompiledSpec) -> Self {
         Self {
             lifter: SleighLifter::new(spec),
-            index: None,
+            function: None,
         }
     }
 
@@ -80,24 +91,27 @@ impl CodeSource for SleighCodeSource<'_> {
         &mut self,
         ctx: &mut Context<'static>,
         memory: &VmMemory,
+        index: &mut AddressIndex,
         addr: u64,
     ) -> Result<(), CodeError> {
         let bytes = Self::fetch(memory, addr)?;
-
-        // Built from the context the first time it is needed, then carried
-        // across the run; `decode_and_lift_indexed` keeps it current as blocks
-        // are added.
-        let index = self
-            .index
-            .get_or_insert_with(|| AddressIndex::analyze(ctx));
 
         let decode_context = self.lifter.spec().new_context();
         let instruction = Decoder::new(self.lifter.spec())
             .decode_one(addr, &bytes, &decode_context)
             .map_err(|error| CodeError::Decode(error.to_string().into()))?;
 
+        let function = match self.function {
+            Some(function) => function,
+            None => {
+                let function = FunctionBody::from_addr_or_create_indexed(ctx, index, addr).id;
+                self.function = Some(function);
+                function
+            }
+        };
+
         self.lifter
-            .lift_instruction_indexed(ctx, index, &instruction, None)
+            .lift_instruction_indexed(ctx, index, &instruction, Some(function))
             .map_err(|error| CodeError::Decode(format!("{error:?}").into()))?;
         Ok(())
     }
@@ -183,6 +197,47 @@ mod tests {
             VmExit::Fault(fault) => assert_eq!(fault.kind, qcode_vm::FaultKind::WriteUnmapped),
             other => panic!("expected a write fault, got {other:?}"),
         }
+    }
+
+    /// Scaling probe: the per-instruction cost must not grow with the size of
+    /// the module already lifted. Reported rather than asserted, so it is a
+    /// measurement rather than a flaky threshold.
+    #[test]
+    fn discovery_cost_does_not_grow_with_module_size() {
+        for count in [200usize, 400, 800] {
+            let code = vec![0x90; count]; // `nop` * count
+            let mut vm = machine(&code);
+            let start = std::time::Instant::now();
+            vm.run(count as u64 * 8);
+            let elapsed = start.elapsed();
+            eprintln!(
+                "{count} instructions: {:?} ({:?}/insn)",
+                elapsed,
+                elapsed / count as u32
+            );
+        }
+    }
+
+    /// Steady-state throughput: a loop is lifted once and then re-executed, so
+    /// this isolates interpretation cost from discovery cost.
+    #[test]
+    fn hot_loop_throughput() {
+        // mov ecx, 2000 ; loop: dec ecx ; jnz loop
+        let mut vm = machine(&[
+            0xb9, 0xd0, 0x07, 0x00, 0x00, // mov ecx, 2000
+            0xff, 0xc9, // dec ecx
+            0x75, 0xfc, // jnz -4
+        ]);
+        let start = std::time::Instant::now();
+        let exit = vm.run(4_000_000);
+        let elapsed = start.elapsed();
+        let ctx = vm.context().clone();
+        let steps = vm.steps;
+        let ecx = vm.emulator().read_varnode_by_name(&ctx, "ECX");
+        eprintln!(
+            "loop: exit={exit:?} steps={steps} in {elapsed:?} ({:.2}M pcode-ops/s) ecx={ecx:?}",
+            steps as f64 / elapsed.as_secs_f64() / 1e6,
+        );
     }
 
     #[test]
