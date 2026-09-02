@@ -7,9 +7,11 @@
 //! snapshots — so that a guest program can be run rather than merely evaluated.
 
 pub mod memory;
+pub mod optimize;
 pub mod mmu;
 pub mod vm;
 
 pub use memory::VmMemory;
+pub use optimize::{Cleanup, forward_temp_stores};
 pub use vm::{CodeError, CodeSource, Vm, VmExit};
 pub use mmu::{FaultKind, MemFault, Mmu, MmuSnapshot, PAGE_SIZE, Perm, perm};

@@ -83,6 +83,18 @@ pub struct Vm<S> {
     ctx: Context<'static>,
     emu: StandaloneEmulator<VmMemory>,
     source: S,
+    /// Times execution left the known module and had to resolve or lift.
+    pub discoveries: u64,
+    /// What the cleanup round has removed so far.
+    pub cleanup: crate::optimize::Cleanup,
+    /// Whether freshly lifted blocks get a cleanup round.
+    ///
+    /// Lifting one machine instruction emits every side effect the
+    /// specification describes, including flag computations the surrounding
+    /// code never reads. Removing the ones with no users at all is sound
+    /// block-locally — an instruction with no users cannot be observed — and is
+    /// paid once per block instead of on every execution of it.
+    pub optimize: bool,
     /// P-code operations retired since the machine was created.
     ///
     /// Deliberately *not* a guest-instruction count: one machine instruction
@@ -104,6 +116,9 @@ impl<S: CodeSource> Vm<S> {
             emu,
             source,
             steps: 0,
+            discoveries: 0,
+            optimize: true,
+            cleanup: crate::optimize::Cleanup::default(),
             breakpoints: FxHashSet::default(),
         }
     }
@@ -203,6 +218,7 @@ impl<S: CodeSource> Vm<S> {
                         // branching instruction's own function, and lifting it
                         // again would collide with the function that owns it.
                         // Resolving first is what makes loops work.
+                        self.discoveries += 1;
                         let before = self.emu.block;
                         self.reposition(addr);
                         if self.emu.block != before {
@@ -261,6 +277,16 @@ impl<S: CodeSource> Vm<S> {
         self.emu.set_address_index(index);
         if let Err(error) = result {
             return Some(VmExit::Unlifted { addr, error });
+        }
+        if self.optimize
+            && let Some(block) = self.emu.block_at_address(&self.ctx, addr)
+        {
+            // Forwarding first: it turns the temp round trips into direct value
+            // uses, which is what leaves the surrounding computation dead.
+            let cleanup = crate::optimize::forward_temp_stores(&mut self.ctx, block);
+            self.cleanup.forwarded_loads += cleanup.forwarded_loads;
+            self.cleanup.removed_stores += cleanup.removed_stores;
+            qcode_analysis::dce::remove_dead_insns(&mut self.ctx, block);
         }
         None
     }

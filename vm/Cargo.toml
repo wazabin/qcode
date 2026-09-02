@@ -8,5 +8,9 @@ repository.workspace = true
 
 [dependencies]
 qcode.workspace = true
+# A cheap, block-local cleanup round over freshly lifted code. SLEIGH emits a
+# great deal of computation whose result is never read, and the interpreter
+# would otherwise evaluate all of it on every pass.
+qcode_analysis.workspace = true
 qcode_emulator.workspace = true
 rustc-hash.workspace = true
