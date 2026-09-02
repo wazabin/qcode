@@ -1343,6 +1343,27 @@ impl TypeManager {
 
     // --- reference reads (built on publication-stable `get`) --------------
 
+    /// The number of published types.
+    ///
+    /// Lock-free, and monotonic because type identities are never removed, so a
+    /// consumer can use it as a cheap "has anything been added" probe before
+    /// paying for a question that needs the lock.
+    pub fn published_len(&self) -> usize {
+        self.published().entries.len()
+    }
+
+    /// Whether any array or list type has been created in this module.
+    ///
+    /// Answers "could any value here be sequence-typed" in one step, without
+    /// inspecting a value. An interpreter uses it to skip a per-operand type
+    /// query entirely on the overwhelmingly common modules that contain no
+    /// sequences at all. Takes the lock, so pair it with
+    /// [`published_len`](Self::published_len) rather than calling it per access.
+    pub fn has_sequence_types(&self) -> bool {
+        let inner = self.read();
+        !inner.array_by_elem_count.is_empty() || !inner.list_by_elem_bound.is_empty()
+    }
+
     /// Returns a reference to the concrete [`Type`] for `id`.
     ///
     /// The lookup loads one immutable published index generation and takes no
