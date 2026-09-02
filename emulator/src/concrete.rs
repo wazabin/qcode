@@ -1737,6 +1737,25 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         ctx: &Context<'_>,
         insn: &InstructionRef<'_, '_>,
     ) -> Result<Option<SizedValue>, EmulatorErrorKind> {
+        // Every instruction on the generic path reaches this function, so the
+        // structural test comes first: resolving "FPUControlWord" and
+        // "FPUStatusWord" by name per p-code operation cost about 8% of run
+        // time in a profile of a loop containing no floating point at all.
+        // These are the only shapes the match below handles.
+        if !matches!(
+            insn.mnemonic(),
+            Mnemonic::Binop(Binary {
+                op: Binop::Float(_),
+                ..
+            }) | Mnemonic::Unop(Unary {
+                op: Unop::FloatSqrt | Unop::FloatRound,
+                ..
+            }) | Mnemonic::IntToFloat(_)
+                | Mnemonic::FloatToInt(_)
+                | Mnemonic::FloatToFloat(_)
+        ) {
+            return Ok(None);
+        }
         let Some((control_register, status_register)) = Self::x87_context(ctx) else {
             return Ok(None);
         };
