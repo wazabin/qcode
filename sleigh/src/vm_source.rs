@@ -220,29 +220,44 @@ mod tests {
 
     /// Steady-state throughput: a loop is lifted once and then re-executed, so
     /// this isolates interpretation cost from discovery cost.
+    ///
+    /// Reports the *best* of several runs. A mean is meaningless on a machine
+    /// doing anything else — an unrelated background build moved this figure by
+    /// more than 2x — whereas the minimum approximates the uncontended cost.
     #[test]
     fn hot_loop_throughput() {
-        // mov ecx, 2000 ; loop: dec ecx ; jnz loop
-        let mut vm = machine(&[
-            0xb9, 0xd0, 0x07, 0x00, 0x00, // mov ecx, 2000
-            0xff, 0xc9, // dec ecx
-            0x75, 0xfc, // jnz -4
-        ]);
-        let start = std::time::Instant::now();
-        let exit = vm.run(4_000_000);
-        let elapsed = start.elapsed();
-        let ctx = vm.context().clone();
-        let steps = vm.steps;
-        let ecx = vm.emulator().read_varnode_by_name(&ctx, "ECX");
+        let mut best: Option<(std::time::Duration, u64)> = None;
+        for _ in 0..5 {
+            // mov ecx, 2000 ; loop: dec ecx ; jnz loop
+            let mut vm = machine(&[
+                0xb9, 0xd0, 0x07, 0x00, 0x00, // mov ecx, 2000
+                0xff, 0xc9, // dec ecx
+                0x75, 0xfc, // jnz -4
+            ]);
+            let start = std::time::Instant::now();
+            vm.run(4_000_000);
+            let elapsed = start.elapsed();
+            let ctx = vm.context().clone();
+            assert_eq!(
+                vm.emulator().read_varnode_by_name(&ctx, "ECX"),
+                Some(0),
+                "the loop must actually run to completion"
+            );
+            if best.is_none_or(|(previous, _)| elapsed < previous) {
+                best = Some((elapsed, vm.steps));
+            }
+        }
+        let (elapsed, steps) = best.expect("at least one run");
+        // 2000 iterations of two instructions, plus the setup instruction.
+        let instructions = 2000 * 2 + 1;
         eprintln!(
-            "loop: steps={steps} discoveries={} in {elapsed:?} ({:.2}M pcode-ops/s) ecx={ecx:?} exit={exit:?}",
-            vm.discoveries,
+            "loop best-of-5: {steps} steps in {elapsed:?} \
+             ({:.2}M pcode-ops/s, {:.2}M guest-insn/s)",
             steps as f64 / elapsed.as_secs_f64() / 1e6,
+            f64::from(instructions) / elapsed.as_secs_f64() / 1e6,
         );
     }
 
-    /// Does the block-local cleanup round actually remove anything from
-    /// SLEIGH-lifted code? Measured rather than assumed.
     #[test]
     fn optimisation_round_effect() {
         // Flag-heavy arithmetic: each of these writes six status flags that the
