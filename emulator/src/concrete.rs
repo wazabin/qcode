@@ -1513,8 +1513,9 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         &mut self,
         ctx: &Context<'_>,
         insn: &InstructionRef<'_, '_>,
+        mnemonic: &Mnemonic,
     ) -> Result<Option<SizedValue>, EmulatorErrorKind> {
-        let Mnemonic::PCodeOp(op) = insn.mnemonic() else {
+        let Mnemonic::PCodeOp(op) = mnemonic else {
             return Ok(None);
         };
         let name = ctx.shared.pcode_ops[op.id].clone();
@@ -1837,6 +1838,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         &mut self,
         ctx: &Context<'_>,
         insn: &InstructionRef<'_, '_>,
+        mnemonic: &Mnemonic,
     ) -> Result<Option<SizedValue>, EmulatorErrorKind> {
         // Every instruction on the generic path reaches this function, so the
         // structural test comes first: resolving "FPUControlWord" and
@@ -1844,7 +1846,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         // time in a profile of a loop containing no floating point at all.
         // These are the only shapes the match below handles.
         if !matches!(
-            insn.mnemonic(),
+            mnemonic,
             Mnemonic::Binop(Binary {
                 op: Binop::Float(_),
                 ..
@@ -1864,7 +1866,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             .read_varnode_u128(ctx, control_register)
             .unwrap_or(0x037f) as u16;
         let func = insn.id.func;
-        match insn.mnemonic() {
+        match mnemonic {
             Mnemonic::Binop(Binary {
                 op: Binop::Float(operation),
                 lhs,
@@ -2080,7 +2082,12 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             hook(&insn, self)
         }
 
-        match insn.mnemonic() {
+        // Resolved once and threaded through the step. Each `insn.mnemonic()`
+        // re-walks `view.instruction(id)`, two registry lookups deep, and the
+        // step path asked for the same instruction's mnemonic several times.
+        let mnemonic = insn.mnemonic();
+
+        match mnemonic {
             Mnemonic::Branch(Branch { target, args }) => {
                 // Terminator targets are bare body-local indices in the terminator's
                 // own arena (`id.func`); qualify to the current block's function.
@@ -2430,7 +2437,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
 
             _ => {
                 if let Some(value) = self
-                    .interpret_packed_pcode_op(ctx, &insn)
+                    .interpret_packed_pcode_op(ctx, &insn, mnemonic)
                     .map_err(|kind| self.make_error(ctx, kind))?
                 {
                     self.insn_values.insert(id, value);
@@ -2438,7 +2445,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                     return Ok(StepEvent::Normal);
                 }
                 if let Some(value) = self
-                    .interpret_x87_float(ctx, &insn)
+                    .interpret_x87_float(ctx, &insn, mnemonic)
                     .map_err(|kind| self.make_error(ctx, kind))?
                 {
                     self.insn_values.insert(id, value);
