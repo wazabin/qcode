@@ -949,6 +949,16 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         }
     }
 
+    /// Drops the cached address lookup.
+    ///
+    /// The index is built once from an immutable module. A VM that lifts code on
+    /// demand makes the module *mutable*, so blocks discovered after the last
+    /// lookup would otherwise stay invisible and a branch to freshly lifted code
+    /// would keep reporting an invalid address.
+    pub fn invalidate_address_index(&mut self) {
+        self.address_index = None;
+    }
+
     fn with_address_index(entry: BlockId, address_index: AddressIndex) -> Self {
         let mut emulator = Self::new_in(entry);
         emulator.address_index = Some(address_index);
@@ -1914,7 +1924,13 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         let block_id = self.block;
         let block = BasicBlock::from_id(ctx, block_id);
         let insn_ids = block.instruction_ids();
-        assert!(self.idx < insn_ids.len(), "Reached end of block");
+        // A degenerate block — empty, or exhausted without a terminator — is
+        // malformed lifter output, not an emulator bug. Report it so a bounded
+        // consumer (and a VM running lifted-on-demand code) can stop with a
+        // reason instead of aborting the process.
+        if self.idx >= insn_ids.len() {
+            return Err(self.make_empty_block_error(ctx));
+        }
         let insn_id = insn_ids[self.idx];
         let insn = InstructionRef::from_id(ctx, insn_id);
         let id = insn.id;
