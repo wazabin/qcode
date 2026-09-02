@@ -944,6 +944,15 @@ pub struct StandaloneEmulator<M = EmulatedMemory> {
     pub memory: M,
     /// Literal values resolved once instead of per access.
     literal_cache: LiteralCache,
+    /// Whether the module contains any array or list type, and the published
+    /// type count that answer was valid for.
+    ///
+    /// Every `Load`, `Store` and `Range` is guarded by "is this operand
+    /// sequence-typed", which otherwise costs an arena resolution plus two
+    /// virtual calls *per operation* — about 9% of run time. Almost every module
+    /// has no sequence types at all, and that is answerable once.
+    sequence_types: bool,
+    sequence_types_checked_at: Option<usize>,
     /// The current block's instruction list, and which block it belongs to.
     ///
     /// Resolving a block means two registry indexes (`bodies[func].blocks[local]`)
@@ -1017,6 +1026,8 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         Self {
             memory: M::default(),
             literal_cache: LiteralCache::default(),
+            sequence_types: false,
+            sequence_types_checked_at: None,
             cached_block: None,
             cached_insns: Vec::new(),
             insn_values: InsnValues::default(),
@@ -2045,6 +2056,10 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         self.memory.configure_spaces(ctx);
         let block_id = self.block;
         if self.cached_block != Some(block_id) || self.idx == 0 {
+            // The module only gains types while nothing is part-way through a
+            // block — lifting happens on block entry — so this rides the same
+            // refresh as the instruction list rather than paying per step.
+            self.refresh_sequence_types(ctx);
             self.cached_insns.clear();
             self.cached_insns
                 .extend_from_slice(ctx.block(block_id).instruction_ids());
@@ -2754,7 +2769,23 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     /// param, a [`BodyArg::Aggregate`] seeds an `Extract`-able tuple param.
     /// Whether `id` is an array/list-typed value (routed through
     /// [`array_values`](Self::array_values) rather than scalar `insn_values`).
+    /// Refreshes [`sequence_types`](Self::sequence_types) when the module has
+    /// gained types since it was last answered. The probe is lock-free; only a
+    /// genuine change pays for the locked question behind it.
+    fn refresh_sequence_types(&mut self, ctx: &Context<'_>) {
+        let published = ctx.shared.types.published_len();
+        if self.sequence_types_checked_at == Some(published) {
+            return;
+        }
+        self.sequence_types = ctx.shared.types.has_sequence_types();
+        self.sequence_types_checked_at = Some(published);
+    }
+
     fn is_array_operand(&self, ctx: &Context<'_>, id: ValueId) -> bool {
+        // Nothing in this module is sequence-typed, so no operand can be.
+        if !self.sequence_types {
+            return false;
+        }
         match ctx.stored_type_of(id) {
             Some(ty) => {
                 ctx.shared.types.array_of(ty).is_some() || ctx.shared.types.list_of(ty).is_some()
