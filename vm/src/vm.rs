@@ -22,7 +22,7 @@ use qcode::{
 use qcode_emulator::{EmulatorErrorKind, EmulatorMemory, StandaloneEmulator};
 use rustc_hash::FxHashSet;
 
-use crate::{memory::VmMemory, mmu::MemFault};
+use crate::{memory::VmMemory, mmu::MemFault, stats::Stats};
 
 /// Why a lifting attempt failed.
 #[derive(Debug, Clone)]
@@ -52,12 +52,17 @@ pub trait CodeSource {
     /// keep it current as it adds blocks — every lifting entry point takes one
     /// for exactly this reason. Rebuilding it per instruction instead is
     /// quadratic in the size of the module discovered so far.
+    ///
+    /// `stats` is the machine's own counters: an implementation records the
+    /// time it spends fetching and decoding there, so a benchmark can separate
+    /// translation cost from interpretation cost.
     fn lift(
         &mut self,
         ctx: &mut Context<'static>,
         memory: &VmMemory,
         index: &mut AddressIndex,
         addr: u64,
+        stats: &mut Stats,
     ) -> Result<(), CodeError>;
 }
 
@@ -83,10 +88,8 @@ pub struct Vm<S> {
     ctx: Context<'static>,
     emu: StandaloneEmulator<VmMemory>,
     source: S,
-    /// Times execution left the known module and had to resolve or lift.
-    pub discoveries: u64,
-    /// What the cleanup round has removed so far.
-    pub cleanup: crate::optimize::Cleanup,
+    /// Counters and phase timings for this run.
+    pub stats: Stats,
     /// Whether freshly lifted blocks get a cleanup round.
     ///
     /// Lifting one machine instruction emits every side effect the
@@ -95,14 +98,6 @@ pub struct Vm<S> {
     /// block-locally — an instruction with no users cannot be observed — and is
     /// paid once per block instead of on every execution of it.
     pub optimize: bool,
-    /// P-code operations retired since the machine was created.
-    ///
-    /// Deliberately *not* a guest-instruction count: one machine instruction
-    /// lifts to many QCode operations, and the interpreter steps one operation
-    /// at a time. Budgets are therefore in units of work done, which is the
-    /// honest thing to bound a run by; a guest-instruction count is a separate
-    /// measure and is not yet tracked.
-    pub steps: u64,
     breakpoints: FxHashSet<u64>,
 }
 
@@ -115,10 +110,8 @@ impl<S: CodeSource> Vm<S> {
             ctx,
             emu,
             source,
-            steps: 0,
-            discoveries: 0,
             optimize: true,
-            cleanup: crate::optimize::Cleanup::default(),
+            stats: Stats::default(),
             breakpoints: FxHashSet::default(),
         }
     }
@@ -134,8 +127,10 @@ impl<S: CodeSource> Vm<S> {
         // Built once here and handed to the machine, which keeps it current
         // from then on.
         let mut index = AddressIndex::analyze(&ctx);
+        let mut stats = Stats::default();
         if resolve(&ctx, &index, addr).is_none() {
-            source.lift(&mut ctx, &memory, &mut index, addr)?;
+            stats.lifts += 1;
+            source.lift(&mut ctx, &memory, &mut index, addr, &mut stats)?;
         }
         let entry = resolve(&ctx, &index, addr).ok_or_else(|| {
             CodeError::Decode(format!("no block at {addr:#x} after lifting").into())
@@ -144,6 +139,7 @@ impl<S: CodeSource> Vm<S> {
         vm.emu.memory = memory;
         vm.emu.memory.configure_spaces(&vm.ctx);
         vm.emu.set_address_index(index);
+        vm.stats = stats;
         Ok(vm)
     }
 
@@ -190,7 +186,7 @@ impl<S: CodeSource> Vm<S> {
         for attempt in 0..2 {
             match self.emu.step(&self.ctx) {
                 Ok(()) => {
-                    self.steps += 1;
+                    self.stats.steps += 1;
                     return None;
                 }
                 Err(error) => match error.kind {
@@ -218,10 +214,11 @@ impl<S: CodeSource> Vm<S> {
                         // branching instruction's own function, and lifting it
                         // again would collide with the function that owns it.
                         // Resolving first is what makes loops work.
-                        self.discoveries += 1;
                         let before = self.emu.block;
                         self.reposition(addr);
                         if self.emu.block != before {
+                            // Already lifted: a translation-cache hit.
+                            self.stats.resolves += 1;
                             continue;
                         }
                         if let Some(exit) = self.discover(addr) {
@@ -271,9 +268,14 @@ impl<S: CodeSource> Vm<S> {
             .emu
             .take_address_index()
             .unwrap_or_else(|| AddressIndex::analyze(&self.ctx));
-        let result = self
-            .source
-            .lift(&mut self.ctx, &self.emu.memory, &mut index, addr);
+        self.stats.lifts += 1;
+        let result = self.source.lift(
+            &mut self.ctx,
+            &self.emu.memory,
+            &mut index,
+            addr,
+            &mut self.stats,
+        );
         self.emu.set_address_index(index);
         if let Err(error) = result {
             return Some(VmExit::Unlifted { addr, error });
@@ -283,10 +285,12 @@ impl<S: CodeSource> Vm<S> {
         {
             // Forwarding first: it turns the temp round trips into direct value
             // uses, which is what leaves the surrounding computation dead.
+            let started = std::time::Instant::now();
             let cleanup = crate::optimize::forward_temp_stores(&mut self.ctx, block);
-            self.cleanup.forwarded_loads += cleanup.forwarded_loads;
-            self.cleanup.removed_stores += cleanup.removed_stores;
             qcode_analysis::dce::remove_dead_insns(&mut self.ctx, block);
+            self.stats.optimize += started.elapsed();
+            self.stats.forwarded_loads += cleanup.forwarded_loads as u64;
+            self.stats.removed_stores += cleanup.removed_stores as u64;
         }
         None
     }
@@ -294,14 +298,14 @@ impl<S: CodeSource> Vm<S> {
     /// Runs until the machine stops, or until `budget` p-code operations have
     /// been retired.
     pub fn run(&mut self, budget: u64) -> VmExit {
-        let deadline = self.steps + budget;
-        while self.steps < deadline {
+        let deadline = self.stats.steps + budget;
+        while self.stats.steps < deadline {
             // Checked before the step so a breakpoint reports the instruction
             // about to run, not the one after it, and so resuming from a
             // breakpoint is possible without immediately re-triggering it.
             if let Some(pc) = self.pc()
                 && self.breakpoints.contains(&pc)
-                && self.steps > 0
+                && self.stats.steps > 0
             {
                 return VmExit::Breakpoint(pc);
             }
@@ -349,6 +353,7 @@ mod tests {
             memory: &VmMemory,
             index: &mut AddressIndex,
             addr: u64,
+            _stats: &mut Stats,
         ) -> Result<(), CodeError> {
             self.calls.push(addr);
             // A real source fetches through the MMU, so executing unmapped or
