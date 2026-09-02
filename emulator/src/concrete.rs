@@ -131,12 +131,6 @@ impl<'space> EmulatedSpaceRegion<'space> {
         (self.end - self.start) as usize
     }
 
-    /// Reads a region as a byte vector
-    pub fn read_bytes(&self, addr: u64, size: usize) -> Result<Vec<u8>, EmulatorErrorKind> {
-        assert!(addr >= self.start && addr + size as u64 <= self.end);
-        self.space.read(addr, size)
-    }
-
     /// Writes a little-endian unsigned integer to the region
     pub fn write_u128(&mut self, value: u128) {
         let end = self.start + cmp::min(16, self.size()) as u64;
@@ -232,7 +226,7 @@ impl SizedValue {
         Self { value, size }
     }
 
-    fn from_bits(value: u128, size: usize) -> Self {
+    pub fn from_bits(value: u128, size: usize) -> Self {
         let size = cmp::min(size, 16) as u8;
         let value = value & mask_for_size(size as usize);
         Self { value, size }
@@ -242,7 +236,7 @@ impl SizedValue {
         u128_to_u64(self.value & mask_for_size(self.size as usize))
     }
 
-    fn as_bits(&self) -> u128 {
+    pub fn as_bits(&self) -> u128 {
         self.value & mask_for_size(self.size as usize)
     }
 
@@ -752,6 +746,67 @@ impl DomainValue for SizedValue {
     }
 }
 
+/// The byte-addressable memory an emulator run needs, over and above the
+/// value-domain reads and writes of [`DomainMemory`].
+///
+/// [`DomainMemory`] speaks in whole values of a domain, which is all the
+/// interpreter itself needs. A *harness* needs more: to seed a fixture, dump a
+/// region, or poke a single register lane, it has to talk in bytes. Keeping
+/// those on a separate trait is what lets [`StandaloneEmulator`] be generic over
+/// its memory, so a richer backend — one with mapped pages and permissions —
+/// can be substituted without the interpreter knowing.
+pub trait EmulatorMemory: DomainMemory<V = SizedValue> {
+    /// Prepares per-space bookkeeping for `ctx`. Called before any access, and
+    /// cheap to call repeatedly: spaces are append-only, so an implementation
+    /// can skip the work when nothing has been added.
+    fn configure_spaces(&mut self, ctx: &Context<'_>);
+
+    /// Reads `size` raw bytes, without the value-domain's width handling.
+    fn read_bytes(
+        &self,
+        space: MemorySpaceId,
+        addr: u64,
+        size: usize,
+    ) -> Result<Vec<u8>, EmulatorErrorKind>;
+
+    /// Writes raw bytes, creating the space if it does not exist yet.
+    fn write_bytes(
+        &mut self,
+        space: MemorySpaceId,
+        addr: u64,
+        bytes: &[u8],
+    ) -> Result<(), EmulatorErrorKind>;
+}
+
+impl EmulatorMemory for EmulatedMemory {
+    fn configure_spaces(&mut self, ctx: &Context<'_>) {
+        EmulatedMemory::configure_spaces(self, ctx)
+    }
+
+    fn read_bytes(
+        &self,
+        space: MemorySpaceId,
+        addr: u64,
+        size: usize,
+    ) -> Result<Vec<u8>, EmulatorErrorKind> {
+        self.read_raw(space, addr, size)
+    }
+
+    fn write_bytes(
+        &mut self,
+        space: MemorySpaceId,
+        addr: u64,
+        bytes: &[u8],
+    ) -> Result<(), EmulatorErrorKind> {
+        let space = self.spaces.entry(space).or_default();
+        space.reserve(bytes.len());
+        for (index, byte) in bytes.iter().enumerate() {
+            space.write_byte(addr + index as u64, *byte);
+        }
+        Ok(())
+    }
+}
+
 impl DomainMemory for EmulatedMemory {
     type V = SizedValue;
 
@@ -791,11 +846,11 @@ impl DomainMemory for EmulatedMemory {
 }
 
 /// Type alias for an instruction hook function, which is called with the current instruction and emulator state after each instruction is executed.
-type InstructionHook = Box<dyn Fn(&InstructionRef<'_, '_>, &StandaloneEmulator) + Send + Sync>;
-type CallInterceptor = Box<
+type InstructionHook<M> = Box<dyn Fn(&InstructionRef<'_, '_>, &StandaloneEmulator<M>) + Send + Sync>;
+type CallInterceptor<M> = Box<
     dyn FnMut(
             &Context<'_>,
-            &mut StandaloneEmulator,
+            &mut StandaloneEmulator<M>,
             &CallSite,
         ) -> Result<CallInterception, Box<str>>
         + Send
@@ -814,8 +869,8 @@ enum StepEvent {
 
 /// A lifetime-free emulator that takes `&Context<'_>` explicitly on each call.
 /// Use this when you need to store an emulator without a lifetime (e.g., across an FFI boundary).
-pub struct StandaloneEmulator {
-    pub memory: EmulatedMemory,
+pub struct StandaloneEmulator<M = EmulatedMemory> {
+    pub memory: M,
     pub insn_values: FxHashMap<InstructionId, SizedValue>,
     pub block_param_values: FxHashMap<BlockParamId, SizedValue>,
     /// Block params bound to **poison** (argpromote v2): a symbolic pure-call
@@ -852,14 +907,32 @@ pub struct StandaloneEmulator {
     /// [`StandaloneEmulator::new`] intentionally takes no `Context`.
     address_index: Option<AddressIndex>,
 
-    pub instruction_hook: Option<InstructionHook>,
-    call_interceptor: Option<CallInterceptor>,
+    pub instruction_hook: Option<InstructionHook<M>>,
+    call_interceptor: Option<CallInterceptor<M>>,
 }
 
-impl StandaloneEmulator {
+impl StandaloneEmulator<EmulatedMemory> {
+    /// Builds an emulator over the default flat memory.
     pub fn new(entry: BlockId) -> Self {
+        Self::new_in(entry)
+    }
+
+    /// Builds an emulator positioned at `addr`, over the default flat memory.
+    pub fn from_address(ctx: &Context<'_>, addr: u64) -> Self {
+        Self::from_address_in(ctx, addr)
+    }
+}
+
+impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
+    /// Builds an emulator over an explicit memory backend.
+    ///
+    /// [`new`](StandaloneEmulator::new) is the one to reach for with the default
+    /// flat memory: Rust's default type parameters do not participate in
+    /// inference, so a generic `new` would force every call site to name its
+    /// backend.
+    pub fn new_in(entry: BlockId) -> Self {
         Self {
-            memory: EmulatedMemory::default(),
+            memory: M::default(),
             insn_values: FxHashMap::default(),
             block_param_values: FxHashMap::default(),
             poison_params: FxHashSet::default(),
@@ -877,7 +950,7 @@ impl StandaloneEmulator {
     }
 
     fn with_address_index(entry: BlockId, address_index: AddressIndex) -> Self {
-        let mut emulator = Self::new(entry);
+        let mut emulator = Self::new_in(entry);
         emulator.address_index = Some(address_index);
         emulator
     }
@@ -936,7 +1009,8 @@ impl StandaloneEmulator {
         EmulatorError::new(kind, &Instruction::from_id(ctx, instruction))
     }
 
-    pub fn from_address(ctx: &Context<'_>, addr: u64) -> Self {
+    /// Builds an emulator positioned at `addr`, over an explicit backend.
+    pub fn from_address_in(ctx: &Context<'_>, addr: u64) -> Self {
         let address_index = AddressIndex::analyze(ctx);
         let entry = Self::resolve_block_at(ctx, &address_index, addr)
             .expect("Invalid block or function address");
@@ -1081,7 +1155,7 @@ impl StandaloneEmulator {
         let addr = varnode.address() as u64;
         let size = varnode.size();
         self.memory
-            .read_raw(space.into(), addr, size)
+            .read_bytes(space.into(), addr, size)
             .unwrap_or_default()
     }
 
@@ -1118,7 +1192,7 @@ impl StandaloneEmulator {
         &mut self,
         interceptor: impl FnMut(
             &Context<'_>,
-            &mut StandaloneEmulator,
+            &mut StandaloneEmulator<M>,
             &CallSite,
         ) -> Result<CallInterception, Box<str>>
         + Send
@@ -1140,7 +1214,7 @@ impl StandaloneEmulator {
         size: usize,
     ) -> Result<Vec<u8>, EmulatorErrorKind> {
         self.memory.configure_spaces(ctx);
-        self.memory.read_raw(space.into(), addr, size)
+        self.memory.read_bytes(space.into(), addr, size)
     }
 
     pub fn write_memory(
@@ -1151,12 +1225,7 @@ impl StandaloneEmulator {
         value: &[u8],
     ) -> Result<(), EmulatorErrorKind> {
         self.memory.configure_spaces(ctx);
-        let space = self.memory.spaces.entry(space.into()).or_default();
-        space.reserve(value.len());
-        for (i, byte) in value.iter().enumerate() {
-            space.write_byte(addr + i as u64, *byte);
-        }
-        Ok(())
+        self.memory.write_bytes(space.into(), addr, value)
     }
 
     /// Resolve a terminator's bare-local argument list; `func` is the owning
@@ -1913,7 +1982,7 @@ impl StandaloneEmulator {
                         self.make_error(ctx, EmulatorErrorKind::EmptyFunctionRoot(target))
                     })?
                     .id;
-                let mut nested = StandaloneEmulator::new(root);
+                let mut nested = StandaloneEmulator::<M>::new_in(root);
                 nested
                     .run_pure(ctx, target, &args, APPLY_STEP_BUDGET)
                     .map_err(|e| self.make_error(ctx, e.kind))?;
@@ -3040,17 +3109,17 @@ pub enum BodyArg {
 
 /// Private helper that pairs `&mut StandaloneEmulator` fields with `&Context<'_>`
 /// so the default `Interpreter::interpret()` impl can be reused.
-struct TempInterpreter<'a, 'ctx> {
-    memory: &'a mut EmulatedMemory,
+struct TempInterpreter<'a, 'ctx, M> {
+    memory: &'a mut M,
     insn_values: &'a mut FxHashMap<InstructionId, SizedValue>,
     block_param_values: &'a mut FxHashMap<BlockParamId, SizedValue>,
     poison_params: &'a FxHashSet<BlockParamId>,
     ctx: &'ctx Context<'ctx>,
 }
 
-impl<'ctx> Interpreter for TempInterpreter<'_, 'ctx> {
+impl<'ctx, M: EmulatorMemory> Interpreter for TempInterpreter<'_, 'ctx, M> {
     type V = SizedValue;
-    type M = EmulatedMemory;
+    type M = M;
 
     fn memory(&mut self) -> &mut Self::M {
         self.memory
@@ -3093,21 +3162,41 @@ impl<'ctx> Interpreter for TempInterpreter<'_, 'ctx> {
     }
 }
 
-pub struct Emulator<'ctx> {
-    inner: StandaloneEmulator,
+pub struct Emulator<'ctx, M = EmulatedMemory> {
+    inner: StandaloneEmulator<M>,
     ctx: &'ctx Context<'ctx>,
 }
 
-impl<'ctx> Emulator<'ctx> {
+impl<'ctx> Emulator<'ctx, EmulatedMemory> {
+    /// Builds an emulator over the default flat memory.
     pub fn new(ctx: &'ctx Context<'ctx>, entry: BlockId) -> Self {
-        let mut inner = StandaloneEmulator::with_address_index(entry, AddressIndex::analyze(ctx));
+        Self::new_in(ctx, entry)
+    }
+
+    pub fn from_function(ctx: &'ctx Context<'ctx>, func: FunctionId) -> Self {
+        Self::from_function_in(ctx, func)
+    }
+
+    pub fn from_block(ctx: &'ctx Context<'ctx>, block: BlockId) -> Self {
+        Self::new_in(ctx, block)
+    }
+
+    pub fn from_address(ctx: &'ctx Context<'ctx>, addr: u64) -> Self {
+        Self::from_address_in(ctx, addr)
+    }
+}
+
+impl<'ctx, M: EmulatorMemory + Default> Emulator<'ctx, M> {
+    /// Builds an emulator over an explicit memory backend.
+    pub fn new_in(ctx: &'ctx Context<'ctx>, entry: BlockId) -> Self {
+        let mut inner = StandaloneEmulator::<M>::with_address_index(entry, AddressIndex::analyze(ctx));
         inner.memory.configure_spaces(ctx);
         Self { inner, ctx }
     }
 
     pub fn set_instruction_hook(
         &mut self,
-        hook: impl Fn(&InstructionRef<'_, '_>, &StandaloneEmulator) + Send + Sync + 'static,
+        hook: impl Fn(&InstructionRef<'_, '_>, &StandaloneEmulator<M>) + Send + Sync + 'static,
     ) {
         self.inner.instruction_hook = Some(Box::new(hook));
     }
@@ -3116,7 +3205,7 @@ impl<'ctx> Emulator<'ctx> {
         &mut self,
         interceptor: impl FnMut(
             &Context<'_>,
-            &mut StandaloneEmulator,
+            &mut StandaloneEmulator<M>,
             &CallSite,
         ) -> Result<CallInterception, Box<str>>
         + Send
@@ -3130,21 +3219,19 @@ impl<'ctx> Emulator<'ctx> {
         self.inner.clear_call_interceptor();
     }
 
-    pub fn from_function(ctx: &'ctx Context<'ctx>, func: FunctionId) -> Self {
+    /// Builds an emulator at a function's root block, over an explicit backend.
+    pub fn from_function_in(ctx: &'ctx Context<'ctx>, func: FunctionId) -> Self {
         let entry = FunctionBody::from_id(ctx, func)
             .root()
             .expect("Cannot create emulator for function with empty root block")
             .id;
-        Self::new(ctx, entry)
+        Self::new_in(ctx, entry)
     }
 
-    pub fn from_block(ctx: &'ctx Context<'ctx>, block: BlockId) -> Self {
-        Self::new(ctx, block)
-    }
-
-    pub fn from_address(ctx: &'ctx Context<'ctx>, addr: u64) -> Self {
+    /// Builds an emulator positioned at `addr`, over an explicit backend.
+    pub fn from_address_in(ctx: &'ctx Context<'ctx>, addr: u64) -> Self {
         Self {
-            inner: StandaloneEmulator::from_address(ctx, addr),
+            inner: StandaloneEmulator::<M>::from_address_in(ctx, addr),
             ctx,
         }
     }
@@ -3153,12 +3240,8 @@ impl<'ctx> Emulator<'ctx> {
     pub fn inspect_memory(&mut self, space: SpaceId, addr: u64, size: usize) -> Option<Vec<u8>> {
         self.inner
             .memory
-            .spaces
-            .get_mut(&MemorySpaceId::Shared(space))
-            .and_then(|s| {
-                let region = s.get_mut_region(addr, size).ok()?;
-                region.read_bytes(addr, size).ok()
-            })
+            .read_bytes(MemorySpaceId::Shared(space), addr, size)
+            .ok()
     }
 
     /// Sets the value of a varnode
@@ -3236,10 +3319,10 @@ impl<'ctx> Emulator<'ctx> {
             (vn.space().id, vn.address() as u64)
         };
         let base = base_addr + (lane as u64) * 8;
-        let space = self.inner.memory.spaces.entry(space_id.into()).or_default();
-        for i in 0..8u64 {
-            space.write_byte(base + i, (value >> (i * 8)) as u8);
-        }
+        let _ = self
+            .inner
+            .memory
+            .write_bytes(space_id.into(), base, &value.to_le_bytes());
     }
 
     /// Reads a single 64-bit lane of a wide register (little-endian).
@@ -3250,10 +3333,14 @@ impl<'ctx> Emulator<'ctx> {
             (vn.space().id, vn.address() as u64)
         };
         let base = base_addr + (lane as u64) * 8;
-        let space = self.inner.memory.spaces.entry(space_id.into()).or_default();
-        (0..8u64).fold(0u64, |acc, i| {
-            acc | u64::from(space.read_byte(base + i).unwrap_or(0)) << (i * 8)
-        })
+        // An unwritten lane reads as zero: register space is architectural
+        // state that exists whether or not a harness has seeded it.
+        let bytes = self
+            .inner
+            .memory
+            .read_bytes(space_id.into(), base, 8)
+            .unwrap_or_else(|_| vec![0; 8]);
+        u64::from_le_bytes(bytes.try_into().expect("read_bytes returns 8 bytes"))
     }
 
     /// Gets the current block
@@ -3299,9 +3386,9 @@ impl<'ctx> Emulator<'ctx> {
     }
 }
 
-impl<'ctx> Interpreter for Emulator<'ctx> {
+impl<'ctx, M: EmulatorMemory> Interpreter for Emulator<'ctx, M> {
     type V = SizedValue;
-    type M = EmulatedMemory;
+    type M = M;
 
     fn memory(&mut self) -> &mut Self::M {
         &mut self.inner.memory
