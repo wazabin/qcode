@@ -878,6 +878,44 @@ impl LiteralCache {
     }
 }
 
+/// Values produced by instructions, stored densely.
+///
+/// Every p-code operation that yields a value writes one here and its consumers
+/// read it back, so this is one of the hottest structures in the interpreter. A
+/// `FxHashMap<InstructionId, _>` hashes a `(function, local)` pair on every
+/// access; instruction ids are dense and small, so a slot array indexed by
+/// those two components removes the hashing entirely.
+///
+/// Sparse ids cost only an unused slot, which is what makes this safe to use
+/// after a pass has removed instructions from a block.
+#[derive(Debug, Default, Clone)]
+pub struct InsnValues(Vec<Vec<Option<SizedValue>>>);
+
+impl InsnValues {
+    pub fn get(&self, id: &InstructionId) -> Option<&SizedValue> {
+        let func: usize = id.func.into();
+        let local: usize = id.local.into();
+        self.0.get(func)?.get(local)?.as_ref()
+    }
+
+    pub fn insert(&mut self, id: InstructionId, value: SizedValue) {
+        let func: usize = id.func.into();
+        let local: usize = id.local.into();
+        if func >= self.0.len() {
+            self.0.resize_with(func + 1, Vec::new);
+        }
+        let slots = &mut self.0[func];
+        if local >= slots.len() {
+            slots.resize(local + 1, None);
+        }
+        slots[local] = Some(value);
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
 /// Type alias for an instruction hook function, which is called with the current instruction and emulator state after each instruction is executed.
 type InstructionHook<M> = Box<dyn Fn(&InstructionRef<'_, '_>, &StandaloneEmulator<M>) + Send + Sync>;
 type CallInterceptor<M> = Box<
@@ -916,7 +954,7 @@ pub struct StandaloneEmulator<M = EmulatedMemory> {
     /// on demand creates when it fills a placeholder block and re-enters it.
     cached_block: Option<BlockId>,
     cached_insns: Vec<qcode::value::LocalInsnId>,
-    pub insn_values: FxHashMap<InstructionId, SizedValue>,
+    pub insn_values: InsnValues,
     pub block_param_values: FxHashMap<BlockParamId, SizedValue>,
     /// Block params bound to **poison** (argpromote v2): a symbolic pure-call
     /// argument whose bits are undefined. Reading one during emulation is a hard
@@ -981,7 +1019,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             literal_cache: LiteralCache::default(),
             cached_block: None,
             cached_insns: Vec::new(),
-            insn_values: FxHashMap::default(),
+            insn_values: InsnValues::default(),
             block_param_values: FxHashMap::default(),
             poison_params: FxHashSet::default(),
             aggregate_values: FxHashMap::default(),
@@ -3219,7 +3257,7 @@ pub enum BodyArg {
 struct TempInterpreter<'a, 'ctx, M> {
     memory: &'a mut M,
     literals: &'a mut LiteralCache,
-    insn_values: &'a mut FxHashMap<InstructionId, SizedValue>,
+    insn_values: &'a mut InsnValues,
     block_param_values: &'a mut FxHashMap<BlockParamId, SizedValue>,
     poison_params: &'a FxHashSet<BlockParamId>,
     ctx: &'ctx Context<'ctx>,
