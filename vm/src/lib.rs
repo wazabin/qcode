@@ -8,6 +8,8 @@
 
 pub mod memory;
 pub mod mmu;
+pub mod vm;
 
 pub use memory::VmMemory;
+pub use vm::{CodeError, CodeSource, Vm, VmExit};
 pub use mmu::{FaultKind, MemFault, Mmu, MmuSnapshot, PAGE_SIZE, Perm, perm};
