@@ -235,9 +235,95 @@ mod tests {
         let steps = vm.steps;
         let ecx = vm.emulator().read_varnode_by_name(&ctx, "ECX");
         eprintln!(
-            "loop: exit={exit:?} steps={steps} in {elapsed:?} ({:.2}M pcode-ops/s) ecx={ecx:?}",
+            "loop: steps={steps} discoveries={} in {elapsed:?} ({:.2}M pcode-ops/s) ecx={ecx:?} exit={exit:?}",
+            vm.discoveries,
             steps as f64 / elapsed.as_secs_f64() / 1e6,
         );
+    }
+
+    /// Does the block-local cleanup round actually remove anything from
+    /// SLEIGH-lifted code? Measured rather than assumed.
+    #[test]
+    fn optimisation_round_effect() {
+        // Flag-heavy arithmetic: each of these writes six status flags that the
+        // next instruction overwrites without reading.
+        let code = [
+            0x01, 0xd8, // add eax, ebx
+            0x29, 0xd8, // sub eax, ebx
+            0x01, 0xd8, // add eax, ebx
+            0x31, 0xd8, // xor eax, ebx
+        ];
+        for optimize in [false, true] {
+            let source = SleighCodeSource::new(spec());
+            let ctx = source.new_context();
+            let mut memory = VmMemory::new();
+            memory
+                .mmu
+                .write_unchecked(0x1000, &code, perm::READ | perm::EXEC);
+            let mut vm = Vm::at_address(ctx, 0x1000, source, memory).expect("entry decodes");
+            vm.optimize = optimize;
+            vm.run(4096);
+            let insns: usize = vm
+                .context()
+                .block_ids()
+                .into_iter()
+                .map(|b| vm.context().block(b).instruction_ids().len())
+                .sum();
+            eprintln!(
+                "optimize={optimize}: steps={} module_insns={insns} cleanup={:?}",
+                vm.steps, vm.cleanup
+            );
+        }
+    }
+
+    /// The cleanup round must be invisible: optimised and unoptimised runs of
+    /// the same code have to agree on every architectural register and flag.
+    /// This is the guard that makes an IR-rewriting pass safe to run by default.
+    #[test]
+    fn optimisation_preserves_architectural_state() {
+        let programs: [&[u8]; 4] = [
+            // Arithmetic and the flags it writes.
+            &[0xb8, 0x39, 0x05, 0x00, 0x00, 0x01, 0xd8, 0x29, 0xd8, 0x31, 0xd8],
+            // Shifts and rotates, which lean hard on temporaries.
+            &[0xb8, 0xff, 0x00, 0x00, 0x00, 0xc1, 0xe0, 0x03, 0xd1, 0xe8, 0xc1, 0xc0, 0x05],
+            // Multiply, and a byte-granular compare.
+            &[0xb8, 0x07, 0x00, 0x00, 0x00, 0xbb, 0x09, 0x00, 0x00, 0x00, 0x0f, 0xaf, 0xc3, 0x38, 0xd8],
+            // A loop, so the optimised block is re-entered many times.
+            &[0xb9, 0x64, 0x00, 0x00, 0x00, 0xff, 0xc9, 0x75, 0xfc],
+        ];
+        let watched = [
+            "RAX", "RBX", "RCX", "EAX", "EBX", "ECX", "CF", "ZF", "SF", "OF", "AF", "PF",
+        ];
+
+        for (index, code) in programs.iter().enumerate() {
+            let mut states = Vec::new();
+            for optimize in [false, true] {
+                let source = SleighCodeSource::new(spec());
+                let ctx = source.new_context();
+                let mut memory = VmMemory::new();
+                memory
+                    .mmu
+                    .write_unchecked(0x1000, code, perm::READ | perm::EXEC);
+                let mut vm = Vm::at_address(ctx, 0x1000, source, memory).expect("entry decodes");
+                vm.optimize = optimize;
+                vm.run(100_000);
+                let ctx = vm.context().clone();
+                let state: Vec<_> = watched
+                    .iter()
+                    .map(|name| (*name, vm.emulator().read_varnode_by_name(&ctx, name)))
+                    .collect();
+                states.push(state);
+            }
+            assert_eq!(
+                states[0], states[1],
+                "program {index} diverged between unoptimised and optimised runs"
+            );
+            // A test that observed nothing would pass vacuously.
+            assert!(
+                states[0].iter().any(|(_, value)| value.is_some()),
+                "program {index} observed no registers at all"
+            );
+        }
     }
 
     #[test]
