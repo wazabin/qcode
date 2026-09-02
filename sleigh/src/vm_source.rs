@@ -290,6 +290,9 @@ mod tests {
             Some(0),
             "the loop must run to completion"
         );
+        // Wall clock on a shared machine moves by more than 10% run to run, so
+        // a single figure here is indicative only. `perf stat -e instructions`
+        // over this same test is the stable measure for comparing two builds.
         eprintln!(
             "qcode-vm HOT: {instructions} insns in {elapsed:?} ({:.2}M guest-insn/s)\n  {}",
             instructions as f64 / elapsed.as_secs_f64() / 1e6,

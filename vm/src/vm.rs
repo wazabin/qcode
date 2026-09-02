@@ -303,7 +303,12 @@ impl<S: CodeSource> Vm<S> {
             // Checked before the step so a breakpoint reports the instruction
             // about to run, not the one after it, and so resuming from a
             // breakpoint is possible without immediately re-triggering it.
-            if let Some(pc) = self.pc()
+            //
+            // Guarded on there being any breakpoint at all: `pc()` resolves the
+            // block through the module arena, and paying that on every step to
+            // consult an empty set cost about 6% of run time.
+            if !self.breakpoints.is_empty()
+                && let Some(pc) = self.pc()
                 && self.breakpoints.contains(&pc)
                 && self.stats.steps > 0
             {
