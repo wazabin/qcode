@@ -1954,16 +1954,18 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     fn step_with_event(&mut self, ctx: &Context<'_>) -> crate::Result<StepEvent> {
         self.memory.configure_spaces(ctx);
         let block_id = self.block;
-        let block = BasicBlock::from_id(ctx, block_id);
-        let insn_ids = block.instruction_ids();
+        // The block's own storage is borrowed rather than
+        // `BlockRef::instruction_ids`, which builds a `Vec` per call — one
+        // allocation on every step, and about 5% of run time in a profile.
+        let locals = ctx.block(block_id).instruction_ids();
         // A degenerate block — empty, or exhausted without a terminator — is
         // malformed lifter output, not an emulator bug. Report it so a bounded
         // consumer (and a VM running lifted-on-demand code) can stop with a
         // reason instead of aborting the process.
-        if self.idx >= insn_ids.len() {
+        let Some(&local) = locals.get(self.idx) else {
             return Err(self.make_empty_block_error(ctx));
-        }
-        let insn_id = insn_ids[self.idx];
+        };
+        let insn_id = InstructionId::new(block_id.func, local);
         let insn = InstructionRef::from_id(ctx, insn_id);
         let id = insn.id;
 
