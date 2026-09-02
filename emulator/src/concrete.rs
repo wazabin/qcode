@@ -949,14 +949,27 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         }
     }
 
-    /// Drops the cached address lookup.
+    /// Takes the cached address lookup, leaving the emulator without one.
     ///
-    /// The index is built once from an immutable module. A VM that lifts code on
-    /// demand makes the module *mutable*, so blocks discovered after the last
-    /// lookup would otherwise stay invisible and a branch to freshly lifted code
-    /// would keep reporting an invalid address.
-    pub fn invalidate_address_index(&mut self) {
-        self.address_index = None;
+    /// The index is derived state, built once from what was assumed to be an
+    /// immutable module. A VM that lifts code on demand makes the module
+    /// *mutable*, so it has to keep the index current instead. Moving the index
+    /// out, updating it in place as blocks are added, and moving it back with
+    /// [`set_address_index`](Self::set_address_index) keeps discovery O(1) —
+    /// rebuilding it per lift is quadratic in the size of the module.
+    pub fn take_address_index(&mut self) -> Option<AddressIndex> {
+        self.address_index.take()
+    }
+
+    /// Installs an address lookup, replacing any cached one.
+    pub fn set_address_index(&mut self, address_index: AddressIndex) {
+        self.address_index = Some(address_index);
+    }
+
+    /// Resolves a guest address to the block that covers it, building the
+    /// cached index if there is not one yet.
+    pub fn block_at_address(&mut self, ctx: &Context<'_>, address: u64) -> Option<BlockId> {
+        self.block_at(ctx, address)
     }
 
     fn with_address_index(entry: BlockId, address_index: AddressIndex) -> Self {
