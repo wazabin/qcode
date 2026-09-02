@@ -845,6 +845,39 @@ impl DomainMemory for EmulatedMemory {
     }
 }
 
+/// Values of literals, resolved once and kept by id.
+///
+/// Reading a literal goes through the module's interner, which takes an
+/// `RwLock` read guard per access so that constants can be minted through a
+/// shared reference. That is two atomic operations for what is morally a
+/// constant, and it measured at 14% of run time in a profile of an interpreter
+/// loop. A literal is immutable once interned — attaching a symbolic reference
+/// later changes neither its value nor its width — so caching it by id is
+/// sound, and turns the access into an array index.
+#[derive(Debug, Default, Clone)]
+pub struct LiteralCache(Vec<Option<SizedValue>>);
+
+impl LiteralCache {
+    fn get(&mut self, ctx: &Context<'_>, id: qcode::value::LiteralId) -> SizedValue {
+        let index: usize = id.into();
+        if index >= self.0.len() {
+            self.0.resize(index + 1, None);
+        }
+        match self.0[index] {
+            Some(value) => value,
+            None => {
+                // The miss pays the interner's lock, once per distinct literal.
+                let ValueRef::Literal(literal) = ValueRef::new(ValueId::Literal(id), ctx) else {
+                    unreachable!("a literal id resolves to a literal")
+                };
+                let value = SizedValue::new(literal.value(), literal.size());
+                self.0[index] = Some(value);
+                value
+            }
+        }
+    }
+}
+
 /// Type alias for an instruction hook function, which is called with the current instruction and emulator state after each instruction is executed.
 type InstructionHook<M> = Box<dyn Fn(&InstructionRef<'_, '_>, &StandaloneEmulator<M>) + Send + Sync>;
 type CallInterceptor<M> = Box<
@@ -871,6 +904,8 @@ enum StepEvent {
 /// Use this when you need to store an emulator without a lifetime (e.g., across an FFI boundary).
 pub struct StandaloneEmulator<M = EmulatedMemory> {
     pub memory: M,
+    /// Literal values resolved once instead of per access.
+    literal_cache: LiteralCache,
     pub insn_values: FxHashMap<InstructionId, SizedValue>,
     pub block_param_values: FxHashMap<BlockParamId, SizedValue>,
     /// Block params bound to **poison** (argpromote v2): a symbolic pure-call
@@ -933,6 +968,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     pub fn new_in(entry: BlockId) -> Self {
         Self {
             memory: M::default(),
+            literal_cache: LiteralCache::default(),
             insn_values: FxHashMap::default(),
             block_param_values: FxHashMap::default(),
             poison_params: FxHashSet::default(),
@@ -1089,6 +1125,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     pub fn get_value(&mut self, ctx: &Context<'_>, id: ValueId) -> Option<u64> {
         let mut tmp = TempInterpreter {
             memory: &mut self.memory,
+            literals: &mut self.literal_cache,
             insn_values: &mut self.insn_values,
             block_param_values: &mut self.block_param_values,
             poison_params: &self.poison_params,
@@ -1192,6 +1229,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     pub fn get_value_bytes(&mut self, ctx: &Context<'_>, id: ValueId) -> Option<Vec<u8>> {
         let mut tmp = TempInterpreter {
             memory: &mut self.memory,
+            literals: &mut self.literal_cache,
             insn_values: &mut self.insn_values,
             block_param_values: &mut self.block_param_values,
             poison_params: &self.poison_params,
@@ -1261,6 +1299,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     ) -> Result<Vec<SizedValue>, EmulatorErrorKind> {
         let mut tmp = TempInterpreter {
             memory: &mut self.memory,
+            literals: &mut self.literal_cache,
             insn_values: &mut self.insn_values,
             block_param_values: &mut self.block_param_values,
             poison_params: &self.poison_params,
@@ -1393,6 +1432,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     ) -> Result<SizedValue, EmulatorErrorKind> {
         let mut interpreter = TempInterpreter {
             memory: &mut self.memory,
+            literals: &mut self.literal_cache,
             insn_values: &mut self.insn_values,
             block_param_values: &mut self.block_param_values,
             poison_params: &self.poison_params,
@@ -2173,6 +2213,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                     let val = {
                         let mut tmp = TempInterpreter {
                             memory: &mut self.memory,
+            literals: &mut self.literal_cache,
                             insn_values: &mut self.insn_values,
                             block_param_values: &mut self.block_param_values,
                             poison_params: &self.poison_params,
@@ -2238,6 +2279,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                     .expect("guard checked register range store address");
                 let mut tmp = TempInterpreter {
                     memory: &mut self.memory,
+            literals: &mut self.literal_cache,
                     insn_values: &mut self.insn_values,
                     block_param_values: &mut self.block_param_values,
                     poison_params: &self.poison_params,
@@ -2338,6 +2380,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                 }
                 let mut tmp = TempInterpreter {
                     memory: &mut self.memory,
+            literals: &mut self.literal_cache,
                     insn_values: &mut self.insn_values,
                     block_param_values: &mut self.block_param_values,
                     poison_params: &self.poison_params,
@@ -3161,6 +3204,7 @@ pub enum BodyArg {
 /// so the default `Interpreter::interpret()` impl can be reused.
 struct TempInterpreter<'a, 'ctx, M> {
     memory: &'a mut M,
+    literals: &'a mut LiteralCache,
     insn_values: &'a mut FxHashMap<InstructionId, SizedValue>,
     block_param_values: &'a mut FxHashMap<BlockParamId, SizedValue>,
     poison_params: &'a FxHashSet<BlockParamId>,
@@ -3180,6 +3224,11 @@ impl<'ctx, M: EmulatorMemory> Interpreter for TempInterpreter<'_, 'ctx, M> {
     }
 
     fn get_value(&mut self, id: ValueId) -> Result<Self::V, EmulatorErrorKind> {
+        // Taken before `ValueRef::new`, which would resolve the literal through
+        // the interner's lock.
+        if let ValueId::Literal(literal) = id {
+            return Ok(self.literals.get(self.ctx, literal));
+        }
         match ValueRef::new(id, self.ctx) {
             ValueRef::Literal(literal) => Ok(SizedValue::new(literal.value(), literal.size())),
             // Byte blobs are wider than the emulator's scalar SizedValue.
@@ -3449,6 +3498,10 @@ impl<'ctx, M: EmulatorMemory> Interpreter for Emulator<'ctx, M> {
     }
 
     fn get_value(&mut self, id: ValueId) -> Result<Self::V, EmulatorErrorKind> {
+        if let ValueId::Literal(literal) = id {
+            let value = self.inner.literal_cache.get(self.ctx, literal);
+            return Ok(value);
+        }
         match ValueRef::new(id, self.ctx) {
             ValueRef::Literal(literal) => Ok(SizedValue::new(literal.value(), literal.size())),
             // Byte blobs are wider than the emulator's scalar SizedValue.
@@ -3501,6 +3554,7 @@ mod tests {
         let mut emu = StandaloneEmulator::new(block);
         let mut tmp = TempInterpreter {
             memory: &mut emu.memory,
+            literals: &mut emu.literal_cache,
             insn_values: &mut emu.insn_values,
             block_param_values: &mut emu.block_param_values,
             poison_params: &emu.poison_params,
