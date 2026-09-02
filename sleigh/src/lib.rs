@@ -10,6 +10,8 @@
 //! [`AddressIndex`] with [`SleighLifter::lift_instruction_indexed`] when
 //! lifting multiple instructions.
 
+pub mod vm_source;
+
 use std::borrow::Cow;
 
 use jstd::registry::Registry;
