@@ -906,6 +906,16 @@ pub struct StandaloneEmulator<M = EmulatedMemory> {
     pub memory: M,
     /// Literal values resolved once instead of per access.
     literal_cache: LiteralCache,
+    /// The current block's instruction list, and which block it belongs to.
+    ///
+    /// Resolving a block means two registry indexes (`bodies[func].blocks[local]`)
+    /// and the interpreter did it on every step, though a block is entered once
+    /// and then walked. Refreshed whenever the block changes *or* execution is
+    /// at a block's first instruction — a block's contents can only change while
+    /// nothing is part-way through it, which is exactly the case a VM that lifts
+    /// on demand creates when it fills a placeholder block and re-enters it.
+    cached_block: Option<BlockId>,
+    cached_insns: Vec<qcode::value::LocalInsnId>,
     pub insn_values: FxHashMap<InstructionId, SizedValue>,
     pub block_param_values: FxHashMap<BlockParamId, SizedValue>,
     /// Block params bound to **poison** (argpromote v2): a symbolic pure-call
@@ -969,6 +979,8 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         Self {
             memory: M::default(),
             literal_cache: LiteralCache::default(),
+            cached_block: None,
+            cached_insns: Vec::new(),
             insn_values: FxHashMap::default(),
             block_param_values: FxHashMap::default(),
             poison_params: FxHashSet::default(),
@@ -1994,15 +2006,17 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     fn step_with_event(&mut self, ctx: &Context<'_>) -> crate::Result<StepEvent> {
         self.memory.configure_spaces(ctx);
         let block_id = self.block;
-        // The block's own storage is borrowed rather than
-        // `BlockRef::instruction_ids`, which builds a `Vec` per call — one
-        // allocation on every step, and about 5% of run time in a profile.
-        let locals = ctx.block(block_id).instruction_ids();
+        if self.cached_block != Some(block_id) || self.idx == 0 {
+            self.cached_insns.clear();
+            self.cached_insns
+                .extend_from_slice(ctx.block(block_id).instruction_ids());
+            self.cached_block = Some(block_id);
+        }
         // A degenerate block — empty, or exhausted without a terminator — is
         // malformed lifter output, not an emulator bug. Report it so a bounded
         // consumer (and a VM running lifted-on-demand code) can stop with a
         // reason instead of aborting the process.
-        let Some(&local) = locals.get(self.idx) else {
+        let Some(&local) = self.cached_insns.get(self.idx) else {
             return Err(self.make_empty_block_error(ctx));
         };
         let insn_id = InstructionId::new(block_id.func, local);
