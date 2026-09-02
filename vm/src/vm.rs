@@ -77,8 +77,14 @@ pub struct Vm<S> {
     ctx: Context<'static>,
     emu: StandaloneEmulator<VmMemory>,
     source: S,
-    /// Instructions retired since the machine was created.
-    pub icount: u64,
+    /// P-code operations retired since the machine was created.
+    ///
+    /// Deliberately *not* a guest-instruction count: one machine instruction
+    /// lifts to many QCode operations, and the interpreter steps one operation
+    /// at a time. Budgets are therefore in units of work done, which is the
+    /// honest thing to bound a run by; a guest-instruction count is a separate
+    /// measure and is not yet tracked.
+    pub steps: u64,
     breakpoints: FxHashSet<u64>,
 }
 
@@ -91,7 +97,7 @@ impl<S: CodeSource> Vm<S> {
             ctx,
             emu,
             source,
-            icount: 0,
+            steps: 0,
             breakpoints: FxHashSet::default(),
         }
     }
@@ -159,7 +165,7 @@ impl<S: CodeSource> Vm<S> {
         for attempt in 0..2 {
             match self.emu.step(&self.ctx) {
                 Ok(()) => {
-                    self.icount += 1;
+                    self.steps += 1;
                     return None;
                 }
                 Err(error) => match error.kind {
@@ -170,6 +176,26 @@ impl<S: CodeSource> Vm<S> {
                         if let Some(exit) = self.discover(addr) {
                             return Some(exit);
                         }
+                    }
+                    // A direct branch to code that has not been lifted does not
+                    // fail to resolve: the lifter materializes the target as an
+                    // *empty* block at that address, and execution walks into
+                    // it. So an empty block carrying an address is a request to
+                    // discover it, not a malformed-IR error.
+                    EmulatorErrorKind::EmptyBlock(block) if attempt == 0 => {
+                        let Some(addr) = BasicBlock::from_id(&self.ctx, block).address() else {
+                            return Some(VmExit::Error(
+                                EmulatorErrorKind::EmptyBlock(block).to_string().into(),
+                            ));
+                        };
+                        if let Some(exit) = self.discover(addr) {
+                            return Some(exit);
+                        }
+                        // Lifting may place the instruction in a *new* block
+                        // rather than filling the placeholder the emulator is
+                        // sitting in, so the machine has to be moved onto
+                        // whatever now covers the address.
+                        self.reposition(addr);
                     }
                     EmulatorErrorKind::MemoryReadError(addr)
                     | EmulatorErrorKind::MemoryWriteError(addr) => {
@@ -188,6 +214,16 @@ impl<S: CodeSource> Vm<S> {
         None
     }
 
+    /// Points the emulator at whatever block now covers `addr`.
+    fn reposition(&mut self, addr: u64) {
+        if let Some(block) = block_at(&self.ctx, addr)
+            && block != self.emu.block
+        {
+            self.emu.block = block;
+            self.emu.idx = 0;
+        }
+    }
+
     /// Lifts `addr` and makes it visible to the emulator. Returns an exit only
     /// if the address could not be supplied.
     fn discover(&mut self, addr: u64) -> Option<VmExit> {
@@ -200,17 +236,17 @@ impl<S: CodeSource> Vm<S> {
         None
     }
 
-    /// Runs until the machine stops, or until `budget` instructions have been
-    /// retired.
+    /// Runs until the machine stops, or until `budget` p-code operations have
+    /// been retired.
     pub fn run(&mut self, budget: u64) -> VmExit {
-        let deadline = self.icount + budget;
-        while self.icount < deadline {
+        let deadline = self.steps + budget;
+        while self.steps < deadline {
             // Checked before the step so a breakpoint reports the instruction
             // about to run, not the one after it, and so resuming from a
             // breakpoint is possible without immediately re-triggering it.
             if let Some(pc) = self.pc()
                 && self.breakpoints.contains(&pc)
-                && self.icount > 0
+                && self.steps > 0
             {
                 return VmExit::Breakpoint(pc);
             }
@@ -291,10 +327,27 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_block_stops_rather_than_panicking() {
+    fn an_empty_addressed_block_asks_the_source_for_code() {
         let (ctx, block) = module(0x1000);
         let mut vm = Vm::new(ctx, block, Planned::default());
-        // A block with no instructions is a degenerate lift, not a crash.
+        // An empty block carrying an address is how the lifter represents a
+        // branch target it has not reached yet, so it is a discovery request.
+        // This source cannot supply it, which is what makes the exit reportable.
+        let exit = vm.run(16);
+        assert!(
+            matches!(exit, VmExit::Unlifted { addr: 0x1000, .. }),
+            "expected a discovery attempt, got {exit:?}"
+        );
+        assert_eq!(vm.source.calls, vec![0x1000]);
+    }
+
+    #[test]
+    fn an_empty_block_with_no_address_is_an_error() {
+        // Nothing to discover: without an address there is no code to fetch.
+        let mut ctx = Context::new();
+        let function = FunctionBody::make_at_addr(&mut ctx, 0x1000, None).id;
+        let block = BasicBlock::make(&mut ctx, function).id;
+        let mut vm = Vm::new(ctx, block, Planned::default());
         assert!(matches!(vm.run(16), VmExit::Error(_)));
     }
 
