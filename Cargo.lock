@@ -1749,6 +1749,7 @@ dependencies = [
  "postgres",
  "qcode",
  "qcode_emulator",
+ "qcode_vm",
  "rustc-hash",
  "serde",
  "serde_json",
