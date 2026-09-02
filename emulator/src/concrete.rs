@@ -2460,7 +2460,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                     poison_params: &self.poison_params,
                     ctx,
                 };
-                if let Some(value) = tmp.interpret(insn)? {
+                if let Some(value) = tmp.interpret(insn, mnemonic)? {
                     self.insn_values.insert(id, value);
                 }
                 self.idx += 1;

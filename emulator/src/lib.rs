@@ -325,11 +325,14 @@ pub trait Interpreter {
     fn interpret_(
         &mut self,
         insn: &InstructionRef<'_, '_>,
+        mnemonic: &Mnemonic,
     ) -> std::result::Result<Option<Self::V>, EmulatorErrorKind> {
         // Operands are stored bare-local; qualify with the instruction's own
         // function (strict IR locality: operands live in the same arena).
         let func = insn.id.func;
-        let v = match insn.mnemonic() {
+        // Supplied by the caller, which has already resolved it: each
+        // `insn.mnemonic()` walks the instruction out of the module registries.
+        let v = match mnemonic {
             // ===== Memory operations =====
             &Mnemonic::Load(Load { space, ptr, size }) => {
                 let addr = self.get_value(ptr.qualify(func))?;
@@ -520,14 +523,18 @@ pub trait Interpreter {
             // does not go through emulation; it inlines the body via `ArrayProject`.)
             Mnemonic::Map(_) => return Err(EmulatorErrorKind::UnsupportedMnemonic("map")),
 
-            _ => todo!("unimplemented mnemonic: {:?}", insn.mnemonic()),
+            _ => todo!("unimplemented mnemonic: {mnemonic:?}"),
         };
 
         Ok(v)
     }
 
-    fn interpret(&mut self, insn: InstructionRef<'_, '_>) -> Result<Option<Self::V>> {
-        self.interpret_(&insn)
+    fn interpret(
+        &mut self,
+        insn: InstructionRef<'_, '_>,
+        mnemonic: &Mnemonic,
+    ) -> Result<Option<Self::V>> {
+        self.interpret_(&insn, mnemonic)
             .map_err(|kind| EmulatorError::new(kind, &insn))
     }
 }
