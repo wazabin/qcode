@@ -489,6 +489,16 @@ impl<S: CodeSource> Vm<S> {
         if head == filled {
             return None;
         }
+        // Only into a block that starts at a machine address. Absorbing makes
+        // the head responsible for the absorbed addresses, and a later branch
+        // to one of them splits the head apart again — which works by emptying
+        // it and lifting it afresh. A block with no address of its own (the
+        // fallthrough arm of a branch *inside* one instruction's p-code) has
+        // nowhere to be lifted from, so emptying it leaves a hole nothing can
+        // fill.
+        if self.ctx.block(head).address.is_none() {
+            return (forward > 0).then_some(filled);
+        }
         // Where `filled`'s instructions land: the head's own, less the
         // terminator that absorption drops.
         let offset = self.ctx.block(head).instruction_ids().len().saturating_sub(1);
