@@ -83,3 +83,39 @@ fn an_uninstalled_jit_leaves_the_machine_on_the_interpreter() {
     let (_, native) = run(&[0xb8, 0x01, 0x00, 0x00, 0x00], false, 1000);
     assert_eq!(native, 0);
 }
+
+/// Throughput with and without the JIT, on the same loop the interpreter
+/// benchmarks use. Ignored by default: it runs for seconds.
+#[test]
+#[ignore = "long-running throughput benchmark"]
+fn jit_throughput() {
+    // mov ecx, 1000000 ; loop: dec ecx ; jnz loop
+    let code: &[u8] = &[
+        0xb9, 0x40, 0x42, 0x0f, 0x00, // mov ecx, 1000000
+        0xff, 0xc9, // dec ecx
+        0x75, 0xfc, // jnz -4
+    ];
+    let instructions = 1_000_000u64 * 2 + 1;
+
+    for jit in [false, true] {
+        let mut vm = machine(code);
+        if jit {
+            vm.set_block_executor(Box::new(Jit::new()));
+        }
+        let start = std::time::Instant::now();
+        vm.run(u64::MAX);
+        let elapsed = start.elapsed();
+        let ctx = vm.context().clone();
+        assert_eq!(
+            vm.emulator().read_varnode_by_name(&ctx, "ECX"),
+            Some(0),
+            "the loop must run to completion"
+        );
+        eprintln!(
+            "jit={jit}: {instructions} insns in {elapsed:?} ({:.2}M guest-insn/s) \
+             native_bodies={}",
+            instructions as f64 / elapsed.as_secs_f64() / 1e6,
+            vm.stats.native_bodies,
+        );
+    }
+}
