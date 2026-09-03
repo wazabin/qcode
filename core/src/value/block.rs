@@ -409,6 +409,16 @@ where
             .collect()
     }
 
+    /// How many instructions this block holds.
+    ///
+    /// Separate from [`instruction_ids`](Self::instruction_ids) because that
+    /// qualifies every id into a fresh `Vec`, and a caller that wants only the
+    /// count should not allocate for it — the JIT reads this per block
+    /// execution.
+    pub fn instruction_count(&'s self) -> usize {
+        self.inner().instructions.len()
+    }
+
     /// Does this block have any instructions?
     pub fn is_empty(&'s self) -> bool {
         self.inner().instructions.is_empty()

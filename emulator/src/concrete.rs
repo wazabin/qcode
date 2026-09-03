@@ -3550,7 +3550,7 @@ impl<'ctx, M: EmulatorMemory + Default> Emulator<'ctx, M> {
     /// Gets the current instruction
     pub fn insn(&self) -> Option<InstructionRef<'ctx, 'ctx>> {
         let block = self.block();
-        if self.inner.idx >= block.instruction_ids().len() {
+        if self.inner.idx >= block.instruction_count() {
             None
         } else {
             let id = block.instruction_ids()[self.inner.idx];
