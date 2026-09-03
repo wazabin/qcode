@@ -16,6 +16,11 @@ fn machine(code: &[u8]) -> Vm<SleighCodeSource<'static>> {
     Vm::at_address(ctx, 0x1000, source, memory).expect("the entry decodes")
 }
 
+/// The registers every program in this file is checked on.
+const WATCHED: [&str; 11] = [
+    "RAX", "RBX", "RCX", "EAX", "EBX", "ECX", "CF", "ZF", "SF", "OF", "PF",
+];
+
 /// Runs `code`, optionally with the JIT installed, and reports the watched
 /// registers plus how much the JIT took on.
 fn run(code: &[u8], jit: bool, budget: u64) -> (Vec<Option<u64>>, u64) {
@@ -25,7 +30,7 @@ fn run(code: &[u8], jit: bool, budget: u64) -> (Vec<Option<u64>>, u64) {
     }
     vm.run(budget);
     let ctx = vm.context().clone();
-    let state = ["RAX", "RBX", "RCX", "EAX", "EBX", "ECX", "CF", "ZF", "SF", "OF", "PF"]
+    let state = WATCHED
         .iter()
         .map(|name| vm.emulator().read_varnode_by_name(&ctx, name))
         .collect();
@@ -34,7 +39,7 @@ fn run(code: &[u8], jit: bool, budget: u64) -> (Vec<Option<u64>>, u64) {
 
 #[test]
 fn the_jit_does_not_change_what_a_program_computes() {
-    let programs: [(&str, &[u8]); 3] = [
+    let programs: [(&str, &[u8], &[(&str, u64)]); 3] = [
         (
             "arithmetic",
             &[
@@ -44,6 +49,7 @@ fn the_jit_does_not_change_what_a_program_computes() {
                 0x29, 0xd8, // sub eax, ebx
                 0x31, 0xd8, // xor eax, ebx
             ],
+            &[("EAX", 1337 ^ 7), ("EBX", 7)],
         ),
         (
             "countdown loop",
@@ -52,6 +58,7 @@ fn the_jit_does_not_change_what_a_program_computes() {
                 0xff, 0xc9, // dec ecx
                 0x75, 0xfc, // jnz -4
             ],
+            &[("ECX", 0)],
         ),
         (
             "logical ops writing undefined flags",
@@ -60,12 +67,28 @@ fn the_jit_does_not_change_what_a_program_computes() {
                 0x21, 0xd8, // and eax, ebx
                 0x09, 0xd8, // or  eax, ebx
             ],
+            &[("EAX", 0)],
         ),
     ];
 
-    for (name, code) in programs {
+    for (name, code, expect) in programs {
         let (interpreted, _) = run(code, false, 200_000);
         let (jitted, native) = run(code, true, 200_000);
+        // Checked against a stated answer, not only against each other: an
+        // equivalence test alone passes happily when both strategies are broken
+        // the same way, which is exactly what a shared bug in the machinery
+        // underneath them looks like.
+        for &(register, want) in expect {
+            let index = WATCHED
+                .iter()
+                .position(|&name| name == register)
+                .expect("the expectation names a watched register");
+            assert_eq!(
+                interpreted[index],
+                Some(want),
+                "program `{name}` interpreted {register} wrongly"
+            );
+        }
         assert_eq!(
             interpreted, jitted,
             "program `{name}` computed a different result with the JIT installed"
