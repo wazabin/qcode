@@ -4,18 +4,21 @@ use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 use qcode::{context::Context, value::BlockId};
-use qcode_emulator::EmulatorErrorKind;
+use qcode_emulator::{EmulatorErrorKind, SizedValue, StandaloneEmulator};
 use qcode_vm::{BlockExecutor, VmMemory};
 use rustc_hash::FxHashMap;
 
-use crate::compile::{BlockTranslator, SpaceTable, Unsupported};
+use crate::compile::{BlockTranslator, Export, SpaceTable, Unsupported};
 
 /// A block that has been compiled to native code.
 struct Compiled {
-    /// The compiled body. Its only argument is the base of an array of space
-    /// base pointers, in the order [`SpaceTable`] records.
-    entry: extern "C" fn(*const *mut u8),
+    /// The compiled body. Its arguments are the base of an array of space base
+    /// pointers, in the order [`SpaceTable`] records, and the base of the
+    /// export buffer, one `u64` slot per entry of `exports`.
+    entry: extern "C" fn(*const *mut u8, *mut u64),
     table: SpaceTable,
+    /// The terminator operands this block computes, in slot order.
+    exports: Vec<Export>,
 }
 
 /// How much work the JIT is taking, and how much it is declining.
@@ -48,6 +51,9 @@ pub struct Jit {
     cache: FxHashMap<(BlockId, usize), Result<usize, Unsupported>>,
     /// Reused across runs so a hot block does not allocate to be entered.
     scratch: Vec<*mut u8>,
+    /// Likewise for the export buffer compiled code writes its terminator
+    /// operands into.
+    exports: Vec<u64>,
     pub stats: JitStats,
 }
 
@@ -78,6 +84,7 @@ impl Jit {
             compiled: Vec::new(),
             cache: FxHashMap::default(),
             scratch: Vec::new(),
+            exports: Vec::new(),
             stats: JitStats::default(),
         }
     }
@@ -103,6 +110,7 @@ impl Jit {
     fn compile(&mut self, ctx: &Context<'_>, block: BlockId) -> Result<usize, Unsupported> {
         let mut signature = self.module.make_signature();
         signature.params.push(AbiParam::new(types::I64));
+        signature.params.push(AbiParam::new(types::I64));
 
         let name = format!("qcode_block_{}_{}", self.compiled.len(), self.cache.len());
         let id = self
@@ -117,7 +125,7 @@ impl Jit {
         // half-built function, which would leave a shared context dirty and
         // trip Cranelift's emptiness assertion on the next compilation.
         let mut builder_ctx = FunctionBuilderContext::new();
-        let table = {
+        let (table, exports) = {
             let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_ctx);
             let entry = builder.create_block();
             builder.append_block_params_for_function_params(entry);
@@ -127,9 +135,9 @@ impl Jit {
             let mut translator = BlockTranslator::new(ctx, builder, entry);
             match translator.translate_body(block) {
                 Ok(()) => {
-                    let table = translator.table.clone();
+                    let compiled = (translator.table.clone(), translator.exports.clone());
                     translator.finish();
-                    table
+                    compiled
                 }
                 Err(unsupported) => {
                     // The half-built function is simply dropped; nothing was
@@ -150,11 +158,16 @@ impl Jit {
 
         let code = self.module.get_finalized_function(id);
         // SAFETY: `code` is the entry point Cranelift just finalized for the
-        // signature declared above — one pointer argument, no return value.
-        let entry =
-            unsafe { std::mem::transmute::<*const u8, extern "C" fn(*const *mut u8)>(code) };
+        // signature declared above — two pointer arguments, no return value.
+        let entry = unsafe {
+            std::mem::transmute::<*const u8, extern "C" fn(*const *mut u8, *mut u64)>(code)
+        };
 
-        self.compiled.push(Compiled { entry, table });
+        self.compiled.push(Compiled {
+            entry,
+            table,
+            exports,
+        });
         Ok(self.compiled.len() - 1)
     }
 
@@ -172,7 +185,7 @@ impl Jit {
     pub fn run_block(
         &mut self,
         ctx: &Context<'_>,
-        memory: &mut VmMemory,
+        emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
     ) -> Result<bool, EmulatorErrorKind> {
         let Ok(index) = self.resolve(ctx, block) else {
@@ -186,13 +199,24 @@ impl Jit {
         self.scratch.clear();
         for &(space, required) in compiled.table.entries() {
             self.scratch
-                .push(memory.flat_mut().base_ptr(space, required)?);
+                .push(emu.memory.flat_mut().base_ptr(space, required)?);
         }
+        self.exports.clear();
+        self.exports.resize(compiled.exports.len(), 0);
 
         // SAFETY: the function was compiled from this block and reads and writes
         // only within the byte ranges recorded in its space table, each of which
-        // has just been made addressable.
-        (compiled.entry)(self.scratch.as_ptr());
+        // has just been made addressable, plus the export buffer, which has just
+        // been sized to the slot count that same compilation recorded.
+        (compiled.entry)(self.scratch.as_ptr(), self.exports.as_mut_ptr());
+
+        // The terminator is still the interpreter's to run, so the operands it
+        // reads have to look as though the interpreter had computed them.
+        for (export, &bits) in compiled.exports.iter().zip(&self.exports) {
+            emu.insn_values
+                .insert(export.insn, SizedValue::new(bits, export.size));
+        }
+
         self.stats.native_runs += 1;
         Ok(true)
     }
@@ -203,10 +227,10 @@ impl BlockExecutor for Jit {
     fn run_block(
         &mut self,
         ctx: &Context<'_>,
-        memory: &mut VmMemory,
+        emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
     ) -> Result<bool, EmulatorErrorKind> {
-        Jit::run_block(self, ctx, memory, block)
+        Jit::run_block(self, ctx, emu, block)
     }
 }
 

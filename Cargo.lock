@@ -1347,6 +1347,7 @@ dependencies = [
  "qcode_emulator",
  "qcode_vm",
  "rustc-hash",
+ "wazabin-qcode-macro",
  "wazabin-qcode-sleigh",
  "wazabin-sleigh-precompile",
 ]

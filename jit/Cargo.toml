@@ -17,5 +17,6 @@ cranelift-module = "0.129"
 cranelift-native = "0.129"
 
 [dev-dependencies]
+wazabin-qcode-macro.workspace = true
 wazabin-qcode-sleigh = { version = "0.1.0", path = "../sleigh" }
 sleigh-precompile = { package = "wazabin-sleigh-precompile", version = "0.1.1", path = "../../wazabin-sleigh/precompile" }

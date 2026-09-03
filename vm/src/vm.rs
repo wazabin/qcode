@@ -75,15 +75,24 @@ pub trait CodeSource {
 ///
 /// An executor runs the block's body, not its terminator. Control flow, block
 /// parameters and call semantics stay in one implementation.
+///
+/// It is handed the whole emulator rather than just its memory because the
+/// interpreter still has to run the terminator, and a terminator reads
+/// operands — a `cbranch` condition, a branch's block arguments. Those are
+/// values the body produced, so an executor that keeps them somewhere other
+/// than the interpreter's value table must put them back before returning.
 pub trait BlockExecutor {
     /// Runs everything in `block` except its terminator.
     ///
     /// `Ok(false)` means "not mine" and is not an error — the caller falls back
     /// to the interpreter.
+    ///
+    /// On `Ok(true)` every value the terminator reads must be readable from
+    /// `emu.insn_values`, exactly as if the interpreter had run the body.
     fn run_block(
         &mut self,
         ctx: &Context<'_>,
-        memory: &mut VmMemory,
+        emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
     ) -> Result<bool, EmulatorErrorKind>;
 }
@@ -227,7 +236,7 @@ impl<S: CodeSource> Vm<S> {
             && let Some(executor) = self.executor.as_mut()
         {
             let block = self.emu.block;
-            match executor.run_block(&self.ctx, &mut self.emu.memory, block) {
+            match executor.run_block(&self.ctx, &mut self.emu, block) {
                 Ok(true) => {
                     let body = BasicBlock::from_id(&self.ctx, block)
                         .instruction_ids()

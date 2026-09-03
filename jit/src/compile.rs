@@ -22,11 +22,21 @@
 //!
 //! # Terminators
 //!
-//! Terminators are left to the interpreter, and a block is only compiled when
-//! its terminator is an argument-less unconditional branch — the shape SLEIGH
-//! lifting produces for straight-line guest code. That keeps control flow, block
-//! parameters and call semantics in exactly one implementation while the
-//! arithmetic, which is the bulk of the work, moves to compiled code.
+//! Control flow itself stays with the interpreter: it runs the terminator after
+//! compiled code has run the body, so branch resolution, block parameters and
+//! call semantics live in exactly one implementation. What the compiler has to
+//! supply is the terminator's *operands* — a `cbranch` condition, a branch's
+//! block arguments — because those are values the body computed and compiled
+//! code keeps in registers, where the interpreter cannot see them.
+//!
+//! So a block's compiled function takes a second argument: an *export buffer*.
+//! Every terminator operand defined in this block is written there as a `u64`,
+//! and the runtime copies it into the interpreter's value table before handing
+//! the terminator back. A terminator whose operands are all literals, addresses
+//! or values from earlier blocks exports nothing and costs nothing — which is
+//! the argument-less unconditional branch that straight-line guest code lifts
+//! to.
+
 
 use cranelift::prelude::*;
 use qcode::{
@@ -40,7 +50,7 @@ use qcode::{
         },
     },
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Why a block could not be compiled.
 ///
@@ -123,15 +133,30 @@ impl SpaceTable {
 pub(crate) struct BlockTranslator<'a, 'ctx> {
     ctx: &'ctx Context<'ctx>,
     builder: FunctionBuilder<'a>,
-    /// Base of the array of space base pointers, the compiled function's only
+    /// Base of the array of space base pointers, the compiled function's first
     /// argument.
     spaces_arg: Value,
+    /// Base of the export buffer, the compiled function's second argument: one
+    /// `u64` slot per entry of [`Self::exports`].
+    exports_arg: Value,
     /// Cached base pointer per space slot, loaded once per block rather than per
     /// access.
     bases: FxHashMap<usize, Value>,
     /// Values produced by instructions in this block.
     values: FxHashMap<InstructionId, Value>,
     pub(crate) table: SpaceTable,
+    /// Values the terminator reads, in export-buffer slot order.
+    pub(crate) exports: Vec<Export>,
+}
+
+/// One value compiled code hands back for the interpreter to read.
+#[derive(Debug, Clone, Copy)]
+pub struct Export {
+    /// The instruction whose result this is; the key it is filed under in the
+    /// interpreter's value table.
+    pub insn: InstructionId,
+    /// Its declared width in bytes, which the slot's low bytes hold.
+    pub size: usize,
 }
 
 impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
@@ -141,13 +166,16 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         entry: cranelift::prelude::Block,
     ) -> Self {
         let spaces_arg = builder.block_params(entry)[0];
+        let exports_arg = builder.block_params(entry)[1];
         Self {
             ctx,
             builder,
             spaces_arg,
+            exports_arg,
             bases: FxHashMap::default(),
             values: FxHashMap::default(),
             table: SpaceTable::default(),
+            exports: Vec::new(),
         }
     }
 
@@ -157,12 +185,10 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
             return *base;
         }
         let offset = (slot * std::mem::size_of::<*mut u8>()) as i32;
-        let base = self.builder.ins().load(
-            types::I64,
-            MemFlags::trusted(),
-            self.spaces_arg,
-            offset,
-        );
+        let base =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), self.spaces_arg, offset);
         self.bases.insert(slot, base);
         base
     }
@@ -207,24 +233,76 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         Ok(self.ctx.shared.types.size_of(ty))
     }
 
-    /// Translates every non-terminator instruction of `block`.
+    /// Translates every non-terminator instruction of `block`, then emits the
+    /// exports its terminator will need.
     pub(crate) fn translate_body(&mut self, block: BlockId) -> Result<(), Unsupported> {
         let insns: Vec<InstructionId> = BasicBlock::from_id(self.ctx, block).instruction_ids();
-        let Some((terminator, body)) = insns.split_last() else {
+        let Some((&terminator, body)) = insns.split_last() else {
             return Err(Unsupported::Terminator("block is empty"));
         };
+        let own: FxHashSet<InstructionId> = insns.iter().copied().collect();
 
         for &insn_id in body {
             self.translate_one(insn_id)?;
         }
 
-        // Only an argument-less unconditional branch is left to the caller; any
-        // other terminator may depend on values this block computed, which are
-        // not materialised anywhere the interpreter could read them.
-        let terminator_mnemonic = qcode::value::Instruction::from_id(self.ctx, *terminator);
-        match terminator_mnemonic.mnemonic() {
-            Mnemonic::Branch(branch) if branch.args.is_empty() => Ok(()),
-            other => Err(Unsupported::Terminator(other.opcode())),
+        self.export_terminator_operands(terminator, &own)
+    }
+
+    /// Writes every terminator operand this block defines into the export
+    /// buffer, so the interpreter can read it back before running the
+    /// terminator.
+    ///
+    /// Operands the interpreter can already resolve on its own — literals,
+    /// varnode and temp addresses, results of earlier blocks it walked — need
+    /// nothing, so a terminator that reads only those exports nothing.
+    fn export_terminator_operands(
+        &mut self,
+        terminator: InstructionId,
+        own: &FxHashSet<InstructionId>,
+    ) -> Result<(), Unsupported> {
+        let insn = qcode::value::Instruction::from_id(self.ctx, terminator);
+        let operands: Vec<ValueId> = insn
+            .mnemonic()
+            .args()
+            .into_iter()
+            .map(|arg| arg.qualify(terminator.func))
+            .collect();
+
+        for operand in operands {
+            let ValueId::Instruction(def) = operand else {
+                continue;
+            };
+            if !own.contains(&def) {
+                continue;
+            }
+            if self.exports.iter().any(|export| export.insn == def) {
+                continue;
+            }
+            let value = *self
+                .values
+                .get(&def)
+                .ok_or(Unsupported::Terminator("operand was not compiled"))?;
+            let size = self.width_of(operand)?;
+            let slot = self.exports.len();
+            let widened = self.widen_to_u64(value);
+            self.builder.ins().store(
+                MemFlags::trusted(),
+                widened,
+                self.exports_arg,
+                (slot * std::mem::size_of::<u64>()) as i32,
+            );
+            self.exports.push(Export { insn: def, size });
+        }
+        Ok(())
+    }
+
+    /// `value` zero-extended to the export buffer's slot width.
+    fn widen_to_u64(&mut self, value: Value) -> Value {
+        if self.builder.func.dfg.value_type(value) == types::I64 {
+            value
+        } else {
+            self.builder.ins().uextend(types::I64, value)
         }
     }
 

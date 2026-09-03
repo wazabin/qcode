@@ -13,5 +13,5 @@
 pub mod compile;
 pub mod jit;
 
-pub use compile::{SpaceTable, Unsupported};
+pub use compile::{Export, SpaceTable, Unsupported};
 pub use jit::{Jit, JitStats};
