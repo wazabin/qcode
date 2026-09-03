@@ -1046,6 +1046,16 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         }
     }
 
+    /// Drops the cached instruction list for the current block.
+    ///
+    /// The cache assumes a block's contents only change while nothing is
+    /// part-way through it. A caller that runs a block's body by some other
+    /// means and then positions the emulator *inside* that block breaks the
+    /// assumption, and must say so.
+    pub fn invalidate_block_cache(&mut self) {
+        self.cached_block = None;
+    }
+
     /// Takes the cached address lookup, leaving the emulator without one.
     ///
     /// The index is derived state, built once from what was assumed to be an
