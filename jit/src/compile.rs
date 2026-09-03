@@ -145,12 +145,20 @@ enum ShiftKind {
 }
 
 /// The machine integer type for a `size`-byte value.
+///
+/// 16 bytes is here because x86 integer code produces it constantly without any
+/// 128-bit types being in sight: SLEIGH lifts a 64-bit `imul` as a widening
+/// multiply into a 128-bit temporary, then slices the halves back out. Declining
+/// that width left the multiply *and every block containing one* to the
+/// interpreter, which was 99.9% of the interpreted block entries on the
+/// benchmarks that lagged.
 pub(crate) fn int_type(size: usize) -> Result<Type, Unsupported> {
     match size {
         1 => Ok(types::I8),
         2 => Ok(types::I16),
         4 => Ok(types::I32),
         8 => Ok(types::I64),
+        16 => Ok(types::I128),
         other => Err(Unsupported::Width(other)),
     }
 }
@@ -324,7 +332,9 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
                 let ValueRef::Literal(literal) = ValueRef::new(id, self.ctx) else {
                     return Err(Unsupported::Operand("literal did not resolve"));
                 };
-                Ok(self.builder.ins().iconst(ty, literal.value() as i64))
+                // A QCode literal is at most 64 bits wide, so widening one to
+                // a 16-byte operand loses nothing.
+                Ok(self.constant(ty, u128::from(literal.value())))
             }
             ValueId::Instruction(insn) => self
                 .values
@@ -422,6 +432,12 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
                 .get(&def)
                 .ok_or(Unsupported::Terminator("operand was not compiled"))?;
             let size = self.width_of(operand)?;
+            // An export slot is a `u64`. A terminator operand is a condition or
+            // a small integer in practice, so this is a decline that has never
+            // been observed rather than a width worth widening the buffer for.
+            if size > std::mem::size_of::<u64>() {
+                return Err(Unsupported::Terminator("operand wider than an export slot"));
+            }
             let slot = self.exports.len();
             let widened = self.widen_to_u64(value);
             self.builder.ins().store(
@@ -554,7 +570,7 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
                 let shifted = if start == 0 {
                     value
                 } else {
-                    let amount = self.builder.ins().iconst(from_ty, (start * 8) as i64);
+                    let amount = self.constant(from_ty, (start * 8) as u128);
                     self.builder.ins().ushr(value, amount)
                 };
                 Some(if from == size {
@@ -570,6 +586,11 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
             &Mnemonic::PopCount(PopCount { src }) => {
                 let src_id = src.qualify(func);
                 let from = self.width_of(src_id)?;
+                // Cranelift has no 128-bit `popcnt` lowering, and reaching it
+                // would be a panic inside the backend rather than a decline.
+                if from > std::mem::size_of::<u64>() {
+                    return Err(Unsupported::Width(from));
+                }
                 let value = self.operand(src_id, from)?;
                 let counted = self.builder.ins().popcnt(value);
                 let out = self.width_of(ValueId::Instruction(insn_id))?;
@@ -592,7 +613,7 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
                 let b_differs = self.builder.ins().bxor(b, sum);
                 let both = self.builder.ins().band(a_differs, b_differs);
                 let ty = self.builder.func.dfg.value_type(both);
-                let zero = self.builder.ins().iconst(ty, 0);
+                let zero = self.constant(ty, 0);
                 Some(self.builder.ins().icmp(IntCC::SignedLessThan, both, zero))
             }
 
@@ -605,7 +626,7 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
                 let result_differs = self.builder.ins().bxor(a, diff);
                 let both = self.builder.ins().band(operands_differ, result_differs);
                 let ty = self.builder.func.dfg.value_type(both);
-                let zero = self.builder.ins().iconst(ty, 0);
+                let zero = self.constant(ty, 0);
                 Some(self.builder.ins().icmp(IntCC::SignedLessThan, both, zero))
             }
 
@@ -620,7 +641,7 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
                     ("undef", []) => {
                         let out = self.width_of(ValueId::Instruction(insn_id))?;
                         let ty = int_type(out)?;
-                        Some(self.builder.ins().iconst(ty, 0))
+                        Some(self.constant(ty, 0))
                     }
                     ("LOCK" | "UNLOCK", []) => None,
                     _ => return Err(Unsupported::Mnemonic("user p-code op")),
@@ -650,6 +671,24 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         // `notrap` is earned: the address has been translated and its
         // permissions checked before any of these run.
         MemFlags::new().with_notrap()
+    }
+
+    /// A constant of `ty`.
+    ///
+    /// `iconst` cannot make an `I128` — Cranelift builds one from its halves —
+    /// so every constant the translator needs goes through here rather than
+    /// each caller having to remember which widths are reachable.
+    fn constant(&mut self, ty: Type, value: u128) -> Value {
+        if ty == types::I128 {
+            let low = self.builder.ins().iconst(types::I64, value as u64 as i64);
+            let high = self
+                .builder
+                .ins()
+                .iconst(types::I64, (value >> 64) as u64 as i64);
+            self.builder.ins().iconcat(low, high)
+        } else {
+            self.builder.ins().iconst(ty, value as u64 as i64)
+        }
     }
 
     /// `byte` repeated across every byte of `ty`.
@@ -794,6 +833,19 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         Ok((host, held))
     }
 
+    /// Whether a RAM access of `size` is one the inlined path is built for.
+    ///
+    /// The permission check splats its mask into an `Imm64` and the fallback
+    /// passes the value as a `u64`, so both stop at eight bytes. Nothing wider
+    /// reaches guest RAM in code built without SSE — the 128-bit values x86
+    /// integer code produces live in lifter temporaries, which are flat.
+    fn narrow_enough_for_ram(&self, size: usize) -> Result<(), Unsupported> {
+        if size > std::mem::size_of::<u64>() {
+            return Err(Unsupported::Access("guest RAM access wider than 8 bytes"));
+        }
+        Ok(())
+    }
+
     /// The stack slot the slow-path load writes through.
     fn load_slot(&mut self) -> codegen::ir::StackSlot {
         if let Some(slot) = self.load_slot {
@@ -811,6 +863,7 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
     /// Reads `size` bytes of guest RAM at `addr`.
     fn ram_load(&mut self, addr: Value, size: usize) -> Result<Value, Unsupported> {
         let ty = int_type(size)?;
+        self.narrow_enough_for_ram(size)?;
         let done = self.builder.create_block();
         self.builder.append_block_param(done, ty);
         let fallback = self.builder.create_block();
@@ -846,6 +899,7 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
     /// Writes `value` to `size` bytes of guest RAM at `addr`.
     fn ram_store(&mut self, addr: Value, value: Value, size: usize) -> Result<(), Unsupported> {
         let ty = int_type(size)?;
+        self.narrow_enough_for_ram(size)?;
         self.checked_width(value, size)?;
         let done = self.builder.create_block();
         let fallback = self.builder.create_block();
@@ -915,16 +969,19 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
     /// What an over-wide shift leaves behind.
     fn guard_shift(&mut self, shifted: Value, a: Value, amount: Value, kind: ShiftKind) -> Value {
         let ty = self.builder.func.dfg.value_type(a);
-        let bits = ty.bits() as i64;
+        let bits = u128::from(ty.bits());
+        // Built as a value rather than with the `_imm` form: those take an
+        // `Imm64`, which cannot describe a 128-bit operand.
+        let width = self.constant(ty, bits);
         let in_range = self
             .builder
             .ins()
-            .icmp_imm(IntCC::UnsignedLessThan, amount, bits);
+            .icmp(IntCC::UnsignedLessThan, amount, width);
         let saturated = match kind {
-            ShiftKind::Logical => self.builder.ins().iconst(ty, 0),
+            ShiftKind::Logical => self.constant(ty, 0),
             // Every bit becomes the sign bit.
             ShiftKind::Arithmetic => {
-                let all = self.builder.ins().iconst(ty, bits - 1);
+                let all = self.constant(ty, bits - 1);
                 self.builder.ins().sshr(a, all)
             }
         };
