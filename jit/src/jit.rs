@@ -264,6 +264,10 @@ impl Jit {
                     retired,
                 }));
             };
+            // Chaining means this block's terminator was decided here rather
+            // than by the interpreter, so it is retired work nobody else will
+            // count. Only the *last* block's terminator is left to the caller.
+            retired += 1;
             current = next;
         }
     }
