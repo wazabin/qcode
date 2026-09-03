@@ -36,7 +36,15 @@
 //! or values from earlier blocks exports nothing and costs nothing — which is
 //! the argument-less unconditional branch that straight-line guest code lifts
 //! to.
-
+//!
+//! # Escaping values
+//!
+//! The same reasoning applies to any value that outlives the block, not just
+//! the ones the terminator reads. Values crossing a block boundary as bare SSA
+//! references do not arise in SLEIGH-lifted code — guest state travels through
+//! registers and uniques, which are memory — but nothing in QCode forbids them,
+//! and dropping one would be a silent miscompile rather than a decline. So a
+//! block with a result used from outside it is declined outright.
 
 use cranelift::prelude::*;
 use qcode::{
@@ -68,6 +76,8 @@ pub enum Unsupported {
     Terminator(&'static str),
     /// An operand whose value the compiler cannot produce.
     Operand(&'static str),
+    /// A value defined in this block and read from outside it.
+    Escapes(&'static str),
 }
 
 impl std::fmt::Display for Unsupported {
@@ -78,6 +88,7 @@ impl std::fmt::Display for Unsupported {
             Self::Access(what) => write!(f, "unsupported memory access: {what}"),
             Self::Terminator(what) => write!(f, "unsupported terminator `{what}`"),
             Self::Operand(what) => write!(f, "unsupported operand: {what}"),
+            Self::Escapes(what) => write!(f, "value escapes the block: {what}"),
         }
     }
 }
@@ -244,9 +255,34 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
 
         for &insn_id in body {
             self.translate_one(insn_id)?;
+            self.check_confined(insn_id, &own)?;
         }
 
         self.export_terminator_operands(terminator, &own)
+    }
+
+    /// Declines the block if `insn_id`'s result is read from outside it.
+    ///
+    /// Compiled code keeps a block-local value in a machine register, so a use
+    /// from another block would read whatever the interpreter's value table
+    /// happened to hold. Lifted guest code does not produce such a use — state
+    /// crosses blocks through registers and uniques, which are memory — but a
+    /// pass that introduced one must make the block decline, not miscompile.
+    fn check_confined(
+        &self,
+        insn_id: InstructionId,
+        own: &FxHashSet<InstructionId>,
+    ) -> Result<(), Unsupported> {
+        let value = ValueId::Instruction(insn_id);
+        if self
+            .ctx
+            .users_of(value)
+            .iter()
+            .any(|user| !own.contains(user))
+        {
+            return Err(Unsupported::Escapes("result used from another block"));
+        }
+        Ok(())
     }
 
     /// Writes every terminator operand this block defines into the export
