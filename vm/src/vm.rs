@@ -447,7 +447,6 @@ impl<S: CodeSource> Vm<S> {
         }
         let started = std::time::Instant::now();
         let cleanup = crate::optimize::forward_temp_stores(&mut self.ctx, block);
-        qcode_analysis::dce::remove_dead_load_insns_block(&mut self.ctx, block, None, &[]);
         qcode_analysis::dce::remove_dead_insns(&mut self.ctx, block);
         self.stats.optimize += started.elapsed();
         self.stats.forwarded_loads += cleanup.forwarded_loads as u64;
