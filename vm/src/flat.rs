@@ -184,7 +184,16 @@ impl FlatSpace {
 /// The set of flat spaces for a module.
 #[derive(Debug, Default, Clone)]
 pub struct FlatSpaces {
-    spaces: FxHashMap<MemorySpaceId, FlatSpace>,
+    /// Storage, appended to as spaces are first touched.
+    ///
+    /// Held in a `Vec` rather than keyed directly by id so that an index is
+    /// *stable*: a caller that resolves a space once can address it forever
+    /// without hashing again. Compiled code re-enters through here on every
+    /// block execution, and two map lookups per space per entry was a
+    /// measurable share of the JIT's run time.
+    spaces: Vec<FlatSpace>,
+    /// Where each space's storage lives in `spaces`. Append-only.
+    slots: FxHashMap<MemorySpaceId, usize>,
     /// Shared spaces whose unwritten bytes read as zero, learned from the
     /// context. Rebuilt only when the module gains spaces.
     zero_filled: FxHashMap<SpaceId, bool>,
@@ -211,6 +220,28 @@ impl FlatSpaces {
         self.configured_space_count = Some(count);
     }
 
+    /// The stable index of `space`'s storage, creating it on first use.
+    ///
+    /// Resolve this once and address the space with [`base_ptr_at`](Self::base_ptr_at)
+    /// thereafter; the index stays valid for the life of these spaces.
+    pub fn slot(&mut self, space: MemorySpaceId) -> usize {
+        if let Some(&slot) = self.slots.get(&space) {
+            return slot;
+        }
+        let zero_filled = self.is_zero_filled(space);
+        self.spaces.push(FlatSpace::new(zero_filled));
+        let slot = self.spaces.len() - 1;
+        self.slots.insert(space, slot);
+        slot
+    }
+
+    /// The base pointer of the storage at `slot`, grown to hold `len` bytes.
+    ///
+    /// Panics if `slot` did not come from [`slot`](Self::slot) on these spaces.
+    pub fn base_ptr_at(&mut self, slot: usize, len: usize) -> Result<*mut u8, EmulatorErrorKind> {
+        self.spaces[slot].base_ptr(len)
+    }
+
     fn is_zero_filled(&self, space: MemorySpaceId) -> bool {
         match space {
             // Lifter scratch is created per function and read after writing.
@@ -229,19 +260,17 @@ impl FlatSpaces {
     }
 
     pub fn get(&self, space: MemorySpaceId) -> Option<&FlatSpace> {
-        self.spaces.get(&space)
+        self.slots.get(&space).map(|&slot| &self.spaces[slot])
     }
 
     /// The space's storage, created on first use.
     pub fn entry(&mut self, space: MemorySpaceId) -> &mut FlatSpace {
-        let zero_filled = self.is_zero_filled(space);
-        self.spaces
-            .entry(space)
-            .or_insert_with(|| FlatSpace::new(zero_filled))
+        let slot = self.slot(space);
+        &mut self.spaces[slot]
     }
 
     pub fn read_u128(&self, space: MemorySpaceId, addr: u64, size: usize) -> Result<u128, EmulatorErrorKind> {
-        match self.spaces.get(&space) {
+        match self.get(space) {
             Some(flat) => flat.read_u128(addr, size),
             None if self.is_zero_filled(space) => Ok(0),
             None => Err(EmulatorErrorKind::UnknownSpace(space)),
@@ -254,7 +283,7 @@ impl FlatSpaces {
         addr: u64,
         size: usize,
     ) -> Result<Vec<u8>, EmulatorErrorKind> {
-        match self.spaces.get(&space) {
+        match self.get(space) {
             Some(flat) => flat.read_bytes(addr, size),
             None if self.is_zero_filled(space) => Ok(vec![0; size]),
             None => Err(EmulatorErrorKind::UnknownSpace(space)),

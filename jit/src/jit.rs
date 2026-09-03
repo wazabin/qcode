@@ -19,6 +19,12 @@ struct Compiled {
     table: SpaceTable,
     /// The terminator operands this block computes, in slot order.
     exports: Vec<Export>,
+    /// Where each of `table`'s spaces lives in the machine's flat storage.
+    ///
+    /// Resolved on first execution and kept: a slot is stable for the life of
+    /// the spaces, so re-entering a hot block costs an array index per space
+    /// rather than a map lookup.
+    slots: Vec<usize>,
 }
 
 /// How much work the JIT is taking, and how much it is declining.
@@ -167,6 +173,7 @@ impl Jit {
             entry,
             table,
             exports,
+            slots: Vec::new(),
         });
         Ok(self.compiled.len() - 1)
     }
@@ -192,14 +199,23 @@ impl Jit {
             return Ok(false);
         };
 
+        let compiled = &mut self.compiled[index];
+        let flat = emu.memory.flat_mut();
+        if compiled.slots.is_empty() {
+            compiled.slots = compiled
+                .table
+                .entries()
+                .iter()
+                .map(|&(space, _)| flat.slot(space))
+                .collect();
+        }
+
         // Each space is grown to the size the block needs *before* its base
         // pointer is taken: growing reallocates, and compiled code holds these
         // pointers for the duration of the call.
-        let compiled = &self.compiled[index];
         self.scratch.clear();
-        for &(space, required) in compiled.table.entries() {
-            self.scratch
-                .push(emu.memory.flat_mut().base_ptr(space, required)?);
+        for (&slot, &(_, required)) in compiled.slots.iter().zip(compiled.table.entries()) {
+            self.scratch.push(flat.base_ptr_at(slot, required)?);
         }
         self.exports.clear();
         self.exports.resize(compiled.exports.len(), 0);

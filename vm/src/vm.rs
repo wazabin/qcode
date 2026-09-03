@@ -239,8 +239,7 @@ impl<S: CodeSource> Vm<S> {
             match executor.run_block(&self.ctx, &mut self.emu, block) {
                 Ok(true) => {
                     let body = BasicBlock::from_id(&self.ctx, block)
-                        .instruction_ids()
-                        .len()
+                        .instruction_count()
                         .saturating_sub(1);
                     // The body's operations were retired by the executor; they
                     // are counted so throughput stays comparable between
