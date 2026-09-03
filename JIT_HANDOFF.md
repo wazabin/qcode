@@ -1,8 +1,8 @@
 # JIT and VM handoff
 
-The JIT is correct on all 17 Embench-IoT benchmarks and worth about 1.0–4.8× on
-them. The next work is coverage: it declines two thirds of real code, and where
-it declines it costs more than it saves.
+The JIT is correct on all 17 Embench-IoT benchmarks and worth about 1.3–31× on
+them. It compiles 99% of the blocks a real program lifts. What is left is
+throughput inside the code it already takes, not coverage.
 
 ## Start here: run the divergence harness on every program
 
@@ -29,6 +29,11 @@ It is deliberately unchained (`run_block(..., false)`), so it isolates compiled
 code from the decision to stay in it. Current state: all 17 agree, 351k–1.79M
 block entries each.
 
+`guest_memory` is the unit-level companion, and the one to extend when touching
+the RAM path: it runs each block *twice*, because which of the two memory paths
+executes depends on history — a page is only reachable inline once an access to
+it has been served the slow way.
+
 Every correctness bug in this area was found by one of these two and would not
 have been found by the other. Three times, a green result turned out to be the
 harness lying — see "Lessons" below.
@@ -42,6 +47,7 @@ harness lying — see "Lessons" below.
 | `276e767` | `forward_temp_stores` applied rewrites in program order, so a forwarded value that was itself a load being removed left a reference to a deleted instruction. This was the `dead or unknown id` panic. Pre-existing. |
 | `361fc76` | An over-wide shift. QCode follows p-code (result is 0, or the sign); Cranelift *masks* the amount. The old comment claimed both behaved alike. |
 | `3d20d27` | The VM's lifter now lowers guest `call`/`ret` as jumps (`with_flat_control_flow`). This is what made Embench run at all — see below. |
+| `33fe87a` | Guest RAM is compiled, through an inlined software TLB and an inlined per-byte permission check. Block coverage went from ~24% to 99.1% and every benchmark crossed 1.0×. |
 
 `7552962` gives up a real optimization: on a merged straight-line block, dead
 flag stores were 12 of 26, and removing them took one block from 96 QCode
@@ -53,46 +59,81 @@ intervening read, which never depends on what is live at the exit.
 ## Where the performance actually is
 
 ```
-aha-mont64 4.81x   huffbench 1.38x   md5sum 1.31x   picojpeg 1.16x
-sglib 1.13x   qrduino 1.12x   depthconv 1.11x   ...   crc32 0.95x   nsichneu 0.96x
+xgboost 31.5x   md5sum 25.9x   nettle-aes 23.1x   huffbench 19.0x   statemate 14.1x
+qrduino 9.1x   edn 7.0x   nettle-sha256 5.8x   picojpeg 5.5x   aha-mont64 4.8x
+sglib 4.5x   nsichneu 2.8x   depthconv 2.5x   crc32 1.9x   ud 1.8x
+tarfind 1.6x   matmult-int 1.3x
 ```
 
-Microbenchmark (`vm_integration jit_throughput`): ~43ms, ~46M guest-insn/s,
-`native_bodies=3` — a million-iteration loop runs inside one entry into the JIT.
-Treat that number with suspicion: it is a two-instruction loop that touches no
-memory, and it predicted none of the above.
+Nothing is below 1.0× any more. The two that used to be — `crc32` at 0.95× and
+`nsichneu` at 0.96× — were paying a `resolve` per execution for blocks that then
+ran on the interpreter anyway; they are now 1.9× and 2.8×.
 
-**The ceiling is memory access.** Measured over `fib-static.ins` (3,779 real
-instructions from icicle's corpus, `~/dev/icicle-emu/icicle-test/tests/`):
+Microbenchmark (`vm_integration jit_throughput`): a two-instruction loop that
+touches no memory. It predicted none of the above and still does not; the
+benchmark that means something is `embench`, which reports these numbers itself.
 
-```
-64.4% of instructions compile
-96% of all declines are "non-constant address" — i.e. guest RAM
-```
+### How guest RAM is compiled
 
-Per *block* it is far worse (~24% on a real kernel), because one unsupported
-instruction declines the whole block, and basic-block absorption made blocks
-bigger. A declined block still pays a `resolve` on every execution, which is why
-`crc32` and `nsichneu` are *below* 1.0×.
+Following icicle (`~/dev/icicle-emu/icicle-jit/src/translate/mem.rs`), with one
+deliberate departure. The `Mmu` stays the only implementation of what an access
+*means*; what is inlined is its answer.
 
-### The next change: inline the MMU
+- `vm/src/tlb.rs` — a 64-entry direct-mapped table of
+  `TlbEntry { tag, guest_to_host_offset }`, 16 bytes so indexing is a shift and
+  a mask. An entry says only *where a resident page lives*; it says nothing
+  about permissions.
+- A page is now one allocation, `PageData { data, perm }`, `#[repr(C)]`, so the
+  permission byte for a data byte is a fixed `PAGE_PERM_OFFSET` away. That
+  layout is an interface — `mmu::tests::the_permission_array_follows_the_data_array`
+  is what holds it.
+- The hot path (`compile::inline_access`): same-page check, index, tag compare,
+  add, then a per-byte permission test that loads `size` permission bytes as one
+  integer and checks `required & !held == 0`. Anything it cannot settle branches
+  to a `set_cold_block` calling `vm/src/jit_abi.rs`, which serves the access
+  through the real `Mmu` and caches the page on the way out.
 
-Follow icicle (`~/dev/icicle-emu/icicle-jit/src/translate/mem.rs`). It inlines a
-software TLB and keeps the real MMU as a cold fallback:
+**The departure from icicle: one table, not separate read and write ones.**
+Separate tables let the table itself carry the coarse permission. Here
+permissions are per *byte*, so the byte scan happens either way and a second
+table would only be a second thing to fill and invalidate.
 
-- `TLBEntry { tag: u64, guest_to_host_offset: u64 }` — 16 bytes, so indexing is a
-  shift and a mask.
-- **Separate read and write tables**, so the coarse permission check *is* which
-  table the entry was found in.
-- Hot path: index, load tag, compare, miss branches to a `set_cold_block` that
-  calls the Rust MMU; hit adds `guest_to_host_offset` and does the access.
-- Plus `check_alignment` and `check_same_page` (both elided for 1-byte), and a
-  per-byte `check_perm`. `tlb_lookup_const` folds the index when the address is
-  constant. TLB loads are tagged `AliasRegion::Vmctx`.
+Three things hold this together, and each is a way to get it silently wrong:
 
-After that, register caching in SSA (icicle's `TranslatorCtx::active_vars`) is
-what would recover the dead-flag-store win structurally, without needing a
-dead-store pass at all: values that never reach memory need no proving dead.
+1. **Invalidation is blunt on purpose.** Every operation that can add, drop or
+   replace a page flushes the whole table (`map`, `unmap`, `protect`,
+   `write_unchecked`, `restore`), and a clone starts empty. An entry is a raw
+   pointer into a page allocation; a mis-scoped invalidation is a use-after-free
+   in compiled code, not a stale read.
+2. **The dynamic checks are opted out of, not approximated.** `check_uninit` and
+   `watchpoints_armed` both turn a *set* bit into a fault, which the inline
+   "these bits are all present" test cannot express. So `cache_translation`
+   refuses to cache anything while either is on, and both setters flush. That is
+   why they are behind setters now rather than public fields.
+3. **An inline store sets `INIT`.** It is bookkeeping nobody reads on a normal
+   run, which is exactly why omitting it would go unnoticed until a
+   `check_uninit` run reported bytes the guest had plainly written.
+
+A faulting access stops the block where it happened and returns `BLOCK_FAULT`;
+the fault itself is left on the `VmMemory` for the VM to turn into a
+`VmExit::Fault`, exactly as an interpreted one is. The stores that already ran
+stay applied — which is what the interpreter leaves too, and the reason guest
+RAM and the flat spaces are compiled *without* alias regions: Cranelift must not
+reorder one store past another, or that prefix stops being a prefix.
+
+## What is next
+
+Coverage is no longer the lever. Of 3,733 blocks lifted across Embench, 34
+decline: 33 for a 16-byte operand width and one for integer division.
+
+- **Register caching in SSA** (icicle's `TranslatorCtx::active_vars`). Guest
+  state still round-trips through memory between every instruction in a block.
+  This is also what would recover the dead-flag-store optimization `7552962`
+  gave up, structurally: a value that never reaches memory needs no proving dead.
+- **128-bit operand widths**, which is the whole remaining decline list and
+  overlaps with lifting SSE.
+- The TLB is direct-mapped with 64 entries and no measurement behind that number.
+  Before tuning it, count misses — `jit_abi` is the one place they pass through.
 
 ## Other things worth knowing
 
@@ -154,6 +195,11 @@ more.
   interpreted exit on every failure, so `qrduino` looked like an interpreter bug
   when the interpreter was fine (`d516d80`). All 9 real failures turned out to be
   the JIT.
+- **Run the JIT's tests in debug too.** Cranelift's FunctionBuilder checks "you
+  have to fill your block before switching" only under `debug_assertions`. The
+  fault epilogue was built by switching away from a half-emitted block, and
+  `--release` — which is how every harness here is run — passed all 17 programs
+  on it. Only `cargo test` without `--release` said anything.
 - **Check the claim in the comment.** Both the shift bug and the RAM bug were
   comments asserting a property the code did not enforce.
 - **Look for the pass before writing it.** Dead-store elimination already
