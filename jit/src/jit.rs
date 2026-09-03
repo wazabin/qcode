@@ -5,7 +5,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 use qcode::{context::Context, value::BlockId};
 use qcode_emulator::EmulatorErrorKind;
-use qcode_vm::VmMemory;
+use qcode_vm::{BlockExecutor, VmMemory};
 use rustc_hash::FxHashMap;
 
 use crate::compile::{BlockTranslator, SpaceTable, Unsupported};
@@ -34,13 +34,18 @@ pub struct JitStats {
 /// Holding the [`JITModule`] means compiled code lives as long as this does.
 pub struct Jit {
     module: JITModule,
-    builder_ctx: FunctionBuilderContext,
     /// Compiled blocks, indexed by the handles in `cache`.
     compiled: Vec<Compiled>,
     /// What is known about each block: an index into `compiled`, or the reason
     /// it was declined. Declining is cached too, so a block the compiler cannot
     /// take is only examined once.
-    cache: FxHashMap<BlockId, Result<usize, Unsupported>>,
+    ///
+    /// Keyed by the block's instruction count as well as its id, because a
+    /// block is *not* immutable here: a VM that lifts on demand first presents
+    /// an empty placeholder (which the compiler rightly declines), then fills
+    /// it, then runs a cleanup pass over it. Keying on the id alone would freeze
+    /// that first decline forever and the block would never be compiled.
+    cache: FxHashMap<(BlockId, usize), Result<usize, Unsupported>>,
     /// Reused across runs so a hot block does not allocate to be entered.
     scratch: Vec<*mut u8>,
     pub stats: JitStats,
@@ -70,7 +75,6 @@ impl Jit {
         ));
         Self {
             module,
-            builder_ctx: FunctionBuilderContext::new(),
             compiled: Vec::new(),
             cache: FxHashMap::default(),
             scratch: Vec::new(),
@@ -83,7 +87,8 @@ impl Jit {
     /// A decline is remembered, so an unsupported block costs one compilation
     /// attempt over the life of the machine rather than one per execution.
     fn resolve(&mut self, ctx: &Context<'_>, block: BlockId) -> Result<usize, Unsupported> {
-        if let Some(known) = self.cache.get(&block) {
+        let key = (block, ctx.block(block).instruction_ids().len());
+        if let Some(known) = self.cache.get(&key) {
             return known.clone();
         }
         let outcome = self.compile(ctx, block);
@@ -91,7 +96,7 @@ impl Jit {
             Ok(_) => self.stats.compiled += 1,
             Err(_) => self.stats.declined += 1,
         }
-        self.cache.insert(block, outcome.clone());
+        self.cache.insert(key, outcome.clone());
         outcome
     }
 
@@ -108,8 +113,12 @@ impl Jit {
         let mut context = self.module.make_context();
         context.func.signature = signature;
 
+        // A fresh builder context per attempt: a declined block abandons its
+        // half-built function, which would leave a shared context dirty and
+        // trip Cranelift's emptiness assertion on the next compilation.
+        let mut builder_ctx = FunctionBuilderContext::new();
         let table = {
-            let mut builder = FunctionBuilder::new(&mut context.func, &mut self.builder_ctx);
+            let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_ctx);
             let entry = builder.create_block();
             builder.append_block_params_for_function_params(entry);
             builder.switch_to_block(entry);
@@ -149,6 +158,13 @@ impl Jit {
         Ok(self.compiled.len() - 1)
     }
 
+    /// Compiles `block` without running it, reporting why if it is declined.
+    ///
+    /// For tooling that wants to report coverage over a module.
+    pub fn try_compile(&mut self, ctx: &Context<'_>, block: BlockId) -> Result<(), Unsupported> {
+        self.resolve(ctx, block).map(|_| ())
+    }
+
     /// Runs `block` as native code, if it has any.
     ///
     /// Returns `Ok(false)` when the block is not compiled, which is the caller's
@@ -179,6 +195,18 @@ impl Jit {
         (compiled.entry)(self.scratch.as_ptr());
         self.stats.native_runs += 1;
         Ok(true)
+    }
+}
+
+/// Lets a [`Jit`] be installed on a machine as its block executor.
+impl BlockExecutor for Jit {
+    fn run_block(
+        &mut self,
+        ctx: &Context<'_>,
+        memory: &mut VmMemory,
+        block: BlockId,
+    ) -> Result<bool, EmulatorErrorKind> {
+        Jit::run_block(self, ctx, memory, block)
     }
 }
 
