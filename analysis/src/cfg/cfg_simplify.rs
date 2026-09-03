@@ -510,8 +510,31 @@ fn substitute(
         .collect()
 }
 
-#[cfg(test)]
-fn simplify_cfg(ctx: &mut qcode::context::Context, function_id: FunctionId) -> bool {
+/// Absorbs the straight-line chain that starts at `block`, and nothing else.
+///
+/// [`try_merge_block`] applied repeatedly from one block: while `block`'s sole
+/// successor has `block` as its sole predecessor, the successor is absorbed.
+/// Returns how many blocks were absorbed.
+///
+/// Unlike [`simplify_cfg`] this deletes only blocks *reachable forward* from
+/// `block`, and never `block` itself. That is what makes it safe to run while
+/// something holds a position inside `block` — a lifter extending a basic
+/// block it has just emitted, say — where a whole-function simplification could
+/// prune or bypass the block under the holder's feet.
+pub fn absorb_straight_line(ctx: &mut qcode::context::Context, block: BlockId) -> usize {
+    let function_id = block.func;
+    crate::with_body_mut(ctx, function_id, |body, cx| {
+        let mut absorbed = 0;
+        while try_merge_block(body, cx, function_id, block) {
+            absorbed += 1;
+        }
+        absorbed
+    })
+}
+
+/// Simplifies `function_id`'s CFG in `ctx` to a fixpoint. See
+/// [`simplify_cfg_body`] for the transforms applied.
+pub fn simplify_cfg(ctx: &mut qcode::context::Context, function_id: FunctionId) -> bool {
     crate::with_body_mut(ctx, function_id, |body, cx| {
         simplify_cfg_body(body, cx, function_id)
     })
