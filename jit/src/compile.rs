@@ -93,6 +93,13 @@ impl std::fmt::Display for Unsupported {
     }
 }
 
+/// Whether an over-wide shift leaves zero or the sign.
+#[derive(Clone, Copy)]
+enum ShiftKind {
+    Logical,
+    Arithmetic,
+}
+
 /// The machine integer type for a `size`-byte value.
 pub(crate) fn int_type(size: usize) -> Result<Type, Unsupported> {
     match size {
@@ -543,6 +550,25 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         })
     }
 
+    /// What an over-wide shift leaves behind.
+    fn guard_shift(&mut self, shifted: Value, a: Value, amount: Value, kind: ShiftKind) -> Value {
+        let ty = self.builder.func.dfg.value_type(a);
+        let bits = ty.bits() as i64;
+        let in_range = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedLessThan, amount, bits);
+        let saturated = match kind {
+            ShiftKind::Logical => self.builder.ins().iconst(ty, 0),
+            // Every bit becomes the sign bit.
+            ShiftKind::Arithmetic => {
+                let all = self.builder.ins().iconst(ty, bits - 1);
+                self.builder.ins().sshr(a, all)
+            }
+        };
+        self.builder.ins().select(in_range, shifted, saturated)
+    }
+
     fn binop(&mut self, op: Binop, a: Value, b: Value) -> Result<Value, Unsupported> {
         let ins = self.builder.ins();
         Ok(match op {
@@ -553,11 +579,24 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
                 IntBinop::Or => ins.bor(a, b),
                 IntBinop::Xor => ins.bxor(a, b),
                 IntBinop::Mul => ins.imul(a, b),
-                // Shift amounts are taken modulo the width by both QCode's
-                // interpreter and Cranelift, so no masking is needed here.
-                IntBinop::ShiftLeft => ins.ishl(a, b),
-                IntBinop::ShiftRight => ins.ushr(a, b),
-                IntBinop::SShiftRight => ins.sshr(a, b),
+                // An out-of-range shift is where QCode and Cranelift disagree,
+                // so it cannot be left to the machine. QCode follows p-code: a
+                // shift by the operand's width or more yields zero, and an
+                // arithmetic one yields the sign. Cranelift instead *masks* the
+                // amount, so a shift by 64 of a 64-bit value would be a shift by
+                // none. Both are handled with a select rather than a branch.
+                IntBinop::ShiftLeft => {
+                    let shifted = ins.ishl(a, b);
+                    return Ok(self.guard_shift(shifted, a, b, ShiftKind::Logical));
+                }
+                IntBinop::ShiftRight => {
+                    let shifted = ins.ushr(a, b);
+                    return Ok(self.guard_shift(shifted, a, b, ShiftKind::Logical));
+                }
+                IntBinop::SShiftRight => {
+                    let shifted = ins.sshr(a, b);
+                    return Ok(self.guard_shift(shifted, a, b, ShiftKind::Arithmetic));
+                }
                 IntBinop::Equal => ins.icmp(IntCC::Equal, a, b),
                 IntBinop::NotEqual => ins.icmp(IntCC::NotEqual, a, b),
                 IntBinop::Less => ins.icmp(IntCC::UnsignedLessThan, a, b),
