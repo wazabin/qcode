@@ -17,8 +17,21 @@
 //! interpreter instead. Declining is a normal outcome, not a failure: it is what
 //! lets this be an alternative strategy rather than a replacement.
 //!
-//! Guest RAM is *not* handled here. Every RAM access must go through the MMU for
-//! its permission check and fault reporting, and inlining that is a later step.
+//! Guest RAM *is* handled here, but not by addressing it: an access to it owes
+//! a translation, a permission check and a fault report, and those belong to
+//! the MMU. What is inlined is the MMU's *answer* — a software TLB entry giving
+//! the host address of a resident guest page, and the permission bytes sitting
+//! beside that page's data. An access that the inlined form cannot settle (a
+//! page not yet cached, one straddling a boundary, a permission it refuses)
+//! calls back into the VM, which is the only implementation of what an access
+//! means. See [`qcode_vm::jit_abi`].
+//!
+//! A faulting access stops the block where it happened and hands the fault back
+//! through the function's status result. The stores that ran before it stay
+//! applied, which is what the interpreter would have left behind too — so guest
+//! RAM and the flat spaces are deliberately compiled *without* alias regions,
+//! keeping Cranelift from reordering one store past another and making that
+//! prefix something other than a prefix.
 //!
 //! # Terminators
 //!
@@ -46,7 +59,9 @@
 //! and dropping one would be a silent miscompile rather than a decline. So a
 //! block with a result used from outside it is declined outright.
 
+use cranelift::codegen::ir::BlockArg;
 use cranelift::prelude::*;
+use cranelift_module::FuncId;
 use qcode::{
     context::Context,
     space::MemorySpaceId,
@@ -58,7 +73,36 @@ use qcode::{
         },
     },
 };
+use qcode_vm::{PAGE_PERM_OFFSET, PAGE_SIZE, TLB_ENTRIES, TlbEntry, perm};
 use rustc_hash::{FxHashMap, FxHashSet};
+
+/// Status a compiled block returns: it ran to the end of its body.
+pub const BLOCK_OK: i64 = 0;
+/// Status a compiled block returns: an access faulted and the block stopped
+/// there. The fault itself is on the VM's memory.
+pub const BLOCK_FAULT: i64 = 1;
+
+/// Which side of memory an access is on, and what it therefore owes.
+#[derive(Clone, Copy)]
+enum Access {
+    Load,
+    Store,
+}
+
+impl Access {
+    /// The permission bits every byte of the access must already have.
+    ///
+    /// [`perm::INIT`] is absent from the read set on purpose. Requiring it
+    /// would be wrong whenever `check_uninit` is off — an uninitialized read is
+    /// then perfectly legal — and the MMU refuses to cache a translation at all
+    /// while it is on, so the inline path never runs under that rule.
+    fn required(self) -> u8 {
+        match self {
+            Self::Load => perm::MAP | perm::READ,
+            Self::Store => perm::MAP | perm::WRITE,
+        }
+    }
+}
 
 /// Why a block could not be compiled.
 ///
@@ -157,6 +201,19 @@ pub(crate) struct BlockTranslator<'a, 'ctx> {
     /// Base of the export buffer, the compiled function's second argument: one
     /// `u64` slot per entry of [`Self::exports`].
     exports_arg: Value,
+    /// Base of the software TLB, the third argument.
+    tlb_arg: Value,
+    /// The `VmMemory` the fallback helpers act on, the fourth argument.
+    memory_arg: Value,
+    /// The runtime's slow-path load and store, already referenced in this
+    /// function.
+    helpers: HelperRefs,
+    /// The block that abandons the run and reports a fault, created on the
+    /// first access that could take one.
+    fault_block: Option<cranelift::prelude::Block>,
+    /// Where the slow-path load leaves its result. One slot serves every
+    /// access in the block: only one call is live at a time.
+    load_slot: Option<codegen::ir::StackSlot>,
     /// Cached base pointer per space slot, loaded once per block rather than per
     /// access.
     bases: FxHashMap<usize, Value>,
@@ -165,6 +222,21 @@ pub(crate) struct BlockTranslator<'a, 'ctx> {
     pub(crate) table: SpaceTable,
     /// Values the terminator reads, in export-buffer slot order.
     pub(crate) exports: Vec<Export>,
+}
+
+/// The runtime entry points compiled code calls when an access cannot be
+/// settled inline, as declared in the module.
+#[derive(Debug, Clone, Copy)]
+pub struct Helpers {
+    pub load: FuncId,
+    pub store: FuncId,
+}
+
+/// The same pair, resolved against one function being built.
+#[derive(Debug, Clone, Copy)]
+struct HelperRefs {
+    load: codegen::ir::FuncRef,
+    store: codegen::ir::FuncRef,
 }
 
 /// One value compiled code hands back for the interpreter to read.
@@ -182,14 +254,25 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         ctx: &'ctx Context<'ctx>,
         builder: FunctionBuilder<'a>,
         entry: cranelift::prelude::Block,
+        helpers: (codegen::ir::FuncRef, codegen::ir::FuncRef),
     ) -> Self {
         let spaces_arg = builder.block_params(entry)[0];
         let exports_arg = builder.block_params(entry)[1];
+        let tlb_arg = builder.block_params(entry)[2];
+        let memory_arg = builder.block_params(entry)[3];
         Self {
             ctx,
             builder,
             spaces_arg,
             exports_arg,
+            tlb_arg,
+            memory_arg,
+            helpers: HelperRefs {
+                load: helpers.0,
+                store: helpers.1,
+            },
+            fault_block: None,
+            load_slot: None,
             bases: FxHashMap::default(),
             values: FxHashMap::default(),
             table: SpaceTable::default(),
@@ -217,7 +300,8 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
     /// a permission check and a fault report, which is the MMU's to give. A
     /// RIP-relative operand resolves to a perfectly constant address and is
     /// still RAM — treating one as flat storage silently reads a fabricated,
-    /// zero-filled space instead of the guest's memory.
+    /// zero-filled space instead of the guest's memory. RAM is reached through
+    /// [`Self::inline_access`] instead.
     fn is_flat(&self, space: MemorySpaceId) -> bool {
         space != MemorySpaceId::Shared(self.ctx.shared.default_space)
     }
@@ -367,7 +451,9 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
             &Mnemonic::Load(Load { space, ptr, size }) => {
                 let space = space.qualify(func);
                 if !self.is_flat(space) {
-                    return Err(Unsupported::Access("guest RAM needs the MMU"));
+                    let addr = self.guest_address(ptr.qualify(func))?;
+                    let value = self.ram_load(addr, size)?;
+                    return self.record(insn_id, Some(value));
                 }
                 let addr = self
                     .constant_address(ptr.qualify(func))
@@ -391,7 +477,10 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
             }) => {
                 let space = space.qualify(func);
                 if !self.is_flat(space) {
-                    return Err(Unsupported::Access("guest RAM needs the MMU"));
+                    let addr = self.guest_address(ptr.qualify(func))?;
+                    let value = self.operand(src.qualify(func), size)?;
+                    self.ram_store(addr, value, size)?;
+                    return Ok(());
                 }
                 let addr = self
                     .constant_address(ptr.qualify(func))
@@ -547,6 +636,262 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         Ok(())
     }
 
+    /// Flags for an access to guest memory or its permission bytes.
+    ///
+    /// Not [`MemFlags::trusted`]: that asserts alignment, and a guest access is
+    /// unaligned whenever the guest says so. No alias region either, so
+    /// Cranelift keeps these ordered against the flat-space stores around them
+    /// — a faulting access must leave exactly the prefix that ran before it.
+    ///
+    /// The endianness is the host's, which is the guest's: this backend is
+    /// built for an x86-64 guest on an x86-64 host, and the flat spaces have
+    /// always been read the same way.
+    fn guest_flags() -> MemFlags {
+        // `notrap` is earned: the address has been translated and its
+        // permissions checked before any of these run.
+        MemFlags::new().with_notrap()
+    }
+
+    /// `byte` repeated across every byte of `ty`.
+    fn splat(byte: u8, ty: Type) -> i64 {
+        let mut bits = [0u8; 8];
+        for slot in bits.iter_mut().take(ty.bytes() as usize) {
+            *slot = byte;
+        }
+        i64::from_le_bytes(bits)
+    }
+
+    /// The block that stops the run and reports a fault to the caller.
+    ///
+    /// Every faulting access jumps to this one block rather than carrying its
+    /// own epilogue. It is only *created* here — its body is emitted by
+    /// [`Self::finish`], because a builder may not leave a block that has not
+    /// been terminated yet, and the block asking for this one is mid-access.
+    fn fault_block(&mut self) -> cranelift::prelude::Block {
+        if let Some(block) = self.fault_block {
+            return block;
+        }
+        let block = self.builder.create_block();
+        self.builder.set_cold_block(block);
+        self.fault_block = Some(block);
+        block
+    }
+
+    /// Continues in a fresh block, taking `target` instead when `cond` is
+    /// non-zero.
+    fn bail_if(&mut self, cond: Value, target: cranelift::prelude::Block) {
+        let carry_on = self.builder.create_block();
+        self.builder.ins().brif(cond, target, &[], carry_on, &[]);
+        self.builder.switch_to_block(carry_on);
+    }
+
+    /// As [`Self::bail_if`], taking `target` when `cond` is zero.
+    fn bail_unless(&mut self, cond: Value, target: cranelift::prelude::Block) {
+        let carry_on = self.builder.create_block();
+        self.builder.ins().brif(cond, carry_on, &[], target, &[]);
+        self.builder.switch_to_block(carry_on);
+    }
+
+    /// A guest address as a 64-bit value.
+    ///
+    /// Unlike a flat access, a RAM pointer is a computed guest value: a
+    /// literal, or something this block worked out. A varnode or temp *id*
+    /// reaching here would mean the block is addressing RAM by the storage
+    /// location's own address, which is not what a guest pointer is.
+    fn guest_address(&mut self, ptr: ValueId) -> Result<Value, Unsupported> {
+        let width = self.width_of(ptr)?;
+        if width > 8 {
+            return Err(Unsupported::Access("address wider than 64 bits"));
+        }
+        let value = self.operand(ptr, width)?;
+        // Widened from the value's own type rather than the declared width. The
+        // two agree on everything lifted so far, and if they ever stop, a
+        // mismatched `iadd` below is a panic inside Cranelift rather than a
+        // declined block.
+        Ok(match self.builder.func.dfg.value_type(value) {
+            types::I64 => value,
+            ty if ty.is_int() => self.builder.ins().uextend(types::I64, value),
+            _ => return Err(Unsupported::Access("address is not an integer")),
+        })
+    }
+
+    /// Checks that a value really is the `size`-byte integer it is declared to
+    /// be, so a machine store writes the width the guest asked for.
+    fn checked_width(&self, value: Value, size: usize) -> Result<(), Unsupported> {
+        if self.builder.func.dfg.value_type(value) == int_type(size)? {
+            Ok(())
+        } else {
+            Err(Unsupported::Operand("value is not its declared width"))
+        }
+    }
+
+    /// Translates `addr` and checks its permissions inline, branching to
+    /// `fallback` at the first thing it cannot settle.
+    ///
+    /// Returns the host address of the access and the permission bytes it
+    /// found there — the store path reuses the latter rather than loading it
+    /// twice.
+    fn inline_access(
+        &mut self,
+        addr: Value,
+        size: usize,
+        kind: Access,
+        fallback: cranelift::prelude::Block,
+    ) -> Result<(Value, Value), Unsupported> {
+        let ty = int_type(size)?;
+        let page_mask = (PAGE_SIZE - 1) as i64;
+
+        // A translation covers one page, so an access spilling into the next
+        // one is not this path's to make. A single byte never can.
+        if size > 1 {
+            let offset = self.builder.ins().band_imm(addr, page_mask);
+            let last = self.builder.ins().iadd_imm(offset, size as i64 - 1);
+            let spills = self.builder.ins().band_imm(last, !page_mask);
+            self.bail_if(spills, fallback);
+        }
+
+        // The entry's *byte* offset comes straight out of the address: shifting
+        // by the page bits would give the page number, so shifting by that
+        // much less the entry size gives the offset of its entry directly.
+        let entry_size = std::mem::size_of::<TlbEntry>() as i64;
+        debug_assert!(entry_size.count_ones() == 1);
+        let entry_bits = entry_size.trailing_zeros() as i64;
+        let index_shift = PAGE_SIZE.trailing_zeros() as i64 - entry_bits;
+        let shifted = self.builder.ins().ushr_imm(addr, index_shift);
+        let offset = self
+            .builder
+            .ins()
+            .band_imm(shifted, (TLB_ENTRIES as i64 - 1) << entry_bits);
+        let entry = self.builder.ins().iadd(self.tlb_arg, offset);
+
+        // The tag and the offset beside it are loaded as plain memory, not as
+        // a no-alias region: the fallback rewrites this table, and a tag
+        // hoisted above that call while its offset stayed below would pair one
+        // page's tag with another page's address.
+        let flags = MemFlags::trusted();
+        let cached = self.builder.ins().load(types::I64, flags, entry, 0);
+        let tag = self.builder.ins().band_imm(addr, !page_mask);
+        let hit = self.builder.ins().icmp(IntCC::Equal, tag, cached);
+        self.bail_unless(hit, fallback);
+
+        let delta = self.builder.ins().load(types::I64, flags, entry, 8);
+        let host = self.builder.ins().iadd(addr, delta);
+
+        // Permissions are per byte and sit one fixed offset past the data, so
+        // `size` of them load as one integer and check as one mask: every
+        // required bit present in every byte is `required & !held == 0`.
+        let held = self
+            .builder
+            .ins()
+            .load(ty, Self::guest_flags(), host, PAGE_PERM_OFFSET as i32);
+        let required = self
+            .builder
+            .ins()
+            .iconst(ty, Self::splat(kind.required(), ty));
+        let missing = self.builder.ins().band_not(required, held);
+        self.bail_if(missing, fallback);
+
+        Ok((host, held))
+    }
+
+    /// The stack slot the slow-path load writes through.
+    fn load_slot(&mut self) -> codegen::ir::StackSlot {
+        if let Some(slot) = self.load_slot {
+            return slot;
+        }
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            8,
+            3,
+        ));
+        self.load_slot = Some(slot);
+        slot
+    }
+
+    /// Reads `size` bytes of guest RAM at `addr`.
+    fn ram_load(&mut self, addr: Value, size: usize) -> Result<Value, Unsupported> {
+        let ty = int_type(size)?;
+        let done = self.builder.create_block();
+        self.builder.append_block_param(done, ty);
+        let fallback = self.builder.create_block();
+        self.builder.set_cold_block(fallback);
+
+        let (host, _) = self.inline_access(addr, size, Access::Load, fallback)?;
+        let value = self.builder.ins().load(ty, Self::guest_flags(), host, 0);
+        self.builder.ins().jump(done, &[BlockArg::from(value)]);
+
+        self.builder.switch_to_block(fallback);
+        let slot = self.load_slot();
+        let out = self.builder.ins().stack_addr(types::I64, slot, 0);
+        let width = self.builder.ins().iconst(types::I32, size as i64);
+        let call = self
+            .builder
+            .ins()
+            .call(self.helpers.load, &[self.memory_arg, addr, width, out]);
+        let status = self.builder.inst_results(call)[0];
+        let faulted = self.fault_block();
+        self.bail_if(status, faulted);
+        let wide = self.builder.ins().stack_load(types::I64, slot, 0);
+        let narrowed = if ty == types::I64 {
+            wide
+        } else {
+            self.builder.ins().ireduce(ty, wide)
+        };
+        self.builder.ins().jump(done, &[BlockArg::from(narrowed)]);
+
+        self.builder.switch_to_block(done);
+        Ok(self.builder.block_params(done)[0])
+    }
+
+    /// Writes `value` to `size` bytes of guest RAM at `addr`.
+    fn ram_store(&mut self, addr: Value, value: Value, size: usize) -> Result<(), Unsupported> {
+        let ty = int_type(size)?;
+        self.checked_width(value, size)?;
+        let done = self.builder.create_block();
+        let fallback = self.builder.create_block();
+        self.builder.set_cold_block(fallback);
+
+        let (host, held) = self.inline_access(addr, size, Access::Store, fallback)?;
+        self.builder
+            .ins()
+            .store(Self::guest_flags(), value, host, 0);
+        // A written byte is a defined byte. The MMU's own `write` records this,
+        // and the inline path has to as well: the bit is guest-visible state
+        // the moment `check_uninit` is turned on, and a run whose JIT-written
+        // bytes read as undefined would diverge from the same run interpreted.
+        let init = self
+            .builder
+            .ins()
+            .bor_imm(held, Self::splat(perm::INIT, ty));
+        self.builder
+            .ins()
+            .store(Self::guest_flags(), init, host, PAGE_PERM_OFFSET as i32);
+        self.builder.ins().jump(done, &[]);
+
+        self.builder.switch_to_block(fallback);
+        let width = self.builder.ins().iconst(types::I32, size as i64);
+        let wide = self.widen_to_u64(value);
+        let call = self
+            .builder
+            .ins()
+            .call(self.helpers.store, &[self.memory_arg, addr, width, wide]);
+        let status = self.builder.inst_results(call)[0];
+        let faulted = self.fault_block();
+        self.bail_if(status, faulted);
+        self.builder.ins().jump(done, &[]);
+
+        self.builder.switch_to_block(done);
+        Ok(())
+    }
+
+    /// Files an instruction's result, if it has one, and reports success.
+    fn record(&mut self, insn_id: InstructionId, result: Option<Value>) -> Result<(), Unsupported> {
+        if let Some(value) = result {
+            self.values.insert(insn_id, value);
+        }
+        Ok(())
+    }
+
     /// Both operands of a two-operand primitive, checked for equal width.
     fn pair(&mut self, lhs: ValueId, rhs: ValueId) -> Result<(Value, Value), Unsupported> {
         let width = self.width_of(lhs)?;
@@ -634,7 +979,19 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
     }
 
     pub(crate) fn finish(mut self) {
-        self.builder.ins().return_(&[]);
+        let ok = self.builder.ins().iconst(types::I32, BLOCK_OK);
+        self.builder.ins().return_(&[ok]);
+        // Now that the body's last block is terminated, the shared fault
+        // epilogue can be filled.
+        if let Some(block) = self.fault_block {
+            self.builder.switch_to_block(block);
+            let status = self.builder.ins().iconst(types::I32, BLOCK_FAULT);
+            self.builder.ins().return_(&[status]);
+        }
+        // The fault block and the continuations every inline check splits off
+        // are reached only by branches already emitted, so they can all be
+        // sealed at once now that no more will be added.
+        self.builder.seal_all_blocks();
         self.builder.finalize();
     }
 }

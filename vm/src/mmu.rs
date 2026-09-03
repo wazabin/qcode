@@ -20,6 +20,8 @@
 
 use rustc_hash::FxHashMap;
 
+use crate::tlb::TranslationCache;
+
 /// Guest page size. Chosen to match the x86-64 base page so that guest `mmap`
 /// granularity and MMU granularity agree; nothing here depends on the value.
 pub const PAGE_SIZE: u64 = 0x1000;
@@ -88,6 +90,18 @@ impl MemFault {
     fn new(kind: FaultKind, addr: u64) -> Self {
         Self { kind, addr }
     }
+
+    /// Whether the access that took this fault was a write.
+    ///
+    /// Kept beside the kinds rather than at the consumer: a backend turning a
+    /// fault back into the interpreter's error type needs the distinction, and
+    /// a second copy of this match would drift the first time a kind is added.
+    pub fn is_write(&self) -> bool {
+        matches!(
+            self.kind,
+            FaultKind::WriteUnmapped | FaultKind::WritePerm | FaultKind::WriteWatch
+        )
+    }
 }
 
 impl std::fmt::Display for MemFault {
@@ -112,20 +126,59 @@ impl std::error::Error for MemFault {}
 
 /// One guest page: its bytes, and one permission bitset per byte.
 ///
-/// Boxed as fixed-size arrays so a page is a single allocation of a known size
-/// and page lookups hand back a contiguous slice the accessors can bulk-check.
+/// The two arrays are one allocation, in this order, with no padding between
+/// them, because that layout is an interface: compiled code reaches a page
+/// through a cached host pointer to `data` and finds the permission byte for
+/// `data[i]` at `PAGE_PERM_OFFSET + i` from it. Two separate `Box`es would mean
+/// a second cached pointer per page, or a second load per access.
+#[repr(C)]
+#[derive(Clone)]
+pub struct PageData {
+    pub data: [u8; PAGE_SIZE as usize],
+    pub perm: [Perm; PAGE_SIZE as usize],
+}
+
+/// Distance from a page's first data byte to its first permission byte.
+///
+/// Compiled code bakes this in; it is checked against the real layout by
+/// [`tests::the_permission_array_follows_the_data_array`].
+pub const PAGE_PERM_OFFSET: usize = PAGE_SIZE as usize;
+
 #[derive(Clone)]
 struct Page {
-    data: Box<[u8; PAGE_SIZE as usize]>,
-    perm: Box<[Perm; PAGE_SIZE as usize]>,
+    inner: Box<PageData>,
 }
 
 impl Page {
     fn unmapped() -> Self {
-        Self {
-            data: Box::new([0; PAGE_SIZE as usize]),
-            perm: Box::new([perm::NONE; PAGE_SIZE as usize]),
-        }
+        // Allocated zeroed rather than built and moved: a `PageData` is 8 KiB,
+        // and `Box::new(PageData { .. })` would materialise all of it on the
+        // stack first.
+        //
+        // SAFETY: `PageData` is two `u8` arrays, for which all-zero — no
+        // permissions, no contents — is both a valid value and the one this
+        // constructor means.
+        let inner = unsafe { Box::<PageData>::new_zeroed().assume_init() };
+        Self { inner }
+    }
+
+    /// The host address of this page's first data byte.
+    fn host_ptr(&mut self) -> *mut u8 {
+        std::ptr::from_mut(&mut *self.inner).cast()
+    }
+}
+
+impl std::ops::Deref for Page {
+    type Target = PageData;
+
+    fn deref(&self) -> &PageData {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for Page {
+    fn deref_mut(&mut self) -> &mut PageData {
+        &mut self.inner
     }
 }
 
@@ -133,17 +186,38 @@ impl Page {
 ///
 /// Unmapped pages are simply absent, so a 64-bit address space costs only what
 /// the guest actually touches.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct Mmu {
     pages: FxHashMap<u64, Page>,
     /// When set, reading a byte without [`perm::INIT`] faults. Off by default:
     /// a plain replay harness seeds registers and memory it cares about and
     /// legitimately reads zeroes elsewhere, and would drown in false faults.
-    pub check_uninit: bool,
+    check_uninit: bool,
     /// When set, [`perm::READ_WATCH`] and [`perm::WRITE_WATCH`] bytes fault.
     /// Separate from the bits themselves so watchpoints can be armed once and
     /// cheaply silenced during harness setup.
-    pub watchpoints_armed: bool,
+    watchpoints_armed: bool,
+    /// Translations compiled code may use without asking. Never consulted by
+    /// the accessors below: they are the authority the cache is filled *from*,
+    /// and a cache that could answer differently from its source would be a
+    /// second implementation of permission checking.
+    tlb: TranslationCache,
+}
+
+/// Cloning an MMU produces one with an empty [`TranslationCache`].
+///
+/// A cached entry names a host address inside *this* MMU's pages, which the
+/// clone does not own. Copying one across would hand compiled code running on
+/// the clone a pointer into the original's memory.
+impl Clone for Mmu {
+    fn clone(&self) -> Self {
+        Self {
+            pages: self.pages.clone(),
+            check_uninit: self.check_uninit,
+            watchpoints_armed: self.watchpoints_armed,
+            tlb: TranslationCache::default(),
+        }
+    }
 }
 
 /// Splits an access into per-page `(page index, offset, length)` chunks.
@@ -180,12 +254,78 @@ impl Mmu {
         self.pages.len()
     }
 
+    pub fn check_uninit(&self) -> bool {
+        self.check_uninit
+    }
+
+    /// Makes a read of a byte without [`perm::INIT`] fault.
+    pub fn set_check_uninit(&mut self, enabled: bool) {
+        self.check_uninit = enabled;
+        // Whether a byte's INIT bit matters is not something a cached
+        // translation records, so a compiled block holding one would keep
+        // checking under the old rule.
+        self.tlb.flush();
+    }
+
+    pub fn watchpoints_armed(&self) -> bool {
+        self.watchpoints_armed
+    }
+
+    /// Makes [`perm::READ_WATCH`] and [`perm::WRITE_WATCH`] bytes fault.
+    pub fn set_watchpoints_armed(&mut self, armed: bool) {
+        self.watchpoints_armed = armed;
+        self.tlb.flush();
+    }
+
+    /// Whether an access may be answered from a cached translation at all.
+    ///
+    /// Both dynamic checks turn a *set* permission bit into a fault, which is
+    /// the one shape the inline "these bits are all present" test cannot
+    /// express. Rather than teach compiled code a second rule, the cache stays
+    /// empty while either is on and every access takes the slow path.
+    fn caching_allowed(&self) -> bool {
+        !self.check_uninit && !self.watchpoints_armed
+    }
+
+    /// The table compiled code indexes, as a raw pointer.
+    ///
+    /// Valid for as long as this MMU is neither moved nor mutated; a caller
+    /// takes it immediately before entering compiled code.
+    pub fn tlb_ptr(&mut self) -> *mut u8 {
+        std::ptr::from_mut(&mut self.tlb).cast()
+    }
+
+    /// Drops every cached translation. Called for any change to which pages
+    /// exist or where they live.
+    pub fn flush_tlb(&mut self) {
+        self.tlb.flush();
+    }
+
+    /// Caches the page holding `addr` so compiled code can reach it directly,
+    /// reporting whether it now can.
+    ///
+    /// Only the page's *residence* is cached. Permissions are left to the
+    /// caller — compiled code reads them from the page itself — so this says
+    /// nothing about whether any particular access is allowed.
+    pub fn cache_translation(&mut self, addr: u64) -> bool {
+        if !self.caching_allowed() {
+            return false;
+        }
+        let Some(page) = self.pages.get_mut(&(addr >> 12)) else {
+            return false;
+        };
+        let host = page.host_ptr();
+        self.tlb.insert(addr, host);
+        true
+    }
+
     /// Maps `len` bytes at `addr` with `permissions`, zero-filling the range.
     ///
     /// Follows `MAP_FIXED` semantics: an already-mapped range is replaced rather
     /// than refused. [`perm::MAP`] is added implicitly — a mapped byte is mapped
     /// regardless of what the caller asked for.
     pub fn map(&mut self, addr: u64, len: u64, permissions: Perm) -> Result<(), MemFault> {
+        self.tlb.flush();
         for (index, offset, take) in page_chunks(addr, len)? {
             let page = self.pages.entry(index).or_insert_with(Page::unmapped);
             page.data[offset..offset + take].fill(0);
@@ -199,6 +339,7 @@ impl Mmu {
     /// A page whose every byte becomes unmapped is dropped outright, so
     /// map/unmap churn does not leak pages.
     pub fn unmap(&mut self, addr: u64, len: u64) -> Result<(), MemFault> {
+        self.tlb.flush();
         for (index, offset, take) in page_chunks(addr, len)? {
             let Some(page) = self.pages.get_mut(&index) else {
                 continue;
@@ -218,6 +359,7 @@ impl Mmu {
     /// initializedness is a property of the bytes, and `mprotect` does not
     /// scribble on them. Unmapped bytes in the range fault, matching `mprotect`.
     pub fn protect(&mut self, addr: u64, len: u64, permissions: Perm) -> Result<(), MemFault> {
+        self.tlb.flush();
         // Checked in a separate pass so a partially-invalid request changes
         // nothing — a half-applied mprotect would be a state the guest cannot
         // reach on real hardware.
@@ -232,7 +374,12 @@ impl Mmu {
                         }
                     }
                 }
-                None => return Err(MemFault::new(FaultKind::WriteUnmapped, base + offset as u64)),
+                None => {
+                    return Err(MemFault::new(
+                        FaultKind::WriteUnmapped,
+                        base + offset as u64,
+                    ));
+                }
             }
         }
 
@@ -362,6 +509,7 @@ impl Mmu {
     /// fixture is not a guest access and must not be refused by the permissions
     /// it is itself installing. Never reachable from emulated code.
     pub fn write_unchecked(&mut self, addr: u64, bytes: &[u8], permissions: Perm) {
+        self.tlb.flush();
         let mut written = 0;
         let chunks = page_chunks(addr, bytes.len() as u64)
             .expect("write_unchecked range must fit the address space");
@@ -387,6 +535,9 @@ impl Mmu {
     /// Restores a snapshot, discarding every change made since it was taken.
     pub fn restore(&mut self, snapshot: &MmuSnapshot) {
         self.pages.clone_from(&snapshot.pages);
+        // `clone_from` reuses pages where it can and replaces the rest, so
+        // which allocation backs a given guest page is no longer knowable.
+        self.tlb.flush();
     }
 }
 
@@ -404,6 +555,61 @@ mod tests {
         let mut mmu = Mmu::new();
         mmu.map(0x1000, 0x2000, perm::RW_INIT).unwrap();
         mmu
+    }
+
+    #[test]
+    fn the_permission_array_follows_the_data_array() {
+        // Compiled code finds a byte's permissions by adding this constant to
+        // the host address of the byte itself. Nothing else enforces it.
+        let page = Page::unmapped();
+        let data = std::ptr::from_ref(&page.data) as usize;
+        let perm = std::ptr::from_ref(&page.perm) as usize;
+        assert_eq!(perm - data, PAGE_PERM_OFFSET);
+        assert_eq!(std::mem::size_of::<PageData>(), 2 * PAGE_SIZE as usize);
+    }
+
+    #[test]
+    fn a_translation_is_cached_only_for_a_resident_page() {
+        let mut mmu = mapped();
+        assert!(!mmu.cache_translation(0x9000), "unmapped page");
+        assert!(mmu.cache_translation(0x1abc));
+        // The cached host address really is where the byte lives.
+        mmu.write(0x1abc, &[0x5a]).unwrap();
+        let host = mmu.tlb.lookup(0x1abc).expect("just cached");
+        assert_eq!(unsafe { *host }, 0x5a);
+        // ... and its permissions are one fixed offset further on.
+        assert_eq!(unsafe { *host.add(PAGE_PERM_OFFSET) }, perm::RW_INIT);
+    }
+
+    #[test]
+    fn a_dynamic_check_empties_the_cache_and_keeps_it_empty() {
+        let mut mmu = mapped();
+        assert!(mmu.cache_translation(0x1000));
+        mmu.set_check_uninit(true);
+        assert!(mmu.tlb.lookup(0x1000).is_none());
+        // Compiled code cannot express "an INIT bit that is *set* still
+        // faults", so nothing is offered to it while the rule is in force.
+        assert!(!mmu.cache_translation(0x1000));
+        mmu.set_check_uninit(false);
+        assert!(mmu.cache_translation(0x1000));
+    }
+
+    #[test]
+    fn unmapping_a_page_drops_its_cached_translation() {
+        let mut mmu = mapped();
+        assert!(mmu.cache_translation(0x1000));
+        // The page allocation is freed here; an entry surviving this would be
+        // a dangling pointer handed to compiled code.
+        mmu.unmap(0x1000, PAGE_SIZE).unwrap();
+        assert!(mmu.tlb.lookup(0x1000).is_none());
+    }
+
+    #[test]
+    fn a_cloned_mmu_starts_with_an_empty_cache() {
+        let mut mmu = mapped();
+        assert!(mmu.cache_translation(0x1000));
+        let clone = mmu.clone();
+        assert!(clone.tlb.lookup(0x1000).is_none());
     }
 
     #[test]
@@ -482,7 +688,7 @@ mod tests {
     fn protect_preserves_contents_and_initializedness() {
         let mut mmu = mapped();
         mmu.write(0x1000, &[7; 4]).unwrap();
-        mmu.check_uninit = true;
+        mmu.set_check_uninit(true);
         mmu.protect(0x1000, PAGE_SIZE, perm::READ).unwrap();
         let mut out = [0; 4];
         mmu.read(0x1000, &mut out).unwrap();
@@ -505,7 +711,7 @@ mod tests {
         let mut out = [0; 1];
         mmu.read(0x1000, &mut out).unwrap();
 
-        mmu.check_uninit = true;
+        mmu.set_check_uninit(true);
         assert_eq!(
             mmu.read(0x1000, &mut out).unwrap_err(),
             MemFault::new(FaultKind::ReadUninit, 0x1000)
@@ -522,7 +728,7 @@ mod tests {
             .unwrap();
         mmu.write(0x1000, &[1]).unwrap();
 
-        mmu.watchpoints_armed = true;
+        mmu.set_watchpoints_armed(true);
         assert_eq!(
             mmu.write(0x1000, &[2]).unwrap_err(),
             MemFault::new(FaultKind::WriteWatch, 0x1000)

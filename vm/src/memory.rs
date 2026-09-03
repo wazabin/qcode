@@ -16,9 +16,7 @@
 //! nowhere else.
 
 use qcode::{context::Context, space::MemorySpaceId};
-use qcode_emulator::{
-    DomainMemory, DomainValue, EmulatorErrorKind, EmulatorMemory, SizedValue,
-};
+use qcode_emulator::{DomainMemory, DomainValue, EmulatorErrorKind, EmulatorMemory, SizedValue};
 
 use crate::{
     flat::FlatSpaces,
@@ -54,6 +52,25 @@ impl VmMemory {
     /// Returns and clears the fault recorded by the most recent failed access.
     pub fn take_fault(&mut self) -> Option<MemFault> {
         self.fault.take()
+    }
+
+    /// The recorded fault, without clearing it.
+    ///
+    /// A backend that has to turn a fault into the interpreter's error type
+    /// needs the address but must leave the fault itself for the VM, which is
+    /// what turns it into a resumable exit.
+    pub fn fault(&self) -> Option<MemFault> {
+        self.fault
+    }
+
+    /// Records a fault taken by a read performed on this memory's behalf.
+    pub(crate) fn record_read_fault(&mut self, fault: MemFault) {
+        self.record(fault, false);
+    }
+
+    /// Records a fault taken by a write performed on this memory's behalf.
+    pub(crate) fn record_write_fault(&mut self, fault: MemFault) {
+        self.record(fault, true);
     }
 
     /// Whether `space` is the guest RAM backed by the MMU.
@@ -243,7 +260,10 @@ mod tests {
         memory
             .write(ram(&ctx), addr, 1, SizedValue::from_bits(1, 1))
             .unwrap_err();
-        assert_eq!(memory.take_fault().map(|f| f.kind), Some(FaultKind::WritePerm));
+        assert_eq!(
+            memory.take_fault().map(|f| f.kind),
+            Some(FaultKind::WritePerm)
+        );
     }
 
     #[test]

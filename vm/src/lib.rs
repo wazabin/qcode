@@ -7,14 +7,20 @@
 //! snapshots — so that a guest program can be run rather than merely evaluated.
 
 pub mod flat;
+pub mod jit_abi;
 pub mod memory;
+pub mod mmu;
 pub mod optimize;
 pub mod stats;
-pub mod mmu;
+pub mod tlb;
 pub mod vm;
 
+pub use jit_abi::{ACCESS_FAULT, ACCESS_OK, qcode_jit_load, qcode_jit_store};
 pub use memory::VmMemory;
+pub use mmu::{
+    FaultKind, MemFault, Mmu, MmuSnapshot, PAGE_PERM_OFFSET, PAGE_SIZE, PageData, Perm, perm,
+};
 pub use optimize::{Cleanup, forward_temp_stores};
 pub use stats::Stats;
+pub use tlb::{TLB_ENTRIES, TLB_INDEX_BITS, TlbEntry, TranslationCache};
 pub use vm::{BlockExecutor, CodeError, CodeSource, Executed, Vm, VmExit};
-pub use mmu::{FaultKind, MemFault, Mmu, MmuSnapshot, PAGE_SIZE, Perm, perm};

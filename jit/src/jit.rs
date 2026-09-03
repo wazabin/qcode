@@ -11,9 +11,9 @@ use qcode::{
     },
 };
 use qcode_emulator::{EmulatorErrorKind, SizedValue, StandaloneEmulator};
-use qcode_vm::{BlockExecutor, Executed, VmMemory};
+use qcode_vm::{BlockExecutor, Executed, VmMemory, qcode_jit_load, qcode_jit_store};
 
-use crate::compile::{BlockTranslator, Export, SpaceTable, Unsupported};
+use crate::compile::{BLOCK_OK, BlockTranslator, Export, Helpers, SpaceTable, Unsupported};
 
 /// What is known about one block: the index of its native code, or the reason
 /// the compiler declined it, together with the instruction count that answer
@@ -23,9 +23,12 @@ type CacheEntry = Option<(usize, Result<usize, Unsupported>)>;
 /// A block that has been compiled to native code.
 struct Compiled {
     /// The compiled body. Its arguments are the base of an array of space base
-    /// pointers, in the order [`SpaceTable`] records, and the base of the
-    /// export buffer, one `u64` slot per entry of `exports`.
-    entry: extern "C" fn(*const *mut u8, *mut u64),
+    /// pointers, in the order [`SpaceTable`] records, the base of the export
+    /// buffer (one `u64` slot per entry of `exports`), the base of the guest's
+    /// software TLB, and the `VmMemory` its slow paths call back into. It
+    /// returns [`BLOCK_OK`], or [`BLOCK_FAULT`](crate::compile::BLOCK_FAULT) if
+    /// an access faulted and the block stopped there.
+    entry: extern "C" fn(*const *mut u8, *mut u64, *mut u8, *mut VmMemory) -> i32,
     table: SpaceTable,
     /// The terminator operands this block computes, in slot order.
     exports: Vec<Export>,
@@ -57,6 +60,9 @@ pub struct JitStats {
 /// Holding the [`JITModule`] means compiled code lives as long as this does.
 pub struct Jit {
     module: JITModule,
+    /// The runtime's slow-path accessors, declared once and referenced by every
+    /// compiled block.
+    helpers: Helpers,
     /// Compiled blocks, indexed by the handles in `cache`.
     compiled: Vec<Compiled>,
     /// What is known about each block: an index into `compiled`, or the reason
@@ -101,12 +107,39 @@ impl Jit {
             .expect("host is a supported target")
             .finish(settings::Flags::new(flags))
             .expect("isa builds for the host");
-        let module = JITModule::new(JITBuilder::with_isa(
-            isa,
-            cranelift_module::default_libcall_names(),
-        ));
+        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        // The two calls compiled code makes. Registered by name because that is
+        // how Cranelift resolves an external function; the addresses are this
+        // process's own, so there is no dynamic loading involved.
+        builder.symbol("qcode_jit_load", qcode_jit_load as *const u8);
+        builder.symbol("qcode_jit_store", qcode_jit_store as *const u8);
+        let mut module = JITModule::new(builder);
+
+        let mut load_sig = module.make_signature();
+        // (memory, address, size, out) -> status
+        load_sig.params.push(AbiParam::new(types::I64));
+        load_sig.params.push(AbiParam::new(types::I64));
+        load_sig.params.push(AbiParam::new(types::I32));
+        load_sig.params.push(AbiParam::new(types::I64));
+        load_sig.returns.push(AbiParam::new(types::I32));
+        let load = module
+            .declare_function("qcode_jit_load", Linkage::Import, &load_sig)
+            .expect("the load helper declares once");
+
+        let mut store_sig = module.make_signature();
+        // (memory, address, size, value) -> status
+        store_sig.params.push(AbiParam::new(types::I64));
+        store_sig.params.push(AbiParam::new(types::I64));
+        store_sig.params.push(AbiParam::new(types::I32));
+        store_sig.params.push(AbiParam::new(types::I64));
+        store_sig.returns.push(AbiParam::new(types::I32));
+        let store = module
+            .declare_function("qcode_jit_store", Linkage::Import, &store_sig)
+            .expect("the store helper declares once");
+
         Self {
             module,
+            helpers: Helpers { load, store },
             compiled: Vec::new(),
             cache: Vec::new(),
             scratch: Vec::new(),
@@ -149,8 +182,11 @@ impl Jit {
     fn compile(&mut self, ctx: &Context<'_>, block: BlockId) -> Result<usize, Unsupported> {
         let body_len = ctx.block(block).instruction_ids().len().saturating_sub(1);
         let mut signature = self.module.make_signature();
-        signature.params.push(AbiParam::new(types::I64));
-        signature.params.push(AbiParam::new(types::I64));
+        // spaces, exports, tlb, memory.
+        for _ in 0..4 {
+            signature.params.push(AbiParam::new(types::I64));
+        }
+        signature.returns.push(AbiParam::new(types::I32));
 
         let name = format!("qcode_block_{}_{}", self.compiled.len(), self.cache.len());
         let id = self
@@ -160,6 +196,12 @@ impl Jit {
 
         let mut context = self.module.make_context();
         context.func.signature = signature;
+        let helpers = (
+            self.module
+                .declare_func_in_func(self.helpers.load, &mut context.func),
+            self.module
+                .declare_func_in_func(self.helpers.store, &mut context.func),
+        );
 
         // A fresh builder context per attempt: a declined block abandons its
         // half-built function, which would leave a shared context dirty and
@@ -172,7 +214,7 @@ impl Jit {
             builder.switch_to_block(entry);
             builder.seal_block(entry);
 
-            let mut translator = BlockTranslator::new(ctx, builder, entry);
+            let mut translator = BlockTranslator::new(ctx, builder, entry, helpers);
             match translator.translate_body(block) {
                 Ok(()) => {
                     let compiled = (translator.table.clone(), translator.exports.clone());
@@ -198,9 +240,13 @@ impl Jit {
 
         let code = self.module.get_finalized_function(id);
         // SAFETY: `code` is the entry point Cranelift just finalized for the
-        // signature declared above — two pointer arguments, no return value.
+        // signature declared above — four pointer-width arguments and a 32-bit
+        // status result.
         let entry = unsafe {
-            std::mem::transmute::<*const u8, extern "C" fn(*const *mut u8, *mut u64)>(code)
+            std::mem::transmute::<
+                *const u8,
+                extern "C" fn(*const *mut u8, *mut u64, *mut u8, *mut VmMemory) -> i32,
+            >(code)
         };
 
         self.compiled.push(Compiled {
@@ -322,15 +368,24 @@ impl Jit {
         emu: &mut StandaloneEmulator<VmMemory>,
         index: usize,
     ) -> Result<usize, EmulatorErrorKind> {
-
         let compiled = &mut self.compiled[index];
-        let flat = emu.memory.flat_mut();
+        // Taken as a raw pointer, and everything below derived from it: the
+        // compiled block holds base pointers into the flat spaces *while*
+        // calling back into this same `VmMemory` for the RAM accesses it could
+        // not settle inline. A live `&mut` spanning the call would make those
+        // base pointers ones the compiler is entitled to assume nothing else
+        // reaches.
+        let memory: *mut VmMemory = &raw mut emu.memory;
+
+        // SAFETY: for every dereference of `memory` here — it points to the
+        // emulator's own memory, which outlives this call, and no reference to
+        // it is held across any of them.
         if compiled.slots.is_empty() {
             compiled.slots = compiled
                 .table
                 .entries()
                 .iter()
-                .map(|&(space, _)| flat.slot(space))
+                .map(|&(space, _)| unsafe { (*memory).flat_mut().slot(space) })
                 .collect();
         }
 
@@ -339,16 +394,41 @@ impl Jit {
         // pointers for the duration of the call.
         self.scratch.clear();
         for (&slot, &(_, required)) in compiled.slots.iter().zip(compiled.table.entries()) {
-            self.scratch.push(flat.base_ptr_at(slot, required)?);
+            self.scratch
+                .push(unsafe { (*memory).flat_mut().base_ptr_at(slot, required)? });
         }
         self.exports.clear();
         self.exports.resize(compiled.exports.len(), 0);
+        // The TLB moves only with the memory itself, which is pinned for the
+        // duration of the call.
+        let tlb = unsafe { (*memory).mmu.tlb_ptr() };
 
         // SAFETY: the function was compiled from this block and reads and writes
         // only within the byte ranges recorded in its space table, each of which
         // has just been made addressable, plus the export buffer, which has just
-        // been sized to the slot count that same compilation recorded.
-        (compiled.entry)(self.scratch.as_ptr(), self.exports.as_mut_ptr());
+        // been sized to the slot count that same compilation recorded, plus
+        // guest RAM through the TLB and the memory it is handed.
+        let status = (compiled.entry)(
+            self.scratch.as_ptr(),
+            self.exports.as_mut_ptr(),
+            tlb,
+            memory,
+        );
+
+        // A faulting access stopped the block where it happened. The fault is
+        // left where an interpreted one would be, for the VM to turn into an
+        // exit; what goes back from here is only the error the interpreter's
+        // own signature can carry.
+        if status != BLOCK_OK as i32 {
+            // SAFETY: as above.
+            let fault = unsafe { (*memory).fault() };
+            let fault = fault.ok_or(EmulatorErrorKind::MemoryReadError(0))?;
+            return Err(if fault.is_write() {
+                EmulatorErrorKind::MemoryWriteError(fault.addr)
+            } else {
+                EmulatorErrorKind::MemoryReadError(fault.addr)
+            });
+        }
 
         // The terminator is still the interpreter's to run, so the operands it
         // reads have to look as though the interpreter had computed them.
