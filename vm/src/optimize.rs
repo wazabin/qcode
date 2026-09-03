@@ -186,9 +186,20 @@ pub fn forward_temp_stores(ctx: &mut Context<'_>, block_id: BlockId) -> Cleanup 
 
     let forwarded_loads = forwards.len();
 
+    // A forwarded value can itself be a load this pass is removing: one slot's
+    // stored value is another slot's forwarded load. Rewriting uses in program
+    // order would then reintroduce a reference to an instruction about to go,
+    // so each target is followed to the value that actually survives first.
+    let mut resolved: FxHashMap<ValueId, ValueId> = FxHashMap::default();
+    for &(load_result, stored_value) in &forwards {
+        let survivor = resolved.get(&stored_value).copied().unwrap_or(stored_value);
+        resolved.insert(load_result, survivor);
+    }
+
     let body = ctx.function_mut(func);
-    for (load_result, stored_value) in forwards {
-        body.replace_all_uses_with(load_result, stored_value);
+    for (load_result, _) in forwards {
+        let survivor = resolved[&load_result];
+        body.replace_all_uses_with(load_result, survivor);
     }
     // A store goes only when every read of its slot in this block was
     // forwarded and nothing accessed the space through an unknown pointer.
