@@ -525,7 +525,19 @@ pub fn absorb_straight_line(ctx: &mut qcode::context::Context, block: BlockId) -
     let function_id = block.func;
     crate::with_body_mut(ctx, function_id, |body, cx| {
         let mut absorbed = 0;
-        while try_merge_block(body, cx, function_id, block) {
+        // Only a successor whose code is *known* may be absorbed. An empty
+        // successor is the placeholder for an address that has not been lifted
+        // yet: absorbing one appends nothing while dropping the terminator that
+        // reaches it, leaving a block that falls off its own end. A block's
+        // shape is extended by discovered ground, never by ground still to come.
+        while cx
+            .body_view(body)
+            .block_ref(block)
+            .successors()
+            .next()
+            .is_some_and(|(_, next)| !cx.body_view(body).block_ref(next).is_empty())
+            && try_merge_block(body, cx, function_id, block)
+        {
             absorbed += 1;
         }
         absorbed
