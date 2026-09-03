@@ -102,9 +102,34 @@ pub struct SleighLifter<'spec> {
     base: Context<'static>,
     storage: HashMap<Varnode, VarnodeId>,
     unique_space: SpaceId,
+    flat_control_flow: bool,
 }
 
 impl<'spec> SleighLifter<'spec> {
+    /// Lowers the guest's calls and returns as plain jumps.
+    ///
+    /// A guest `call` is a push and a jump, and a `ret` is a pop and an
+    /// indirect jump. SLEIGH already emits both halves: the stack write and the
+    /// stack read are ordinary p-code, and the `CALL`/`RETURN` operations on
+    /// top of them are nothing but the transfer of control. So lowering those
+    /// to [`Branch`](qcode::value::insn::Branch) and
+    /// [`BranchInd`](qcode::value::insn::BranchInd) loses no semantics.
+    ///
+    /// What it avoids is the *function structure* that a real `Call` implies —
+    /// a callee `FunctionId`, entered through that function's root block. An
+    /// emulator has no use for it: the guest keeps its own stack, and its code
+    /// is flat, with branch targets rather than a call graph. Worse, imposing
+    /// it is not merely useless but unsound for code discovered on demand,
+    /// because guest code branches across function boundaries freely, and a
+    /// block belongs to exactly one function's arena.
+    ///
+    /// A decompiler wants the opposite and gets it by default. This is for
+    /// running code, not for understanding it.
+    pub fn with_flat_control_flow(mut self) -> Self {
+        self.flat_control_flow = true;
+        self
+    }
+
     /// Creates a lifter for `spec` and prebuilds its immutable QCode state.
     pub fn new(spec: &'spec CompiledSpec) -> Self {
         let mut base = Context::default();
@@ -153,6 +178,7 @@ impl<'spec> SleighLifter<'spec> {
             base,
             storage,
             unique_space,
+            flat_control_flow: false,
         }
     }
 
@@ -272,8 +298,14 @@ impl<'spec> SleighLifter<'spec> {
         }
         let mut calls = HashMap::default();
         for &target in plan.direct_calls() {
-            let callee = FunctionBody::from_addr_or_create_indexed(ctx, addresses, target).id;
-            calls.insert(target, callee);
+            if self.flat_control_flow {
+                // Just another branch target, resolved in this same function.
+                let block = ctx.get_or_make_block_indexed(addresses, target, function);
+                branches.insert(target, block);
+            } else {
+                let callee = FunctionBody::from_addr_or_create_indexed(ctx, addresses, target).id;
+                calls.insert(target, callee);
+            }
         }
         let next = ctx.get_or_make_block_indexed(addresses, address + length as u64, function);
 
@@ -287,6 +319,7 @@ impl<'spec> SleighLifter<'spec> {
             calls,
             address,
             plan,
+            self.flat_control_flow,
         )
     }
 
@@ -321,7 +354,7 @@ impl<'spec> SleighLifter<'spec> {
         function: Option<FunctionId>,
     ) -> Result<BlockId, LiftError> {
         let function = self.function_for(ctx, addresses, address, function);
-        let plan = Self::plan_from_ops(pcode)?;
+        let plan = Self::plan_from_ops(pcode, self.flat_control_flow)?;
         let mut emitter = self.emitter(ctx, addresses, address, length, function, &plan.plan);
         for (index, op) in pcode.iter().enumerate() {
             if let Some(&label) = plan.labels.get(&index) {
@@ -347,7 +380,7 @@ impl<'spec> SleighLifter<'spec> {
     }
 
     /// Rebuilds the plan facts of an already-flattened instruction.
-    fn plan_from_ops(pcode: &[PcodeOp]) -> Result<VectorPlan, LiftError> {
+    fn plan_from_ops(pcode: &[PcodeOp], flat_control_flow: bool) -> Result<VectorPlan, LiftError> {
         let mut plan = PcodePlan::default();
         let mut labels = HashMap::default();
         for (index, op) in pcode.iter().enumerate() {
@@ -363,7 +396,11 @@ impl<'spec> SleighLifter<'spec> {
                 }
                 Opcode::Branch | Opcode::CBranch => plan.declare_direct_branch(target.offset),
                 Opcode::Call if target.space != SPACE_CONST => {
-                    plan.declare_direct_call(target.offset);
+                    if flat_control_flow {
+                        plan.declare_direct_branch(target.offset);
+                    } else {
+                        plan.declare_direct_call(target.offset);
+                    }
                 }
                 _ => {}
             }
@@ -418,6 +455,9 @@ struct FlatEmitter<'spec, 'str, 'ctx> {
     next: BlockId,
     address: u64,
     fallthrough: usize,
+    /// Lower the guest's calls and returns as jumps. See
+    /// [`SleighLifter::with_flat_control_flow`].
+    flat: bool,
     /// A sink cannot fail, so the first failure is latched and the rest of the
     /// instruction is ignored; its caller discards a partial instruction.
     error: Option<LiftError>,
@@ -435,6 +475,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         calls: HashMap<u64, FunctionId>,
         address: u64,
         plan: &PcodePlan,
+        flat: bool,
     ) -> Self {
         Self {
             builder,
@@ -451,6 +492,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             next,
             address,
             fallthrough: 0,
+            flat,
             error: None,
         }
     }
@@ -719,6 +761,18 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
                     expected: 1,
                     actual: 0,
                 })?;
+                // The return address is already on the guest's stack by now —
+                // SLEIGH wrote it with ordinary p-code — so in flat mode all
+                // that is left of the call is the jump.
+                if self.flat {
+                    let block = self
+                        .branches
+                        .get(&target.offset)
+                        .copied()
+                        .ok_or(LiftError::InvalidDirectTarget(op.opcode))?;
+                    self.builder.push_branch(block);
+                    return Ok(());
+                }
                 let callee = self
                     .calls
                     .get(&target.offset)
@@ -729,11 +783,21 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             }
             CallInd => {
                 let target = self.input(op, 0)?;
+                if self.flat {
+                    self.builder.push_branchind(target);
+                    return Ok(());
+                }
                 self.builder.push_call_ind(target);
                 Ok(())
             }
             Return => {
                 let target = self.input(op, 0)?;
+                // The stack has already been popped into this value; returning
+                // is a jump to it.
+                if self.flat {
+                    self.builder.push_branchind(target);
+                    return Ok(());
+                }
                 self.builder.push_return(target);
                 Ok(())
             }

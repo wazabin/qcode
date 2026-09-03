@@ -49,7 +49,9 @@ pub struct SleighCodeSource<'spec> {
 impl<'spec> SleighCodeSource<'spec> {
     pub fn new(spec: &'spec CompiledSpec) -> Self {
         Self {
-            lifter: SleighLifter::new(spec),
+            // The VM runs code; it does not need a call graph. See
+            // `SleighLifter::with_flat_control_flow`.
+            lifter: SleighLifter::new(spec).with_flat_control_flow(),
             function: None,
         }
     }
