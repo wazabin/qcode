@@ -162,10 +162,14 @@ fn embench_verifies_under_both_strategies() {
             interpreted.elapsed,
             jitted.elapsed,
             jitted.native_bodies,
-            if interpreted.verified && jitted.verified {
-                "ok".to_owned()
-            } else {
-                format!("FAILED {}", interpreted.exit)
+            match (interpreted.verified, jitted.verified) {
+                (true, true) => "ok".to_owned(),
+                // Which side is wrong is the whole triage: a benchmark the
+                // interpreter also gets wrong is a semantics bug, while one only
+                // the JIT gets wrong is a miscompilation.
+                (true, false) => format!("JIT WRONG (interpreter ok) {}", jitted.exit),
+                (false, true) => format!("INTERPRETER WRONG {}", interpreted.exit),
+                (false, false) => format!("BOTH WRONG {}", interpreted.exit),
             }
         );
         if !interpreted.verified {
