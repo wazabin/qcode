@@ -86,18 +86,37 @@ pub trait BlockExecutor {
     /// Runs everything in `block` except its terminator.
     ///
     /// `Ok(None)` means "not mine" and is not an error — the caller falls back
-    /// to the interpreter. `Ok(Some(n))` means it ran, retiring `n` body
-    /// instructions; reporting the count saves the caller resolving the block
-    /// through the module arena again, which it does on every execution.
+    /// to the interpreter.
     ///
-    /// On `Ok(Some(_))` every value the terminator reads must be readable from
-    /// `emu.insn_values`, exactly as if the interpreter had run the body.
+    /// On `Ok(Some(_))` every value the terminator of [`Executed::block`] reads
+    /// must be readable from `emu.insn_values`, exactly as if the interpreter
+    /// had run that body.
+    ///
+    /// `chain` lets the executor run on past `block` into successors it also
+    /// handles, instead of handing control back after one. Deciding a branch
+    /// itself is how an executor keeps control inside its own code rather than
+    /// paying a round trip per block. The caller withholds it when something
+    /// needs to observe every block — a breakpoint is set, say — because blocks
+    /// crossed this way are never offered to the interpreter.
     fn run_block(
         &mut self,
         ctx: &Context<'_>,
         emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
-    ) -> Result<Option<usize>, EmulatorErrorKind>;
+        chain: bool,
+    ) -> Result<Option<Executed>, EmulatorErrorKind>;
+}
+
+/// Where an executor left the machine.
+#[derive(Debug, Clone, Copy)]
+pub struct Executed {
+    /// The block whose terminator the interpreter still has to run. With
+    /// chaining this is the last of several, not the one that was asked for.
+    pub block: BlockId,
+    /// How many instructions of that block were retired: its body.
+    pub body: usize,
+    /// Operations retired across every block run, for accounting.
+    pub retired: u64,
 }
 
 /// Why the machine stopped.
@@ -244,17 +263,20 @@ impl<S: CodeSource> Vm<S> {
             && let Some(executor) = self.executor.as_mut()
         {
             let block = self.emu.block;
-            match executor.run_block(&self.ctx, &mut self.emu, block) {
-                Ok(Some(body)) => {
-                    // The body's operations were retired by the executor; they
-                    // are counted so throughput stays comparable between
-                    // strategies.
-                    self.stats.steps += body as u64;
+            // Blocks the executor runs are never offered to the interpreter, so
+            // it may only run past the first when nothing needs to see them.
+            let chain = self.breakpoints.is_empty();
+            match executor.run_block(&self.ctx, &mut self.emu, block, chain) {
+                Ok(Some(run)) => {
+                    // The operations were retired by the executor; they are
+                    // counted so throughput stays comparable between strategies.
+                    self.stats.steps += run.retired;
                     self.stats.native_bodies += 1;
                     // Positioning inside a block the interpreter has not walked
                     // into invalidates its cached instruction list.
                     self.emu.invalidate_block_cache();
-                    self.emu.idx = body;
+                    self.emu.block = run.block;
+                    self.emu.idx = run.body;
                 }
                 Ok(None) => {}
                 Err(kind) => {

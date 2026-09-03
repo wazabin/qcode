@@ -72,7 +72,7 @@ fn agree(code: &[u8]) -> bool {
     let mut jitted = machine(block, &ctx);
     let mut jit = Jit::new();
     let ran = jit
-        .run_block(&ctx, &mut jitted, block)
+        .run_block(&ctx, &mut jitted, block, false)
         .expect("running compiled code does not fault")
         .is_some();
     if !ran {
@@ -125,7 +125,7 @@ fn a_declined_block_is_reported_rather_than_miscompiled() {
     let mut emu = machine(block, &ctx);
     let mut jit = Jit::new();
     let ran = jit
-        .run_block(&ctx, &mut emu, block)
+        .run_block(&ctx, &mut emu, block, false)
         .expect("declining is not an error")
         .is_some();
     assert!(!ran, "division must be left to the interpreter");

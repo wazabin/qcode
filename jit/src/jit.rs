@@ -3,9 +3,15 @@
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
-use qcode::{context::Context, value::BlockId};
+use qcode::{
+    context::Context,
+    value::{
+        BlockId, ValueId,
+        insn::{InstructionId, Mnemonic},
+    },
+};
 use qcode_emulator::{EmulatorErrorKind, SizedValue, StandaloneEmulator};
-use qcode_vm::{BlockExecutor, VmMemory};
+use qcode_vm::{BlockExecutor, Executed, VmMemory};
 
 use crate::compile::{BlockTranslator, Export, SpaceTable, Unsupported};
 
@@ -224,10 +230,94 @@ impl Jit {
         ctx: &Context<'_>,
         emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
-    ) -> Result<Option<usize>, EmulatorErrorKind> {
-        let Ok(index) = self.resolve(ctx, block) else {
-            return Ok(None);
+        chain: bool,
+    ) -> Result<Option<Executed>, EmulatorErrorKind> {
+        let mut current = block;
+        let mut retired = 0;
+        loop {
+            let Ok(index) = self.resolve(ctx, current) else {
+                // Nothing compiled here. If earlier blocks ran, the machine is
+                // already at `current`'s start and the interpreter takes over
+                // from there; otherwise this call did nothing at all.
+                return Ok((retired > 0).then_some(Executed {
+                    block: current,
+                    body: 0,
+                    retired,
+                }));
+            };
+            let body = self.enter(ctx, emu, index)?;
+            retired += body as u64;
+            self.stats.native_runs += 1;
+
+            // Only continue while the successor is one this backend can also
+            // run: deciding the branch here is what keeps control inside
+            // compiled code, and the interpreter would otherwise redo it.
+            let next = if chain {
+                self.next_block(ctx, emu, current)
+            } else {
+                None
+            };
+            let Some(next) = next.filter(|&next| self.is_compiled(ctx, next)) else {
+                return Ok(Some(Executed {
+                    block: current,
+                    body,
+                    retired,
+                }));
+            };
+            current = next;
+        }
+    }
+
+    /// Whether `block` has native code, without compiling it.
+    fn is_compiled(&mut self, ctx: &Context<'_>, block: BlockId) -> bool {
+        self.resolve(ctx, block).is_ok()
+    }
+
+    /// The successor this block's terminator selects, when that is a decision
+    /// the backend can make: an argument-less branch, or a conditional one
+    /// whose condition the compiled body has just exported.
+    ///
+    /// `None` means "leave it to the interpreter" — an indirect branch, a call,
+    /// a return, or any edge that binds block arguments, all of which stay in
+    /// one implementation.
+    fn next_block(
+        &self,
+        ctx: &Context<'_>,
+        emu: &StandaloneEmulator<VmMemory>,
+        block: BlockId,
+    ) -> Option<BlockId> {
+        let &terminator = ctx.block(block).instruction_ids().last()?;
+        let terminator = InstructionId::new(block.func, terminator);
+        let insn = qcode::value::Instruction::from_id(ctx, terminator);
+        let target = match insn.mnemonic() {
+            Mnemonic::Branch(branch) if branch.args.is_empty() => branch.target,
+            Mnemonic::CBranch(cbranch)
+                if cbranch.success_args.is_empty() && cbranch.failure_args.is_empty() =>
+            {
+                let ValueId::Instruction(condition) = cbranch.condition.qualify(block.func) else {
+                    return None;
+                };
+                let taken = emu.insn_values.get(&condition)?.as_bits() != 0;
+                if taken {
+                    cbranch.success_block
+                } else {
+                    cbranch.failure_block
+                }
+            }
+            _ => return None,
         };
+        Some(BlockId::new(block.func, target))
+    }
+
+    /// Runs one compiled block, leaving its terminator's operands where the
+    /// interpreter would have put them. Returns how many body instructions it
+    /// retired.
+    fn enter(
+        &mut self,
+        _ctx: &Context<'_>,
+        emu: &mut StandaloneEmulator<VmMemory>,
+        index: usize,
+    ) -> Result<usize, EmulatorErrorKind> {
 
         let compiled = &mut self.compiled[index];
         let flat = emu.memory.flat_mut();
@@ -263,8 +353,7 @@ impl Jit {
                 .insert(export.insn, SizedValue::new(bits, export.size));
         }
 
-        self.stats.native_runs += 1;
-        Ok(Some(compiled.body_len))
+        Ok(compiled.body_len)
     }
 }
 
@@ -275,8 +364,9 @@ impl BlockExecutor for Jit {
         ctx: &Context<'_>,
         emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
-    ) -> Result<Option<usize>, EmulatorErrorKind> {
-        Jit::run_block(self, ctx, emu, block)
+        chain: bool,
+    ) -> Result<Option<Executed>, EmulatorErrorKind> {
+        Jit::run_block(self, ctx, emu, block, chain)
     }
 }
 

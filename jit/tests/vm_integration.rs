@@ -16,6 +16,9 @@ fn machine(code: &[u8]) -> Vm<SleighCodeSource<'static>> {
     Vm::at_address(ctx, 0x1000, source, memory).expect("the entry decodes")
 }
 
+/// A program, its bytes, and what the watched registers must hold after it.
+type Program = (&'static str, &'static [u8], &'static [(&'static str, u64)]);
+
 /// The registers every program in this file is checked on.
 const WATCHED: [&str; 11] = [
     "RAX", "RBX", "RCX", "EAX", "EBX", "ECX", "CF", "ZF", "SF", "OF", "PF",
@@ -39,7 +42,7 @@ fn run(code: &[u8], jit: bool, budget: u64) -> (Vec<Option<u64>>, u64) {
 
 #[test]
 fn the_jit_does_not_change_what_a_program_computes() {
-    let programs: [(&str, &[u8], &[(&str, u64)]); 3] = [
+    let programs: [Program; 3] = [
         (
             "arithmetic",
             &[
