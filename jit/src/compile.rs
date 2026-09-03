@@ -211,6 +211,17 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         base
     }
 
+    /// Whether `space` is one this backend may address directly.
+    ///
+    /// Guest RAM is not, however constant its address: every access to it owes
+    /// a permission check and a fault report, which is the MMU's to give. A
+    /// RIP-relative operand resolves to a perfectly constant address and is
+    /// still RAM — treating one as flat storage silently reads a fabricated,
+    /// zero-filled space instead of the guest's memory.
+    fn is_flat(&self, space: MemorySpaceId) -> bool {
+        space != MemorySpaceId::Shared(self.ctx.shared.default_space)
+    }
+
     /// The address a flat access resolves to, or `None` if it is not a constant.
     fn constant_address(&self, ptr: ValueId) -> Option<u64> {
         match ValueRef::new(ptr, self.ctx) {
@@ -355,6 +366,9 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         let result = match insn.mnemonic() {
             &Mnemonic::Load(Load { space, ptr, size }) => {
                 let space = space.qualify(func);
+                if !self.is_flat(space) {
+                    return Err(Unsupported::Access("guest RAM needs the MMU"));
+                }
                 let addr = self
                     .constant_address(ptr.qualify(func))
                     .ok_or(Unsupported::Access("non-constant address"))?;
@@ -376,6 +390,9 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
                 src,
             }) => {
                 let space = space.qualify(func);
+                if !self.is_flat(space) {
+                    return Err(Unsupported::Access("guest RAM needs the MMU"));
+                }
                 let addr = self
                     .constant_address(ptr.qualify(func))
                     .ok_or(Unsupported::Access("non-constant address"))?;
