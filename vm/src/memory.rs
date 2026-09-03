@@ -61,6 +61,17 @@ impl VmMemory {
         self.ram == Some(space)
     }
 
+    /// Whether `space` is densely stored, and so directly addressable by
+    /// compiled code. False for guest RAM, which needs the MMU's checks.
+    pub fn is_flat(&self, space: MemorySpaceId) -> bool {
+        !self.is_ram(space)
+    }
+
+    /// The flat spaces, for a backend that addresses them directly.
+    pub fn flat_mut(&mut self) -> &mut FlatSpaces {
+        &mut self.flat
+    }
+
     /// Records `fault` and converts it into the error the interpreter
     /// understands. The address is preserved in both, so a consumer that never
     /// looks at [`take_fault`](Self::take_fault) still gets a truthful error.

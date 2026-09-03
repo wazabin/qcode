@@ -89,6 +89,18 @@ impl FlatSpace {
         (end <= MAX_FLAT_SPACE).then_some((start, end))
     }
 
+    /// Grows the space so `len` bytes are addressable, and returns the base
+    /// pointer of its storage.
+    ///
+    /// For compiled code, which addresses this storage directly rather than
+    /// through the accessors. The caller must not cause the space to grow while
+    /// holding the pointer — growing may reallocate — which is why the required
+    /// size is requested up front.
+    pub fn base_ptr(&mut self, len: usize) -> Result<*mut u8, EmulatorErrorKind> {
+        self.reserve_to(len)?;
+        Ok(self.bytes.as_mut_ptr())
+    }
+
     pub fn read_bytes(&self, addr: u64, size: usize) -> Result<Vec<u8>, EmulatorErrorKind> {
         let Some((start, end)) = Self::range(addr, size) else {
             return Err(EmulatorErrorKind::AddressOverflow(addr, size));
@@ -205,6 +217,15 @@ impl FlatSpaces {
             MemorySpaceId::Temp(_) => true,
             MemorySpaceId::Shared(id) => self.zero_filled.get(&id).copied().unwrap_or(false),
         }
+    }
+
+    /// The base pointer of `space`'s storage, grown to hold `len` bytes.
+    pub fn base_ptr(
+        &mut self,
+        space: MemorySpaceId,
+        len: usize,
+    ) -> Result<*mut u8, EmulatorErrorKind> {
+        self.entry(space).base_ptr(len)
     }
 
     pub fn get(&self, space: MemorySpaceId) -> Option<&FlatSpace> {
