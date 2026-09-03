@@ -42,6 +42,9 @@ pub struct Stats {
     /// Block bodies executed by an installed [`BlockExecutor`](crate::BlockExecutor)
     /// rather than interpreted.
     pub native_bodies: u64,
+    /// Blocks folded into a predecessor as a guest basic block was discovered,
+    /// each one a unit the machine no longer enters and leaves separately.
+    pub absorbed: u64,
     /// Instruction bytes read from guest memory.
     pub fetch_bytes: u64,
     /// Time spent reading instruction bytes.

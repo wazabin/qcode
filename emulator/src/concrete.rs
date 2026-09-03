@@ -1069,6 +1069,11 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     }
 
     /// Installs an address lookup, replacing any cached one.
+    /// Borrows the cached address index, if one has been built.
+    pub fn address_index(&self) -> Option<&AddressIndex> {
+        self.address_index.as_ref()
+    }
+
     pub fn set_address_index(&mut self, address_index: AddressIndex) {
         self.address_index = Some(address_index);
     }

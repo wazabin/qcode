@@ -126,6 +126,10 @@ pub struct Vm<S> {
     /// An optional faster path for block bodies. `None` means the interpreter
     /// executes everything, which is always a valid way to run.
     executor: Option<Box<dyn BlockExecutor>>,
+    /// Set by a lift that folded the block it filled into a predecessor, which
+    /// leaves the machine already positioned. Taken by the step that asked for
+    /// the lift.
+    absorbed_into: Option<BlockId>,
     /// Whether freshly lifted blocks get a cleanup round.
     ///
     /// Lifting one machine instruction emits every side effect the
@@ -149,6 +153,7 @@ impl<S: CodeSource> Vm<S> {
             optimize: true,
             stats: Stats::default(),
             executor: None,
+            absorbed_into: None,
             breakpoints: FxHashSet::default(),
         }
     }
@@ -304,8 +309,14 @@ impl<S: CodeSource> Vm<S> {
                         // Lifting may place the instruction in a *new* block
                         // rather than filling the placeholder the emulator is
                         // sitting in, so the machine has to be moved onto
-                        // whatever now covers the address.
-                        self.reposition(addr);
+                        // whatever now covers the address — unless the lift
+                        // folded that block into its predecessor, which
+                        // positions the machine itself. `addr` is interior to
+                        // the absorbing block then, and resolving it by address
+                        // would land at that block's *start*.
+                        if self.absorbed_into.take().is_none() {
+                            self.reposition(addr);
+                        }
                     }
                     EmulatorErrorKind::MemoryReadError(addr)
                     | EmulatorErrorKind::MemoryWriteError(addr) => {
@@ -369,7 +380,85 @@ impl<S: CodeSource> Vm<S> {
             self.stats.forwarded_loads += cleanup.forwarded_loads as u64;
             self.stats.removed_stores += cleanup.removed_stores as u64;
         }
+        self.absorbed_into = self.absorb_into_basic_block(addr);
         None
+    }
+
+    /// Folds the block just lifted at `addr` into its predecessor, when the two
+    /// are a straight-line pair.
+    ///
+    /// Lifting is per guest instruction, so a run of straight-line guest code
+    /// arrives as a chain of one-instruction blocks joined by unconditional
+    /// branches. Left that way, every guest instruction is its own unit of
+    /// execution: a separate compilation, a separate entry into compiled code
+    /// and a separate return to the interpreter for its terminator. Folding the
+    /// chain as it is discovered rebuilds the guest's *basic block*, which is
+    /// the unit worth compiling.
+    ///
+    /// Absorbing an address does not settle that it belongs here — code
+    /// discovered later may branch into the middle of the run, and
+    /// [`Context::split_block_at_address`] breaks it apart again when it does.
+    fn absorb_into_basic_block(&mut self, addr: u64) -> Option<BlockId> {
+        let filled = self.emu.block_at_address(&self.ctx, addr)?;
+
+        // Forward: the rest of this run may already be known. That is the shape
+        // a split leaves behind — it re-establishes a block's *start* while
+        // everything after it is still lifted — and the shape a back-edge into
+        // the middle of a run creates generally.
+        let forward = qcode_analysis::cfg::absorb_straight_line(&mut self.ctx, filled);
+        self.stats.absorbed += forward as u64;
+
+        // Backward: the straight-line predecessor that branched here, for the
+        // ordinary case of a run discovered one guest instruction at a time.
+        //
+        // Not if something branches to this address: it has to keep *starting*
+        // a block, or the split that established that would be undone here.
+        // Extending it forward, above, stays fine — that moves its end, not its
+        // start.
+        if self
+            .emu
+            .address_index()
+            .is_some_and(|index| index.is_boundary(addr))
+        {
+            return (forward > 0).then_some(filled);
+        }
+        // Exactly one predecessor, or absorbing would strand the others.
+        // Collected eagerly so the module is free to be mutated below.
+        let preds: Vec<BlockId> = BasicBlock::from_id(&self.ctx, filled)
+            .predecessors()
+            .map(|(_, block)| block)
+            .take(2)
+            .collect();
+        let [head] = preds[..] else {
+            return None;
+        };
+        if head == filled {
+            return None;
+        }
+        // Where `filled`'s instructions land: the head's own, less the
+        // terminator that absorption drops.
+        let offset = self.ctx.block(head).instruction_ids().len().saturating_sub(1);
+        if qcode_analysis::cfg::absorb_straight_line(&mut self.ctx, head) == 0 {
+            return (forward > 0).then_some(filled);
+        }
+        self.stats.absorbed += 1;
+
+        // The index still sends `addr` to a block that no longer exists.
+        let mut index = self
+            .emu
+            .take_address_index()
+            .unwrap_or_else(|| AddressIndex::analyze(&self.ctx));
+        index.rehome_block(addr, filled, head);
+        self.emu.set_address_index(index);
+
+        // The machine stopped at the empty placeholder this lift filled, which
+        // absorption has just deleted; its instructions are in the head now.
+        if self.emu.block == filled {
+            self.emu.block = head;
+            self.emu.idx += offset;
+            self.emu.invalidate_block_cache();
+        }
+        Some(head)
     }
 
     /// Runs until the machine stops, or until `budget` p-code operations have
