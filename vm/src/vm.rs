@@ -407,6 +407,28 @@ impl<S: CodeSource> Vm<S> {
         None
     }
 
+    /// Points every address `block` has absorbed back at `block`.
+    ///
+    /// Absorption deletes the blocks it takes in, and each of them was what the
+    /// index named for its address. Left alone the index hands out ids of
+    /// deleted blocks — and a run may absorb a whole chain, not just the block
+    /// that was being discovered, so every address the absorber now covers has
+    /// to be repointed, not only the one that prompted this.
+    fn reindex_absorbed(&mut self, block: BlockId) {
+        let covered = self.ctx.block(block).extra_addresses.clone();
+        if covered.is_empty() {
+            return;
+        }
+        let mut index = self
+            .emu
+            .take_address_index()
+            .unwrap_or_else(|| AddressIndex::analyze(&self.ctx));
+        for addr in covered {
+            index.set_block(addr, block);
+        }
+        self.emu.set_address_index(index);
+    }
+
     /// Re-runs the block cleanup over a block that has just grown.
     ///
     /// The cleanup at discovery saw a single guest instruction, where every
@@ -459,6 +481,7 @@ impl<S: CodeSource> Vm<S> {
         let forward = qcode_analysis::cfg::absorb_straight_line(&mut self.ctx, filled);
         self.stats.absorbed += forward as u64;
         if forward > 0 {
+            self.reindex_absorbed(filled);
             self.reoptimize(filled);
         }
 
@@ -514,13 +537,7 @@ impl<S: CodeSource> Vm<S> {
         let resume: Vec<LocalInsnId> = self.ctx.block(head).instruction_ids()[offset..].to_vec();
         self.reoptimize(head);
 
-        // The index still sends `addr` to a block that no longer exists.
-        let mut index = self
-            .emu
-            .take_address_index()
-            .unwrap_or_else(|| AddressIndex::analyze(&self.ctx));
-        index.rehome_block(addr, filled, head);
-        self.emu.set_address_index(index);
+        self.reindex_absorbed(head);
 
         // The machine stopped at the empty placeholder this lift filled, which
         // absorption has just deleted; its instructions are in the head now.

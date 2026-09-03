@@ -94,6 +94,15 @@ impl AddressIndex {
         self.targets.remove(&address);
     }
 
+    /// Points `address` at `block`, whatever it pointed at before.
+    ///
+    /// For a caller that has just made `block` cover an address another block
+    /// used to — absorbing that block, typically, which leaves the index
+    /// naming something deleted.
+    pub fn set_block(&mut self, address: u64, block: BlockId) {
+        self.targets.insert(address, AddressTarget::Block(block));
+    }
+
     /// Records that `address` starts a block, and must keep starting one.
     pub fn mark_boundary(&mut self, address: u64) {
         self.boundaries.insert(address);
