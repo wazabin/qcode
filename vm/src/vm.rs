@@ -430,6 +430,9 @@ impl<S: CodeSource> Vm<S> {
         self.stats.optimize += started.elapsed();
         self.stats.forwarded_loads += cleanup.forwarded_loads as u64;
         self.stats.removed_stores += cleanup.removed_stores as u64;
+        // The interpreter may hold this block's instruction list, and some of
+        // those instructions are gone.
+        self.emu.invalidate_block_cache();
     }
 
     /// Folds the block just lifted at `addr` into its predecessor, when the two
