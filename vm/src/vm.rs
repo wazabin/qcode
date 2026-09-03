@@ -19,6 +19,7 @@ use qcode::{
     context::Context,
     value::{BasicBlock, BlockId},
 };
+use qcode::value::LocalInsnId;
 use qcode_emulator::{EmulatorErrorKind, EmulatorMemory, StandaloneEmulator};
 use rustc_hash::FxHashSet;
 
@@ -384,6 +385,31 @@ impl<S: CodeSource> Vm<S> {
         None
     }
 
+    /// Re-runs the block cleanup over a block that has just grown.
+    ///
+    /// The cleanup at discovery saw a single guest instruction, where every
+    /// register it writes is still live at the block's edge. Absorption puts a
+    /// whole run in one block, and that is the first point at which a write
+    /// nothing goes on to read is visible as dead: the flags an arithmetic
+    /// instruction sets, when the next instruction overwrites all of them
+    /// before the branch reads any.
+    ///
+    /// Deliberately block-local (no alias result): at discovery the rest of the
+    /// CFG is still unknown, so only a store this block itself overwrites can
+    /// be proven dead. Anything live at the exit stays.
+    fn reoptimize(&mut self, block: BlockId) {
+        if !self.optimize {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let cleanup = crate::optimize::forward_temp_stores(&mut self.ctx, block);
+        qcode_analysis::dce::remove_dead_load_insns_block(&mut self.ctx, block, None, &[]);
+        qcode_analysis::dce::remove_dead_insns(&mut self.ctx, block);
+        self.stats.optimize += started.elapsed();
+        self.stats.forwarded_loads += cleanup.forwarded_loads as u64;
+        self.stats.removed_stores += cleanup.removed_stores as u64;
+    }
+
     /// Folds the block just lifted at `addr` into its predecessor, when the two
     /// are a straight-line pair.
     ///
@@ -407,6 +433,9 @@ impl<S: CodeSource> Vm<S> {
         // the middle of a run creates generally.
         let forward = qcode_analysis::cfg::absorb_straight_line(&mut self.ctx, filled);
         self.stats.absorbed += forward as u64;
+        if forward > 0 {
+            self.reoptimize(filled);
+        }
 
         // Backward: the straight-line predecessor that branched here, for the
         // ordinary case of a run discovered one guest instruction at a time.
@@ -443,6 +472,13 @@ impl<S: CodeSource> Vm<S> {
         }
         self.stats.absorbed += 1;
 
+        // Where the machine has to resume, named by instruction rather than by
+        // index: cleaning the enlarged block deletes instructions ahead of that
+        // point, and every index after a deletion shifts. The first of these
+        // still standing afterwards is the one to resume at.
+        let resume: Vec<LocalInsnId> = self.ctx.block(head).instruction_ids()[offset..].to_vec();
+        self.reoptimize(head);
+
         // The index still sends `addr` to a block that no longer exists.
         let mut index = self
             .emu
@@ -454,8 +490,13 @@ impl<S: CodeSource> Vm<S> {
         // The machine stopped at the empty placeholder this lift filled, which
         // absorption has just deleted; its instructions are in the head now.
         if self.emu.block == filled {
+            let now = self.ctx.block(head).instruction_ids();
+            let resumed = resume
+                .iter()
+                .find_map(|wanted| now.iter().position(|have| have == wanted))
+                .unwrap_or(now.len().saturating_sub(1));
             self.emu.block = head;
-            self.emu.idx += offset;
+            self.emu.idx = resumed;
             self.emu.invalidate_block_cache();
         }
         Some(head)
