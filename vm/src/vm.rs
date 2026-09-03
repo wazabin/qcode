@@ -84,17 +84,19 @@ pub trait CodeSource {
 pub trait BlockExecutor {
     /// Runs everything in `block` except its terminator.
     ///
-    /// `Ok(false)` means "not mine" and is not an error — the caller falls back
-    /// to the interpreter.
+    /// `Ok(None)` means "not mine" and is not an error — the caller falls back
+    /// to the interpreter. `Ok(Some(n))` means it ran, retiring `n` body
+    /// instructions; reporting the count saves the caller resolving the block
+    /// through the module arena again, which it does on every execution.
     ///
-    /// On `Ok(true)` every value the terminator reads must be readable from
+    /// On `Ok(Some(_))` every value the terminator reads must be readable from
     /// `emu.insn_values`, exactly as if the interpreter had run the body.
     fn run_block(
         &mut self,
         ctx: &Context<'_>,
         emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
-    ) -> Result<bool, EmulatorErrorKind>;
+    ) -> Result<Option<usize>, EmulatorErrorKind>;
 }
 
 /// Why the machine stopped.
@@ -237,10 +239,7 @@ impl<S: CodeSource> Vm<S> {
         {
             let block = self.emu.block;
             match executor.run_block(&self.ctx, &mut self.emu, block) {
-                Ok(true) => {
-                    let body = BasicBlock::from_id(&self.ctx, block)
-                        .instruction_count()
-                        .saturating_sub(1);
+                Ok(Some(body)) => {
                     // The body's operations were retired by the executor; they
                     // are counted so throughput stays comparable between
                     // strategies.
@@ -251,7 +250,7 @@ impl<S: CodeSource> Vm<S> {
                     self.emu.invalidate_block_cache();
                     self.emu.idx = body;
                 }
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(kind) => {
                     let fault = self.emu.memory.take_fault();
                     return Some(match fault {

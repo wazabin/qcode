@@ -6,9 +6,13 @@ use cranelift_module::{Linkage, Module};
 use qcode::{context::Context, value::BlockId};
 use qcode_emulator::{EmulatorErrorKind, SizedValue, StandaloneEmulator};
 use qcode_vm::{BlockExecutor, VmMemory};
-use rustc_hash::FxHashMap;
 
 use crate::compile::{BlockTranslator, Export, SpaceTable, Unsupported};
+
+/// What is known about one block: the index of its native code, or the reason
+/// the compiler declined it, together with the instruction count that answer
+/// was reached for.
+type CacheEntry = Option<(usize, Result<usize, Unsupported>)>;
 
 /// A block that has been compiled to native code.
 struct Compiled {
@@ -19,6 +23,10 @@ struct Compiled {
     table: SpaceTable,
     /// The terminator operands this block computes, in slot order.
     exports: Vec<Export>,
+    /// How many body instructions this block has — everything but the
+    /// terminator. The caller needs it to position the interpreter, and taking
+    /// it from here saves resolving the block through the module arena again.
+    body_len: usize,
     /// Where each of `table`'s spaces lives in the machine's flat storage.
     ///
     /// Resolved on first execution and kept: a slot is stable for the life of
@@ -49,12 +57,18 @@ pub struct Jit {
     /// it was declined. Declining is cached too, so a block the compiler cannot
     /// take is only examined once.
     ///
-    /// Keyed by the block's instruction count as well as its id, because a
+    /// Each entry records the instruction count it was made for, because a
     /// block is *not* immutable here: a VM that lifts on demand first presents
     /// an empty placeholder (which the compiler rightly declines), then fills
-    /// it, then runs a cleanup pass over it. Keying on the id alone would freeze
-    /// that first decline forever and the block would never be compiled.
-    cache: FxHashMap<(BlockId, usize), Result<usize, Unsupported>>,
+    /// it, then runs a cleanup pass over it. Trusting the entry regardless of
+    /// count would freeze that first decline forever and the block would never
+    /// be compiled.
+    ///
+    /// Stored as slots indexed by the block id's two components rather than in
+    /// a map: this is read on *every* block execution, and hashing a
+    /// `(function, local)` pair each time was a measurable share of run time.
+    /// Sparse ids cost only an unused slot.
+    cache: Vec<Vec<CacheEntry>>,
     /// Reused across runs so a hot block does not allocate to be entered.
     scratch: Vec<*mut u8>,
     /// Likewise for the export buffer compiled code writes its terminator
@@ -88,7 +102,7 @@ impl Jit {
         Self {
             module,
             compiled: Vec::new(),
-            cache: FxHashMap::default(),
+            cache: Vec::new(),
             scratch: Vec::new(),
             exports: Vec::new(),
             stats: JitStats::default(),
@@ -100,20 +114,34 @@ impl Jit {
     /// A decline is remembered, so an unsupported block costs one compilation
     /// attempt over the life of the machine rather than one per execution.
     fn resolve(&mut self, ctx: &Context<'_>, block: BlockId) -> Result<usize, Unsupported> {
-        let key = (block, ctx.block(block).instruction_ids().len());
-        if let Some(known) = self.cache.get(&key) {
+        let count = ctx.block(block).instruction_ids().len();
+        let func: usize = block.func.into();
+        let local: usize = block.local.into();
+        if let Some(Some((cached_count, known))) =
+            self.cache.get(func).and_then(|slots| slots.get(local))
+            && *cached_count == count
+        {
             return known.clone();
         }
+
         let outcome = self.compile(ctx, block);
         match &outcome {
             Ok(_) => self.stats.compiled += 1,
             Err(_) => self.stats.declined += 1,
         }
-        self.cache.insert(key, outcome.clone());
+        if func >= self.cache.len() {
+            self.cache.resize_with(func + 1, Vec::new);
+        }
+        let slots = &mut self.cache[func];
+        if local >= slots.len() {
+            slots.resize(local + 1, None);
+        }
+        slots[local] = Some((count, outcome.clone()));
         outcome
     }
 
     fn compile(&mut self, ctx: &Context<'_>, block: BlockId) -> Result<usize, Unsupported> {
+        let body_len = ctx.block(block).instruction_ids().len().saturating_sub(1);
         let mut signature = self.module.make_signature();
         signature.params.push(AbiParam::new(types::I64));
         signature.params.push(AbiParam::new(types::I64));
@@ -173,6 +201,7 @@ impl Jit {
             entry,
             table,
             exports,
+            body_len,
             slots: Vec::new(),
         });
         Ok(self.compiled.len() - 1)
@@ -187,16 +216,17 @@ impl Jit {
 
     /// Runs `block` as native code, if it has any.
     ///
-    /// Returns `Ok(false)` when the block is not compiled, which is the caller's
-    /// signal to run it on the interpreter instead.
+    /// Returns `Ok(None)` when the block is not compiled, which is the caller's
+    /// signal to run it on the interpreter instead, and `Ok(Some(n))` when it
+    /// ran, where `n` is the number of body instructions it retired.
     pub fn run_block(
         &mut self,
         ctx: &Context<'_>,
         emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
-    ) -> Result<bool, EmulatorErrorKind> {
+    ) -> Result<Option<usize>, EmulatorErrorKind> {
         let Ok(index) = self.resolve(ctx, block) else {
-            return Ok(false);
+            return Ok(None);
         };
 
         let compiled = &mut self.compiled[index];
@@ -234,7 +264,7 @@ impl Jit {
         }
 
         self.stats.native_runs += 1;
-        Ok(true)
+        Ok(Some(compiled.body_len))
     }
 }
 
@@ -245,7 +275,7 @@ impl BlockExecutor for Jit {
         ctx: &Context<'_>,
         emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
-    ) -> Result<bool, EmulatorErrorKind> {
+    ) -> Result<Option<usize>, EmulatorErrorKind> {
         Jit::run_block(self, ctx, emu, block)
     }
 }
