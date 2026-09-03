@@ -23,6 +23,14 @@ pub enum AddressTarget {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AddressIndex {
     targets: FxHashMap<u64, AddressTarget>,
+    /// Addresses known to start a block because something branches to them.
+    ///
+    /// Learned, not derived: an address becomes a boundary the first time a
+    /// block has to be split at it. Remembering that is what stops a run from
+    /// being folded across the same address again on the next pass, which for a
+    /// loop header — the branch target that is discovered *after* the run
+    /// through it — would otherwise repeat forever.
+    boundaries: rustc_hash::FxHashSet<u64>,
 }
 
 impl AddressIndex {
@@ -53,7 +61,10 @@ impl AddressIndex {
             }
         }
 
-        Self { targets }
+        Self {
+            targets,
+            boundaries: rustc_hash::FxHashSet::default(),
+        }
     }
 
     /// Recomputes this index after a structural mutation that changes several
@@ -75,6 +86,22 @@ impl AddressIndex {
         if self.targets.get(&addr) == Some(&AddressTarget::Block(old)) {
             self.targets.insert(addr, AddressTarget::Block(new));
         }
+    }
+
+    /// Drops `address` from the index, so it resolves to nothing until it is
+    /// registered again. Used when a block stops covering an address.
+    pub fn forget(&mut self, address: u64) {
+        self.targets.remove(&address);
+    }
+
+    /// Records that `address` starts a block, and must keep starting one.
+    pub fn mark_boundary(&mut self, address: u64) {
+        self.boundaries.insert(address);
+    }
+
+    /// Whether `address` is known to start a block.
+    pub fn is_boundary(&self, address: u64) -> bool {
+        self.boundaries.contains(&address)
     }
 
     /// Registers one address-bearing entity during module construction.

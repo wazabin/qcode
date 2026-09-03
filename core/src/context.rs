@@ -627,6 +627,15 @@ impl<'str> Context<'str> {
         };
         match existing {
             Some(block) => {
+                // The address resolves to a block that does not *start* there:
+                // it absorbed the address when a straight-line run was folded
+                // into one basic block. Something branches here after all, so
+                // the run has to be broken back up.
+                if self.block(block).address != Some(addr)
+                    && self.block(block).extra_addresses.contains(&addr)
+                {
+                    return self.split_block_at_address(addresses, block, addr);
+                }
                 if block.func != func {
                     let stored = FunctionBody::from_id(self, block.func);
                     let requested = FunctionBody::from_id(self, func);
@@ -659,6 +668,53 @@ impl<'str> Context<'str> {
                     .id
             }
         }
+    }
+
+    /// Re-establishes `addr` as the start of a block of its own, when it is
+    /// currently *interior* to `block` — one of the addresses `block` absorbed.
+    ///
+    /// # Why this discards code instead of moving it
+    ///
+    /// The obvious split copies the instructions from `addr` onward into the
+    /// new block. That is only sound while a block's instructions still
+    /// correspond, one run at a time, to the guest instructions they came from
+    /// — and they do not: a discovered block is optimized in place, so stores
+    /// have been forwarded and dead computation removed *across* the guest
+    /// instruction boundaries. There is no longer an instruction that "is" the
+    /// start of `addr`.
+    ///
+    /// So neither half's code survives the split. Both blocks are emptied and
+    /// keep only their place in the graph: `block` keeps its identity, so every
+    /// branch already targeting it stays valid, and the new block takes `addr`.
+    /// An empty block carrying an address is already this module's request to
+    /// lift it, so the code comes back from the guest bytes — which are the
+    /// only faithful source for it — the next time control reaches either half.
+    pub fn split_block_at_address(
+        &mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        block: BlockId,
+        addr: u64,
+    ) -> BlockId {
+        // `addr` is a branch target, and stays one: a later run through here
+        // must not fold across it and undo this split.
+        addresses.mark_boundary(addr);
+        let tail = BasicBlock::make(self, block.func).id;
+
+        // Emptying `block` drops its terminator, and with it every outgoing
+        // edge; the successors are rebuilt when it is lifted again.
+        self.bodies[block.func].clear_block_instructions(block);
+
+        // `addr` and everything else absorbed into `block` stop being its, and
+        // the index stops pointing at it for them: whichever half covers each
+        // address is settled by lifting, not guessed at here.
+        let absorbed = std::mem::take(&mut self.block_mut(block).extra_addresses);
+        for absorbed_addr in absorbed {
+            addresses.forget(absorbed_addr);
+        }
+        BasicBlock::from_id_mut(self, tail)
+            .in_function(block.func)
+            .with_address_indexed(addresses, addr);
+        tail
     }
 
     /// Borrows one function body and creates the concrete body-local builder

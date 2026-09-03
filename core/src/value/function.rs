@@ -1459,6 +1459,37 @@ impl<'str> FunctionBody<'str> {
 
     /// Remove `block` from this body: unlink every incident CFG edge, remove its
     /// instructions and params, clear ownership metadata, then drop its payload.
+    /// Empties `block` of code, keeping the block itself.
+    ///
+    /// Only the *outgoing* edges go, because those are owned by the terminator
+    /// being removed; the incoming ones belong to other blocks' terminators,
+    /// which still name this block and must keep resolving to it. That is the
+    /// point of clearing rather than deleting: every branch already targeting
+    /// this block stays valid while its contents are rebuilt.
+    pub fn clear_block_instructions(&mut self, block: BlockId) {
+        assert_eq!(block.func, self.id(), "block belongs to another function");
+        let mut outgoing: Vec<EdgeId> = self
+            .block(block)
+            .edges
+            .iter()
+            .copied()
+            .filter(|&edge| self.edges[edge].from == block.local)
+            .collect();
+        outgoing.sort_unstable();
+        for edge in outgoing {
+            self.remove_cfg_edge(edge);
+        }
+        let insns: Vec<InstructionId> = self
+            .block(block)
+            .instructions
+            .iter()
+            .map(|&local| InstructionId::new(self.id(), local))
+            .collect();
+        for insn in insns {
+            self.remove_instruction(insn);
+        }
+    }
+
     pub fn delete_block(&mut self, block: BlockId) {
         assert_eq!(block.func, self.id(), "block belongs to another function");
         let mut edges: Vec<EdgeId> = self.block(block).edges.iter().copied().collect();
