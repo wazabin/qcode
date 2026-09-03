@@ -51,11 +51,29 @@ fn load(image: &[u8], memory: &mut VmMemory) -> u64 {
 }
 
 /// One block entry: where the machine was, and what it held.
-#[derive(PartialEq, Eq, Clone)]
+///
+/// The register file is kept as a digest rather than a copy. A run reaches
+/// millions of block entries, and a few hundred bytes each would be gigabytes;
+/// a mismatching digest is enough to find *where*, and the second pass goes
+/// back for the bytes.
+#[derive(PartialEq, Eq, Clone, Copy)]
 struct Entry {
     block: BlockId,
     address: Option<u64>,
-    registers: Vec<u8>,
+    registers: u64,
+}
+
+/// Register bytes held back for the second pass.
+type Kept = std::rc::Rc<std::cell::RefCell<Vec<Vec<u8>>>>;
+
+/// FNV-1a. Any digest would do; this one needs no dependency.
+fn digest(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
 }
 
 /// Records every block entry, and optionally runs the block with a [`Jit`].
@@ -67,6 +85,12 @@ struct Recorder {
     jit: Option<Jit>,
     registers: MemorySpaceId,
     log: std::rc::Rc<std::cell::RefCell<Vec<Entry>>>,
+    /// Stop recording past this many entries, so a long run cannot exhaust
+    /// memory. The run itself continues.
+    limit: usize,
+    /// When set, the full register bytes for these entries are kept too.
+    detail: Option<(usize, Kept)>,
+    seen: usize,
 }
 
 impl BlockExecutor for Recorder {
@@ -77,26 +101,45 @@ impl BlockExecutor for Recorder {
         block: BlockId,
         chain: bool,
     ) -> Result<Option<Executed>, EmulatorErrorKind> {
-        let registers = emu
+        let bytes = emu
             .memory
             .flat_mut()
             .read_bytes(self.registers, 0, 0x300)
             .unwrap_or_default();
-        self.log.borrow_mut().push(Entry {
-            block,
-            address: qcode::value::BasicBlock::from_id(ctx, block).address(),
-            registers,
-        });
+        let index = self.seen;
+        self.seen += 1;
+        if index < self.limit {
+            self.log.borrow_mut().push(Entry {
+                block,
+                address: qcode::value::BasicBlock::from_id(ctx, block).address(),
+                registers: digest(&bytes),
+            });
+        }
+        if let Some((around, kept)) = &self.detail
+            && index + 1 >= *around
+            && index <= *around
+        {
+            kept.borrow_mut().push(bytes);
+        }
         match self.jit.as_mut() {
-            // Never chained: a chained run crosses blocks without being asked
-            // again, and those crossings are what has to be observed.
-            Some(jit) => jit.run_block(ctx, emu, block, false && chain),
+            // Never chained, whatever the caller allows: a chained run crosses
+            // blocks without being asked again, and those crossings are exactly
+            // what has to be observed. This isolates the compiled code from the
+            // decision to stay in it.
+            Some(jit) => {
+                let _ = chain;
+                jit.run_block(ctx, emu, block, false)
+            }
             None => Ok(None),
         }
     }
 }
 
-fn trace(image: &[u8], jit: bool, budget: u64) -> Vec<Entry> {
+/// Runs `image` once, recording every block entry.
+///
+/// `detail` names an entry index whose register bytes — and its predecessor's —
+/// are kept alongside the digests, for the second pass.
+fn trace(image: &[u8], jit: bool, budget: u64, detail: Option<usize>) -> (Vec<Entry>, Vec<Vec<u8>>) {
     let source = SleighCodeSource::new(sleigh_precompile::x64::spec());
     let ctx = source.new_context();
     let registers = (0..ctx.space_count())
@@ -122,65 +165,122 @@ fn trace(image: &[u8], jit: bool, budget: u64) -> Vec<Entry> {
         .set_varnode_by_name(&ctx, "RSP", STACK_TOP)
         .expect("RSP is a register");
     let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let kept = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     vm.set_block_executor(Box::new(Recorder {
         jit: jit.then(Jit::new),
         registers,
         log: log.clone(),
+        limit: MAX_ENTRIES,
+        detail: detail.map(|at| (at, kept.clone())),
+        seen: 0,
     }));
     vm.run(budget);
-    let out = log.borrow().clone();
-    out
+    let entries = log.borrow().clone();
+    let bytes = kept.borrow().clone();
+    (entries, bytes)
 }
 
+/// How many block entries are recorded before a run stops being followed.
+const MAX_ENTRIES: usize = 8_000_000;
+
+/// Reports the first block entry at which the two strategies disagree.
+fn compare(name: &str, image: &[u8], budget: u64) -> bool {
+    let (reference, _) = trace(image, false, budget, None);
+    let (compiled, _) = trace(image, true, budget, None);
+
+    let divergence = reference
+        .iter()
+        .zip(&compiled)
+        .position(|(want, got)| want != got);
+
+    let Some(n) = divergence else {
+        let same = reference.len() == compiled.len();
+        eprintln!(
+            "{name:16} {} entries, agree{}",
+            reference.len(),
+            if same {
+                String::new()
+            } else {
+                format!(" (but {} vs {} entries)", reference.len(), compiled.len())
+            }
+        );
+        if reference.len() >= MAX_ENTRIES {
+            eprintln!("                 (recording stopped at the {MAX_ENTRIES} entry cap)");
+        }
+        return same;
+    };
+
+    let (want, got) = (&reference[n], &compiled[n]);
+    eprintln!("{name:16} DIVERGES at block entry {n}");
+    eprintln!(
+        "                 interpreted {:?} addr={:x?}",
+        want.block, want.address
+    );
+    eprintln!(
+        "                 jitted      {:?} addr={:x?}",
+        got.block, got.address
+    );
+    if n > 0 {
+        eprintln!(
+            "                 produced by {:?} addr={:x?}",
+            reference[n - 1].block,
+            reference[n - 1].address
+        );
+    }
+    if want.block == got.block {
+        // Go back for the register bytes at just this entry.
+        let (_, a) = trace(image, false, budget, Some(n));
+        let (_, b) = trace(image, true, budget, Some(n));
+        if let (Some(a), Some(b)) = (a.last(), b.last()) {
+            for (offset, (x, y)) in a.iter().zip(b).enumerate() {
+                if x != y {
+                    eprintln!(
+                        "                 register byte {offset:#05x}: interpreted {x:#04x}, jitted {y:#04x}"
+                    );
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Every built benchmark, or just `B` when it names one.
+///
+/// This is the check the suite's own pass/fail cannot give: a benchmark that
+/// verifies has agreed on one number at the end, while this agrees on the whole
+/// register file at every block boundary.
 #[test]
 #[ignore = "needs benchmarks/embench/build.sh to have been run"]
-fn report_first_divergent_block() {
-    let name = std::env::var("B").unwrap_or_else(|_| "md5sum".into());
-    let path = format!(
-        "{}/../target/embench/{name}.elf",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let image = std::fs::read(&path).expect("image; run benchmarks/embench/build.sh");
+fn no_program_diverges_under_the_jit() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("target/embench");
     let budget: u64 = std::env::var("BUDGET")
         .ok()
         .and_then(|b| b.parse().ok())
-        .unwrap_or(50_000_000);
+        .unwrap_or(4_000_000_000);
+    let only = std::env::var("B").ok();
 
-    let reference = trace(&image, false, budget);
-    let compiled = trace(&image, true, budget);
-    eprintln!(
-        "{name}: {} interpreted entries, {} jitted",
-        reference.len(),
-        compiled.len()
-    );
+    let mut images: Vec<_> = std::fs::read_dir(&dir)
+        .expect("images; run benchmarks/embench/build.sh")
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "elf"))
+        .map(|e| e.path())
+        .collect();
+    images.sort();
+    assert!(!images.is_empty(), "no images in {}", dir.display());
 
-    for (n, (want, got)) in reference.iter().zip(&compiled).enumerate() {
-        if want == got {
+    let mut diverged = Vec::new();
+    for path in images {
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        if only.as_ref().is_some_and(|want| *want != name) {
             continue;
         }
-        eprintln!("first divergence at block entry {n}:");
-        eprintln!(
-            "  interpreted {:?} addr={:x?}",
-            want.block, want.address
-        );
-        eprintln!("  jitted      {:?} addr={:x?}", got.block, got.address);
-        if want.block == got.block {
-            for (offset, (a, b)) in want.registers.iter().zip(&got.registers).enumerate() {
-                if a != b {
-                    eprintln!("  register byte {offset:#x}: interpreted {a:#04x}, jitted {b:#04x}");
-                }
-            }
-            // The block *before* this entry is the one that computed the
-            // difference.
-            if n > 0 {
-                eprintln!(
-                    "  produced by {:?} addr={:x?}",
-                    reference[n - 1].block,
-                    reference[n - 1].address
-                );
-            }
+        let image = std::fs::read(&path).expect("image");
+        if !compare(&name, &image, budget) {
+            diverged.push(name);
         }
-        return;
     }
-    eprintln!("no divergence within the recorded entries");
+    assert!(diverged.is_empty(), "diverged under the JIT: {diverged:#?}");
 }
