@@ -66,6 +66,28 @@ pub trait CodeSource {
     ) -> Result<(), CodeError>;
 }
 
+/// An alternative way to execute a block's body.
+///
+/// The interpreter is always present and always correct; an executor is an
+/// *optimisation* that may decline any block for any reason, in which case the
+/// interpreter runs it unchanged. That is what lets a backend be partial: a JIT
+/// need only handle the shapes it handles well.
+///
+/// An executor runs the block's body, not its terminator. Control flow, block
+/// parameters and call semantics stay in one implementation.
+pub trait BlockExecutor {
+    /// Runs everything in `block` except its terminator.
+    ///
+    /// `Ok(false)` means "not mine" and is not an error — the caller falls back
+    /// to the interpreter.
+    fn run_block(
+        &mut self,
+        ctx: &Context<'_>,
+        memory: &mut VmMemory,
+        block: BlockId,
+    ) -> Result<bool, EmulatorErrorKind>;
+}
+
 /// Why the machine stopped.
 #[derive(Debug, Clone)]
 pub enum VmExit {
@@ -90,6 +112,9 @@ pub struct Vm<S> {
     source: S,
     /// Counters and phase timings for this run.
     pub stats: Stats,
+    /// An optional faster path for block bodies. `None` means the interpreter
+    /// executes everything, which is always a valid way to run.
+    executor: Option<Box<dyn BlockExecutor>>,
     /// Whether freshly lifted blocks get a cleanup round.
     ///
     /// Lifting one machine instruction emits every side effect the
@@ -112,6 +137,7 @@ impl<S: CodeSource> Vm<S> {
             source,
             optimize: true,
             stats: Stats::default(),
+            executor: None,
             breakpoints: FxHashSet::default(),
         }
     }
@@ -141,6 +167,17 @@ impl<S: CodeSource> Vm<S> {
         vm.emu.set_address_index(index);
         vm.stats = stats;
         Ok(vm)
+    }
+
+    /// Installs an alternative executor for block bodies, replacing any
+    /// previous one. Purely an optimisation: removing it changes speed, not
+    /// behaviour.
+    pub fn set_block_executor(&mut self, executor: Box<dyn BlockExecutor>) {
+        self.executor = Some(executor);
+    }
+
+    pub fn clear_block_executor(&mut self) {
+        self.executor = None;
     }
 
     pub fn context(&self) -> &Context<'static> {
@@ -184,6 +221,39 @@ impl<S: CodeSource> Vm<S> {
         // the second failure means the source did not produce the block it
         // claimed to, which is a source bug rather than a discovery step.
         for attempt in 0..2 {
+        // At a block's first instruction, an installed executor may run the
+        // whole body at once, leaving the interpreter only the terminator.
+        if self.emu.idx == 0
+            && let Some(executor) = self.executor.as_mut()
+        {
+            let block = self.emu.block;
+            match executor.run_block(&self.ctx, &mut self.emu.memory, block) {
+                Ok(true) => {
+                    let body = BasicBlock::from_id(&self.ctx, block)
+                        .instruction_ids()
+                        .len()
+                        .saturating_sub(1);
+                    // The body's operations were retired by the executor; they
+                    // are counted so throughput stays comparable between
+                    // strategies.
+                    self.stats.steps += body as u64;
+                    self.stats.native_bodies += 1;
+                    // Positioning inside a block the interpreter has not walked
+                    // into invalidates its cached instruction list.
+                    self.emu.invalidate_block_cache();
+                    self.emu.idx = body;
+                }
+                Ok(false) => {}
+                Err(kind) => {
+                    let fault = self.emu.memory.take_fault();
+                    return Some(match fault {
+                        Some(fault) => VmExit::Fault(fault),
+                        None => VmExit::Error(kind.to_string().into()),
+                    });
+                }
+            }
+        }
+
             match self.emu.step(&self.ctx) {
                 Ok(()) => {
                     self.stats.steps += 1;

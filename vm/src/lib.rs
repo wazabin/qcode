@@ -16,5 +16,5 @@ pub mod vm;
 pub use memory::VmMemory;
 pub use optimize::{Cleanup, forward_temp_stores};
 pub use stats::Stats;
-pub use vm::{CodeError, CodeSource, Vm, VmExit};
+pub use vm::{BlockExecutor, CodeError, CodeSource, Vm, VmExit};
 pub use mmu::{FaultKind, MemFault, Mmu, MmuSnapshot, PAGE_SIZE, Perm, perm};
