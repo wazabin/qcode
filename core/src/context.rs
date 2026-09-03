@@ -631,7 +631,13 @@ impl<'str> Context<'str> {
                 // it absorbed the address when a straight-line run was folded
                 // into one basic block. Something branches here after all, so
                 // the run has to be broken back up.
+                //
+                // Only within one function: a block id is local to its arena,
+                // so handing a caller in another function a block from this one
+                // would be unrepresentable as a branch target. That case falls
+                // through to the cross-arena report below, which says so.
                 if self.block(block).address != Some(addr)
+                    && block.func == func
                     && self.block(block).extra_addresses.contains(&addr)
                 {
                     return self.split_block_at_address(addresses, block, addr);
