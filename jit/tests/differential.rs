@@ -119,16 +119,18 @@ fn compiled_blocks_match_the_interpreter() {
 
 #[test]
 fn a_declined_block_is_reported_rather_than_miscompiled() {
-    // Integer division is deliberately declined: its trap behaviour is the
-    // guest architecture's, not Cranelift's.
-    let (ctx, block) = lift(&[0xf7, 0xf3]); // div ebx
+    // An x87 add: an 80-bit float, which is neither a machine integer width
+    // nor an operation this backend models. Declining is a normal outcome, and
+    // what makes a partial backend safe: the block runs on the interpreter,
+    // unchanged.
+    let (ctx, block) = lift(&[0xd8, 0xc1]); // fadd st, st(1)
     let mut emu = machine(block, &ctx);
     let mut jit = Jit::new();
     let ran = jit
         .run_block(&ctx, &mut emu, block, false)
         .expect("declining is not an error")
         .is_some();
-    assert!(!ran, "division must be left to the interpreter");
+    assert!(!ran, "an 80-bit float op must be left to the interpreter");
     assert_eq!(jit.stats.declined, 1);
     assert_eq!(jit.stats.compiled, 0);
 }

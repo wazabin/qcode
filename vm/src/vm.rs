@@ -14,12 +14,12 @@
 //! resume from, or count as a crash. So the loop returns [`VmExit`] and leaves
 //! the machine intact and inspectable.
 
+use qcode::value::LocalInsnId;
 use qcode::{
     address_index::{AddressIndex, AddressTarget},
     context::Context,
     value::{BasicBlock, BlockId},
 };
-use qcode::value::LocalInsnId;
 use qcode_emulator::{EmulatorErrorKind, EmulatorMemory, StandaloneEmulator};
 use rustc_hash::FxHashSet;
 
@@ -257,37 +257,37 @@ impl<S: CodeSource> Vm<S> {
         // the second failure means the source did not produce the block it
         // claimed to, which is a source bug rather than a discovery step.
         for attempt in 0..2 {
-        // At a block's first instruction, an installed executor may run the
-        // whole body at once, leaving the interpreter only the terminator.
-        if self.emu.idx == 0
-            && let Some(executor) = self.executor.as_mut()
-        {
-            let block = self.emu.block;
-            // Blocks the executor runs are never offered to the interpreter, so
-            // it may only run past the first when nothing needs to see them.
-            let chain = self.breakpoints.is_empty();
-            match executor.run_block(&self.ctx, &mut self.emu, block, chain) {
-                Ok(Some(run)) => {
-                    // The operations were retired by the executor; they are
-                    // counted so throughput stays comparable between strategies.
-                    self.stats.steps += run.retired;
-                    self.stats.native_bodies += 1;
-                    // Positioning inside a block the interpreter has not walked
-                    // into invalidates its cached instruction list.
-                    self.emu.invalidate_block_cache();
-                    self.emu.block = run.block;
-                    self.emu.idx = run.body;
-                }
-                Ok(None) => {}
-                Err(kind) => {
-                    let fault = self.emu.memory.take_fault();
-                    return Some(match fault {
-                        Some(fault) => VmExit::Fault(fault),
-                        None => VmExit::Error(kind.to_string().into()),
-                    });
+            // At a block's first instruction, an installed executor may run the
+            // whole body at once, leaving the interpreter only the terminator.
+            if self.emu.idx == 0
+                && let Some(executor) = self.executor.as_mut()
+            {
+                let block = self.emu.block;
+                // Blocks the executor runs are never offered to the interpreter, so
+                // it may only run past the first when nothing needs to see them.
+                let chain = self.breakpoints.is_empty();
+                match executor.run_block(&self.ctx, &mut self.emu, block, chain) {
+                    Ok(Some(run)) => {
+                        // The operations were retired by the executor; they are
+                        // counted so throughput stays comparable between strategies.
+                        self.stats.steps += run.retired;
+                        self.stats.native_bodies += 1;
+                        // Positioning inside a block the interpreter has not walked
+                        // into invalidates its cached instruction list.
+                        self.emu.invalidate_block_cache();
+                        self.emu.block = run.block;
+                        self.emu.idx = run.body;
+                    }
+                    Ok(None) => {}
+                    Err(kind) => {
+                        let fault = self.emu.memory.take_fault();
+                        return Some(match fault {
+                            Some(fault) => VmExit::Fault(fault),
+                            None => VmExit::Error(kind.to_string().into()),
+                        });
+                    }
                 }
             }
-        }
 
             match self.emu.step(&self.ctx) {
                 Ok(()) => {
@@ -523,7 +523,12 @@ impl<S: CodeSource> Vm<S> {
         }
         // Where `filled`'s instructions land: the head's own, less the
         // terminator that absorption drops.
-        let offset = self.ctx.block(head).instruction_ids().len().saturating_sub(1);
+        let offset = self
+            .ctx
+            .block(head)
+            .instruction_ids()
+            .len()
+            .saturating_sub(1);
         if qcode_analysis::cfg::absorb_straight_line(&mut self.ctx, head) == 0 {
             return (forward > 0).then_some(filled);
         }
@@ -715,7 +720,8 @@ mod tests {
             available: vec![0x1000],
             calls: Vec::new(),
         };
-        let error = Vm::at_address(ctx, 0x1000, source, memory).err()
+        let error = Vm::at_address(ctx, 0x1000, source, memory)
+            .err()
             .expect("the page is not executable");
         assert!(matches!(
             error,

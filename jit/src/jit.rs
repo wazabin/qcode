@@ -11,7 +11,10 @@ use qcode::{
     },
 };
 use qcode_emulator::{EmulatorErrorKind, SizedValue, StandaloneEmulator};
-use qcode_vm::{BlockExecutor, Executed, VmMemory, qcode_jit_load, qcode_jit_store};
+use qcode_vm::{
+    BlockExecutor, Executed, VmMemory, qcode_jit_load, qcode_jit_sdiv128, qcode_jit_srem128,
+    qcode_jit_store, qcode_jit_udiv128, qcode_jit_urem128,
+};
 
 use crate::compile::{BLOCK_OK, BlockTranslator, Export, Helpers, SpaceTable, Unsupported};
 
@@ -113,6 +116,10 @@ impl Jit {
         // process's own, so there is no dynamic loading involved.
         builder.symbol("qcode_jit_load", qcode_jit_load as *const u8);
         builder.symbol("qcode_jit_store", qcode_jit_store as *const u8);
+        builder.symbol("qcode_jit_udiv128", qcode_jit_udiv128 as *const u8);
+        builder.symbol("qcode_jit_urem128", qcode_jit_urem128 as *const u8);
+        builder.symbol("qcode_jit_sdiv128", qcode_jit_sdiv128 as *const u8);
+        builder.symbol("qcode_jit_srem128", qcode_jit_srem128 as *const u8);
         let mut module = JITModule::new(builder);
 
         let mut load_sig = module.make_signature();
@@ -137,9 +144,30 @@ impl Jit {
             .declare_function("qcode_jit_store", Linkage::Import, &store_sig)
             .expect("the store helper declares once");
 
+        // (a low, a high, b low, b high, out) -> ()
+        let mut divide_sig = module.make_signature();
+        for _ in 0..5 {
+            divide_sig.params.push(AbiParam::new(types::I64));
+        }
+        let mut wide_division = |name: &str| {
+            module
+                .declare_function(name, Linkage::Import, &divide_sig)
+                .expect("a division helper declares once")
+        };
+        let divisions = [
+            wide_division("qcode_jit_udiv128"),
+            wide_division("qcode_jit_urem128"),
+            wide_division("qcode_jit_sdiv128"),
+            wide_division("qcode_jit_srem128"),
+        ];
+
         Self {
             module,
-            helpers: Helpers { load, store },
+            helpers: Helpers {
+                load,
+                store,
+                divisions,
+            },
             compiled: Vec::new(),
             cache: Vec::new(),
             scratch: Vec::new(),
@@ -196,12 +224,18 @@ impl Jit {
 
         let mut context = self.module.make_context();
         context.func.signature = signature;
-        let helpers = (
-            self.module
+        let helpers = crate::compile::HelperRefs {
+            load: self
+                .module
                 .declare_func_in_func(self.helpers.load, &mut context.func),
-            self.module
+            store: self
+                .module
                 .declare_func_in_func(self.helpers.store, &mut context.func),
-        );
+            divisions: self
+                .helpers
+                .divisions
+                .map(|id| self.module.declare_func_in_func(id, &mut context.func)),
+        };
 
         // A fresh builder context per attempt: a declined block abandons its
         // half-built function, which would leave a shared context dirty and

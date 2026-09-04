@@ -15,7 +15,10 @@ pub mod stats;
 pub mod tlb;
 pub mod vm;
 
-pub use jit_abi::{ACCESS_FAULT, ACCESS_OK, qcode_jit_load, qcode_jit_store};
+pub use jit_abi::{
+    ACCESS_FAULT, ACCESS_OK, qcode_jit_load, qcode_jit_sdiv128, qcode_jit_srem128, qcode_jit_store,
+    qcode_jit_udiv128, qcode_jit_urem128,
+};
 pub use memory::VmMemory;
 pub use mmu::{
     FaultKind, MemFault, Mmu, MmuSnapshot, PAGE_PERM_OFFSET, PAGE_SIZE, PageData, Perm, perm,

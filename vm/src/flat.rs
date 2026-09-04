@@ -135,7 +135,8 @@ impl FlatSpace {
         let Some((start, end)) = Self::range(addr, width) else {
             return Err(EmulatorErrorKind::AddressOverflow(addr, width));
         };
-        if end > self.bytes.len() || (!self.zero_filled && self.written[start..end].contains(&false))
+        if end > self.bytes.len()
+            || (!self.zero_filled && self.written[start..end].contains(&false))
         {
             // Fall back to the checked path, which reports the exact byte.
             let bytes = self.read_bytes(addr, width)?;
@@ -165,7 +166,12 @@ impl FlatSpace {
     }
 
     /// Writes the low `size` bytes of a little-endian integer.
-    pub fn write_u128(&mut self, addr: u64, size: usize, bits: u128) -> Result<(), EmulatorErrorKind> {
+    pub fn write_u128(
+        &mut self,
+        addr: u64,
+        size: usize,
+        bits: u128,
+    ) -> Result<(), EmulatorErrorKind> {
         let width = size.min(16);
         let Some((start, end)) = Self::range(addr, width) else {
             return Err(EmulatorErrorKind::AddressOverflow(addr, width));
@@ -214,7 +220,8 @@ impl FlatSpaces {
             let space = Space::from_id(ctx, id);
             // Register space is architectural state, and x86's private x87 file
             // is too — FXSAVE can read a slot before a harness seeds it.
-            let zero = matches!(space.ty, SpaceType::Register) || space.name.as_deref() == Some("x87");
+            let zero =
+                matches!(space.ty, SpaceType::Register) || space.name.as_deref() == Some("x87");
             self.zero_filled.insert(id, zero);
         }
         self.configured_space_count = Some(count);
@@ -269,7 +276,12 @@ impl FlatSpaces {
         &mut self.spaces[slot]
     }
 
-    pub fn read_u128(&self, space: MemorySpaceId, addr: u64, size: usize) -> Result<u128, EmulatorErrorKind> {
+    pub fn read_u128(
+        &self,
+        space: MemorySpaceId,
+        addr: u64,
+        size: usize,
+    ) -> Result<u128, EmulatorErrorKind> {
         match self.get(space) {
             Some(flat) => flat.read_u128(addr, size),
             None if self.is_zero_filled(space) => Ok(0),

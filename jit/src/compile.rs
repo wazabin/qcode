@@ -137,6 +137,32 @@ impl std::fmt::Display for Unsupported {
     }
 }
 
+/// Which of the four integer divisions is being compiled.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Division {
+    Unsigned,
+    UnsignedRem,
+    Signed,
+    SignedRem,
+}
+
+impl Division {
+    fn is_signed(self) -> bool {
+        matches!(self, Self::Signed | Self::SignedRem)
+    }
+
+    /// Index of this operation's runtime helper, for the widths the machine
+    /// cannot divide itself.
+    fn helper(self) -> usize {
+        match self {
+            Self::Unsigned => 0,
+            Self::UnsignedRem => 1,
+            Self::Signed => 2,
+            Self::SignedRem => 3,
+        }
+    }
+}
+
 /// Whether an over-wide shift leaves zero or the sign.
 #[derive(Clone, Copy)]
 enum ShiftKind {
@@ -238,13 +264,16 @@ pub(crate) struct BlockTranslator<'a, 'ctx> {
 pub struct Helpers {
     pub load: FuncId,
     pub store: FuncId,
+    /// The 128-bit divisions, in [`Division`] order.
+    pub divisions: [FuncId; 4],
 }
 
 /// The same pair, resolved against one function being built.
 #[derive(Debug, Clone, Copy)]
-struct HelperRefs {
-    load: codegen::ir::FuncRef,
-    store: codegen::ir::FuncRef,
+pub(crate) struct HelperRefs {
+    pub(crate) load: codegen::ir::FuncRef,
+    pub(crate) store: codegen::ir::FuncRef,
+    pub(crate) divisions: [codegen::ir::FuncRef; 4],
 }
 
 /// One value compiled code hands back for the interpreter to read.
@@ -262,7 +291,7 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         ctx: &'ctx Context<'ctx>,
         builder: FunctionBuilder<'a>,
         entry: cranelift::prelude::Block,
-        helpers: (codegen::ir::FuncRef, codegen::ir::FuncRef),
+        helpers: HelperRefs,
     ) -> Self {
         let spaces_arg = builder.block_params(entry)[0];
         let exports_arg = builder.block_params(entry)[1];
@@ -275,10 +304,7 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
             exports_arg,
             tlb_arg,
             memory_arg,
-            helpers: HelperRefs {
-                load: helpers.0,
-                store: helpers.1,
-            },
+            helpers,
             fault_block: None,
             load_slot: None,
             bases: FxHashMap::default(),
@@ -988,6 +1014,77 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         self.builder.ins().select(in_range, shifted, saturated)
     }
 
+    /// Integer division, with the cases Cranelift traps on steered around.
+    ///
+    /// QCode leaves nothing undefined here, so neither does this:
+    ///
+    /// * a zero divisor yields zero, for all four operations;
+    /// * signed division of the most negative value by `-1` wraps — the
+    ///   quotient is that same value and the remainder is zero — where the
+    ///   machine instruction would fault.
+    ///
+    /// Both are handled by dividing by `1` instead and then correcting, which
+    /// needs no branch. The correction is only needed for the zero divisor:
+    /// dividing the most negative value by `1` *already* gives exactly the
+    /// wrapped quotient, and its remainder of zero, so the overflow case needs
+    /// nothing but to be kept away from the divide.
+    fn divide(&mut self, a: Value, b: Value, kind: Division) -> Result<Value, Unsupported> {
+        let ty = self.builder.func.dfg.value_type(a);
+        if ty == types::I128 {
+            return Ok(self.divide_wide(a, b, kind));
+        }
+        let zero = self.constant(ty, 0);
+        let one = self.constant(ty, 1);
+        let by_zero = self.builder.ins().icmp(IntCC::Equal, b, zero);
+
+        let mut avoid = by_zero;
+        if kind.is_signed() {
+            let most_negative = self.constant(ty, 1u128 << (ty.bits() - 1));
+            let minus_one = self.constant(ty, u128::MAX);
+            let a_is_min = self.builder.ins().icmp(IntCC::Equal, a, most_negative);
+            let b_is_minus_one = self.builder.ins().icmp(IntCC::Equal, b, minus_one);
+            let overflows = self.builder.ins().band(a_is_min, b_is_minus_one);
+            avoid = self.builder.ins().bor(by_zero, overflows);
+        }
+
+        let divisor = self.builder.ins().select(avoid, one, b);
+        let result = match kind {
+            Division::Unsigned => self.builder.ins().udiv(a, divisor),
+            Division::UnsignedRem => self.builder.ins().urem(a, divisor),
+            Division::Signed => self.builder.ins().sdiv(a, divisor),
+            Division::SignedRem => self.builder.ins().srem(a, divisor),
+        };
+        Ok(self.builder.ins().select(by_zero, zero, result))
+    }
+
+    /// A 128-bit division, through the runtime.
+    ///
+    /// x86-64 has no instruction for it and Cranelift no lowering to synthesise
+    /// one, so this is a call — but only for the division itself. Declining
+    /// instead would send the whole block to the interpreter, and on the
+    /// benchmarks that divide, that block is the loop body.
+    fn divide_wide(&mut self, a: Value, b: Value, kind: Division) -> Value {
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            16,
+            4,
+        ));
+        let out = self.builder.ins().stack_addr(types::I64, slot, 0);
+        // The halves are passed separately rather than as one 128-bit
+        // argument: how a `__int128` travels is an ABI detail the two sides
+        // would have to agree on silently, and getting it wrong corrupts
+        // results rather than failing to link.
+        let (a_low, a_high) = self.builder.ins().isplit(a);
+        let (b_low, b_high) = self.builder.ins().isplit(b);
+        let helper = self.helpers.divisions[kind.helper()];
+        self.builder
+            .ins()
+            .call(helper, &[a_low, a_high, b_low, b_high, out]);
+        let low = self.builder.ins().stack_load(types::I64, slot, 0);
+        let high = self.builder.ins().stack_load(types::I64, slot, 8);
+        self.builder.ins().iconcat(low, high)
+    }
+
     fn binop(&mut self, op: Binop, a: Value, b: Value) -> Result<Value, Unsupported> {
         let ins = self.builder.ins();
         Ok(match op {
@@ -1022,12 +1119,15 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
                 IntBinop::LessEqual => ins.icmp(IntCC::UnsignedLessThanOrEqual, a, b),
                 IntBinop::SLess => ins.icmp(IntCC::SignedLessThan, a, b),
                 IntBinop::SLessEqual => ins.icmp(IntCC::SignedLessThanOrEqual, a, b),
-                // Division traps on zero in Cranelift but is defined by the
-                // guest architecture's own rules, so it is left to the
-                // interpreter rather than guessed at.
-                IntBinop::Div | IntBinop::Rem | IntBinop::Sdiv | IntBinop::Srem => {
-                    return Err(Unsupported::Mnemonic("integer division"));
-                }
+                // Division is not the guest architecture's business at this
+                // level: QCode defines it completely — a zero divisor yields
+                // zero, and signed division wraps rather than trapping. What
+                // Cranelift does instead is *trap*, so the trapping cases are
+                // steered away from rather than left to the interpreter.
+                IntBinop::Div => return self.divide(a, b, Division::Unsigned),
+                IntBinop::Rem => return self.divide(a, b, Division::UnsignedRem),
+                IntBinop::Sdiv => return self.divide(a, b, Division::Signed),
+                IntBinop::Srem => return self.divide(a, b, Division::SignedRem),
                 _ => return Err(Unsupported::Mnemonic("integer binop")),
             },
             Binop::Float(_) => return Err(Unsupported::Mnemonic("float binop")),

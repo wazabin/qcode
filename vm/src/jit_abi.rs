@@ -22,6 +22,58 @@
 
 use crate::VmMemory;
 
+/// The four integer divisions, at a width the host has no instruction for.
+///
+/// x86-64 divides a 128-bit dividend by a 64-bit divisor, so SLEIGH lifts every
+/// `div` and `idiv` as a 128-bit operation — and neither the machine nor
+/// Cranelift can do one. Compiled code calls out to these rather than declining
+/// the block: a call is far cheaper than interpreting every instruction around
+/// the division as well.
+///
+/// Each states QCode's rule directly, rather than the caller guarding the
+/// operands: a zero divisor yields zero, and signed division wraps where the
+/// machine would fault.
+macro_rules! wide_division {
+    ($name:ident, $int:ty, $checked:ident, $wrapping:ident) => {
+        /// # Safety
+        ///
+        /// `out` must point to two writable, consecutive `u64`s, which receive
+        /// the low and high halves of the result. Called only from code this
+        /// crate's JIT backend generated.
+        pub unsafe extern "C" fn $name(
+            a_low: u64,
+            a_high: u64,
+            b_low: u64,
+            b_high: u64,
+            out: *mut u64,
+        ) {
+            let a = (u128::from(a_high) << 64 | u128::from(a_low)) as $int;
+            let b = (u128::from(b_high) << 64 | u128::from(b_low)) as $int;
+            // `checked_*` covers both rules at once: it declines a zero divisor
+            // and the signed overflow, and QCode's answer for each is zero and
+            // the wrapped value respectively.
+            let result = match a.$checked(b) {
+                Some(value) => value,
+                None if b == 0 => 0,
+                // The only other refusal is the most negative value over -1,
+                // where wrapping gives exactly what QCode specifies: that same
+                // value as the quotient, and zero as the remainder.
+                None => a.$wrapping(b),
+            } as u128;
+            // SAFETY: the caller guarantees two writable `u64`s.
+            unsafe {
+                out.write(result as u64);
+                out.add(1).write((result >> 64) as u64);
+            }
+        }
+    };
+}
+
+wide_division!(qcode_jit_udiv128, u128, checked_div, wrapping_div);
+wide_division!(qcode_jit_urem128, u128, checked_rem, wrapping_rem);
+wide_division!(qcode_jit_sdiv128, i128, checked_div, wrapping_div);
+wide_division!(qcode_jit_srem128, i128, checked_rem, wrapping_rem);
+
 /// The access succeeded.
 pub const ACCESS_OK: u32 = 0;
 /// The access faulted; the fault is on the [`VmMemory`].
