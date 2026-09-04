@@ -88,18 +88,24 @@ per program — less work than it takes to translate it.
   Dominated by one-time cost — SLEIGH decoding, the block cleanup, and Cranelift
   compiling blocks that then run for a few milliseconds.
 * **Steady state** (`benchmarks/embench/build.sh` with `GLOBAL_SCALE_FACTOR=20`,
-  run with `EMBENCH_DIR=target/embench-x20`): **~50M guest-insn/s aggregate,
-  median ~60M/s**, ranging 45–130M/s. This is the rate compiled code actually
-  sustains once translation is amortised.
+  run with `EMBENCH_DIR=target/embench-x20`): **55M guest-insn/s aggregate,
+  median 63M/s**, ranging 13–152M/s, all 17 verifying. This is the rate compiled
+  code actually sustains once translation is amortised.
+
+  Measure it on *CPU* time (`/usr/bin/time -f %U`), not wall time: the emulator
+  is single-threaded, so CPU time stays honest on a machine that is busy with
+  something else. Guest-instruction counts at this scale are derived as
+  `steps ÷ p-code-per-instruction`, the ratio taken from the stock corpus; that
+  was checked against an exact count for `statemate` and came within 0.9%.
 
 Neither is wrong; they answer different questions. Optimise against the one that
 matches the workload — a fuzzing harness that re-lifts constantly lives in the
 first, a long-running emulation in the second.
 
-**`nsichneu` is the outlier worth chasing**: 12M/s even at steady state, five
+**`nsichneu` is the outlier worth chasing**: 13M/s even at steady state, five
 times worse than anything else. Its guest basic blocks average ~1.8 guest
 instructions, so it leaves and re-enters compiled code constantly and pays
-per-block dispatch rather than compilation. Everything else clears 30M/s.
+per-block dispatch rather than compilation. Everything else clears 34M/s.
 
 A caution when reading `stats.steps` rates: `nettle-sha256` retires 2.7 *billion*
 p-code operations per second, which is not one interpreted operation per
