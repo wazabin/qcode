@@ -49,6 +49,28 @@ harness lying — see "Lessons" below.
 | `3d20d27` | The VM's lifter now lowers guest `call`/`ret` as jumps (`with_flat_control_flow`). This is what made Embench run at all — see below. |
 | `33fe87a` | Guest RAM is compiled, through an inlined software TLB and an inlined per-byte permission check. Block coverage went from ~24% to 99.1% and every benchmark crossed 1.0×. |
 
+### The conservative dead-store rule does not work as stated
+
+This handoff used to suggest recovering `7552962` with "a strictly conservative
+rule — remove a store only when a later store *in the same block* covers every
+byte with no intervening read". That was tried and **reverted**; it makes
+`qrduino` diverge (`B=qrduino` names the block), and the interpreter alone
+retires 13% fewer operations while still finishing, so the pass really does find
+the work — it just is not sound in that form. Two holes, both found the hard way:
+
+1. **Slots are keyed by start address, and x86 registers nest.** `AH`, `AX`,
+   `EAX` and `RAX` are the same bytes filed under three different keys, so a
+   read of one does not mark the others as read. Any such rule has to invalidate
+   by *byte range*, not by slot key.
+2. **Only `Load` counts as a read.** A user p-code op reads registers without
+   ever being a `Load`, so a side-effecting instruction between the two stores
+   is an invisible reader. Anything not understood has to count as a reader of
+   every flat space.
+
+Fixing (1) alone was not enough. The next attempt should take the handoff's
+*other* option — real liveness from `crate::mem::mem_liveness` — rather than
+extending the hand-rolled rule with a third special case.
+
 `7552962` gives up a real optimization: on a merged straight-line block, dead
 flag stores were 12 of 26, and removing them took one block from 96 QCode
 instructions to 40. Recovering it needs either liveness supplied to that pass
@@ -195,6 +217,18 @@ more.
   interpreted exit on every failure, so `qrduino` looked like an interpreter bug
   when the interpreter was fine (`d516d80`). All 9 real failures turned out to be
   the JIT.
+- **A benchmark script that ignores exit status reports crashes as records.**
+  A run that panics exits early, and `sglib-combined` duly "improved" from 230ms
+  to 40ms. This is the same lesson as the Embench sentinel below, relearned
+  through a shell script. Check the exit status *and* grep for `panic`.
+- **Take min-of-three.** This machine varies by ±20% run to run, which is wider
+  than most of the wins here. Two optimizations that looked good on one reading
+  (`rposition` for terminator removal, reusing Cranelift's contexts) measured
+  *worse* when A/B'd properly, and were dropped.
+- **The two harnesses really do catch different things.** Caching a branch
+  target with the compiled code passed `divergence` and hung `embench`:
+  divergence runs unchained, so it cannot see a chaining bug by construction.
+  A cached target is also wrong on its own terms — discovery deletes blocks.
 - **Run the JIT's tests in debug too.** Cranelift's FunctionBuilder checks "you
   have to fill your block before switching" only under `debug_assertions`. The
   fault epilogue was built by switching away from a half-emitted block, and
