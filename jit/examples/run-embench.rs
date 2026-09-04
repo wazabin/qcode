@@ -129,8 +129,24 @@ fn main() {
     let exit = vm.run(4_000_000_000);
     let elapsed = started.elapsed();
 
+    // A run is only meaningful if it ran to the end: `main` returned onto the
+    // sentinel, and Embench's `main` returns 0 when the benchmark verified its
+    // own result. Any other exit leaves noise in that register, and timing a
+    // run that stopped early is how a benchmark comes to report its best
+    // number ever for a crash.
+    let ctx = vm.context().clone();
+    let finished = matches!(&exit, qcode_vm::VmExit::Unlifted { addr, .. } if *addr == SENTINEL);
+    let verified = finished && vm.emulator().read_varnode_by_name(&ctx, "EAX") == Some(0);
+
     let stats = vm.stats.clone();
-    eprintln!("{name}: {exit:?} in {elapsed:.2?}");
+    eprintln!(
+        "{name}: {} in {elapsed:.2?}  ({exit:?})",
+        if verified {
+            "verified"
+        } else {
+            "DID NOT VERIFY"
+        }
+    );
     eprintln!(
         "  steps={} native_bodies={} lifts={} resolves={} absorbed={}",
         stats.steps, stats.native_bodies, stats.lifts, stats.resolves, stats.absorbed
