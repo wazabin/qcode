@@ -87,10 +87,14 @@ fn main() {
     let name = args.next().unwrap_or_else(|| "matmult-int".to_owned());
     let interpret = args.next().as_deref() == Some("interp");
 
+    // `EMBENCH_DIR` selects an alternative corpus — a build at a larger scale
+    // factor, say, where one-time translation is amortised over enough
+    // execution to show a steady-state rate rather than a warm-up one.
+    let dir = std::env::var("EMBENCH_DIR").unwrap_or_else(|_| "target/embench".to_owned());
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
-        .join("target/embench")
+        .join(dir)
         .join(format!("{name}.elf"));
     let image = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 

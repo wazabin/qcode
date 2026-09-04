@@ -112,10 +112,14 @@ fn load(image: &[u8], memory: &mut VmMemory) -> u64 {
 }
 
 fn images() -> Vec<(String, Vec<u8>)> {
+    // `EMBENCH_DIR` selects an alternative corpus — a build at a larger scale
+    // factor, say, where one-time translation is amortised over enough
+    // execution to show a steady-state rate rather than a warm-up one.
+    let corpus = std::env::var("EMBENCH_DIR").unwrap_or_else(|_| "target/embench".to_owned());
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
-        .join("target/embench");
+        .join(corpus);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
