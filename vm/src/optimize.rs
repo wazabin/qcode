@@ -92,6 +92,22 @@ pub fn forward_temp_stores(ctx: &mut Context<'_>, block_id: BlockId) -> Cleanup 
     let func = block_id.func;
     let insn_ids: Vec<InstructionId> = BasicBlock::from_id(ctx, block_id).instruction_ids();
 
+    /// The operands of the one or two mnemonics this pass reads, copied out of
+    /// the instruction so that nothing has to be cloned to look at them.
+    enum Access {
+        Store {
+            space: qcode::space::LocalMemorySpaceId,
+            ptr: qcode::value::LocalValueId,
+            size: usize,
+            src: qcode::value::LocalValueId,
+        },
+        Load {
+            space: qcode::space::LocalMemorySpaceId,
+            ptr: qcode::value::LocalValueId,
+            size: usize,
+        },
+    }
+
     /// The value last stored to a temporary location, and its width.
     struct Stored {
         value: ValueId,
@@ -112,14 +128,32 @@ pub fn forward_temp_stores(ctx: &mut Context<'_>, block_id: BlockId) -> Cleanup 
     let mut forwards: Vec<(ValueId, ValueId)> = Vec::new();
 
     for &insn_id in &insn_ids {
-        let mnemonic = Instruction::from_id(ctx, insn_id).mnemonic().clone();
-        match mnemonic {
-            Mnemonic::Store(Store {
+        // The operands are copied out rather than the mnemonic cloned. A
+        // `Mnemonic` owns its argument list, so cloning one allocates; doing it
+        // for every instruction of every lifted block made allocation a
+        // measurable share of translation time, to read four `Copy` ids.
+        let accessed = match Instruction::from_id(ctx, insn_id).mnemonic() {
+            &Mnemonic::Store(Store {
                 space,
                 ptr,
                 size,
                 src,
-            }) => {
+            }) => Access::Store {
+                space,
+                ptr,
+                size,
+                src,
+            },
+            &Mnemonic::Load(Load { space, ptr, size }) => Access::Load { space, ptr, size },
+            _ => continue,
+        };
+        match accessed {
+            Access::Store {
+                space,
+                ptr,
+                size,
+                src,
+            } => {
                 let space = space.qualify(func);
                 if !is_temporary(ctx, space) {
                     continue;
@@ -145,7 +179,7 @@ pub fn forward_temp_stores(ctx: &mut Context<'_>, block_id: BlockId) -> Cleanup 
                     }
                 }
             }
-            Mnemonic::Load(Load { space, ptr, size }) => {
+            Access::Load { space, ptr, size } => {
                 let space = space.qualify(func);
                 if !is_temporary(ctx, space) {
                     continue;
@@ -176,7 +210,6 @@ pub fn forward_temp_stores(ctx: &mut Context<'_>, block_id: BlockId) -> Cleanup 
                     }
                 }
             }
-            _ => {}
         }
     }
 
@@ -208,11 +241,15 @@ pub fn forward_temp_stores(ctx: &mut Context<'_>, block_id: BlockId) -> Cleanup 
         .filter(|(_, slot)| !poisoned.contains(&slot.0) && !read_otherwise.contains(slot))
         .map(|(store, _)| *store)
         .collect();
-    let mut dead: Vec<_> = consumed.iter().copied().chain(dead_stores.iter().copied()).collect();
-    dead.sort_unstable();
-    for id in dead {
-        body.remove_instruction(id);
-    }
+    // Removed in one pass over the block: unlinking them one at a time walks
+    // the instruction list once per instruction, which on an absorbed guest
+    // basic block is the dominant cost of the whole round.
+    let dead: FxHashSet<_> = consumed
+        .iter()
+        .chain(dead_stores.iter())
+        .map(|id| id.localize(func))
+        .collect();
+    body.remove_block_instructions(block_id, &dead);
 
     Cleanup {
         forwarded_loads,

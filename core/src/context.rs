@@ -1801,6 +1801,14 @@ impl<'str> Context<'str> {
         }
     }
 
+    /// Whether anything uses `value`, without building the user list to ask.
+    pub fn has_users(&self, value: ValueId) -> bool {
+        match value.owning_function() {
+            Some(func) => self.bodies[func].has_users(value),
+            None => false,
+        }
+    }
+
     pub fn push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
         let local = self.bodies[func].blocks.push(block);
         let id = BlockId::new(func, local);

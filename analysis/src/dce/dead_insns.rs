@@ -9,8 +9,35 @@ use qcode::{
 
 use crate::loop_unroll::replace_terminator_with_branch;
 
-/// This host's users of `v` (its owning function's reverse-use list), or empty
-/// for a shared value with no owning function. Mirrors [`Context::users`].
+/// This host's users of `v` as body-local ids, without allocating.
+///
+/// Body-local because that is how they are stored: the qualified form exists
+/// only to be built, and this is read once per instruction.
+fn users_of_slice<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    v: ValueId,
+) -> &'a [qcode::value::insn::LocalInsnId] {
+    match v.owning_function() {
+        Some(f) => host.function_ref(f).local_users_of(v),
+        None => &[],
+    }
+}
+
+/// Whether this host records any user of `v`. A shared value with no owning
+/// function has none. Mirrors [`Context::has_users`].
+///
+/// Deliberately not `users_of(v).is_empty()`: this is asked once per
+/// instruction per round, and building a vector only to discard it was the
+/// largest single cost of lifting a block.
+fn has_users<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, v: ValueId) -> bool {
+    match v.owning_function() {
+        Some(f) => host.function_ref(f).has_users(v),
+        None => false,
+    }
+}
+
+/// This host's users of `v`. Allocates; prefer [`has_users`] to ask whether
+/// there are any, and [`users_of_slice`] to look at them in a hot loop.
 fn host_users<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, v: ValueId) -> Vec<InstructionId> {
     match v.owning_function() {
         Some(f) => host.function_ref(f).users_of(v),
@@ -18,18 +45,33 @@ fn host_users<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, v: ValueId) -> Vec<I
     }
 }
 
-/// Returns instructions in `block_id` that are pure and have no users.
+/// Returns instructions in `block_id` that are pure and have no *live* users:
+/// no users at all, or none that this same answer does not already condemn.
+///
+/// Walked in reverse so that one pass reaches the fixed point. Within a block
+/// the IR is SSA, so a definition precedes its uses; going backwards means
+/// every user of an instruction has already been judged by the time the
+/// instruction itself is, and a whole dead chain falls in one sweep. Repeating
+/// a forward scan until nothing changes reaches the same answer, but rescans
+/// the entire block once per link in the longest chain — which on a lifted
+/// guest basic block was the dominant cost of translation.
 pub fn dead_insns<'a, 'str: 'a>(
     host: impl QCodeView<'a, 'str>,
     block_id: BlockId,
 ) -> HashSet<InstructionId> {
-    let mut dead = HashSet::default();
+    let mut dead: HashSet<InstructionId> = HashSet::default();
     let insn_ids: Vec<InstructionId> = host.block_ref(block_id).instruction_ids().to_vec();
-    for id in insn_ids {
-        let mnemonic = host.instruction(id).mnemonic();
-        let side_effects = mnemonic.has_side_effects();
-
-        if !side_effects && host_users(host, ValueId::Instruction(id)).is_empty() {
+    let func = block_id.func;
+    for id in insn_ids.into_iter().rev() {
+        if host.instruction(id).mnemonic().has_side_effects() {
+            continue;
+        }
+        // A user in another block is never in `dead`, so it keeps this
+        // instruction alive — as it must.
+        let live_user = users_of_slice(host, ValueId::Instruction(id))
+            .iter()
+            .any(|&user| !dead.contains(&InstructionId::new(func, user)));
+        if !live_user {
             dead.insert(id);
         }
     }
@@ -52,18 +94,20 @@ pub fn remove_dead_insns_body<'a, 'str>(
 ) -> bool {
     let mut changed = false;
     loop {
-        let mut dead: Vec<_> = dead_insns(cx.body_view(body), block_id)
-            .into_iter()
-            .collect();
+        let dead = dead_insns(cx.body_view(body), block_id);
         if dead.is_empty() {
             break;
         }
 
-        dead.sort_unstable();
         changed = true;
-        for id in dead {
-            body.remove_instruction(id);
-        }
+        // One pass over the block's instruction list however many go: removing
+        // them one at a time is quadratic in the size of the block, and lifted
+        // guest basic blocks are large.
+        let dead: HashSet<_> = dead
+            .into_iter()
+            .map(|id| id.localize(block_id.func))
+            .collect();
+        body.remove_block_instructions(block_id, &dead);
     }
 
     let params_changed = remove_unused_no_pred_block_params(body, cx, block_id);
@@ -122,7 +166,7 @@ fn remove_dead_pure_call_body<'a, 'str>(
     {
         return false;
     }
-    if !host_users(cx.body_view(body), ValueId::Instruction(term_id)).is_empty() {
+    if has_users(cx.body_view(body), ValueId::Instruction(term_id)) {
         return false;
     }
 
@@ -186,7 +230,7 @@ fn remove_unused_no_pred_block_params<'a, 'str>(
     let mut changed = false;
     for local in params {
         let param = qcode::value::BlockParamId::new(block_id.func, local);
-        if host_users(cx.body_view(body), ValueId::BlockParam(param)).is_empty() {
+        if !has_users(cx.body_view(body), ValueId::BlockParam(param)) {
             body.remove_block_param(param);
             changed = true;
         } else {
@@ -246,7 +290,24 @@ mod tests {
     }
 
     #[test]
-    fn test_pure_binop_with_users_kept() {
+    fn a_pure_result_a_side_effecting_instruction_reads_is_kept() {
+        let (ctx, block_id) = build_block(|b| {
+            let a = b.shr().get_const(1u64, 8);
+            let c = b.shr().get_const(2u64, 8);
+            let sum = b.push_add(a, c).id();
+            let rax_vn = b.shr().get_named("r0").unwrap().as_varnode().unwrap();
+            let space = b.shr().named_spaces["register"];
+            b.push_store(sum, ValueId::Varnode(rax_vn), space);
+        });
+
+        // The store is never dead, so the value it reads is never dead either,
+        // however the sweep is ordered.
+        let dead = dead_insns(ModuleView::new(&ctx), block_id);
+        assert!(dead.is_empty(), "nothing here is dead, got {dead:?}");
+    }
+
+    #[test]
+    fn a_dead_chain_falls_in_a_single_pass() {
         let (ctx, block_id) = build_block(|b| {
             let a = b.shr().get_const(1u64, 8);
             let c = b.shr().get_const(2u64, 8);
@@ -255,27 +316,15 @@ mod tests {
             b.push_add(sum, d);
         });
 
-        // The top-level add (no users) is dead, but the first add feeds it —
-        // after top-level is removed, first add has no users and is then also removed.
-        // This test checks the chain case; use dead_insns (single round) for the kept case.
+        // Nothing reads the outer add, so it is dead; the inner one is dead
+        // *because* of that. One reverse pass sees both, where a forward scan
+        // would need a second round to reach the inner one.
         let dead = dead_insns(ModuleView::new(&ctx), block_id);
         let insn_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
             .to_vec();
-        // Only the outermost add (no users) is dead in the first round.
-        assert_eq!(
-            dead.len(),
-            1,
-            "only the unused result should be dead initially"
-        );
-        assert!(
-            !dead.contains(&insn_ids[0]),
-            "first add (whose result is used) must not be dead"
-        );
-        assert!(
-            dead.contains(&insn_ids[1]),
-            "second add (no users) should be dead"
-        );
+        assert_eq!(dead.len(), 2, "the whole chain is dead, got {dead:?}");
+        assert!(dead.contains(&insn_ids[0]) && dead.contains(&insn_ids[1]));
     }
 
     #[test]

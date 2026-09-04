@@ -745,6 +745,22 @@ impl<'str> FunctionBody<'str> {
             .unwrap_or(&[])
     }
 
+    /// Whether any instruction in this body uses `value`.
+    ///
+    /// The question `users_of(v).is_empty()` asks, without the allocation it
+    /// takes to answer it that way. Dead-code elimination asks it once per
+    /// instruction per round, which made building those vectors the single
+    /// largest cost of lifting a block.
+    pub fn has_users(&self, value: ValueId) -> bool {
+        if value
+            .owning_function()
+            .is_some_and(|owner| owner != self.id())
+        {
+            return false;
+        }
+        !self.local_users_of(value).is_empty()
+    }
+
     /// This body's qualified instruction IDs that use `value`. A value owned by
     /// another function has no users in this body, even if its local index
     /// collides with one of this body's values.
@@ -1368,6 +1384,67 @@ impl<'str> FunctionBody<'str> {
         self.insns.remove(id.local);
     }
 
+    /// Removes several non-terminator instructions of one block at once.
+    ///
+    /// [`remove_instruction`](Self::remove_instruction) walks the block's
+    /// instruction list to unlink each one, so removing *n* of them costs
+    /// `n × block`. Lifting an absorbed guest basic block deletes hundreds of
+    /// instructions from a block hundreds long, and that product was a real
+    /// share of translation time. Here the list is walked once however many go.
+    ///
+    /// Terminators are rejected rather than handled: removing one has to tear
+    /// down CFG edges too, and no caller of this deletes one — dead-code
+    /// elimination will not touch a terminator, and store forwarding removes
+    /// only loads and stores.
+    pub fn remove_block_instructions(&mut self, block_id: BlockId, dead: &FxHashSet<LocalInsnId>) {
+        assert_eq!(
+            block_id.func,
+            self.id(),
+            "block belongs to another function"
+        );
+        if dead.is_empty() {
+            return;
+        }
+
+        let mut names = Vec::new();
+        let mut operands: FxHashSet<LocalValueId> = FxHashSet::default();
+        for &id in dead {
+            let insn = &self.insns[id];
+            assert!(
+                !insn.mnemonic().is_terminator(),
+                "bulk removal does not unlink CFG edges; {id:?} is a terminator"
+            );
+            if let Some(name) = insn.name.clone() {
+                names.push(name);
+            }
+            operands.extend(insn.mnemonic().args());
+        }
+
+        self.block_mut(block_id)
+            .instructions
+            .retain(|local| !dead.contains(local));
+
+        for name in names {
+            self.names.forget(name.as_ref());
+        }
+        // Each operand's user list is pruned once, not once per dead user.
+        for arg in operands {
+            let now_empty = if let Some(users) = self.users.get_mut(&arg) {
+                users.retain(|local| !dead.contains(local));
+                users.is_empty()
+            } else {
+                false
+            };
+            if now_empty {
+                self.users.remove(&arg);
+            }
+        }
+        for &id in dead {
+            self.users.remove(&LocalValueId::Instruction(id));
+            self.insns.remove(id);
+        }
+    }
+
     /// Rehome `remove`'s outgoing CFG edges onto `keep`. The direct edge and
     /// `keep`'s forwarding terminator have already been removed by the caller.
     pub fn rehome_outgoing_edges(&mut self, keep: BlockId, remove: BlockId) {
@@ -1826,6 +1903,29 @@ where
             return Vec::new();
         }
         self.inner().users_of(value)
+    }
+
+    /// This function's users of `value` in their stored, body-local form.
+    ///
+    /// Borrowed rather than built: a pass that reads the list once per
+    /// instruction should not allocate one per instruction to do it. Qualify
+    /// with this function's id when a whole [`InstructionId`] is needed.
+    pub fn local_users_of(&'s self, value: ValueId) -> &'ctx [LocalInsnId] {
+        let func = self.id;
+        if value.owning_function().is_some_and(|owner| owner != func) {
+            return &[];
+        }
+        self.inner().local_users_of(value)
+    }
+
+    /// Whether this function uses `value` at all, without building the user
+    /// list to ask. See [`FunctionBody::has_users`].
+    pub fn has_users(&'s self, value: ValueId) -> bool {
+        let func = self.id;
+        if value.owning_function().is_some_and(|owner| owner != func) {
+            return false;
+        }
+        self.inner().has_users(value)
     }
 
     /// Iterate this function's recorded `(value, users)` reverse-use entries
