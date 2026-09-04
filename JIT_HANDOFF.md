@@ -49,6 +49,34 @@ harness lying — see "Lessons" below.
 | `3d20d27` | The VM's lifter now lowers guest `call`/`ret` as jumps (`with_flat_control_flow`). This is what made Embench run at all — see below. |
 | `33fe87a` | Guest RAM is compiled, through an inlined software TLB and an inlined per-byte permission check. Block coverage went from ~24% to 99.1% and every benchmark crossed 1.0×. |
 
+### Dead stores: use the pass that exists, and expect ~9%
+
+`qcode_analysis::remove_dead_stores_with_liveness(ctx, func)` runs the real
+thing — the alias oracle (`AliasAnalysis`) and the memory liveness
+(`compute_memory_liveness`) that `remove_dead_load_insns` needs to be sound.
+`remove_dead_load_insns` still accepts `aliases: None`, and with `None` its scan
+treats nothing as live at a block's exit, which is exactly the unsoundness
+`7552962` removed; the new entry point exists so that choice cannot be made by
+accident.
+
+Measured on the code each benchmark discovers (`DEAD_STORES=1` on the
+`run-embench` example):
+
+```
+nettle-sha256  38758 -> 35419 insns  ( 8.6%)  438ms
+nsichneu       20086 -> 18653 insns  ( 7.1%)  510ms
+qrduino        47891 -> 43199 insns  ( 9.8%)  231ms
+matmult-int     2297 ->  2029 insns  (11.7%)    4ms
+```
+
+Two things follow. The prize is **~9% of instructions, not the ~2x** the "12 of
+26 flag stores" note below implies — that anecdote was one hand-picked block,
+not a program. And the cost is *more than the whole run* on the larger
+programs, because the VM lifts with flat control flow, so the "function" the
+alias analysis must chew through is the entire discovered program. This is a
+one-shot "the program is now known, optimise it properly" step for a
+long-running workload, never a per-lift one.
+
 ### The conservative dead-store rule does not work as stated
 
 This handoff used to suggest recovering `7552962` with "a strictly conservative
@@ -67,9 +95,10 @@ the work — it just is not sound in that form. Two holes, both found the hard w
    is an invisible reader. Anything not understood has to count as a reader of
    every flat space.
 
-Fixing (1) alone was not enough. The next attempt should take the handoff's
-*other* option — real liveness from `crate::mem::mem_liveness` — rather than
-extending the hand-rolled rule with a third special case.
+Fixing (1) alone was not enough. Do not extend the rule with a third special
+case — use `remove_dead_stores_with_liveness` above, which is what the project
+already had. Writing a new pass instead of looking for the existing one is the
+same mistake recorded in "Lessons" below, made twice.
 
 `7552962` gives up a real optimization: on a merged straight-line block, dead
 flag stores were 12 of 26, and removing them took one block from 96 QCode
