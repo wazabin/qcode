@@ -31,7 +31,7 @@ mod test_util;
 pub mod dce;
 pub use dce::{
     dead_insns, dead_load_insns, remove_dead_insns, remove_dead_load_insns,
-    remove_dead_load_insns_block,
+    remove_dead_load_insns_block, remove_dead_stores_with_liveness,
 };
 
 pub mod alias;

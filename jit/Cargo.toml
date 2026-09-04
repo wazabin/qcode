@@ -10,6 +10,7 @@ repository.workspace = true
 qcode.workspace = true
 qcode_emulator.workspace = true
 qcode_vm.workspace = true
+qcode_analysis.workspace = true
 rustc-hash.workspace = true
 cranelift = "0.129"
 cranelift-jit = "0.129"

@@ -1092,6 +1092,22 @@ pub fn remove_dead_load_insns(
     })
 }
 
+/// Removes dead loads and stores from `function_id`, computing the alias oracle
+/// and memory liveness this needs rather than requiring the caller to have one.
+///
+/// [`remove_dead_load_insns`] takes `aliases: None` to mean "no oracle", and
+/// with no oracle its per-block scan treats nothing as live at a block's exit.
+/// That is right for a pipeline that hands it an alias result and wrong for
+/// anyone else — it is what made the pass unsound for the VM (`7552962`). This
+/// entry point removes the choice: the analyses are always run, so the answer
+/// is always justified by liveness.
+pub fn remove_dead_stores_with_liveness(ctx: &mut Context, function_id: FunctionId) -> bool {
+    let aliases = crate::with_body_mut(ctx, function_id, |body, cx| {
+        <crate::AliasAnalysis as crate::LocalAnalysis>::analyze(body, cx)
+    });
+    remove_dead_load_insns(ctx, function_id, Some(&aliases), &[])
+}
+
 /// Body-local core of [`remove_dead_load_insns`].
 pub fn remove_dead_load_insns_body<'a, 'str>(
     body: &'a mut FunctionBody<'str>,

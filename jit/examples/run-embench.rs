@@ -138,6 +138,33 @@ fn main() {
     let finished = matches!(&exit, qcode_vm::VmExit::Unlifted { addr, .. } if *addr == SENTINEL);
     let verified = finished && vm.emulator().read_varnode_by_name(&ctx, "EAX") == Some(0);
 
+    // Diagnostic: what the real dead-store pass — alias oracle plus memory
+    // liveness — would remove from the code this run discovered, and what it
+    // costs to find out. Run after the fact, so it perturbs nothing.
+    if std::env::var("DEAD_STORES").is_ok() {
+        let mut ctx = vm.context().clone();
+        let functions: Vec<_> = ctx.function_ids();
+        let before: usize = ctx
+            .block_ids()
+            .into_iter()
+            .map(|b| ctx.block(b).instruction_ids().len())
+            .sum();
+        let started = std::time::Instant::now();
+        for &f in &functions {
+            qcode_analysis::remove_dead_stores_with_liveness(&mut ctx, f);
+        }
+        let took = started.elapsed();
+        let after: usize = ctx
+            .block_ids()
+            .into_iter()
+            .map(|b| ctx.block(b).instruction_ids().len())
+            .sum();
+        eprintln!(
+            "  dead stores: {before} -> {after} instructions ({:.1}% removed) in {took:.2?}",
+            100.0 * (before - after) as f64 / before.max(1) as f64
+        );
+    }
+
     let stats = vm.stats.clone();
     eprintln!(
         "{name}: {} in {elapsed:.2?}  ({exit:?})",

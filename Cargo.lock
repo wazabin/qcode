@@ -1344,6 +1344,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "qcode",
+ "qcode_analysis",
  "qcode_emulator",
  "qcode_vm",
  "rustc-hash",
