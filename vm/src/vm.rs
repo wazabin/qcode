@@ -158,6 +158,15 @@ pub struct Vm<S> {
     /// block-locally — an instruction with no users cannot be observed — and is
     /// paid once per block instead of on every execution of it.
     pub optimize: bool,
+    /// Blocks that have grown by absorption and not been cleaned since.
+    ///
+    /// Absorption folds a straight-line run one guest instruction at a time,
+    /// and cleaning the whole enlarged block after each one is quadratic in the
+    /// length of the run — which on unrolled code is the dominant cost of
+    /// translation. The cleanup is deferred to the point the block is next
+    /// entered at its first instruction, by which time the run has stopped
+    /// growing and one pass does the work of all of them.
+    dirty: FxHashSet<BlockId>,
     breakpoints: FxHashSet<u64>,
 }
 
@@ -174,6 +183,7 @@ impl<S: CodeSource> Vm<S> {
             stats: Stats::default(),
             executor: None,
             absorbed_into: None,
+            dirty: FxHashSet::default(),
             breakpoints: FxHashSet::default(),
         }
     }
@@ -257,6 +267,15 @@ impl<S: CodeSource> Vm<S> {
         // the second failure means the source did not produce the block it
         // claimed to, which is a source bug rather than a discovery step.
         for attempt in 0..2 {
+            // At its first instruction a block is between runs, which is the
+            // one moment a deferred cleanup can be taken without disturbing a
+            // position inside it — and it has to happen before the executor
+            // looks, or compiled code gets built from uncleaned QCode.
+            if self.emu.idx == 0 {
+                let block = self.emu.block;
+                self.clean_before_entering(block);
+            }
+
             // At a block's first instruction, an installed executor may run the
             // whole body at once, leaving the interpreter only the terminator.
             if self.emu.idx == 0
@@ -441,6 +460,27 @@ impl<S: CodeSource> Vm<S> {
     /// Deliberately block-local (no alias result): at discovery the rest of the
     /// CFG is still unknown, so only a store this block itself overwrites can
     /// be proven dead. Anything live at the exit stays.
+    /// Records that `block` has grown and owes a cleanup.
+    fn mark_dirty(&mut self, block: BlockId) {
+        if self.optimize {
+            self.dirty.insert(block);
+        }
+    }
+
+    /// Cleans the block the machine is about to run, if it has grown since it
+    /// was last cleaned.
+    ///
+    /// Only ever the block being entered, which is why a stale id cannot be
+    /// reached here: absorption and splitting retire blocks that may still be
+    /// listed, but the machine can only be about to run a live one. A leftover
+    /// entry for a retired id is harmless — at worst it cleans a block whose id
+    /// was reused, which is always safe.
+    fn clean_before_entering(&mut self, block: BlockId) {
+        if self.dirty.remove(&block) {
+            self.reoptimize(block);
+        }
+    }
+
     fn reoptimize(&mut self, block: BlockId) {
         if !self.optimize {
             return;
@@ -481,7 +521,7 @@ impl<S: CodeSource> Vm<S> {
         self.stats.absorbed += forward as u64;
         if forward > 0 {
             self.reindex_absorbed(filled);
-            self.reoptimize(filled);
+            self.mark_dirty(filled);
         }
 
         // Backward: the straight-line predecessor that branched here, for the
@@ -539,7 +579,7 @@ impl<S: CodeSource> Vm<S> {
         // point, and every index after a deletion shifts. The first of these
         // still standing afterwards is the one to resume at.
         let resume: Vec<LocalInsnId> = self.ctx.block(head).instruction_ids()[offset..].to_vec();
-        self.reoptimize(head);
+        self.mark_dirty(head);
 
         self.reindex_absorbed(head);
 
