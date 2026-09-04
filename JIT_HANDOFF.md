@@ -78,6 +78,36 @@ instructions to 40. Recovering it needs either liveness supplied to that pass
 only when a later store *in the same block* covers every byte with no
 intervening read, which never depends on what is live at the exit.
 
+## Two throughput numbers, and which one you mean
+
+Quoting one figure for "how fast is it" hides the thing that matters most here,
+because Embench at its stock scale factor executes only ~3M guest instructions
+per program — less work than it takes to translate it.
+
+* **Warm-up** (stock corpus, `target/embench`): ~18M guest-insn/s aggregate.
+  Dominated by one-time cost — SLEIGH decoding, the block cleanup, and Cranelift
+  compiling blocks that then run for a few milliseconds.
+* **Steady state** (`benchmarks/embench/build.sh` with `GLOBAL_SCALE_FACTOR=20`,
+  run with `EMBENCH_DIR=target/embench-x20`): **~50M guest-insn/s aggregate,
+  median ~60M/s**, ranging 45–130M/s. This is the rate compiled code actually
+  sustains once translation is amortised.
+
+Neither is wrong; they answer different questions. Optimise against the one that
+matches the workload — a fuzzing harness that re-lifts constantly lives in the
+first, a long-running emulation in the second.
+
+**`nsichneu` is the outlier worth chasing**: 12M/s even at steady state, five
+times worse than anything else. Its guest basic blocks average ~1.8 guest
+instructions, so it leaves and re-enters compiled code constantly and pays
+per-block dispatch rather than compilation. Everything else clears 30M/s.
+
+A caution when reading `stats.steps` rates: `nettle-sha256` retires 2.7 *billion*
+p-code operations per second, which is not one interpreted operation per
+0.4 cycles — it is Cranelift deleting most of them. x86 lifting emits ~20 p-code
+ops per guest instruction, mostly flag computation nothing reads, and the
+backend's own DCE removes them. That is also why shrinking QCode helps
+*compile* time far more than it helps execution.
+
 ## Where the performance actually is
 
 ```
