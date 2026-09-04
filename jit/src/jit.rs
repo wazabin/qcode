@@ -106,6 +106,14 @@ impl Jit {
         flags
             .set("opt_level", "speed")
             .expect("opt_level is a known flag");
+        // The verifier re-checks Cranelift IR this backend has just built, on
+        // the guest's critical path, for every block. It is a development aid
+        // for the compiler itself; what guards *this* translation is the
+        // divergence harness, which compares compiled code against the
+        // interpreter block by block over whole programs.
+        flags
+            .set("enable_verifier", "false")
+            .expect("enable_verifier is a known flag");
         let isa = cranelift_native::builder()
             .expect("host is a supported target")
             .finish(settings::Flags::new(flags))
