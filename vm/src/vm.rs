@@ -158,7 +158,7 @@ pub struct Vm<S> {
     /// block-locally — an instruction with no users cannot be observed — and is
     /// paid once per block instead of on every execution of it.
     pub optimize: bool,
-    /// Blocks that have grown by absorption and not been cleaned since.
+    /// The block that has grown by absorption and not been cleaned since.
     ///
     /// Absorption folds a straight-line run one guest instruction at a time,
     /// and cleaning the whole enlarged block after each one is quadratic in the
@@ -166,7 +166,14 @@ pub struct Vm<S> {
     /// translation. The cleanup is deferred to the point the block is next
     /// entered at its first instruction, by which time the run has stopped
     /// growing and one pass does the work of all of them.
-    dirty: FxHashSet<BlockId>,
+    ///
+    /// At most one: absorption extends one run at a time, so a *different*
+    /// block being absorbed into means the previous run has stopped growing
+    /// and can be cleaned right there. Waiting for it to be entered again
+    /// instead would let compiled code be built from the uncleaned form — and
+    /// worse, would clean it in an interpreted run but not in a chained
+    /// compiled one, leaving the two strategies running different QCode.
+    dirty: Option<BlockId>,
     breakpoints: FxHashSet<u64>,
 }
 
@@ -183,7 +190,7 @@ impl<S: CodeSource> Vm<S> {
             stats: Stats::default(),
             executor: None,
             absorbed_into: None,
-            dirty: FxHashSet::default(),
+            dirty: None,
             breakpoints: FxHashSet::default(),
         }
     }
@@ -460,10 +467,20 @@ impl<S: CodeSource> Vm<S> {
     /// Deliberately block-local (no alias result): at discovery the rest of the
     /// CFG is still unknown, so only a store this block itself overwrites can
     /// be proven dead. Anything live at the exit stays.
-    /// Records that `block` has grown and owes a cleanup.
+    /// Records that `block` has grown and owes a cleanup, cleaning whatever
+    /// run was growing before it.
     fn mark_dirty(&mut self, block: BlockId) {
-        if self.optimize {
-            self.dirty.insert(block);
+        if !self.optimize {
+            return;
+        }
+        let previous = self.dirty.replace(block);
+        if let Some(previous) = previous
+            && previous != block
+            // Discovery retires blocks — splitting an absorbed run empties
+            // both halves — so the one that was growing may be gone.
+            && self.ctx.contains_block(previous)
+        {
+            self.reoptimize(previous);
         }
     }
 
@@ -476,7 +493,8 @@ impl<S: CodeSource> Vm<S> {
     /// entry for a retired id is harmless — at worst it cleans a block whose id
     /// was reused, which is always safe.
     fn clean_before_entering(&mut self, block: BlockId) {
-        if self.dirty.remove(&block) {
+        if self.dirty == Some(block) {
+            self.dirty = None;
             self.reoptimize(block);
         }
     }
