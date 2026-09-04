@@ -1407,7 +1407,6 @@ impl<'str> FunctionBody<'str> {
         }
 
         let mut names = Vec::new();
-        let mut operands: FxHashSet<LocalValueId> = FxHashSet::default();
         for &id in dead {
             let insn = &self.insns[id];
             assert!(
@@ -1417,17 +1416,30 @@ impl<'str> FunctionBody<'str> {
             if let Some(name) = insn.name.clone() {
                 names.push(name);
             }
-            operands.extend(insn.mnemonic().args());
         }
 
         self.block_mut(block_id)
             .instructions
             .retain(|local| !dead.contains(local));
+        self.purge_instructions(dead, names);
+    }
 
+    /// Forgets `dead`'s names, prunes them from every user list they appear in,
+    /// and drops their payloads.
+    ///
+    /// The shared tail of removing instructions in bulk. It does not touch any
+    /// block's instruction list — the caller has already dealt with that, which
+    /// is the whole point: doing it per instruction is what makes removal
+    /// quadratic in the size of the block.
+    fn purge_instructions(&mut self, dead: &FxHashSet<LocalInsnId>, names: Vec<Cow<'str, str>>) {
         for name in names {
             self.names.forget(name.as_ref());
         }
         // Each operand's user list is pruned once, not once per dead user.
+        let mut operands: FxHashSet<LocalValueId> = FxHashSet::default();
+        for &id in dead {
+            operands.extend(self.insns[id].mnemonic().args());
+        }
         for arg in operands {
             let now_empty = if let Some(users) = self.users.get_mut(&arg) {
                 users.retain(|local| !dead.contains(local));
@@ -1556,15 +1568,18 @@ impl<'str> FunctionBody<'str> {
         for edge in outgoing {
             self.remove_cfg_edge(edge);
         }
-        let insns: Vec<InstructionId> = self
-            .block(block)
-            .instructions
+        // The list is emptied in one move and the instructions purged as a
+        // set. Removing them one at a time means re-scanning the very list
+        // being emptied for each one, which is quadratic — and the blocks this
+        // clears are absorbed guest basic blocks, thousands of instructions
+        // long. Splitting one used to cost more than lifting it did.
+        let insns = std::mem::take(&mut self.block_mut(block).instructions);
+        let dead: FxHashSet<LocalInsnId> = insns.iter().copied().collect();
+        let names: Vec<Cow<'str, str>> = insns
             .iter()
-            .map(|&local| InstructionId::new(self.id(), local))
+            .filter_map(|&local| self.insns[local].name.clone())
             .collect();
-        for insn in insns {
-            self.remove_instruction(insn);
-        }
+        self.purge_instructions(&dead, names);
     }
 
     pub fn delete_block(&mut self, block: BlockId) {
