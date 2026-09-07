@@ -725,6 +725,381 @@ mod tests {
         assert_eq!(emu.read_register(x64::FPUTAGWORD), Some(0x0180));
     }
 
+    /// Exercise every register constructor and TOP mapping, including aliased
+    /// ST(0), with both masked and unmasked stack underflows. No DB required.
+    #[test]
+    fn test_x87_register_store_stack_faults() {
+        const INDEFINITE: u128 = 0xffff_c000_0000_0000_0000;
+        for pop in [false, true] {
+            for index in 0..8usize {
+                let bytes = [0xdd, 0xd0 + index as u8 + if pop { 8 } else { 0 }];
+                let insn = x64::Disassembler::from_bytes(0x1000, &bytes)
+                    .next()
+                    .unwrap();
+                let mut ctx = x64::make_context();
+                x64::lift(&mut ctx, &insn, None).unwrap();
+                for top in 0..8usize {
+                    for empty in [false, true] {
+                        for masked in [false, true] {
+                            let mut emu = Emulator::from_address(&ctx, 0x1000);
+                            let control = if masked { 0x37f } else { 0x37e };
+                            emu.set_register(x64::FPUCONTROLWORD, control).unwrap();
+                            emu.set_register(x64::FPUSTATUSWORD, (top as u64) << 11 | 0x4700)
+                                .unwrap();
+                            let tags = if empty { 3u64 << (top * 2) } else { 0 };
+                            emu.set_register(x64::FPUTAGWORD, tags).unwrap();
+                            let mut values = std::array::from_fn::<_, 8, _>(|i| {
+                                0x3fff_8000_0000_0000_0000u128 + i as u128
+                            });
+                            for (i, value) in values.iter().enumerate() {
+                                write_x87_slot(&mut emu, &ctx, i, *value);
+                            }
+                            let target = (top + index) & 7;
+                            let commit = !empty || masked;
+                            let mut expected_tags = tags;
+                            if commit {
+                                values[target] = if empty { INDEFINITE } else { values[top] };
+                                expected_tags = (tags & !(3 << (target * 2)))
+                                    | (if empty { 2 } else { 0 } << (target * 2));
+                                if pop {
+                                    expected_tags |= 3 << (top * 2);
+                                }
+                            }
+                            let next = (top + usize::from(commit && pop)) & 7;
+                            let status = (next as u64) << 11
+                                | 0x4500
+                                | if empty {
+                                    if masked { 0x41 } else { 0x80c1 }
+                                } else {
+                                    0
+                                };
+                            emu.run_block().unwrap();
+                            assert_eq!(
+                                emu.read_register(x64::FPUSTATUSWORD),
+                                Some(status),
+                                "pop={pop} index={index} top={top} empty={empty} masked={masked}"
+                            );
+                            assert_eq!(emu.read_register(x64::FPUTAGWORD), Some(expected_tags));
+                            for (i, value) in values.iter().enumerate() {
+                                assert_eq!(read_x87_slot(&mut emu, &ctx, i), *value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_x87_register_load_stack_faults() {
+        const INDEFINITE: u128 = 0xffff_c000_0000_0000_0000;
+        for index in 0..8usize {
+            let bytes = [0xd9, 0xc0 + index as u8];
+            let insn = x64::Disassembler::from_bytes(0x1000, &bytes)
+                .next()
+                .unwrap();
+            let mut ctx = x64::make_context();
+            x64::lift(&mut ctx, &insn, None).unwrap();
+            for top in 0..8usize {
+                for empty in [false, true] {
+                    for overflow in [false, true] {
+                        for masked in [false, true] {
+                            let source = (top + index) & 7;
+                            let target = (top + 7) & 7;
+                            // ST(7) is also the push destination; its two tag
+                            // predicates cannot be varied independently.
+                            if source == target && empty == overflow {
+                                continue;
+                            }
+                            let mut emu = Emulator::from_address(&ctx, 0x1000);
+                            emu.set_register(
+                                x64::FPUCONTROLWORD,
+                                if masked { 0x37f } else { 0x37e },
+                            )
+                            .unwrap();
+                            emu.set_register(x64::FPUSTATUSWORD, (top as u64) << 11 | 0x4700)
+                                .unwrap();
+                            // Other slots are empty: FLD ST(i) must not fault
+                            // merely because the old ST(0) is empty.
+                            let mut tags = 0xffffu64;
+                            if !empty {
+                                tags &= !(3 << (source * 2));
+                            }
+                            if overflow {
+                                tags &= !(3 << (target * 2));
+                            }
+                            emu.set_register(x64::FPUTAGWORD, tags).unwrap();
+                            let mut values = std::array::from_fn::<_, 8, _>(|i| {
+                                0x3fff_8000_0000_0000_0000u128 + i as u128
+                            });
+                            for (i, value) in values.iter().enumerate() {
+                                write_x87_slot(&mut emu, &ctx, i, *value);
+                            }
+                            let fault = empty || overflow;
+                            let commit = !fault || masked;
+                            if commit {
+                                values[target] = if fault { INDEFINITE } else { values[source] };
+                                tags = (tags & !(3 << (target * 2)))
+                                    | (if fault { 2 } else { 0 } << (target * 2));
+                            }
+                            let next = if commit { target } else { top };
+                            let status = (next as u64) << 11
+                                | 0x4500
+                                | if overflow { 0x200 } else { 0 }
+                                | if fault {
+                                    if masked { 0x41 } else { 0x80c1 }
+                                } else {
+                                    0
+                                };
+                            emu.run_block().unwrap();
+                            assert_eq!(
+                                emu.read_register(x64::FPUSTATUSWORD),
+                                Some(status),
+                                "index={index} top={top} empty={empty} overflow={overflow} masked={masked}"
+                            );
+                            assert_eq!(emu.read_register(x64::FPUTAGWORD), Some(tags));
+                            for (i, value) in values.iter().enumerate() {
+                                assert_eq!(read_x87_slot(&mut emu, &ctx, i), *value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_x87_register_exchange_stack_faults() {
+        const INDEFINITE: u128 = 0xffff_c000_0000_0000_0000;
+        for index in 0..8usize {
+            let bytes = [0xd9, 0xc8 + index as u8];
+            let insn = x64::Disassembler::from_bytes(0x1000, &bytes)
+                .next()
+                .unwrap();
+            let mut ctx = x64::make_context();
+            x64::lift(&mut ctx, &insn, None).unwrap();
+            for top in 0..8usize {
+                for empty0 in [false, true] {
+                    for empty1 in [false, true] {
+                        if index == 0 && empty0 != empty1 {
+                            continue;
+                        }
+                        for masked in [false, true] {
+                            let target = (top + index) & 7;
+                            let mut emu = Emulator::from_address(&ctx, 0x1000);
+                            emu.set_register(
+                                x64::FPUCONTROLWORD,
+                                if masked { 0x37f } else { 0x37e },
+                            )
+                            .unwrap();
+                            emu.set_register(x64::FPUSTATUSWORD, (top as u64) << 11 | 0x4700)
+                                .unwrap();
+                            let mut tags = (if empty0 { 3u64 } else { 0 } << (top * 2))
+                                | (if empty1 { 3u64 } else { 0 } << (target * 2));
+                            emu.set_register(x64::FPUTAGWORD, tags).unwrap();
+                            let mut values = std::array::from_fn::<_, 8, _>(|i| {
+                                0x3fff_8000_0000_0000_0000u128 + i as u128
+                            });
+                            for (i, value) in values.iter().enumerate() {
+                                write_x87_slot(&mut emu, &ctx, i, *value);
+                            }
+                            let fault = empty0 || empty1;
+                            if !fault || masked {
+                                if empty0 {
+                                    values[top] = INDEFINITE;
+                                }
+                                if empty1 {
+                                    values[target] = INDEFINITE;
+                                }
+                                values.swap(top, target);
+                                tags = (if empty1 { 2u64 } else { 0 } << (top * 2))
+                                    | (if empty0 { 2u64 } else { 0 } << (target * 2));
+                            }
+                            let status = (top as u64) << 11
+                                | 0x4500
+                                | if fault {
+                                    if masked { 0x41 } else { 0x80c1 }
+                                } else {
+                                    0
+                                };
+                            emu.run_block().unwrap();
+                            assert_eq!(
+                                emu.read_register(x64::FPUSTATUSWORD),
+                                Some(status),
+                                "index={index} top={top} empty0={empty0} empty1={empty1} masked={masked}"
+                            );
+                            assert_eq!(emu.read_register(x64::FPUTAGWORD), Some(tags));
+                            for (i, value) in values.iter().enumerate() {
+                                assert_eq!(read_x87_slot(&mut emu, &ctx, i), *value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_x87_integer_stores_clear_c1_and_fault_on_empty_stack() {
+        for (opcode, width, bcd) in [
+            (0xdf, 2, false),
+            (0xdb, 4, false),
+            (0xdd, 8, false),
+            (0xdf, 10, true),
+        ] {
+            let bytes = [opcode, if bcd { 0x30 } else { 0x08 }, 0x90];
+            let mut ctx = x64::make_context();
+            for insn in x64::Disassembler::from_bytes(0x1000, &bytes) {
+                x64::lift(&mut ctx, &insn, None).unwrap();
+            }
+            let ram = ctx.shared.default_space;
+            for top in 0..8usize {
+                for empty in [false, true] {
+                    for masked in [false, true] {
+                        let mut emu = Emulator::from_address(&ctx, 0x1000);
+                        emu.set_register(x64::RAX, 0x2000).unwrap();
+                        emu.write_memory(ram, 0x2000, &[0xa5; 10]).unwrap();
+                        emu.set_register(x64::FPUCONTROLWORD, if masked { 0x37f } else { 0x37e })
+                            .unwrap();
+                        emu.set_register(x64::FPUSTATUSWORD, (top as u64) << 11 | 0x4700)
+                            .unwrap();
+                        let tags = if empty { 3u64 << (top * 2) } else { 0 };
+                        emu.set_register(x64::FPUTAGWORD, tags).unwrap();
+                        let one = 0x3fff_8000_0000_0000_0000u128;
+                        write_x87_slot(&mut emu, &ctx, top, one);
+                        emu.run_until(0x1002).unwrap();
+                        let commit = !empty || masked;
+                        let mut expected = [0xa5; 10];
+                        if commit {
+                            expected[..width].fill(0);
+                            if empty {
+                                if bcd {
+                                    expected[7..10].copy_from_slice(&[0xc0, 0xff, 0xff]);
+                                } else {
+                                    expected[width - 1] = 0x80;
+                                }
+                            } else {
+                                expected[0] = 1;
+                            }
+                        }
+                        assert_eq!(
+                            emu.read_memory(ram, 0x2000, 10).unwrap(),
+                            expected,
+                            "width={width} top={top} empty={empty} masked={masked}"
+                        );
+                        let next = (top + usize::from(commit)) & 7;
+                        let status = (next as u64) << 11
+                            | 0x4500
+                            | if empty {
+                                if masked { 0x41 } else { 0x80c1 }
+                            } else {
+                                0
+                            };
+                        assert_eq!(emu.read_register(x64::FPUSTATUSWORD), Some(status));
+                        assert_eq!(
+                            emu.read_register(x64::FPUTAGWORD),
+                            Some(if commit {
+                                tags | (3 << (top * 2))
+                            } else {
+                                tags
+                            })
+                        );
+                        assert_eq!(read_x87_slot(&mut emu, &ctx, top), one);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Confirmed with native FXRSTOR/FISTTP-or-FBSTP/FXSAVE: unmasked
+    /// precision still stores and pops (SW=0x88a0 at TOP=0), whereas
+    /// unmasked invalid aborts (SW=0x8081, memory and TOP unchanged).
+    #[test]
+    fn test_x87_integer_store_unmasked_precision_commits_but_invalid_aborts() {
+        for (opcode, width, bcd) in [
+            (0xdf, 2, false),
+            (0xdb, 4, false),
+            (0xdd, 8, false),
+            (0xdf, 10, true),
+        ] {
+            let bytes = [opcode, if bcd { 0x30 } else { 0x08 }, 0x90];
+            let mut ctx = x64::make_context();
+            for insn in x64::Disassembler::from_bytes(0x1000, &bytes) {
+                x64::lift(&mut ctx, &insn, None).unwrap();
+            }
+            let ram = ctx.shared.default_space;
+            for invalid in [false, true] {
+                let mut emu = Emulator::from_address(&ctx, 0x1000);
+                emu.set_register(x64::RAX, 0x2000).unwrap();
+                emu.write_memory(ram, 0x2000, &[0xa5; 10]).unwrap();
+                emu.set_register(x64::FPUCONTROLWORD, if invalid { 0x37e } else { 0x35f })
+                    .unwrap();
+                emu.set_register(x64::FPUSTATUSWORD, 0).unwrap();
+                emu.set_register(x64::FPUTAGWORD, 0xfffc).unwrap();
+                let value = if invalid {
+                    0x7fff_8000_0000_0000_0000
+                } else {
+                    0x3ffe_8000_0000_0000_0000
+                };
+                write_x87_slot(&mut emu, &ctx, 0, value);
+                emu.run_until(0x1002).unwrap();
+                let mut expected = [0xa5; 10];
+                if !invalid {
+                    expected[..width].fill(0);
+                }
+                assert_eq!(
+                    emu.read_memory(ram, 0x2000, 10).unwrap(),
+                    expected,
+                    "width={width} invalid={invalid}"
+                );
+                assert_eq!(
+                    emu.read_register(x64::FPUSTATUSWORD),
+                    Some(if invalid { 0x8081 } else { 0x88a0 })
+                );
+                assert_eq!(
+                    emu.read_register(x64::FPUTAGWORD),
+                    Some(if invalid { 0xfffc } else { 0xffff })
+                );
+                assert_eq!(read_x87_slot(&mut emu, &ctx, 0), value);
+            }
+        }
+    }
+
+    #[test]
+    fn test_x87_free_clears_c1_without_touching_payloads() {
+        for pop in [false, true] {
+            for index in 0..8usize {
+                let bytes = [if pop { 0xdf } else { 0xdd }, 0xc0 + index as u8];
+                let insn = x64::Disassembler::from_bytes(0x1000, &bytes)
+                    .next()
+                    .unwrap();
+                let mut ctx = x64::make_context();
+                x64::lift(&mut ctx, &insn, None).unwrap();
+                for top in 0..8usize {
+                    let mut emu = Emulator::from_address(&ctx, 0x1000);
+                    emu.set_register(x64::FPUSTATUSWORD, (top as u64) << 11 | 0x4700)
+                        .unwrap();
+                    emu.set_register(x64::FPUTAGWORD, 0).unwrap();
+                    for i in 0..8 {
+                        write_x87_slot(&mut emu, &ctx, i, i as u128 + 1);
+                    }
+                    emu.run_block().unwrap();
+                    let next = (top + usize::from(pop)) & 7;
+                    let tags =
+                        (3 << (((top + index) & 7) * 2)) | if pop { 3 << (top * 2) } else { 0 };
+                    assert_eq!(emu.read_register(x64::FPUTAGWORD), Some(tags));
+                    assert_eq!(
+                        emu.read_register(x64::FPUSTATUSWORD),
+                        Some((next as u64) << 11 | 0x4500)
+                    );
+                    for i in 0..8 {
+                        assert_eq!(read_x87_slot(&mut emu, &ctx, i), i as u128 + 1);
+                    }
+                }
+            }
+        }
+    }
+
     /// MMX operands are low-64 views of the same physical x87 slots. A write
     /// updates only its destination payload's high 16 bits and marks the full
     /// x87 tag word valid; its source slot remains otherwise untouched.
