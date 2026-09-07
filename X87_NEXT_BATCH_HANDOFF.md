@@ -1,5 +1,98 @@
 # Binit corpus QCode replay status
 
+## SLEIGH transfer fixes — 2026-09-07
+
+The August status below is historical. The September 3 CSV had 40 x87
+first-difference state mismatches; it is not the post-fix backlog.
+
+Changed `wazabin-sleigh/precompile/open_sleigh/src/x86/ia.sinc` (the vendored
+specification, not the sibling top-level `open_sleigh` checkout). Spec commit
+`8602251` is pinned by `wazabin-sleigh` commit `2cb0031`; standalone tests are
+in QCode commit `13b4551`:
+
+- `FLD ST(i)` checks the source tag, not the old ST(0) tag, and checks the
+  push destination for overflow before changing TOP. Masked faults push the
+  indefinite value; unmasked invalid preserves payloads, tags, and TOP.
+- Register `FST`/`FSTP` report empty-source IE|SF, write an occupied indefinite
+  destination when masked, and do not store/pop on unmasked invalid. Every
+  register form clears C1, including ST(0) aliases and the previously missed
+  FSTP constructors.
+- `FXCH` substitutes indefinite only for empty operands before exchanging,
+  propagates the corresponding full tags, clears C1, and leaves both operands
+  alone on unmasked invalid. The implicit and explicit forms share the logic.
+- `FISTTP` and `FBSTP` clear stale C1 and report empty-stack faults without
+  overwriting the source payload. Conversion is staged before storing/popping;
+  unmasked invalid leaves memory and TOP alone.
+- `FFREE`/`FFREEP` clear C1 consistently. FFREE condition codes are
+  architecturally undefined; zero is an explicit hardware-compatible choice,
+  not a newly claimed architectural guarantee.
+
+**Important correction to the old exception diagnosis:** not every unmasked
+exception aborts without producing a result. A native
+`FXRSTOR; FISTTP/FBSTP; FXSAVE; FNINIT` check with ST(0)=0.5 and CW=0x35f
+(unmasked precision) stores zero and pops: SW=0x88a0 from TOP=0. With +infinity
+and CW=0x37e (unmasked invalid), memory/TOP stay unchanged: SW=0x8081.
+The standalone regression tests cover this distinction; the existing Binit
+FISTTP/FBSTP inputs only use CW=0x37f. General arithmetic exception delivery
+and exception-priority handling are **not** fixed by this batch. Nor is this
+complete FBSTP rounding-control coverage: the `to_bcd` user-op still does not
+provide a rounded-up C1 result; this batch clears the stale bit for the exact,
+round-down, and invalid/empty cases covered here.
+
+Regression tests are in `sleigh/tests/x64.rs`: every ST(i), every TOP,
+masked/unmasked stack faults, FLD overflow/source-destination aliases, full
+payload/tag preservation, all three FISTTP widths, and BCD stores. ST(0)
+constructors are tested even though this database snapshot lacks most of them.
+
+Focused selection (resolve IDs from the current database; do not hard-code):
+
+```sql
+select string_agg(id::text, ',' order by id) from test_cases
+where instruction ~* '^(ffree|fisttp|fbstp|fld st|fstp? st|fxch)';
+```
+
+The first focused replay went from 8 failing families / 0 clean cases to
+**53 clean cases / 69,144 states, no mismatches**. Expanding the selection to
+memory FLD/FST/FSTP exposes remaining faults rather than register regressions:
+
+- `FLD m64fp`, input signaling NaN `0x7ff0000000000001`: the widened payload
+  is correct but IE is missing (SW=0x3800 versus 0x3801).
+- Memory `FST`/`FSTP`, minimum f80 subnormal and CW=0x340: the floating-point
+  conversion reports PE as well as unmasked UE (0x80b0 versus 0x8090); FSTP
+  also pops where hardware does not. These constructors were not changed.
+
+### Post-fix verification
+
+- `cargo test -p wazabin-qcode-sleigh --test x64`: 66 passed, 11 pre-existing
+  ignored; `--test x86`: 7 passed. Six new regression tests exercise 1,736
+  transfer/store scenarios without the database.
+- `binit_undefined_flags_are_explicit_undef_assignments`: passed.
+- `binit_smoke`: passed.
+- Final focused replay: all 53 cases / 69,144 states passed, output
+  `/tmp/x87-spec-targeted-final.csv` (header only).
+- Full scalar corpus: 13,079 cases / 9,869,419 recorded states, 12 threads,
+  315.71 seconds in release mode. **12,792 clean cases**, 238 skipped behind
+  a same-instruction failure, **35 state mismatches**, 13 unsupported,
+  1 fixture limitation. The test exits failing for the remaining 35 state
+  mismatches and the fixture limitation; it does not waive them.
+
+```sh
+# From wazabin-qcode/. Use release mode for the full multi-million-state run.
+PCODE_FUZZ_OUTPUT=/tmp/binit-x87-spec-fixes-full.csv \
+  cargo test --release -p wazabin-qcode-sleigh --test binit binit_full \
+  -- --ignored --nocapture
+```
+
+The full CSV has 49 rows (including the 13 ignored unsupported records),
+versus 54 in `/tmp/binit-full-20260903-155700.csv`. State mismatches fall from
+**40 to 35**: `FBSTP`, `FFREE`, `FFREEP`, `FISTTP`, and `FXCH` disappear.
+`FLD`, `FST`, and `FSTP` now fail on the untouched memory forms rather than
+register transfers. No newly failing mnemonic and no non-x87 state mismatch
+appeared. This is still a first-difference/sibling-suppressed report, not a
+claim that every remaining field or opcode is correct. The remaining
+arithmetic, denormal, payload/precision, transcendental, and FXSAVE issues
+need further work; the entire suite is **not green**.
+
 ## The corpus is generated — never select cases by ID
 
 Binit's corpus is built from `generator/data/insn.json`, and regenerating it
