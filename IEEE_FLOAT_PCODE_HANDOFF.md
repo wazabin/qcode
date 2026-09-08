@@ -199,6 +199,10 @@ FYL2X/FYL2XP1 finally take a real logarithm.
 
 ### Known remaining mismatches
 
+A full `^f` replay (518 cases) ends with six state mismatches: `fprem`,
+`fprem1`, `fscale`, `fyl2x`, `fyl2xp1` and one `fdiv m64`. The arithmetic,
+compare, load and store families are clean.
+
 - Precision control is applied by re-rounding a 64-bit result, which double
   rounds. `fdiv m64` of 1.0 by the largest double under PC=53 lands one ulp
   below hardware for that reason; a single rounding needs the arithmetic
