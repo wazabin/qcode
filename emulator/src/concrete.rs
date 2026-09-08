@@ -1977,36 +1977,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         exponent == 0 && value & ((1u128 << 64) - 1) != 0
     }
 
-    fn scalar_is_denormal(value: SizedValue) -> bool {
-        match value.size as usize {
-            4 => value.as_u64() & 0x7f80_0000 == 0 && value.as_u64() & 0x007f_ffff != 0,
-            8 => {
-                value.as_u64() & 0x7ff0_0000_0000_0000 == 0
-                    && value.as_u64() & 0x000f_ffff_ffff_ffff != 0
-            }
-            10 => Self::f80_is_denormal(value.as_bits()),
-            _ => false,
-        }
-    }
 
-    fn scalar_is_signaling_nan(value: SizedValue) -> bool {
-        match value.size as usize {
-            4 => {
-                let bits = value.as_u64();
-                bits & 0x7f80_0000 == 0x7f80_0000
-                    && bits & 0x007f_ffff != 0
-                    && bits & 0x0040_0000 == 0
-            }
-            8 => {
-                let bits = value.as_u64();
-                bits & 0x7ff0_0000_0000_0000 == 0x7ff0_0000_0000_0000
-                    && bits & 0x000f_ffff_ffff_ffff != 0
-                    && bits & 0x0008_0000_0000_0000 == 0
-            }
-            10 => float80::is_signaling_nan(value.as_bits()),
-            _ => false,
-        }
-    }
 
     /// Interpret f80 operations with the x87 control/status words in scope.
     /// Returns `None` for all non-x87 operations so the generic DomainValue
@@ -2195,21 +2166,11 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                     )?;
                     return Ok(Some(SizedValue::from_bits(result.bits, *size)));
                 }
-                if *size == 10 {
-                    let status = if Self::scalar_is_signaling_nan(value) {
-                        Status::INVALID_OP
-                    } else {
-                        Status::OK
-                    };
-                    self.record_x87_status(
-                        ctx,
-                        control,
-                        status_register,
-                        status,
-                        None,
-                        Self::scalar_is_denormal(value),
-                    )?;
-                }
+                // Widening a narrow memory source to the extended format is a
+                // pure IEEE conversion. The denormal-operand and
+                // signalling-NaN facts it carries belong to the x87
+                // instruction, not to the conversion, and the specification
+                // reads them from the original encoding.
                 Ok(None)
             }
             _ => Ok(None),
