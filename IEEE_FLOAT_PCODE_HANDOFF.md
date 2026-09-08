@@ -89,25 +89,20 @@ The implementation has result/flag agreement tests across operations, formats,
 and rounding modes. Reported verification: `cargo test -p qcode_emulator --lib`
 passes 56 tests.
 
-## Immediate migration task
+## Migration status
 
-Migrate one x87 family at a time to `ieee_*` macros:
+The x87 add family (`FADD`, `FADDP`, and `FIADD`) now uses `ieee_add` through
+`fpu_ieee_add_result` in the vendored `ia.sinc`. The helper passes
+`(FPUControlWord >> 10) & 3`, maps generic flags into the x87 status word,
+reports DE from the source encodings, computes C1 against a toward-zero
+result, selects x87 invalid payloads, and applies existing mask/commit logic.
+The add constructors consequently no longer use generic `f+`, so QCode's
+contextual `FloatBinop::Add` path is not reached for them.
 
-1. Use `round = (FPUControlWord >> 10) & 3` and obtain paired result/flags.
-2. In SLEIGH, map IEEE flags to x87 status, add DE from operand inspection,
-   apply x87 priority/masks, C1/ES/B, result choice, and commit/pop policy.
-3. Remove QCode's corresponding contextual x87 status mutation only after the
-   SLEIGH family consumes the generic flags.
-4. Replay focused Binit cases, then the full corpus, before moving to the next
-   family.
-
-Do not replace generic `f+` globally: non-x87 specifications keep it. The new
-operations are explicit supplemental IEEE evaluation used only where a spec
-needs flags/rounding control.
-
-Do not replace generic `f+` globally: non-x87 specifications keep it. The new
-operations are explicit supplemental IEEE evaluation used only where a spec
-needs flags/rounding control.
+Next, replay focused Binit add cases and then the full corpus. Migrate the
+remaining subtraction, multiplication, and division families one at a time
+only after that succeeds. Do not replace generic `f+` globally: non-x87
+specifications keep it.
 
 ## Relevant commits
 
