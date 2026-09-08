@@ -60,10 +60,53 @@ effects one operation family at a time, replaying Binit after each family.
 5. Keep x87 invalid-result payload selection and exception priority explicit
 in SLEIGH; capture more hardware cases where payload sign differs.
 
-## Existing commits
+## Current implementation status
 
-- open-sleigh `76c76b2`: declares the prototype flag user-ops.
-- wazabin-sleigh `8ff7b9e`: updates the submodule pin.
-- wazabin-qcode `22f7402`: prototype emulator support.
+The declarations/macros from the sibling `/home/jack/dev/binary/open_sleigh`
+checkout were integrated into the vendored submodule:
+
+- `float_{add,sub,mul,div}` and matching `*_flags` declarations are in
+  `precompile/open_sleigh/src/x86/ia.sinc`.
+- `ieee_{add,sub,mul,div}` macros are in
+  `precompile/open_sleigh/src/x86/macros.sinc` and call the operations with
+  `(a, b, round)`.
+
+They are intentionally **not wired** into constructors yet. The current QCode
+prototype supports only two-argument f80 `*_flags` queries and directly
+mutates x87 status for ordinary `f+` etc.; wiring the macros now would produce
+unsupported p-code operations and duplicate x87 effects.
+
+## Immediate implementation task
+
+Refactor `wazabin-qcode/emulator/src/concrete.rs`, in
+`StandaloneEmulator::interpret_packed_pcode_op` around the current
+`let [lhs, rhs] = op.args.as_slice()` dispatch:
+
+1. Accept both `[lhs, rhs]` (legacy p-code ops) and
+   `[lhs, rhs, rounding_mode]` (new IEEE ops).
+2. Implement `float_{add,sub,mul,div}` returning the f80 result, and matching
+   `*_flags` returning the IEEE bit mask, using the same explicit rounding
+   mode for both calls.
+3. Generalize the implementation beyond f80 before claiming the operations
+   architecture-independent; f32/f64 must use their corresponding IEEE
+   formats.
+4. Add focused emulator tests proving result/flags agreement for every
+   rounding mode.
+5. Only then migrate one x87 family at a time to `ieee_*`, move status mapping
+   into SLEIGH, and remove the corresponding contextual x87 mutation from
+   QCode. Replay Binit after each family.
+
+Do not replace generic `f+` globally: non-x87 specifications keep it. The new
+operations are explicit supplemental IEEE evaluation used only where a spec
+needs flags/rounding control.
+
+## Relevant commits
+
+- open-sleigh `76c76b2`: original f80 flag-op prototype.
+- open-sleigh `4d33b85`: sibling generic IEEE declarations/macros integrated.
+- open-sleigh `c3f54b7`: removes duplicate declarations.
+- wazabin-sleigh `25161ec`: pins the integration.
+- wazabin-qcode `22f7402`: f80 flag-op prototype.
+- wazabin-qcode `14d3c0d`: original design handoff.
 
 The arithmetic commit/status experiments are separate later open-sleigh commits.
