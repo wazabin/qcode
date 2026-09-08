@@ -120,6 +120,89 @@ fn apply_precision(value: X87DoubleExtended, control: u16, round: Round) -> Resu
     }
 }
 
+/// Round an 80-bit value's significand to a narrower precision while keeping
+/// the extended exponent range.  This is the IEEE notion of "round to a
+/// narrower significand precision within the same format", not a conversion
+/// to single or double: the exponent range is unchanged, so a value that a
+/// narrower format could not represent still keeps its exponent here.
+///
+/// `precision` counts significand bits including the explicit integer bit;
+/// 64 (or more) is the identity.  Only the 80-bit format is supported, so
+/// callers holding an f32 or f64 value get `None` from the p-code layer.
+pub(super) fn round_to_precision(raw: u128, precision: u32, round: Round) -> Result {
+    if precision >= 64 {
+        return Result {
+            bits: raw,
+            status: Status::OK,
+        };
+    }
+    let sign_exponent = (raw >> 64) as u16;
+    let negative = sign_exponent & 0x8000 != 0;
+    let exponent = sign_exponent & 0x7fff;
+    // Infinities and NaNs carry no significand to narrow.
+    if exponent == 0x7fff {
+        return Result {
+            bits: raw,
+            status: Status::OK,
+        };
+    }
+    let denormal = exponent == 0;
+    if denormal && raw as u64 == 0 {
+        return Result {
+            bits: raw,
+            status: Status::OK,
+        };
+    }
+    let significand = raw as u64;
+    let discarded_bits = 64 - precision;
+    let discarded_mask = (1u64 << discarded_bits) - 1;
+    let discarded = significand & discarded_mask;
+    if discarded == 0 {
+        // A subnormal input is already inexact with respect to the narrower
+        // precision's exponent range, and rounding it reports tininess.
+        let status = if denormal {
+            Status::UNDERFLOW | Status::INEXACT
+        } else {
+            Status::OK
+        };
+        return Result { bits: raw, status };
+    }
+    let retained = significand >> discarded_bits;
+    let increment = match round {
+        Round::NearestTiesToEven => {
+            let halfway = 1u64 << (discarded_bits - 1);
+            discarded > halfway || (discarded == halfway && retained & 1 != 0)
+        }
+        Round::TowardPositive => !negative,
+        Round::TowardNegative => negative,
+        Round::TowardZero => false,
+        Round::NearestTiesToAway => discarded >= (1u64 << (discarded_bits - 1)),
+    };
+    let (retained, exponent) = if increment {
+        let (rounded, carry) = retained.overflowing_add(1);
+        if carry || rounded == (1u64 << precision) {
+            (1u64 << (precision - 1), exponent.saturating_add(1))
+        } else {
+            (rounded, exponent)
+        }
+    } else {
+        (retained, exponent)
+    };
+    let rounded = (u128::from(sign_exponent & 0x8000 | exponent) << 64)
+        | (u128::from(retained) << discarded_bits);
+    let mut status = Status::INEXACT;
+    if denormal {
+        status |= Status::UNDERFLOW;
+    }
+    if exponent == 0x7fff {
+        status |= Status::OVERFLOW;
+    }
+    Result {
+        bits: rounded,
+        status,
+    }
+}
+
 /// x87's unsupported encodings: a non-zero exponent with the explicit integer
 /// bit clear. An unnormal, and the pseudo-NaN and pseudo-infinity that share
 /// that shape, are not values the FPU will operate on - it reports invalid and

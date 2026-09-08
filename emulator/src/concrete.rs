@@ -22,7 +22,10 @@ use std::cmp;
 
 mod float80;
 
-use rustc_apfloat::Status;
+use rustc_apfloat::{
+    Float, Round, Status,
+    ieee::{Double, Single, X87DoubleExtended},
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::DomainValue;
@@ -1518,6 +1521,115 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         interpreter.get_value(id)
     }
 
+    /// Decode the IEEE rounding-direction argument used by the supplemental
+    /// floating p-code operations.  Its encoding is deliberately independent
+    /// of architectural control words: 0 = nearest-even, 1 = down, 2 = up,
+    /// 3 = toward zero.
+    fn ieee_rounding_mode(value: u128) -> Option<Round> {
+        match value {
+            0 => Some(Round::NearestTiesToEven),
+            1 => Some(Round::TowardNegative),
+            2 => Some(Round::TowardPositive),
+            3 => Some(Round::TowardZero),
+            _ => None,
+        }
+    }
+
+    /// Evaluate one of the explicit IEEE arithmetic p-code operations in the
+    /// format carried by its operands.  Unlike the x87 helpers, this has no
+    /// architectural payload selection or precision-control policy.
+    fn ieee_arithmetic(
+        lhs: SizedValue,
+        rhs: SizedValue,
+        round: Round,
+        name: &str,
+    ) -> Option<(SizedValue, Status)> {
+        if lhs.size != rhs.size {
+            return None;
+        }
+        macro_rules! operation {
+            ($lhs:expr, $rhs:expr) => {
+                match name {
+                    "float_add" | "float_add_flags" => $lhs.add_r($rhs, round),
+                    "float_sub" | "float_sub_flags" => $lhs.sub_r($rhs, round),
+                    "float_mul" | "float_mul_flags" => $lhs.mul_r($rhs, round),
+                    "float_div" | "float_div_flags" => $lhs.div_r($rhs, round),
+                    _ => return None,
+                }
+            };
+        }
+        // Keeping the formats separate is important: routing f32 through f64
+        // changes both the rounded result and its exception facts.
+        match lhs.size {
+            4 => {
+                let lhs = Single::from_bits(lhs.as_bits());
+                let rhs = Single::from_bits(rhs.as_bits());
+                let value = operation!(lhs, rhs);
+                Some((
+                    SizedValue::from_bits(value.value.to_bits(), 4),
+                    value.status,
+                ))
+            }
+            8 => {
+                let lhs = Double::from_bits(lhs.as_bits());
+                let rhs = Double::from_bits(rhs.as_bits());
+                let value = operation!(lhs, rhs);
+                Some((
+                    SizedValue::from_bits(value.value.to_bits(), 8),
+                    value.status,
+                ))
+            }
+            10 => {
+                let lhs = X87DoubleExtended::from_bits(lhs.as_bits());
+                let rhs = X87DoubleExtended::from_bits(rhs.as_bits());
+                let value = operation!(lhs, rhs);
+                Some((
+                    SizedValue::from_bits(value.value.to_bits(), 10),
+                    value.status,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Round a floating value to a narrower significand precision within its
+    /// own exponent range.  This is an IEEE-level operation: the precision is
+    /// an explicit argument, not read from any architectural control word.
+    /// Only the 80-bit format is implemented; f32/f64 operands return `None`
+    /// so the caller falls through to the generic interpreter.
+    fn ieee_round_to_precision(
+        value: SizedValue,
+        precision: u128,
+        round: Round,
+    ) -> Option<(SizedValue, Status)> {
+        if value.size != 10 {
+            return None;
+        }
+        let precision = u32::try_from(precision).ok()?;
+        let result = float80::round_to_precision(value.as_bits(), precision, round);
+        Some((SizedValue::from_bits(result.bits, 10), result.status))
+    }
+
+    fn ieee_flags(status: Status) -> SizedValue {
+        let mut flags = 0u128;
+        if status.contains(Status::INVALID_OP) {
+            flags |= 1;
+        }
+        if status.contains(Status::DIV_BY_ZERO) {
+            flags |= 1 << 2;
+        }
+        if status.contains(Status::OVERFLOW) {
+            flags |= 1 << 3;
+        }
+        if status.contains(Status::UNDERFLOW) {
+            flags |= 1 << 4;
+        }
+        if status.contains(Status::INEXACT) {
+            flags |= 1 << 5;
+        }
+        SizedValue::from_bits(flags, 1)
+    }
+
     /// Interpret the packed-integer SLEIGH user-ops that x86's MMX/SSE
     /// constructors leave as `pcodeop` applications. Returns `None` for every
     /// other user-op so the generic interpreter stays the implementation.
@@ -1585,34 +1697,44 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             });
         }
 
+        // The three-argument form is the explicit, architecture-neutral IEEE
+        // interface.  Leave two-argument user-ops on the legacy dispatch below.
+        if let [lhs, rhs, rounding_mode] = op.args.as_slice() {
+            let lhs = self.scalar_value(ctx, lhs.qualify(func))?;
+            let rhs = self.scalar_value(ctx, rhs.qualify(func))?;
+            let rounding_mode = self.scalar_value(ctx, rounding_mode.qualify(func))?;
+            let Some(round) = Self::ieee_rounding_mode(rounding_mode.as_bits()) else {
+                return Ok(None);
+            };
+            let evaluated = match name.as_ref() {
+                "float_round_to_precision" | "float_round_to_precision_flags" => {
+                    Self::ieee_round_to_precision(lhs, rhs.as_bits(), round)
+                }
+                _ => Self::ieee_arithmetic(lhs, rhs, round, name.as_ref()),
+            };
+            if let Some((result, status)) = evaluated {
+                return Ok(Some(if name.ends_with("_flags") {
+                    Self::ieee_flags(status)
+                } else {
+                    result
+                }));
+            }
+            return Ok(None);
+        }
+
         let [lhs, rhs] = op.args.as_slice() else {
             return Ok(None);
         };
         let lhs = self.scalar_value(ctx, lhs.qualify(func))?;
         let rhs = self.scalar_value(ctx, rhs.qualify(func))?;
 
-        // Generic IEEE-754 status facts. These p-code ops deliberately do not
-        // touch architectural status registers: consumers such as x87 map the
-        // returned flags through their own masking and priority rules.
-        let ieee_flags = |status: Status| {
-            let mut flags = 0u128;
-            if status.contains(Status::INVALID_OP) { flags |= 1; }
-            if status.contains(Status::DIV_BY_ZERO) { flags |= 1 << 2; }
-            if status.contains(Status::OVERFLOW) { flags |= 1 << 3; }
-            if status.contains(Status::UNDERFLOW) { flags |= 1 << 4; }
-            if status.contains(Status::INEXACT) { flags |= 1 << 5; }
-            SizedValue::from_bits(flags, 1)
-        };
-        if lhs.size == 10 && rhs.size == 10 {
-            let result = match name.as_ref() {
-                "float_add_flags" => Some(float80::add_contextual(lhs.as_bits(), rhs.as_bits(), 0x037f)),
-                "float_sub_flags" => Some(float80::sub_contextual(lhs.as_bits(), rhs.as_bits(), 0x037f)),
-                "float_mul_flags" => Some(float80::mul_contextual(lhs.as_bits(), rhs.as_bits(), 0x037f)),
-                "float_div_flags" => Some(float80::div_contextual(lhs.as_bits(), rhs.as_bits(), 0x037f)),
-                _ => None,
-            };
-            if let Some(result) = result {
-                return Ok(Some(ieee_flags(result.status)));
+        // Retain the f80/nearest prototype for already-lifted p-code while
+        // constructors migrate to the explicit three-argument interface.
+        if lhs.size == 10 && rhs.size == 10 && name.ends_with("_flags") {
+            if let Some((_, status)) =
+                Self::ieee_arithmetic(lhs, rhs, Round::NearestTiesToEven, name.as_ref())
+            {
+                return Ok(Some(Self::ieee_flags(status)));
             }
         }
 
@@ -4444,6 +4566,101 @@ mod tests {
             SizedValue::new(3, 1).int_to_float(10).unwrap().as_bits(),
             three.as_bits()
         );
+    }
+
+    #[test]
+    fn explicit_ieee_arithmetic_pairs_results_and_flags_in_every_rounding_mode() {
+        // Each tuple has an inexact operand pair for its respective operation.
+        // Exercise all supported formats as well as every rounding direction;
+        // the result and flags calls must be two views of exactly one IEEE
+        // evaluation, not host arithmetic with independently inferred flags.
+        let cases = [
+            (
+                4,
+                0x3f80_0000,
+                0x3380_0000,
+                0x3f80_0001,
+                0x3fc0_0000,
+                0x3f80_0000,
+                0x4040_0000,
+            ),
+            (
+                8,
+                0x3ff0_0000_0000_0000,
+                0x3ca0_0000_0000_0000,
+                0x3ff0_0000_0000_0001,
+                0x3ff8_0000_0000_0000,
+                0x3ff0_0000_0000_0000,
+                0x4008_0000_0000_0000,
+            ),
+            (
+                10,
+                0x3fff_8000_0000_0000_0000,
+                0x3fbf_8000_0000_0000_0000,
+                0x3fff_8000_0000_0000_0001,
+                0x3fff_c000_0000_0000_0000,
+                0x3fff_8000_0000_0000_0000,
+                0x4000_c000_0000_0000_0000,
+            ),
+        ];
+        let operations = [
+            ("float_add", "float_add_flags", 0usize),
+            ("float_sub", "float_sub_flags", 1),
+            ("float_mul", "float_mul_flags", 2),
+            ("float_div", "float_div_flags", 3),
+        ];
+
+        for (size, add_lhs, add_rhs, mul_lhs, mul_rhs, div_lhs, div_rhs) in cases {
+            // At one, the spacing below is half the spacing above. Use a
+            // quarter of the upward ULP for subtraction so it is inexact too.
+            let sub_rhs = match size {
+                4 => 0x3300_0000,
+                8 => 0x3c90_0000_0000_0000,
+                10 => 0x3fbe_8000_0000_0000_0000,
+                _ => unreachable!(),
+            };
+            let operands = [
+                (add_lhs, add_rhs),
+                (add_lhs, sub_rhs),
+                (mul_lhs, mul_rhs),
+                (div_lhs, div_rhs),
+            ];
+            for (result_name, flags_name, pair) in operations {
+                let (lhs, rhs) = operands[pair];
+                for mode in 0..4 {
+                    let round =
+                        StandaloneEmulator::<EmulatedMemory>::ieee_rounding_mode(mode).unwrap();
+                    let (result, status) = StandaloneEmulator::<EmulatedMemory>::ieee_arithmetic(
+                        SizedValue::from_bits(lhs, size),
+                        SizedValue::from_bits(rhs, size),
+                        round,
+                        result_name,
+                    )
+                    .unwrap();
+                    let (_, flag_status) = StandaloneEmulator::<EmulatedMemory>::ieee_arithmetic(
+                        SizedValue::from_bits(lhs, size),
+                        SizedValue::from_bits(rhs, size),
+                        round,
+                        flags_name,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        status,
+                        flag_status,
+                        "{result_name}, f{}, mode {mode}",
+                        size * 8
+                    );
+                    let flags = StandaloneEmulator::<EmulatedMemory>::ieee_flags(flag_status);
+                    assert_ne!(
+                        flags.as_bits() & (1 << 5),
+                        0,
+                        "{result_name}, f{}, mode {mode}",
+                        size * 8
+                    );
+                    assert_eq!(result.size as usize, size);
+                }
+            }
+        }
     }
 
     #[test]
