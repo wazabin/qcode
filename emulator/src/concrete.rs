@@ -917,7 +917,8 @@ impl InsnValues {
 }
 
 /// Type alias for an instruction hook function, which is called with the current instruction and emulator state after each instruction is executed.
-type InstructionHook<M> = Box<dyn Fn(&InstructionRef<'_, '_>, &StandaloneEmulator<M>) + Send + Sync>;
+type InstructionHook<M> =
+    Box<dyn Fn(&InstructionRef<'_, '_>, &StandaloneEmulator<M>) + Send + Sync>;
 type CallInterceptor<M> = Box<
     dyn FnMut(
             &Context<'_>,
@@ -1550,7 +1551,9 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                 .read_varnode_u128(ctx, control_varnode)
                 .unwrap_or(0x037f) as u16;
             return Ok(match name.as_ref() {
-                "from_bcd" => Some(SizedValue::from_f80_bits(float80::from_bcd(value.as_bits()))),
+                "from_bcd" => Some(SizedValue::from_f80_bits(float80::from_bcd(
+                    value.as_bits(),
+                ))),
                 "extract_significand" => Some(SizedValue::from_f80_bits(
                     float80::extract_significand(value.as_bits()),
                 )),
@@ -1587,6 +1590,31 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         };
         let lhs = self.scalar_value(ctx, lhs.qualify(func))?;
         let rhs = self.scalar_value(ctx, rhs.qualify(func))?;
+
+        // Generic IEEE-754 status facts. These p-code ops deliberately do not
+        // touch architectural status registers: consumers such as x87 map the
+        // returned flags through their own masking and priority rules.
+        let ieee_flags = |status: Status| {
+            let mut flags = 0u128;
+            if status.contains(Status::INVALID_OP) { flags |= 1; }
+            if status.contains(Status::DIV_BY_ZERO) { flags |= 1 << 2; }
+            if status.contains(Status::OVERFLOW) { flags |= 1 << 3; }
+            if status.contains(Status::UNDERFLOW) { flags |= 1 << 4; }
+            if status.contains(Status::INEXACT) { flags |= 1 << 5; }
+            SizedValue::from_bits(flags, 1)
+        };
+        if lhs.size == 10 && rhs.size == 10 {
+            let result = match name.as_ref() {
+                "float_add_flags" => Some(float80::add_contextual(lhs.as_bits(), rhs.as_bits(), 0x037f)),
+                "float_sub_flags" => Some(float80::sub_contextual(lhs.as_bits(), rhs.as_bits(), 0x037f)),
+                "float_mul_flags" => Some(float80::mul_contextual(lhs.as_bits(), rhs.as_bits(), 0x037f)),
+                "float_div_flags" => Some(float80::div_contextual(lhs.as_bits(), rhs.as_bits(), 0x037f)),
+                _ => None,
+            };
+            if let Some(result) = result {
+                return Ok(Some(ieee_flags(result.status)));
+            }
+        }
 
         // Unsigned rounded average of one lane: (a + b + 1) >> 1, computed
         // wide enough that the carry out of the lane is kept.
@@ -1669,7 +1697,8 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             "psubusw" => Self::saturating(&lhs, &rhs, 2, false, true),
             // Signed 16x16 multiplies summed in pairs into each dword lane.
             "pmaddwd" => Self::packed_lanes(&lhs, &rhs, 4, |a, b| {
-                let word = |v: u128, half: u32| i64::from(((v >> (half * 16)) & 0xffff) as u16 as i16);
+                let word =
+                    |v: u128, half: u32| i64::from(((v >> (half * 16)) & 0xffff) as u16 as i16);
                 let product = word(a, 0) * word(b, 0) + word(a, 1) * word(b, 1);
                 u128::from(product as u32)
             }),
@@ -1690,7 +1719,8 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         let bits = width * 8;
         Self::packed_lanes(lhs, rhs, width, |a, b| {
             if signed {
-                let sign = |v: u128| (v as i128) - (((v >> (bits - 1)) & 1) as i128) * (1i128 << bits);
+                let sign =
+                    |v: u128| (v as i128) - (((v >> (bits - 1)) & 1) as i128) * (1i128 << bits);
                 let (a, b) = (sign(a), sign(b));
                 let value = if subtract { a - b } else { a + b };
                 let max = (1i128 << (bits - 1)) - 1;
@@ -1714,7 +1744,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         lane: impl Fn(u128, u128) -> u128,
     ) -> Option<SizedValue> {
         let size = lhs.size as usize;
-        if size != rhs.size as usize || size == 0 || size % width != 0 {
+        if size != rhs.size as usize || size == 0 || !size.is_multiple_of(width) {
             return None;
         }
         let bits = width * 8;
@@ -1798,7 +1828,8 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         // - including an exact one - clears C1 rather than leaving the previous
         // instruction's answer standing.
         if let Some(rounded_up) = rounded_up {
-            new = (new & !(1 << 9)) | (u16::from(rounded_up && ap_status.contains(Status::INEXACT)) << 9);
+            new = (new & !(1 << 9))
+                | (u16::from(rounded_up && ap_status.contains(Status::INEXACT)) << 9);
         }
         if exceptions & !control & 0x003f != 0 {
             // ES: one or more unmasked exceptions are pending. B mirrors ES on
@@ -1981,10 +2012,8 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                     return Ok(None);
                 }
                 let result = float80::sqrt_contextual(value.as_bits(), control);
-                let zero_result = float80::sqrt_contextual(
-                    value.as_bits(),
-                    Self::toward_zero_control(control),
-                );
+                let zero_result =
+                    float80::sqrt_contextual(value.as_bits(), Self::toward_zero_control(control));
                 self.record_x87_status(
                     ctx,
                     control,
@@ -2333,7 +2362,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                     let val = {
                         let mut tmp = TempInterpreter {
                             memory: &mut self.memory,
-            literals: &mut self.literal_cache,
+                            literals: &mut self.literal_cache,
                             insn_values: &mut self.insn_values,
                             block_param_values: &mut self.block_param_values,
                             poison_params: &self.poison_params,
@@ -2399,14 +2428,13 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                     .expect("guard checked register range store address");
                 let mut tmp = TempInterpreter {
                     memory: &mut self.memory,
-            literals: &mut self.literal_cache,
+                    literals: &mut self.literal_cache,
                     insn_values: &mut self.insn_values,
                     block_param_values: &mut self.block_param_values,
                     poison_params: &self.poison_params,
                     ctx,
                 };
                 let value = tmp.get_value(store.src.qualify(id.func));
-                drop(tmp);
                 let value = value.map_err(|kind| self.make_error(ctx, kind))?;
                 self.memory
                     .write(
@@ -2500,7 +2528,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                 }
                 let mut tmp = TempInterpreter {
                     memory: &mut self.memory,
-            literals: &mut self.literal_cache,
+                    literals: &mut self.literal_cache,
                     insn_values: &mut self.insn_values,
                     block_param_values: &mut self.block_param_values,
                     poison_params: &self.poison_params,
@@ -3424,7 +3452,8 @@ impl<'ctx> Emulator<'ctx, EmulatedMemory> {
 impl<'ctx, M: EmulatorMemory + Default> Emulator<'ctx, M> {
     /// Builds an emulator over an explicit memory backend.
     pub fn new_in(ctx: &'ctx Context<'ctx>, entry: BlockId) -> Self {
-        let mut inner = StandaloneEmulator::<M>::with_address_index(entry, AddressIndex::analyze(ctx));
+        let mut inner =
+            StandaloneEmulator::<M>::with_address_index(entry, AddressIndex::analyze(ctx));
         inner.memory.configure_spaces(ctx);
         Self { inner, ctx }
     }
@@ -4330,7 +4359,8 @@ mod tests {
         assert!(divide_by_zero.status.contains(Status::DIV_BY_ZERO));
 
         // The concrete interpreter's non-trapping policy keeps a result for
-        // unmasked exceptions, but marks ES in addition to the sticky flag.
+        // unmasked exceptions, but marks ES — and B, which mirrors it on 387
+        // and later — in addition to the sticky flag.
         let mut ctx = Context::new();
         qcode!(
             ctx,
@@ -4353,7 +4383,10 @@ mod tests {
         emu.set_varnode_u128(B, 0).unwrap();
         emu.run_block().unwrap();
         assert_eq!(emu.get_value(result.into()).unwrap().size().unwrap(), 10);
-        assert_eq!(emu.read_varnode(FPUStatusWord), Some((1 << 2) | (1 << 7)));
+        assert_eq!(
+            emu.read_varnode(FPUStatusWord),
+            Some((1 << 2) | (1 << 7) | (1 << 15))
+        );
     }
 
     /// The 80-bit square root is computed on the integer significand, so it
