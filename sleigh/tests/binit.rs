@@ -1611,8 +1611,14 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
                     })?;
             }
 
-            // Aegis executes from CpuState::zero(). Seed the same scalar and
-            // physical x87/MMX baseline because emulator storage is lazy.
+            // Seed the architectural scalar and physical x87/MMX baseline
+            // because emulator storage is lazy. MXCSR's architectural reset
+            // value is 0x1f80; it is not transported by the scalar Binit
+            // fixture, but FXSAVE exposes it.
+            let mxcsr = x64_register("MXCSR").expect("MXCSR is present in the x64 spec");
+            emu.set_register(mxcsr, 0x1f80).map_err(|error| {
+                DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+            })?;
             for &name in SCALAR_REGISTERS {
                 let id = x64_register(name).expect("scalar register is present in the x64 spec");
                 emu.set_register(id, 0).map_err(|error| {
