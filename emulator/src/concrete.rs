@@ -1846,6 +1846,25 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         }
     }
 
+    fn scalar_is_signaling_nan(value: SizedValue) -> bool {
+        match value.size as usize {
+            4 => {
+                let bits = value.as_u64();
+                bits & 0x7f80_0000 == 0x7f80_0000
+                    && bits & 0x007f_ffff != 0
+                    && bits & 0x0040_0000 == 0
+            }
+            8 => {
+                let bits = value.as_u64();
+                bits & 0x7ff0_0000_0000_0000 == 0x7ff0_0000_0000_0000
+                    && bits & 0x000f_ffff_ffff_ffff != 0
+                    && bits & 0x0008_0000_0000_0000 == 0
+            }
+            10 => float80::is_signaling_nan(value.as_bits()),
+            _ => false,
+        }
+    }
+
     /// Interpret f80 operations with the x87 control/status words in scope.
     /// Returns `None` for all non-x87 operations so the generic DomainValue
     /// interpreter remains the implementation for every other architecture.
@@ -2060,8 +2079,20 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                     )?;
                     return Ok(Some(SizedValue::from_bits(result.bits, *size)));
                 }
-                if *size == 10 && Self::scalar_is_denormal(value) {
-                    self.record_x87_status(ctx, control, status_register, Status::OK, None, true)?;
+                if *size == 10 {
+                    let status = if Self::scalar_is_signaling_nan(value) {
+                        Status::INVALID_OP
+                    } else {
+                        Status::OK
+                    };
+                    self.record_x87_status(
+                        ctx,
+                        control,
+                        status_register,
+                        status,
+                        None,
+                        Self::scalar_is_denormal(value),
+                    )?;
                 }
                 Ok(None)
             }

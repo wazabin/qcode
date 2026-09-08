@@ -251,9 +251,11 @@ pub(super) fn to_float_contextual(raw: u128, size: usize, control: u16) -> Resul
             let value: rustc_apfloat::StatusAnd<Single> =
                 value(raw).convert_r(round, &mut loses_info);
             Result {
-                bits: if value.status.contains(Status::INVALID_OP) {
+                bits: if value.status.contains(Status::INVALID_OP) && !is_signaling_nan(raw) {
                     indefinite(4)
                 } else {
+                    // A signalling NaN is quieted and keeps its sign/payload;
+                    // the indefinite result is for unsupported f80 encodings.
                     value.value.to_bits()
                 },
                 status: value.status,
@@ -263,7 +265,7 @@ pub(super) fn to_float_contextual(raw: u128, size: usize, control: u16) -> Resul
             let value: rustc_apfloat::StatusAnd<Double> =
                 value(raw).convert_r(round, &mut loses_info);
             Result {
-                bits: if value.status.contains(Status::INVALID_OP) {
+                bits: if value.status.contains(Status::INVALID_OP) && !is_signaling_nan(raw) {
                     indefinite(8)
                 } else {
                     value.value.to_bits()
