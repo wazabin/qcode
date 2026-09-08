@@ -1728,16 +1728,6 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         let lhs = self.scalar_value(ctx, lhs.qualify(func))?;
         let rhs = self.scalar_value(ctx, rhs.qualify(func))?;
 
-        // Retain the f80/nearest prototype for already-lifted p-code while
-        // constructors migrate to the explicit three-argument interface.
-        if lhs.size == 10 && rhs.size == 10 && name.ends_with("_flags") {
-            if let Some((_, status)) =
-                Self::ieee_arithmetic(lhs, rhs, Round::NearestTiesToEven, name.as_ref())
-            {
-                return Ok(Some(Self::ieee_flags(status)));
-            }
-        }
-
         // Unsigned rounded average of one lane: (a + b + 1) >> 1, computed
         // wide enough that the carry out of the lane is kept.
         let average = |width: usize| -> Option<SizedValue> {
@@ -2064,63 +2054,38 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                 if lhs.size != 10 || rhs.size != 10 {
                     return Ok(None);
                 }
-                let toward_zero = Self::toward_zero_control(control);
-                let (result, zero_result) = match operation {
-                    FloatBinop::Add => (
-                        float80::add_contextual(lhs.as_bits(), rhs.as_bits(), control),
-                        float80::add_contextual(lhs.as_bits(), rhs.as_bits(), toward_zero),
-                    ),
-                    FloatBinop::Sub => (
-                        float80::sub_contextual(lhs.as_bits(), rhs.as_bits(), control),
-                        float80::sub_contextual(lhs.as_bits(), rhs.as_bits(), toward_zero),
-                    ),
-                    FloatBinop::Mul => (
-                        float80::mul_contextual(lhs.as_bits(), rhs.as_bits(), control),
-                        float80::mul_contextual(lhs.as_bits(), rhs.as_bits(), toward_zero),
-                    ),
-                    FloatBinop::Div => (
-                        float80::div_contextual(lhs.as_bits(), rhs.as_bits(), control),
-                        float80::div_contextual(lhs.as_bits(), rhs.as_bits(), toward_zero),
-                    ),
-                    // A comparison is quiet: only a signalling NaN raises
-                    // invalid here. x87's *ordered* compares also raise it for
-                    // a quiet NaN, which the FCOM constructors add explicitly,
-                    // because the p-code is identical for FCOM and FUCOM and
-                    // cannot distinguish them. Comparisons keep their generic
-                    // boolean result and only update the sticky status word.
+                // Arithmetic is no longer interpreted here: the x87
+                // constructors use the explicit IEEE p-code operations and
+                // apply their own exception policy.
+                //
+                // A comparison is quiet: only a signalling NaN raises invalid
+                // here. x87's *ordered* compares also raise it for a quiet
+                // NaN, which the FCOM constructors add explicitly, because the
+                // p-code is identical for FCOM and FUCOM and cannot
+                // distinguish them. Comparisons keep their generic boolean
+                // result and only update the sticky status word.
+                if !matches!(
+                    operation,
                     FloatBinop::Equal
-                    | FloatBinop::NotEqual
-                    | FloatBinop::Less
-                    | FloatBinop::LessEqual => {
-                        if float80::is_signaling_nan(lhs.as_bits())
-                            || float80::is_signaling_nan(rhs.as_bits())
-                        {
-                            self.record_x87_status(
-                                ctx,
-                                control,
-                                status_register,
-                                Status::INVALID_OP,
-                                None,
-                                false,
-                            )?;
-                        }
-                        return Ok(None);
-                    }
-                    _ => return Ok(None),
-                };
-                self.record_x87_status(
-                    ctx,
-                    control,
-                    status_register,
-                    result.status,
-                    Some(Self::rounded_away_from_zero(
-                        result.bits,
-                        zero_result.bits,
-                        10,
-                    )),
-                    Self::f80_denormal_operands(lhs.as_bits(), rhs.as_bits()),
-                )?;
-                Ok(Some(SizedValue::from_f80_bits(result.bits)))
+                        | FloatBinop::NotEqual
+                        | FloatBinop::Less
+                        | FloatBinop::LessEqual
+                ) {
+                    return Ok(None);
+                }
+                if float80::is_signaling_nan(lhs.as_bits())
+                    || float80::is_signaling_nan(rhs.as_bits())
+                {
+                    self.record_x87_status(
+                        ctx,
+                        control,
+                        status_register,
+                        Status::INVALID_OP,
+                        None,
+                        false,
+                    )?;
+                }
+                Ok(None)
             }
             // FSQRT rounds under the control word and reports inexact and the
             // C1 rounding indicator, so it takes the contextual path rather
@@ -4447,27 +4412,37 @@ mod tests {
     }
 
     #[test]
-    fn x87_context_uses_rounding_control_and_makes_apfloat_exceptions_sticky() {
-        // Half an f80 ULP at 1.0 rounds back to 1.0 under RC=nearest, but
-        // upward rounding produces the next representable extended value.
-        let one = 0x3fff_8000_0000_0000_0000;
-        let half_ulp = 0x3fbf_8000_0000_0000_0000;
-        assert_eq!(float80::add_contextual(one, half_ulp, 0x037f).bits, one);
-        assert_eq!(float80::add_contextual(one, half_ulp, 0x0b7f).bits, one + 1);
-        // PC=single rounds the f80 significand to 24 bits without narrowing
-        // the exponent.  RC=up selects the next single-precision quantum.
-        let single_half_ulp = 0x3fe7_8000_0000_0000_0000;
+    fn x87_precision_and_store_rounding_are_separate_from_generic_arithmetic() {
+        let one = 0x3fff_8000_0000_0000_0000u128;
+        // Precision rounding narrows the f80 significand without narrowing
+        // the exponent, and follows the IEEE rounding mode it is given.
+        let one_plus_half_single_ulp = one + (1u128 << 39);
         assert_eq!(
-            float80::add_contextual(one, single_half_ulp, 0x007f).bits,
+            float80::round_to_precision(
+                one_plus_half_single_ulp,
+                24,
+                Round::NearestTiesToEven
+            )
+            .bits,
             one
         );
         assert_eq!(
-            float80::add_contextual(one, single_half_ulp, 0x087f).bits,
+            float80::round_to_precision(one_plus_half_single_ulp, 24, Round::TowardPositive).bits,
             one + (1u128 << 40)
         );
-        // f80 stores narrow under RC too: the exact halfway value stores as
-        // 1.0 under nearest-even and as the next f32 under round-up.
-        let one_plus_half_single_ulp = one + (1u128 << 39);
+        // 64 significand bits is the identity.
+        assert_eq!(
+            float80::round_to_precision(
+                one_plus_half_single_ulp,
+                64,
+                Round::TowardPositive
+            )
+            .bits,
+            one_plus_half_single_ulp
+        );
+
+        // f80 stores narrow under RC: the exact halfway value stores as 1.0
+        // under nearest-even and as the next f32 under round-up.
         assert_eq!(
             float80::to_float_contextual(one_plus_half_single_ulp, 4, 0x037f).bits,
             u128::from(1.0f32.to_bits())
@@ -4477,12 +4452,9 @@ mod tests {
             u128::from((1.0f32).to_bits() + 1)
         );
 
-        let divide_by_zero = float80::div_contextual(one, 0, 0x037f);
-        assert!(divide_by_zero.status.contains(Status::DIV_BY_ZERO));
-
-        // The concrete interpreter's non-trapping policy keeps a result for
-        // unmasked exceptions, but marks ES — and B, which mirrors it on 387
-        // and later — in addition to the sticky flag.
+        // Generic f80 arithmetic is architecture-neutral: it computes a value
+        // and records no x87 status.  x87 constructors use the explicit IEEE
+        // p-code operations instead and apply their own exception policy.
         let mut ctx = Context::new();
         qcode!(
             ctx,
@@ -4505,10 +4477,8 @@ mod tests {
         emu.set_varnode_u128(B, 0).unwrap();
         emu.run_block().unwrap();
         assert_eq!(emu.get_value(result.into()).unwrap().size().unwrap(), 10);
-        assert_eq!(
-            emu.read_varnode(FPUStatusWord),
-            Some((1 << 2) | (1 << 7) | (1 << 15))
-        );
+        // Never written: the status word stays untouched by the operation.
+        assert_eq!(emu.read_varnode(FPUStatusWord), None);
     }
 
     /// The 80-bit square root is computed on the integer significand, so it

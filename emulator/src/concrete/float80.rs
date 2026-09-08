@@ -387,59 +387,40 @@ pub(super) fn truncate_to_i128(raw: u128, width: usize) -> rustc_apfloat::Status
     converted
 }
 
+/// The generic 80-bit arithmetic the interpreter falls back to for any
+/// specification that has no explicit IEEE p-code operation.  It carries no
+/// architectural policy: no precision control, no x87 payload selection, and
+/// no status reporting.  x87 constructors use `float_{add,sub,mul,div}` with
+/// an explicit rounding mode instead.
 pub(super) fn add(lhs: u128, rhs: u128) -> u128 {
-    add_contextual(lhs, rhs, 0x037f).bits
-}
-
-pub(super) fn add_contextual(lhs: u128, rhs: u128, control: u16) -> Result {
-    let round = round_from_control(control);
-    arithmetic(
-        value(lhs).add_r(value(rhs), round),
-        control,
-        round,
-        &[lhs, rhs],
+    bits(
+        value(lhs)
+            .add_r(value(rhs), Round::NearestTiesToEven)
+            .value,
     )
 }
 
 pub(super) fn sub(lhs: u128, rhs: u128) -> u128 {
-    sub_contextual(lhs, rhs, 0x037f).bits
-}
-
-pub(super) fn sub_contextual(lhs: u128, rhs: u128, control: u16) -> Result {
-    let round = round_from_control(control);
-    arithmetic(
-        value(lhs).sub_r(value(rhs), round),
-        control,
-        round,
-        &[lhs, rhs],
+    bits(
+        value(lhs)
+            .sub_r(value(rhs), Round::NearestTiesToEven)
+            .value,
     )
 }
 
 pub(super) fn mul(lhs: u128, rhs: u128) -> u128 {
-    mul_contextual(lhs, rhs, 0x037f).bits
-}
-
-pub(super) fn mul_contextual(lhs: u128, rhs: u128, control: u16) -> Result {
-    let round = round_from_control(control);
-    arithmetic(
-        value(lhs).mul_r(value(rhs), round),
-        control,
-        round,
-        &[lhs, rhs],
+    bits(
+        value(lhs)
+            .mul_r(value(rhs), Round::NearestTiesToEven)
+            .value,
     )
 }
 
 pub(super) fn div(lhs: u128, rhs: u128) -> u128 {
-    div_contextual(lhs, rhs, 0x037f).bits
-}
-
-pub(super) fn div_contextual(lhs: u128, rhs: u128, control: u16) -> Result {
-    let round = round_from_control(control);
-    arithmetic(
-        value(lhs).div_r(value(rhs), round),
-        control,
-        round,
-        &[lhs, rhs],
+    bits(
+        value(lhs)
+            .div_r(value(rhs), Round::NearestTiesToEven)
+            .value,
     )
 }
 
