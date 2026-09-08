@@ -115,3 +115,39 @@ floating operators globally: non-x87 specifications keep them.
 - wazabin-qcode `14d3c0d`: original design handoff.
 
 The arithmetic commit/status experiments are separate later open-sleigh commits.
+
+## Precision control, division, and the removal of the contextual path
+
+Three further changes completed the arithmetic migration.
+
+**Precision control as an IEEE operation.** `float_round_to_precision(value,
+precision_bits, round)` and its `*_flags` twin round a value's significand to a
+narrower precision *within its own exponent range*. The precision is an
+explicit operand (24, 53, or 64 significand bits, integer bit included; 64 is
+the identity), so the operation carries no x87 policy. Only the 80-bit format
+is implemented — f32/f64 operands return no result and fall through to the
+generic interpreter. `ia.sinc`'s `fpu_precision_control` maps the architectural
+`(FPUControlWord >> 8) & 3` field onto it, treating the reserved `01` encoding
+as extended, and `fpu_ieee_{add,sub,mul,div}_result` apply it to both the
+result and the toward-zero value the C1 comparison uses.
+
+**Division.** `fpu_ieee_div_result` mirrors the other families and adds x87's
+exponent-wrapped delivery: on an unmasked overflow or underflow the true
+exponent is biased by -24576 or +24576 so a result the format cannot hold is
+still delivered, with its real rounding indication and inexactness. SLEIGH
+reproduces that by rescaling whichever operand has the exponent room by the
+same factor and dividing again; with no unmasked range exception the operands
+are unchanged, so one evaluation serves both cases. `fpu_ieee_arithmetic_status`
+gained a `wrapped` argument that keeps C1 and PE for such a delivered result.
+The division constructors also report stack faults (`fpu_stack_underflow`).
+`FYL2X` and `FYL2XP1` moved to `fpu_ieee_mul_result` at the same time.
+
+**Emulator cleanup.** No constructor now applies generic `f+ f- f* f/` to an
+f80 with x87 semantics, so `interpret_x87_float` no longer interprets
+arithmetic: its `Binop::Float` arm handles only comparisons (a signalling NaN
+still raises invalid there). The legacy two-argument `_flags` prototype is
+gone, and `float80::{add,sub,mul,div}` are now plain architecture-neutral
+IEEE fallbacks; their `*_contextual` forms were deleted. `apply_precision`,
+`arithmetic`, and `invalid_result` survive only because `from_i128_contextual`
+and `scale_contextual` still use them; they should disappear when the
+conversion and FSCALE families migrate.
