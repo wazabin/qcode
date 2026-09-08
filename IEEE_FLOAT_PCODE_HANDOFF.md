@@ -151,3 +151,66 @@ IEEE fallbacks; their `*_contextual` forms were deleted. `apply_precision`,
 `arithmetic`, and `invalid_result` survive only because `from_i128_contextual`
 and `scale_contextual` still use them; they should disappear when the
 conversion and FSCALE families migrate.
+
+## Status after the conversion, store and unary migration
+
+Four more families moved out of the emulator.
+
+**Narrow memory operands.** `interpret_x87_float` no longer records anything
+for a widening `float2float`. `ia.sinc` reads the denormal-operand and
+signalling-NaN facts from the original f32/f64 encoding (`fpu_f32_source_flags`,
+`fpu_f64_source_flags`) because the widened extended value is a normal, quiet
+number. The arithmetic macros gained `_ex` forms taking `mem_de`/`mem_ie`;
+the plain names are register-only wrappers. `fcom_faulted_mem` and
+`fpu_signal_denormal2_mem` do the same for the compares, and FLD reports its
+own IE and DE. The constructors also restore the signalling bit the widening
+cleared, because x87 chooses between two NaN operands by significand *before*
+quieting either.
+
+**Stores.** New architecture-neutral operations `float_narrow(value, size,
+round)` / `float_narrow_flags` and `float_to_int(value, size, round)` /
+`float_to_int_flags` replace the `FloatToFloat` and `FloatToInt` arms, which
+are gone along with `float80::to_float_contextual`. `fpu_narrow_store` and
+`fpu_integer_store` in `ia.sinc` own the destination indefinite, C1, the mask
+handling and - the behaviour hardware showed - the suppression of both the
+store and the pop when the fault is unmasked. FIST/FISTP now report stack
+faults like FISTTP through one shared `fpu_store_integer_st0`, and FSTP m80
+stages its store the same way.
+
+**Unary operations.** `float_sqrt`, `float_round_to_integral`, `float_log2`
+(two-argument, rounding mode last) and `float_scalb` (three-argument) are new
+generic operations; `float80::{sqrt_ieee, round_to_integral_ieee, scalb_ieee,
+log2_ieee}` implement them and carry no status word, no payload choice and no
+precision control. `fpu_ieee_sqrt_result`, `fpu_ieee_round_result` and
+`fpu_ieee_scale_result` reuse `fpu_ieee_invalid_result` and
+`fpu_ieee_arithmetic_status` with the single operand passed twice, which
+reduces their two-operand rules to the one-operand ones exactly. FXTRACT
+classifies its operand in SLEIGH, FBLD decodes packed decimal there, and
+FYL2X/FYL2XP1 finally take a real logarithm.
+
+`float80::round_to_precision` was also corrected: precision counts significand
+bits from the value's own leading one, so a subnormal that already carries
+fewer bits than the target precision is left alone instead of being rounded to
+zero.
+
+### Still in the emulator
+
+- `record_x87_status` and `x87_context` survive for `to_bcd` and for the
+  signalling-NaN invalid on an f80 comparison.
+- The `fprem`/`fprem1` user-op still writes C0/C1/C2/C3 directly; its
+  exceptions and NaN choice are now the specification's.
+- `float80::{apply_precision, arithmetic, invalid_result}` survive through
+  `from_i128_contextual` and `to_bcd`.
+
+### Known remaining mismatches
+
+- Precision control is applied by re-rounding a 64-bit result, which double
+  rounds. `fdiv m64` of 1.0 by the largest double under PC=53 lands one ulp
+  below hardware for that reason; a single rounding needs the arithmetic
+  itself performed at the target precision.
+- `float80::remainder`'s partial reduction returns the wrong value for a
+  dividend 16000 binary exponents above the divisor.
+- FSCALE's C1/PE reporting under an unmasked overflow matches some hardware
+  states and not others; the corpus disagrees with a single `wrapped` rule.
+- FYL2XP1's underflow reporting depends on the logarithm's exact value, which
+  the f64 implementation cannot reproduce.
