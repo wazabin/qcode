@@ -97,8 +97,8 @@ fn apply_precision(value: X87DoubleExtended, control: u16, round: Round) -> Resu
     };
     let (retained, exponent) = if increment {
         let (rounded, carry) = retained.overflowing_add(1);
-        if carry || rounded == (1u64 << precision) {
-            (1u64 << (precision - 1), exponent.saturating_add(1))
+        if carry || rounded == (1u64 << (64 - discarded_bits)) {
+            (1u64 << (63 - discarded_bits), exponent.saturating_add(1))
         } else {
             (rounded, exponent)
         }
@@ -154,18 +154,25 @@ pub(super) fn round_to_precision(raw: u128, precision: u32, round: Round) -> Res
         };
     }
     let significand = raw as u64;
-    let discarded_bits = 64 - precision;
+    // Precision counts significand bits from the value's own leading one. For
+    // a normal that is bit 63; a subnormal's leading one sits lower, so it
+    // already carries fewer bits than the format and a narrower precision may
+    // discard nothing at all.
+    let leading = 63 - significand.leading_zeros();
+    let discarded_bits = (i64::from(leading) + 1 - i64::from(precision)).max(0) as u32;
+    if discarded_bits == 0 {
+        return Result {
+            bits: raw,
+            status: Status::OK,
+        };
+    }
     let discarded_mask = (1u64 << discarded_bits) - 1;
     let discarded = significand & discarded_mask;
     if discarded == 0 {
-        // A subnormal input is already inexact with respect to the narrower
-        // precision's exponent range, and rounding it reports tininess.
-        let status = if denormal {
-            Status::UNDERFLOW | Status::INEXACT
-        } else {
-            Status::OK
+        return Result {
+            bits: raw,
+            status: Status::OK,
         };
-        return Result { bits: raw, status };
     }
     let retained = significand >> discarded_bits;
     let increment = match round {
@@ -377,32 +384,81 @@ pub(super) fn div(lhs: u128, rhs: u128) -> u128 {
     )
 }
 
-/// FSCALE: multiply by 2 raised to the truncated integer value of `factor`.
-/// The scale is exact for a finite result, so only the destination rounding
-/// applies. A NaN, infinite or zero source is returned by APFloat unchanged.
-pub(super) fn scale_contextual(raw: u128, factor: u128, control: u16) -> Result {
-    let round = round_from_control(control);
+/// IEEE scaleB: multiply by two raised to an integral power, rounded once.
+/// Overflow, underflow and inexact are derived from the value the format can
+/// hold; every architectural special case belongs to the caller.
+pub(super) fn scalb_ieee(raw: u128, steps: i32, round: Round) -> Result {
     let source = value(raw);
-    // x87 truncates the scale operand toward zero, whatever the rounding
-    // control says, and clamps far beyond the representable exponent range.
-    let mut exact = false;
-    let steps = value(factor)
-        .to_i128_r(32, Round::TowardZero, &mut exact)
-        .value
-        .clamp(-0x8000, 0x7fff) as i32;
-    arithmetic(
-        rustc_apfloat::StatusAnd {
-            status: Status::OK,
-            value: source.scalbn_r(steps, round),
-        },
-        control,
-        round,
-        &[raw],
-    )
+    let scaled = source.scalbn_r(steps, round);
+    let mut status = Status::OK;
+    if source.is_finite() && !source.is_zero() {
+        // Scaling is exact unless the format cannot hold the answer, and the
+        // direction of the scale says which end it ran off. Under a directed
+        // rounding mode an overflow delivers the largest finite value rather
+        // than an infinity, so the result's class cannot decide this.
+        let restored = scaled.scalbn_r(-steps, Round::NearestTiesToEven);
+        if scaled.is_infinite() || scaled.is_zero() || restored != source {
+            status |= Status::INEXACT
+                | if steps > 0 {
+                    Status::OVERFLOW
+                } else {
+                    Status::UNDERFLOW
+                };
+        }
+    }
+    Result {
+        bits: bits(scaled),
+        status,
+    }
 }
 
-pub(super) fn round_to_integral_contextual(raw: u128, control: u16) -> Result {
-    let round = round_from_control(control);
+/// Base-two logarithm.  rustc_apfloat has no transcendental functions, so the
+/// value is computed in double precision; the special cases - which are the
+/// only part the hardware corpus can check - are exact.
+pub(super) fn log2_ieee(raw: u128) -> Result {
+    let source = value(raw);
+    if source.is_nan() {
+        return Result {
+            bits: raw,
+            status: if source.is_signaling() {
+                Status::INVALID_OP
+            } else {
+                Status::OK
+            },
+        };
+    }
+    if source.is_zero() {
+        return Result {
+            bits: 0xffff_8000_0000_0000_0000,
+            status: Status::DIV_BY_ZERO,
+        };
+    }
+    if source.is_negative() {
+        return Result {
+            bits: raw,
+            status: Status::INVALID_OP,
+        };
+    }
+    if source.is_infinite() {
+        return Result {
+            bits: 0x7fff_8000_0000_0000_0000,
+            status: Status::OK,
+        };
+    }
+    let exact_one = bits(source) == 0x3fff_8000_0000_0000_0000;
+    Result {
+        bits: from_f64(to_f64(raw).log2()),
+        status: if exact_one {
+            Status::OK
+        } else {
+            Status::INEXACT
+        },
+    }
+}
+
+/// Round to an integral value in the same format under an explicit rounding
+/// mode.  Inexact is the only exception it can report.
+pub(super) fn round_to_integral_ieee(raw: u128, round: Round) -> Result {
     result(value(raw).round_to_integral(round))
 }
 
@@ -411,7 +467,6 @@ pub(super) fn round_to_integral_contextual(raw: u128, control: u16) -> Result {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Remainder {
     pub bits: u128,
-    pub status: Status,
     /// Low three bits of the quotient's magnitude, reported in C0/C3/C1.
     pub quotient: u64,
     /// Set when the reduction did not complete, which x87 reports as C2.
@@ -433,7 +488,6 @@ pub(super) fn remainder(raw: u128, divisor: u128, ieee: bool) -> Remainder {
 
     let indefinite = Remainder {
         bits: 0xffff_c000_0000_0000_0000,
-        status: Status::INVALID_OP,
         quotient: 0,
         incomplete: false,
     };
@@ -442,34 +496,26 @@ pub(super) fn remainder(raw: u128, divisor: u128, ieee: bool) -> Remainder {
     if y.is_zero() || x.is_infinite() {
         return indefinite;
     }
+    // The propagated NaN and the exception it does or does not raise are
+    // architectural choices the specification makes from the operands.
     if x.is_nan() || y.is_nan() {
-        let status = if x.is_signaling() || y.is_signaling() {
-            Status::INVALID_OP
-        } else {
-            Status::OK
-        };
-        return Remainder {
-            status,
-            ..indefinite
-        };
+        return indefinite;
     }
     if x.is_zero() || y.is_infinite() {
         return Remainder {
             bits: raw,
-            status: Status::OK,
             quotient: 0,
             incomplete: false,
         };
     }
 
-    let exponent_span = i32::from(x.ilogb()) - i32::from(y.ilogb());
+    let exponent_span = x.ilogb() - y.ilogb();
     if exponent_span >= 64 {
         // Partial reduction: bring the dividend within reach of one more step.
         let scaled = y.scalbn(exponent_span - 32);
         let value = x.c_fmod(scaled);
         return Remainder {
             bits: bits(value.value),
-            status: value.status,
             quotient: 0,
             incomplete: true,
         };
@@ -479,17 +525,27 @@ pub(super) fn remainder(raw: u128, divisor: u128, ieee: bool) -> Remainder {
     // The quotient is exact and fits once the span is under 64 exponents.
     let mut exact = false;
     let quotient = x
-        .div_r(y, if ieee { Round::NearestTiesToEven } else { Round::TowardZero })
+        .div_r(
+            y,
+            if ieee {
+                Round::NearestTiesToEven
+            } else {
+                Round::TowardZero
+            },
+        )
         .value
         .to_i128_r(
             80,
-            if ieee { Round::NearestTiesToEven } else { Round::TowardZero },
+            if ieee {
+                Round::NearestTiesToEven
+            } else {
+                Round::TowardZero
+            },
             &mut exact,
         )
         .value;
     Remainder {
         bits: bits(value.value),
-        status: value.status,
         quotient: quotient.unsigned_abs() as u64,
         incomplete: false,
     }
@@ -502,27 +558,12 @@ const BCD_INDEFINITE: u128 = 0xffff_c000_0000_0000_0000;
 /// The largest magnitude eighteen packed decimal digits can hold.
 const BCD_MAX: i128 = 999_999_999_999_999_999;
 
-/// FBLD: eighteen packed decimal digits in bytes 0..9 with the sign in bit 7
-/// of byte 9. Every such value is exactly representable in extended format.
-pub(super) fn from_bcd(raw: u128) -> u128 {
-    let mut magnitude: i128 = 0;
-    let mut scale: i128 = 1;
-    for byte in 0..9 {
-        let packed = ((raw >> (byte * 8)) & 0xff) as i128;
-        magnitude += (packed & 0xf) * scale + (packed >> 4) * scale * 10;
-        scale *= 100;
-    }
-    if (raw >> 79) & 1 == 1 {
-        magnitude = -magnitude;
-    }
-    bits(X87DoubleExtended::from_i128_r(magnitude, Round::NearestTiesToEven).value)
-}
 
 /// FBSTP: round to an integer under the rounding control, then pack it as
 /// eighteen decimal digits. A value that will not fit — including a NaN or an
 /// infinity — stores the packed-decimal indefinite and raises invalid.
 pub(super) fn to_bcd(raw: u128, control: u16) -> Result {
-    let rounded = round_to_integral_contextual(raw, control);
+    let rounded = round_to_integral_ieee(raw, round_from_control(control));
     let mut exact = false;
     let converted = value(rounded.bits).to_i128_r(80, Round::TowardZero, &mut exact);
     let magnitude = converted.value;
@@ -557,17 +598,16 @@ pub(super) fn to_bcd(raw: u128, control: u16) -> Result {
 /// significand bits. Compute it on the integer significand instead: shift so
 /// the exponent is even, take an integer square root wide enough for 64
 /// significand bits, and round the remainder under the rounding control.
-pub(super) fn sqrt_contextual(raw: u128, control: u16) -> Result {
-    let round = round_from_control(control);
+/// Correctly rounded square root of an extended value under an explicit
+/// rounding mode.  The only exceptions it reports are the IEEE ones: invalid
+/// for a negative operand or a signalling NaN, inexact for a rounded root.
+/// Choosing what an invalid square root delivers is the caller's policy.
+pub(super) fn sqrt_ieee(raw: u128, round: Round) -> Result {
     let source = value(raw);
 
     if source.is_nan() {
         return Result {
-            bits: if source.is_signaling() {
-                0xffff_c000_0000_0000_0000
-            } else {
-                raw
-            },
+            bits: raw,
             status: if source.is_signaling() {
                 Status::INVALID_OP
             } else {
@@ -578,7 +618,7 @@ pub(super) fn sqrt_contextual(raw: u128, control: u16) -> Result {
     // sqrt of a negative is invalid; negative zero returns itself.
     if source.is_negative() && !source.is_zero() {
         return Result {
-            bits: 0xffff_c000_0000_0000_0000,
+            bits: raw,
             status: Status::INVALID_OP,
         };
     }
@@ -591,7 +631,7 @@ pub(super) fn sqrt_contextual(raw: u128, control: u16) -> Result {
 
     // Renormalize so the significand's integer bit is set. `ilogb` gives the
     // unbiased exponent of the leading bit for denormals too.
-    let leading = i32::from(source.ilogb());
+    let leading = source.ilogb();
     let normalized = source.scalbn(-leading);
     let significand = bits(normalized) as u64;
 
@@ -651,7 +691,7 @@ pub(super) fn extract_significand(raw: u128) -> u128 {
     if source.is_zero() || source.is_infinite() || source.is_nan() {
         return raw;
     }
-    bits(source.scalbn(-i32::from(source.ilogb())))
+    bits(source.scalbn(-source.ilogb()))
 }
 
 /// FXTRACT's exponent: the operand's unbiased base-two exponent as an integer
@@ -680,11 +720,8 @@ pub(super) fn extract_exponent(raw: u128) -> Result {
     }
     Result {
         bits: bits(
-            X87DoubleExtended::from_i128_r(
-                i128::from(source.ilogb()),
-                Round::NearestTiesToEven,
-            )
-            .value,
+            X87DoubleExtended::from_i128_r(i128::from(source.ilogb()), Round::NearestTiesToEven)
+                .value,
         ),
         status: Status::OK,
     }

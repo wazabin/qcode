@@ -13,7 +13,7 @@ use qcode::{
             Binary, Binop, Branch, BranchInd, CBranch, Call, CallInd, Callee, Carry, Extract,
             FloatBinop, InstructionId, InstructionRef, IntBinop,
             LzCount, Mnemonic, PopCount, Range, Return, SBorrow, SCarry, Scan, Sext,
-            Store, Tuple, Unary, Unop, Zext,
+            Store, Tuple, Unop, Zext,
         },
         varnode::{VarnodeId, register::RegisterId},
     },
@@ -1715,23 +1715,11 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                 .read_varnode_u128(ctx, control_varnode)
                 .unwrap_or(0x037f) as u16;
             return Ok(match name.as_ref() {
-                "from_bcd" => Some(SizedValue::from_f80_bits(float80::from_bcd(
-                    value.as_bits(),
-                ))),
                 "extract_significand" => Some(SizedValue::from_f80_bits(
                     float80::extract_significand(value.as_bits()),
                 )),
                 "extract_exponent" => {
-                    let result = float80::extract_exponent(value.as_bits());
-                    self.record_x87_status(
-                        ctx,
-                        control,
-                        status_register,
-                        result.status,
-                        None,
-                        Self::f80_is_denormal(value.as_bits()),
-                    )?;
-                    Some(SizedValue::from_f80_bits(result.bits))
+                    Some(SizedValue::from_f80_bits(float80::extract_exponent(value.as_bits()).bits))
                 }
                 "to_bcd" => {
                     let result = float80::to_bcd(value.as_bits(), control);
@@ -1768,6 +1756,12 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                 "float_to_int" | "float_to_int_flags" => {
                     Self::ieee_to_int(lhs, rhs.as_bits(), round)
                 }
+                "float_scalb" | "float_scalb_flags" if lhs.size == 10 => {
+                    let steps = i32::try_from(rhs.as_bits() as i64).unwrap_or(if
+                        (rhs.as_bits() as i64) < 0 { i32::MIN } else { i32::MAX });
+                    let result = float80::scalb_ieee(lhs.as_bits(), steps, round);
+                    Some((SizedValue::from_f80_bits(result.bits), result.status))
+                }
                 _ => Self::ieee_arithmetic(lhs, rhs, round, name.as_ref()),
             };
             if let Some((result, status)) = evaluated {
@@ -1786,6 +1780,29 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         let lhs = self.scalar_value(ctx, lhs.qualify(func))?;
         let rhs = self.scalar_value(ctx, rhs.qualify(func))?;
 
+        // The explicit IEEE unary operations take their rounding mode as the
+        // second operand and report architecture-neutral facts, exactly like
+        // their binary counterparts.
+        if lhs.size == 10 {
+            let unary = Self::ieee_rounding_mode(rhs.as_bits()).and_then(|round| {
+                Some(match name.as_ref() {
+                    "float_sqrt" | "float_sqrt_flags" => float80::sqrt_ieee(lhs.as_bits(), round),
+                    "float_round_to_integral" | "float_round_to_integral_flags" => {
+                        float80::round_to_integral_ieee(lhs.as_bits(), round)
+                    }
+                    "float_log2" | "float_log2_flags" => float80::log2_ieee(lhs.as_bits()),
+                    _ => return None,
+                })
+            });
+            if let Some(result) = unary {
+                return Ok(Some(if name.ends_with("_flags") {
+                    Self::ieee_flags(result.status)
+                } else {
+                    SizedValue::from_f80_bits(result.bits)
+                }));
+            }
+        }
+
         // Unsigned rounded average of one lane: (a + b + 1) >> 1, computed
         // wide enough that the carry out of the lane is kept.
         let average = |width: usize| -> Option<SizedValue> {
@@ -1797,25 +1814,15 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
 
         let value = match name.as_ref() {
             // FPREM and FPREM1 report the quotient's low three bits in
-            // C0/C3/C1 and an incomplete reduction in C2, so the condition
-            // codes are written here alongside the sticky exceptions.
+            // C0/C3/C1 and an incomplete reduction in C2. The exceptions are
+            // the specification's; only these condition codes are written
+            // here, and they are still to be moved out.
             "fprem" | "fprem1" if lhs.size == 10 && rhs.size == 10 => {
-                let Some((control_varnode, status_register)) = Self::x87_context(ctx) else {
+                let Some((_, status_register)) = Self::x87_context(ctx) else {
                     return Ok(None);
                 };
-                let control = self
-                    .read_varnode_u128(ctx, control_varnode)
-                    .unwrap_or(0x037f) as u16;
                 let result =
                     float80::remainder(lhs.as_bits(), rhs.as_bits(), name.as_ref() == "fprem1");
-                self.record_x87_status(
-                    ctx,
-                    control,
-                    status_register,
-                    result.status,
-                    None,
-                    Self::f80_denormal_operands(lhs.as_bits(), rhs.as_bits()),
-                )?;
                 let old = self.read_varnode_u128(ctx, status_register).unwrap_or(0) as u16;
                 // C0, C1, C2 and C3 are all operation results here.
                 let mut new = old & !0x4700;
@@ -1827,28 +1834,6 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                     new |= u16::from((result.quotient >> 2) as u8 & 1) << 8;
                 }
                 self.set_varnode(ctx, status_register, u64::from(new))?;
-                return Ok(Some(SizedValue::from_f80_bits(result.bits)));
-            }
-            // FSCALE reads its scale from ST(1) and rounds under the x87
-            // control word, so it is interpreted here rather than as a
-            // generic packed lane operation.
-            "fscale" if lhs.size == 10 && rhs.size == 10 => {
-                let (control, status_register) = match Self::x87_context(ctx) {
-                    Some((control, status)) => (
-                        self.read_varnode_u128(ctx, control).unwrap_or(0x037f) as u16,
-                        status,
-                    ),
-                    None => return Ok(None),
-                };
-                let result = float80::scale_contextual(lhs.as_bits(), rhs.as_bits(), control);
-                self.record_x87_status(
-                    ctx,
-                    control,
-                    status_register,
-                    result.status,
-                    None,
-                    Self::f80_denormal_operands(lhs.as_bits(), rhs.as_bits()),
-                )?;
                 return Ok(Some(SizedValue::from_f80_bits(result.bits)));
             }
             "pavgb" => average(1),
@@ -2010,31 +1995,6 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         self.set_varnode(ctx, status_register, u64::from(new))
     }
 
-    fn toward_zero_control(control: u16) -> u16 {
-        (control & !0x0c00) | 0x0c00
-    }
-
-    fn rounded_away_from_zero(value: u128, toward_zero: u128, size: usize) -> bool {
-        let magnitude_mask = (1u128 << (size * 8 - 1)) - 1;
-        (value & magnitude_mask) > (toward_zero & magnitude_mask)
-    }
-
-    /// x87 reports a denormal operand only when the operation actually works
-    /// on it. A NaN operand determines the result on its own, so hardware
-    /// raises invalid or nothing at all and leaves DE clear - the same
-    /// precedence `fpu_signal_denormal2` applies in the specification.
-    fn f80_denormal_operands(lhs: u128, rhs: u128) -> bool {
-        if float80::is_nan(lhs) || float80::is_nan(rhs) {
-            return false;
-        }
-        Self::f80_is_denormal(lhs) || Self::f80_is_denormal(rhs)
-    }
-
-    fn f80_is_denormal(value: u128) -> bool {
-        let exponent = (value >> 64) & 0x7fff;
-        exponent == 0 && value & ((1u128 << 64) - 1) != 0
-    }
-
 
 
     /// Interpret f80 operations with the x87 control/status words in scope.
@@ -2055,9 +2015,6 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             mnemonic,
             Mnemonic::Binop(Binary {
                 op: Binop::Float(_),
-                ..
-            }) | Mnemonic::Unop(Unary {
-                op: Unop::FloatSqrt | Unop::FloatRound,
                 ..
             })
         ) {
@@ -2113,61 +2070,6 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                     )?;
                 }
                 Ok(None)
-            }
-            // FSQRT rounds under the control word and reports inexact and the
-            // C1 rounding indicator, so it takes the contextual path rather
-            // than the generic sqrt, which narrows f80 through f64.
-            Mnemonic::Unop(Unary {
-                op: Unop::FloatSqrt,
-                src,
-            }) => {
-                let value = self.scalar_value(ctx, src.qualify(func))?;
-                if value.size != 10 {
-                    return Ok(None);
-                }
-                let result = float80::sqrt_contextual(value.as_bits(), control);
-                let zero_result =
-                    float80::sqrt_contextual(value.as_bits(), Self::toward_zero_control(control));
-                self.record_x87_status(
-                    ctx,
-                    control,
-                    status_register,
-                    result.status,
-                    Some(Self::rounded_away_from_zero(
-                        result.bits,
-                        zero_result.bits,
-                        10,
-                    )),
-                    Self::f80_is_denormal(value.as_bits()),
-                )?;
-                Ok(Some(SizedValue::from_f80_bits(result.bits)))
-            }
-            Mnemonic::Unop(Unary {
-                op: Unop::FloatRound,
-                src,
-            }) => {
-                let value = self.scalar_value(ctx, src.qualify(func))?;
-                if value.size != 10 {
-                    return Ok(None);
-                }
-                let result = float80::round_to_integral_contextual(value.as_bits(), control);
-                let zero_result = float80::round_to_integral_contextual(
-                    value.as_bits(),
-                    Self::toward_zero_control(control),
-                );
-                self.record_x87_status(
-                    ctx,
-                    control,
-                    status_register,
-                    result.status,
-                    Some(Self::rounded_away_from_zero(
-                        result.bits,
-                        zero_result.bits,
-                        10,
-                    )),
-                    Self::f80_is_denormal(value.as_bits()),
-                )?;
-                Ok(Some(SizedValue::from_f80_bits(result.bits)))
             }
             // FIST/FISTP/FISTTP and FST/FSTP convert through the explicit
             // `float_to_int` and `float_narrow` operations, which carry no
@@ -4458,19 +4360,18 @@ mod tests {
     /// keeps all 64 bits. Routing it through f64 would lose eleven of them.
     #[test]
     fn float80_sqrt_is_correctly_rounded_at_extended_precision() {
-        let nearest = 0x037f;
         let two = 0x4000_8000_0000_0000_0000;
         let four = 0x4001_8000_0000_0000_0000;
         let one = 0x3fff_8000_0000_0000_0000;
 
         // sqrt(2) rounds up into the last significand bit.
-        let root_two = float80::sqrt_contextual(two, nearest);
+        let root_two = float80::sqrt_ieee(two, Round::NearestTiesToEven);
         assert_eq!(root_two.bits, 0x3fff_b504_f333_f9de_6484);
         assert!(root_two.status.contains(Status::INEXACT));
 
         // Exact roots stay exact and report nothing.
         for (input, expect) in [(four, two), (one, one), (0, 0)] {
-            let result = float80::sqrt_contextual(input, nearest);
+            let result = float80::sqrt_ieee(input, Round::NearestTiesToEven);
             assert_eq!(result.bits, expect);
             assert_eq!(result.status, Status::OK);
         }
@@ -4479,17 +4380,19 @@ mod tests {
         // and truncation land on different significands.
         let three = 0x4000_c000_0000_0000_0000;
         assert_eq!(
-            float80::sqrt_contextual(three, nearest).bits,
+            float80::sqrt_ieee(three, Round::NearestTiesToEven).bits,
             0x3fff_ddb3_d742_c265_539e
         );
         assert_eq!(
-            float80::sqrt_contextual(three, 0x0f7f).bits,
+            float80::sqrt_ieee(three, Round::TowardZero).bits,
             0x3fff_ddb3_d742_c265_539d
         );
 
-        // A negative operand is invalid and yields the indefinite QNaN.
-        let negative = float80::sqrt_contextual(0xbfff_8000_0000_0000_0000, nearest);
-        assert_eq!(negative.bits, 0xffff_c000_0000_0000_0000);
+        // A negative operand is invalid. What is delivered in its place is
+        // the specification's choice, so the operation returns the operand.
+        let negative =
+            float80::sqrt_ieee(0xbfff_8000_0000_0000_0000, Round::NearestTiesToEven);
+        assert_eq!(negative.bits, 0xbfff_8000_0000_0000_0000);
         assert!(negative.status.contains(Status::INVALID_OP));
     }
 
