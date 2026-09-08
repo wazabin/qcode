@@ -91,18 +91,19 @@ passes 56 tests.
 
 ## Migration status
 
-The x87 add family (`FADD`, `FADDP`, and `FIADD`) now uses `ieee_add` through
-`fpu_ieee_add_result` in the vendored `ia.sinc`. The helper passes
-`(FPUControlWord >> 10) & 3`, maps generic flags into the x87 status word,
-reports DE from the source encodings, computes C1 against a toward-zero
-result, selects x87 invalid payloads, and applies existing mask/commit logic.
-The add constructors consequently no longer use generic `f+`, so QCode's
-contextual `FloatBinop::Add` path is not reached for them.
+The x87 add (`FADD`, `FADDP`, `FIADD`) and subtraction (`FSUB`, `FSUBR`,
+`FSUBP`, `FSUBRP`, `FISUB`, `FISUBR`) families now use `ieee_add` and
+`ieee_sub` through helpers in the vendored `ia.sinc`. The helpers pass
+`(FPUControlWord >> 10) & 3`, map generic flags into the x87 status word,
+report DE from the source encodings, compute C1 against a toward-zero result,
+select x87 invalid payloads, and apply existing mask/commit logic. These
+constructors no longer use generic `f+`/`f-`, so QCode's contextual add and
+subtraction paths are not reached for them.
 
-Next, replay focused Binit add cases and then the full corpus. Migrate the
-remaining subtraction, multiplication, and division families one at a time
-only after that succeeds. Do not replace generic `f+` globally: non-x87
-specifications keep it.
+Next, replay focused Binit add/subtraction cases and then the full corpus.
+Migrate multiplication and division one family at a time only after that
+succeeds. Do not replace generic `f+` or `f-` globally: non-x87 specifications
+keep them.
 
 ## Relevant commits
 
