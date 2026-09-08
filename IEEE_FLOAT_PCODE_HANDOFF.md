@@ -71,30 +71,39 @@ checkout were integrated into the vendored submodule:
   `precompile/open_sleigh/src/x86/macros.sinc` and call the operations with
   `(a, b, round)`.
 
-They are intentionally **not wired** into constructors yet. The current QCode
-prototype supports only two-argument f80 `*_flags` queries and directly
-mutates x87 status for ordinary `f+` etc.; wiring the macros now would produce
-unsupported p-code operations and duplicate x87 effects.
+They are intentionally **not wired** into x87 constructors yet. Wiring them
+before removing QCode's current contextual x87 status recording would duplicate
+architectural effects.
 
-## Immediate implementation task
+## IEEE operation implementation — complete
 
-Refactor `wazabin-qcode/emulator/src/concrete.rs`, in
-`StandaloneEmulator::interpret_packed_pcode_op` around the current
-`let [lhs, rhs] = op.args.as_slice()` dispatch:
+`wazabin-qcode/emulator/src/concrete.rs` now implements:
 
-1. Accept both `[lhs, rhs]` (legacy p-code ops) and
-   `[lhs, rhs, rounding_mode]` (new IEEE ops).
-2. Implement `float_{add,sub,mul,div}` returning the f80 result, and matching
-   `*_flags` returning the IEEE bit mask, using the same explicit rounding
-   mode for both calls.
-3. Generalize the implementation beyond f80 before claiming the operations
-   architecture-independent; f32/f64 must use their corresponding IEEE
-   formats.
-4. Add focused emulator tests proving result/flags agreement for every
-   rounding mode.
-5. Only then migrate one x87 family at a time to `ieee_*`, move status mapping
-   into SLEIGH, and remove the corresponding contextual x87 mutation from
-   QCode. Replay Binit after each family.
+- three-argument `float_{add,sub,mul,div}(a, b, rounding_mode)` result ops;
+- matching three-argument `*_flags` ops returning architecture-neutral IEEE
+  masks;
+- f32, f64, and f80 evaluation for every IEEE rounding mode;
+- legacy two-argument f80 flag ops for existing callers.
+
+The implementation has result/flag agreement tests across operations, formats,
+and rounding modes. Reported verification: `cargo test -p qcode_emulator --lib`
+passes 56 tests.
+
+## Immediate migration task
+
+Migrate one x87 family at a time to `ieee_*` macros:
+
+1. Use `round = (FPUControlWord >> 10) & 3` and obtain paired result/flags.
+2. In SLEIGH, map IEEE flags to x87 status, add DE from operand inspection,
+   apply x87 priority/masks, C1/ES/B, result choice, and commit/pop policy.
+3. Remove QCode's corresponding contextual x87 status mutation only after the
+   SLEIGH family consumes the generic flags.
+4. Replay focused Binit cases, then the full corpus, before moving to the next
+   family.
+
+Do not replace generic `f+` globally: non-x87 specifications keep it. The new
+operations are explicit supplemental IEEE evaluation used only where a spec
+needs flags/rounding control.
 
 Do not replace generic `f+` globally: non-x87 specifications keep it. The new
 operations are explicit supplemental IEEE evaluation used only where a spec
