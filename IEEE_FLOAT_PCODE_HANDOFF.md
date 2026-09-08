@@ -188,11 +188,6 @@ reduces their two-operand rules to the one-operand ones exactly. FXTRACT
 classifies its operand in SLEIGH, FBLD decodes packed decimal there, and
 FYL2X/FYL2XP1 finally take a real logarithm.
 
-`float80::round_to_precision` was also corrected: precision counts significand
-bits from the value's own leading one, so a subnormal that already carries
-fewer bits than the target precision is left alone instead of being rounded to
-zero.
-
 ### Still in the emulator
 
 - `record_x87_status` and `x87_context` survive for `to_bcd` and for the
@@ -212,5 +207,9 @@ zero.
   dividend 16000 binary exponents above the divisor.
 - FSCALE's C1/PE reporting under an unmasked overflow matches some hardware
   states and not others; the corpus disagrees with a single `wrapped` rule.
+- `round_to_precision` treats a subnormal as inexact against the narrower
+  precision. That is what the arithmetic families need, so FSCALE simply does
+  not apply precision control; whether hardware really exempts it, or applies
+  it with a different subnormal rule, is unresolved.
 - FYL2XP1's underflow reporting depends on the logarithm's exact value, which
   the f64 implementation cannot reproduce.

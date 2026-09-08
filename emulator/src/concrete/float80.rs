@@ -97,8 +97,8 @@ fn apply_precision(value: X87DoubleExtended, control: u16, round: Round) -> Resu
     };
     let (retained, exponent) = if increment {
         let (rounded, carry) = retained.overflowing_add(1);
-        if carry || rounded == (1u64 << (64 - discarded_bits)) {
-            (1u64 << (63 - discarded_bits), exponent.saturating_add(1))
+        if carry || rounded == (1u64 << precision) {
+            (1u64 << (precision - 1), exponent.saturating_add(1))
         } else {
             (rounded, exponent)
         }
@@ -154,25 +154,18 @@ pub(super) fn round_to_precision(raw: u128, precision: u32, round: Round) -> Res
         };
     }
     let significand = raw as u64;
-    // Precision counts significand bits from the value's own leading one. For
-    // a normal that is bit 63; a subnormal's leading one sits lower, so it
-    // already carries fewer bits than the format and a narrower precision may
-    // discard nothing at all.
-    let leading = 63 - significand.leading_zeros();
-    let discarded_bits = (i64::from(leading) + 1 - i64::from(precision)).max(0) as u32;
-    if discarded_bits == 0 {
-        return Result {
-            bits: raw,
-            status: Status::OK,
-        };
-    }
+    let discarded_bits = 64 - precision;
     let discarded_mask = (1u64 << discarded_bits) - 1;
     let discarded = significand & discarded_mask;
     if discarded == 0 {
-        return Result {
-            bits: raw,
-            status: Status::OK,
+        // A subnormal input is already inexact with respect to the narrower
+        // precision's exponent range, and rounding it reports tininess.
+        let status = if denormal {
+            Status::UNDERFLOW | Status::INEXACT
+        } else {
+            Status::OK
         };
+        return Result { bits: raw, status };
     }
     let retained = significand >> discarded_bits;
     let increment = match round {
