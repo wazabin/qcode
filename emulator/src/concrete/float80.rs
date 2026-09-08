@@ -316,53 +316,6 @@ pub(super) fn from_f32_bits(raw: u32) -> u128 {
     )
 }
 
-/// Narrow an f80 store using the x87 rounding-control field.  Precision
-/// control governs arithmetic results, not the destination format; conversion
-/// to f32/f64 is rounded directly to that format.
-pub(super) fn to_float_contextual(raw: u128, size: usize, control: u16) -> Result {
-    let round = round_from_control(control);
-    let mut loses_info = false;
-    // A masked invalid conversion — an unsupported f80 encoding, for instance —
-    // stores the destination format's QNaN floating-point indefinite, whose
-    // sign bit is set. APFloat produces a positive quiet NaN instead.
-    let indefinite = |size: usize| match size {
-        4 => 0xffc0_0000u128,
-        _ => 0xfff8_0000_0000_0000u128,
-    };
-    match size {
-        4 => {
-            let value: rustc_apfloat::StatusAnd<Single> =
-                value(raw).convert_r(round, &mut loses_info);
-            Result {
-                bits: if value.status.contains(Status::INVALID_OP) && !is_signaling_nan(raw) {
-                    indefinite(4)
-                } else {
-                    // A signalling NaN is quieted and keeps its sign/payload;
-                    // the indefinite result is for unsupported f80 encodings.
-                    value.value.to_bits()
-                },
-                status: value.status,
-            }
-        }
-        8 => {
-            let value: rustc_apfloat::StatusAnd<Double> =
-                value(raw).convert_r(round, &mut loses_info);
-            Result {
-                bits: if value.status.contains(Status::INVALID_OP) && !is_signaling_nan(raw) {
-                    indefinite(8)
-                } else {
-                    value.value.to_bits()
-                },
-                status: value.status,
-            }
-        }
-        _ => Result {
-            bits: raw,
-            status: Status::OK,
-        },
-    }
-}
-
 pub(super) fn to_i128(raw: u128, width: usize) -> i128 {
     truncate_to_i128(raw, width).value
 }

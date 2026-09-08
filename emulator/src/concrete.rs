@@ -11,8 +11,8 @@ use qcode::{
         LocalValueId, Value, ValueId, ValueRef, Varnode,
         insn::{
             Binary, Binop, Branch, BranchInd, CBranch, Call, CallInd, Callee, Carry, Extract,
-            FloatBinop, FloatToFloat, FloatToInt, InstructionId, InstructionRef, IntBinop,
-            IntToFloat, LzCount, Mnemonic, PopCount, Range, Return, SBorrow, SCarry, Scan, Sext,
+            FloatBinop, InstructionId, InstructionRef, IntBinop,
+            LzCount, Mnemonic, PopCount, Range, Return, SBorrow, SCarry, Scan, Sext,
             Store, Tuple, Unary, Unop, Zext,
         },
         varnode::{VarnodeId, register::RegisterId},
@@ -23,7 +23,7 @@ use std::cmp;
 mod float80;
 
 use rustc_apfloat::{
-    Float, Round, Status,
+    Float, FloatConvert, Round, Status,
     ieee::{Double, Single, X87DoubleExtended},
 };
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1610,6 +1610,58 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         Some((SizedValue::from_bits(result.bits, 10), result.status))
     }
 
+    /// Narrow an extended value to a smaller IEEE format under an explicit
+    /// rounding mode.  This is the conversion alone: no architectural
+    /// indefinite substitution, no status word, no store policy.
+    fn ieee_narrow(value: SizedValue, size: u128, round: Round) -> Option<(SizedValue, Status)> {
+        if value.size != 10 {
+            return None;
+        }
+        let source = X87DoubleExtended::from_bits(value.as_bits());
+        let mut loses_info = false;
+        match size {
+            4 => {
+                let converted: rustc_apfloat::StatusAnd<Single> =
+                    source.convert_r(round, &mut loses_info);
+                Some((
+                    SizedValue::from_bits(converted.value.to_bits(), 4),
+                    converted.status,
+                ))
+            }
+            8 => {
+                let converted: rustc_apfloat::StatusAnd<Double> =
+                    source.convert_r(round, &mut loses_info);
+                Some((
+                    SizedValue::from_bits(converted.value.to_bits(), 8),
+                    converted.status,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Convert a floating value to a two's-complement integer of `size` bytes
+    /// under an explicit rounding mode.  A NaN, an infinity or a value outside
+    /// the destination range is invalid; the architectural replacement value
+    /// for that case is the caller's business, not this operation's.
+    fn ieee_to_int(value: SizedValue, size: u128, round: Round) -> Option<(SizedValue, Status)> {
+        if value.size != 10 {
+            return None;
+        }
+        let size = usize::try_from(size).ok()?;
+        if !matches!(size, 2 | 4 | 8) {
+            return None;
+        }
+        let mut exact = false;
+        let converted =
+            X87DoubleExtended::from_bits(value.as_bits()).to_i128_r(size * 8, round, &mut exact);
+        let mask = (1u128 << (size * 8)) - 1;
+        Some((
+            SizedValue::from_bits(converted.value as u128 & mask, size),
+            converted.status,
+        ))
+    }
+
     fn ieee_flags(status: Status) -> SizedValue {
         let mut flags = 0u128;
         if status.contains(Status::INVALID_OP) {
@@ -1709,6 +1761,12 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             let evaluated = match name.as_ref() {
                 "float_round_to_precision" | "float_round_to_precision_flags" => {
                     Self::ieee_round_to_precision(lhs, rhs.as_bits(), round)
+                }
+                "float_narrow" | "float_narrow_flags" => {
+                    Self::ieee_narrow(lhs, rhs.as_bits(), round)
+                }
+                "float_to_int" | "float_to_int_flags" => {
+                    Self::ieee_to_int(lhs, rhs.as_bits(), round)
                 }
                 _ => Self::ieee_arithmetic(lhs, rhs, round, name.as_ref()),
             };
@@ -2001,9 +2059,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             }) | Mnemonic::Unop(Unary {
                 op: Unop::FloatSqrt | Unop::FloatRound,
                 ..
-            }) | Mnemonic::IntToFloat(_)
-                | Mnemonic::FloatToInt(_)
-                | Mnemonic::FloatToFloat(_)
+            })
         ) {
             return Ok(None);
         }
@@ -2113,66 +2169,10 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                 )?;
                 Ok(Some(SizedValue::from_f80_bits(result.bits)))
             }
-            // FILD converts exactly to the extended format.  PC applies to
-            // arithmetic results, not this integer load.
-            Mnemonic::IntToFloat(IntToFloat { size: 10, .. }) => Ok(None),
-            Mnemonic::FloatToInt(FloatToInt { src, size }) => {
-                let value = self.scalar_value(ctx, src.qualify(func))?;
-                if value.size != 10 {
-                    return Ok(None);
-                }
-                let result = float80::truncate_to_i128(value.as_bits(), size * 8);
-                self.record_x87_status(
-                    ctx,
-                    control,
-                    status_register,
-                    result.status,
-                    None,
-                    // FIST/FISTP/FISTTP convert ST(0), always a register, so
-                    // there is no denormal *memory* operand to report. A
-                    // denormal source is converted like any other value and
-                    // reports precision, not DE. Only invalid and precision
-                    // are architecturally raised here.
-                    false,
-                )?;
-                Ok(Some(SizedValue::from_bits(result.value as u128, *size)))
-            }
-            Mnemonic::FloatToFloat(FloatToFloat { src, size }) => {
-                let value = self.scalar_value(ctx, src.qualify(func))?;
-                if value.size == 10 && matches!(*size, 4 | 8) {
-                    let result = float80::to_float_contextual(value.as_bits(), *size, control);
-                    let zero_result = float80::to_float_contextual(
-                        value.as_bits(),
-                        *size,
-                        Self::toward_zero_control(control),
-                    );
-                    self.record_x87_status(
-                        ctx,
-                        control,
-                        status_register,
-                        result.status,
-                        Some(Self::rounded_away_from_zero(
-                            result.bits,
-                            zero_result.bits,
-                            *size,
-                        )),
-                        // Narrowing an extended-precision register to f32/f64
-                        // does not raise the denormal-operand exception. A
-                        // denormal source too small for the destination is
-                        // reported as underflow and inexact instead. DE is for
-                        // a denormal *memory* operand, handled by the widening
-                        // arm below.
-                        false,
-                    )?;
-                    return Ok(Some(SizedValue::from_bits(result.bits, *size)));
-                }
-                // Widening a narrow memory source to the extended format is a
-                // pure IEEE conversion. The denormal-operand and
-                // signalling-NaN facts it carries belong to the x87
-                // instruction, not to the conversion, and the specification
-                // reads them from the original encoding.
-                Ok(None)
-            }
+            // FIST/FISTP/FISTTP and FST/FSTP convert through the explicit
+            // `float_to_int` and `float_narrow` operations, which carry no
+            // architectural policy, so a generic conversion reaching here is
+            // some other specification's and must stay generic.
             _ => Ok(None),
         }
     }
@@ -4402,14 +4402,26 @@ mod tests {
             one_plus_half_single_ulp
         );
 
-        // f80 stores narrow under RC: the exact halfway value stores as 1.0
-        // under nearest-even and as the next f32 under round-up.
+        // Narrowing takes an explicit rounding mode and no control word: the
+        // exact halfway value narrows to 1.0 under nearest-even and to the
+        // next f32 under round-up.
+        let extended = SizedValue::from_bits(one_plus_half_single_ulp, 10);
         assert_eq!(
-            float80::to_float_contextual(one_plus_half_single_ulp, 4, 0x037f).bits,
+            StandaloneEmulator::<EmulatedMemory>::ieee_narrow(
+                extended,
+                4,
+                Round::NearestTiesToEven
+            )
+            .unwrap()
+            .0
+            .as_bits(),
             u128::from(1.0f32.to_bits())
         );
         assert_eq!(
-            float80::to_float_contextual(one_plus_half_single_ulp, 4, 0x0b7f).bits,
+            StandaloneEmulator::<EmulatedMemory>::ieee_narrow(extended, 4, Round::TowardPositive)
+                .unwrap()
+                .0
+                .as_bits(),
             u128::from((1.0f32).to_bits() + 1)
         );
 
