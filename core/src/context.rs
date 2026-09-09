@@ -22,7 +22,7 @@ use crate::{
         varnode::{Varnode, VarnodeId, VarnodeRef, register::RegisterId},
     },
 };
-use jstd::registry::{self, Registry};
+use jstd::registry::{self, Identified, Registry};
 
 /// The central arena that owns all IR state.
 ///
@@ -236,6 +236,12 @@ impl<'str> Shared<'str> {
         &self.spaces[id]
     }
 
+    /// Iterates over every space registered in this module, in id order, each
+    /// paired with its [`SpaceId`].
+    pub fn spaces(&self) -> impl Iterator<Item = Identified<SpaceId, &Space>> + '_ {
+        self.spaces.iter()
+    }
+
     /// An interned integer constant of the given byte width, as a [`ValueId`].
     /// Shared-only mirror of [`Context::get_const`] returning the id directly
     /// (the `LiteralRef` wrapper needs a whole `&Context`).
@@ -405,6 +411,12 @@ impl<'str> Context<'str> {
     /// Returns the number of spaces registered in this context.
     pub fn space_count(&self) -> usize {
         self.shared.spaces.len()
+    }
+
+    /// Iterates over every space registered in this context, in id order, each
+    /// paired with its [`SpaceId`].
+    pub fn spaces(&self) -> impl Iterator<Item = Identified<SpaceId, &Space>> + '_ {
+        self.shared.spaces()
     }
 
     pub fn set_primary_entrypoint(&mut self, entrypoint: Option<u64>) {

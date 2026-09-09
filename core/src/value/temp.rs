@@ -38,6 +38,18 @@ impl TempSpace {
             addr_size,
         }
     }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub fn word_size(&self) -> usize {
+        self.word_size
+    }
+
+    pub fn addr_size(&self) -> usize {
+        self.addr_size
+    }
 }
 
 /// A body-owned temporary memory value.

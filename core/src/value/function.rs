@@ -969,6 +969,14 @@ impl<'str> FunctionBody<'str> {
         &self.temp_spaces[id.local]
     }
 
+    /// Iterates over every temporary space owned by this body, in id order.
+    pub fn temp_spaces(&self) -> impl Iterator<Item = (TempSpaceId, &TempSpace)> + '_ {
+        let func = self.id();
+        self.temp_spaces
+            .iter()
+            .map(move |space| (TempSpaceId::new(func, space.id), space.inner))
+    }
+
     /// Whether `id` names a temporary space in this body.
     pub fn contains_temp_space(&self, id: TempSpaceId) -> bool {
         id.func == self.id() && usize::from(id.local) < self.temp_spaces.len()
