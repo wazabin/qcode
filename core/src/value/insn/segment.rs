@@ -134,7 +134,44 @@ where
         // is needed (or wanted: one would mask a mis-qualification). Only the
         // *absolute* ids below (blocks, and symbolic block literals) can name
         // another function.
+        // An operand can name an arena slot that has been freed: a diagnostic
+        // rendered for an instruction whose operand was deleted from under it,
+        // or for a block that has since been emptied and lifted again. A
+        // rendering is a description, and must not be the thing that aborts
+        // the process — so a dead operand is spelled out as dead rather than
+        // resolved.
         match id {
+            ValueId::Instruction(iid) if !self.view.contains_instruction(iid) => {
+                self.push(
+                    dead_atom("tmp", usize::from(iid.local)),
+                    TokenKind::Variable,
+                    link,
+                );
+            }
+            ValueId::BlockParam(pid) if !self.view.contains_block_param(pid) => {
+                self.push(
+                    dead_atom("param", usize::from(pid.local)),
+                    TokenKind::BlockParam,
+                    link,
+                );
+            }
+            ValueId::Temp(tid) if !self.view.contains_temp(tid) => {
+                self.push(
+                    dead_atom("temp", usize::from(tid.local)),
+                    TokenKind::Varnode,
+                    link,
+                );
+            }
+            ValueId::BasicBlock(bid)
+                if self.view.owner().is_none_or(|o| o == bid.func)
+                    && !self.view.contains_block(bid) =>
+            {
+                self.push(
+                    format!("<dead {bid}>"),
+                    TokenKind::Label,
+                    Some(Link::Block(bid)),
+                );
+            }
             ValueId::Instruction(iid) => {
                 let r = self.view.insn_ref(iid);
                 self.ty(r.type_id());
@@ -255,6 +292,11 @@ fn instruction_atom<'ctx, 'str: 'ctx>(
         Some(name) => format!("%{name}"),
         None => format!("%tmp{:x}", usize::from(id.local)),
     }
+}
+
+/// The atom for an operand whose arena slot is gone: `%dead-tmp<id>`.
+fn dead_atom(kind: &str, local: usize) -> String {
+    format!("%dead-{kind}{local:x}")
 }
 
 /// The bare atom for a block parameter: `@name` or `@param<id>`.
@@ -959,4 +1001,39 @@ pub fn value_tokens_shared(shared: &Shared<'_>, id: ValueId) -> Vec<Token> {
         _ => panic!("value_tokens_shared: not a shared-leaf value id"),
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        context::Context,
+        value::{
+            Instruction, ValueId,
+            insn::{Binop, IntBinop},
+        },
+    };
+
+    /// A statement is a description, and one is most needed exactly when the
+    /// module is in a bad state — so an operand whose arena slot has been
+    /// freed renders as dead instead of aborting the process.
+    #[test]
+    fn a_dead_operand_renders_instead_of_panicking() {
+        let mut ctx = Context::new();
+        let one = ctx.get_const(1, 8).id();
+        let (dead, user) = {
+            let source = ctx.builder_at(0x1000).current_block();
+            let target = ctx.get_or_make_block(0x1001, source.func);
+            let mut builder = ctx.builder(source);
+            let dead = builder.push_binop(Binop::Int(IntBinop::Add), one, one).id;
+            let user = builder
+                .push_binop(Binop::Int(IntBinop::Add), ValueId::Instruction(dead), one)
+                .id;
+            builder.finalize(target);
+            (dead, user)
+        };
+        ctx.body_mut(dead.func).remove_instruction(dead);
+
+        let text = Instruction::from_id(&ctx, user).as_statement().to_string();
+        assert!(text.contains("%dead-tmp"), "{text}");
+    }
 }
