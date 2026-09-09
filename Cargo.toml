@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "emulator", "jit", "macro", "parser", "passes", "sleigh", "vm"]
+members = ["core", "emulator", "jit", "macro", "parser", "passes", "sleigh", "userland", "vm"]
 exclude = ["analysis"]
 resolver = "2"
 
@@ -19,6 +19,7 @@ qcode = { package = "wazabin-qcode", version = "0.3.0", path = "core" }
 qcode_emulator = { package = "wazabin-qcode-emulator", version = "0.3.0", path = "emulator" }
 qcode_jit = { package = "wazabin-qcode-jit", version = "0.3.0", path = "jit" }
 qcode_passes = { package = "wazabin-qcode-passes", version = "0.3.0", path = "passes" }
+qcode_userland = { package = "wazabin-qcode-userland", version = "0.3.0", path = "userland" }
 qcode_vm = { package = "wazabin-qcode-vm", version = "0.3.0", path = "vm" }
 wazabin-qcode-macro = { version = "0.3.0", path = "macro" }
 wazabin-qcode-parser = { version = "0.3.0", path = "parser" }

@@ -1,0 +1,31 @@
+[package]
+name = "wazabin-qcode-userland"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Linux x86-64 userland on the qcode VM: ELF loader, SysV stack, system calls, and the run-elf runner"
+readme = "README.md"
+documentation = "https://docs.rs/wazabin-qcode-userland"
+keywords = ["emulator", "elf", "linux", "syscall", "binary-analysis"]
+categories = ["emulators", "development-tools"]
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+name = "qcode_userland"
+
+[[bin]]
+name = "run-elf"
+path = "src/bin/run_elf.rs"
+
+[dependencies]
+qcode.workspace = true
+qcode_emulator.workspace = true
+qcode_vm.workspace = true
+qcode_jit.workspace = true
+wazabin-qcode-sleigh = { version = "0.3.0", path = "../sleigh" }
+sleigh-precompile = { package = "wazabin-sleigh-precompile", version = "0.1.2" }
+wazabin-binary.workspace = true
+log.workspace = true
+env_logger.workspace = true
