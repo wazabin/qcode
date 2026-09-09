@@ -16,14 +16,17 @@ concurrency:
 env:
   # Override these repository variables when dependencies are hosted elsewhere.
   BINIT_REPOSITORY: ${{ vars.BINIT_REPOSITORY || format('{0}/binit', github.repository_owner) }}
-  BINARY_REPOSITORY: ${{ vars.BINARY_REPOSITORY || format('{0}/wazabin-binary', github.repository_owner) }}
+  BINARY_REPOSITORY: ${{ vars.BINARY_REPOSITORY || format('{0}/binary', github.repository_owner) }}
   JSTD_REPOSITORY: ${{ vars.JSTD_REPOSITORY || format('{0}/jstd', github.repository_owner) }}
-  PCODE_TYPES_REPOSITORY: ${{ vars.PCODE_TYPES_REPOSITORY || format('{0}/wazabin-pcode', github.repository_owner) }}
-  SLEIGH_REPOSITORY: ${{ vars.SLEIGH_REPOSITORY || format('{0}/wazabin-sleigh', github.repository_owner) }}
+  PCODE_TYPES_REPOSITORY: ${{ vars.PCODE_TYPES_REPOSITORY || format('{0}/pcode', github.repository_owner) }}
+  SLEIGH_REPOSITORY: ${{ vars.SLEIGH_REPOSITORY || format('{0}/sleigh', github.repository_owner) }}
   X86DB_DSN: postgresql://x86db:x86db@localhost:5432/x86db
 
 jobs:
   binit-smoke:
+    # The Binit corpus and schema live in a private repository; forks and
+    # public clones skip this job unless BINIT_REPOSITORY is configured.
+    if: ${{ vars.BINIT_REPOSITORY != '' }}
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -44,7 +47,7 @@ jobs:
       - name: Check out local path dependencies and Binit schema
         run: |
           git clone --depth=1 "https://github.com/${BINARY_REPOSITORY}.git" ../wazabin-binary
-          git clone --depth=1 "https://github.com/${JSTD_REPOSITORY}.git" ../jstd
+          git clone --depth=1 "https://github.com/${JSTD_REPOSITORY}.git" ../wazabin-jstd
           git clone --depth=1 "https://github.com/${PCODE_TYPES_REPOSITORY}.git" ../wazabin-pcode
           git clone --depth=1 "https://github.com/${SLEIGH_REPOSITORY}.git" ../wazabin-sleigh
           git clone --depth=1 "https://github.com/${BINIT_REPOSITORY}.git" ../binit
