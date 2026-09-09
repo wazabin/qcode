@@ -1636,6 +1636,18 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     /// value is exactly representable there, so the widening is lossless and
     /// operations implemented for the extended format alone can serve the
     /// narrower ones through it.
+    /// True when a 32-, 64- or 80-bit IEEE value is a signalling NaN.  The
+    /// widening below quiets one, so the fact has to be read from the source.
+    fn is_signaling_nan(value: SizedValue) -> bool {
+        let bits = value.as_bits();
+        match value.size {
+            4 => Single::from_bits(bits).is_signaling(),
+            8 => Double::from_bits(bits).is_signaling(),
+            10 => X87DoubleExtended::from_bits(bits).is_signaling(),
+            _ => false,
+        }
+    }
+
     fn widen_to_f80(value: SizedValue) -> Option<X87DoubleExtended> {
         let mut loses_info = false;
         match value.size {
@@ -1691,6 +1703,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     fn ieee_to_int(value: SizedValue, size: u128, round: Round) -> Option<(SizedValue, Status)> {
         // Every narrower format widens losslessly, so one extended conversion
         // serves f32, f64 and f80 alike.
+        let signaling = Self::is_signaling_nan(value);
         let value = SizedValue::from_bits(Self::widen_to_f80(value)?.to_bits(), 10);
         let size = usize::try_from(size).ok()?;
         if !matches!(size, 2 | 4 | 8) {
@@ -1700,10 +1713,11 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         let converted =
             X87DoubleExtended::from_bits(value.as_bits()).to_i128_r(size * 8, round, &mut exact);
         let mask = (1u128 << (size * 8)) - 1;
-        Some((
-            SizedValue::from_bits(converted.value as u128 & mask, size),
-            converted.status,
-        ))
+        let mut status = converted.status;
+        if signaling {
+            status |= Status::INVALID_OP;
+        }
+        Some((SizedValue::from_bits(converted.value as u128 & mask, size), status))
     }
 
     /// Convert a two's-complement integer of the operand's own width to an
@@ -1897,8 +1911,17 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                 .flatten();
             let unary = wide.and_then(|wide| {
                 let wide = wide.to_bits();
+                // A narrower format is served by an extended evaluation that
+                // truncates, so that the sticky narrowing below performs the
+                // operand format's single rounding. Rounding twice would move
+                // an inexact result two steps under a directed mode.
+                let inner = if lhs.size == 10 {
+                    round
+                } else {
+                    Round::TowardZero
+                };
                 Some(match name.as_ref() {
-                    "float_sqrt" | "float_sqrt_flags" => float80::sqrt_ieee(wide, round),
+                    "float_sqrt" | "float_sqrt_flags" => float80::sqrt_ieee(wide, inner),
                     "float_round_to_integral" | "float_round_to_integral_flags" => {
                         float80::round_to_integral_ieee(wide, round)
                     }
@@ -1915,6 +1938,12 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                         // The packed decimal is ten bytes of digits, not a float.
                         SizedValue::from_bits(result.bits, 10)
                     }));
+                }
+                // Widening quiets a signalling NaN, so its invalid report is
+                // read from the source operand instead.
+                let mut result = result;
+                if Self::is_signaling_nan(lhs) {
+                    result.status |= Status::INVALID_OP;
                 }
                 let inexact = result.status.contains(Status::INEXACT);
                 let (value, status) =
