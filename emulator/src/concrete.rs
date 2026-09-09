@@ -1613,30 +1613,75 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     /// rounding mode.  This is the conversion alone: no architectural
     /// indefinite substitution, no status word, no store policy.
     fn ieee_narrow(value: SizedValue, size: u128, round: Round) -> Option<(SizedValue, Status)> {
-        if value.size != 10 {
-            return None;
-        }
-        let source = X87DoubleExtended::from_bits(value.as_bits());
         let mut loses_info = false;
-        match size {
-            4 => {
-                let converted: rustc_apfloat::StatusAnd<Single> =
-                    source.convert_r(round, &mut loses_info);
+        macro_rules! to {
+            ($source:expr, $target:ty, $bytes:expr) => {{
+                let converted: rustc_apfloat::StatusAnd<$target> =
+                    $source.convert_r(round, &mut loses_info);
                 Some((
-                    SizedValue::from_bits(converted.value.to_bits(), 4),
+                    SizedValue::from_bits(converted.value.to_bits(), $bytes),
                     converted.status,
                 ))
-            }
-            8 => {
-                let converted: rustc_apfloat::StatusAnd<Double> =
-                    source.convert_r(round, &mut loses_info);
-                Some((
-                    SizedValue::from_bits(converted.value.to_bits(), 8),
-                    converted.status,
-                ))
-            }
+            }};
+        }
+        match (value.size, size) {
+            (8, 4) => to!(Double::from_bits(value.as_bits()), Single, 4),
+            (10, 4) => to!(X87DoubleExtended::from_bits(value.as_bits()), Single, 4),
+            (10, 8) => to!(X87DoubleExtended::from_bits(value.as_bits()), Double, 8),
             _ => None,
         }
+    }
+
+    /// Widen a 32- or 64-bit IEEE value to the extended format.  Every such
+    /// value is exactly representable there, so the widening is lossless and
+    /// operations implemented for the extended format alone can serve the
+    /// narrower ones through it.
+    fn widen_to_f80(value: SizedValue) -> Option<X87DoubleExtended> {
+        let mut loses_info = false;
+        match value.size {
+            4 => Some(
+                Single::from_bits(value.as_bits())
+                    .convert_r(Round::NearestTiesToEven, &mut loses_info)
+                    .value,
+            ),
+            8 => Some(
+                Double::from_bits(value.as_bits())
+                    .convert_r(Round::NearestTiesToEven, &mut loses_info)
+                    .value,
+            ),
+            10 => Some(X87DoubleExtended::from_bits(value.as_bits())),
+            _ => None,
+        }
+    }
+
+    /// Narrow an extended intermediate that carries a sticky inexactness back
+    /// to `size` bytes without double rounding.  Forcing the extended
+    /// significand's low bit when the intermediate was inexact (round to odd)
+    /// keeps the exact value on the correct side of every boundary of the
+    /// narrower format, which has at least two fewer significand bits.
+    fn narrow_with_sticky(
+        bits: u128,
+        inexact: bool,
+        size: u8,
+        round: Round,
+    ) -> Option<(SizedValue, Status)> {
+        if size == 10 {
+            return Some((
+                SizedValue::from_bits(bits, 10),
+                if inexact { Status::INEXACT } else { Status::OK },
+            ));
+        }
+        let sticky = if inexact { bits | 1 } else { bits };
+        let (mut result, mut status) = Self::ieee_narrow(
+            SizedValue::from_bits(sticky, 10),
+            u128::from(size),
+            round,
+        )?;
+        if inexact {
+            status |= Status::INEXACT;
+        }
+        result = SizedValue::from_bits(result.as_bits(), size as usize);
+        Some((result, status))
     }
 
     /// Convert a floating value to a two's-complement integer of `size` bytes
@@ -1644,9 +1689,9 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     /// the destination range is invalid; the architectural replacement value
     /// for that case is the caller's business, not this operation's.
     fn ieee_to_int(value: SizedValue, size: u128, round: Round) -> Option<(SizedValue, Status)> {
-        if value.size != 10 {
-            return None;
-        }
+        // Every narrower format widens losslessly, so one extended conversion
+        // serves f32, f64 and f80 alike.
+        let value = SizedValue::from_bits(Self::widen_to_f80(value)?.to_bits(), 10);
         let size = usize::try_from(size).ok()?;
         if !matches!(size, 2 | 4 | 8) {
             return None;
@@ -1659,6 +1704,42 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             SizedValue::from_bits(converted.value as u128 & mask, size),
             converted.status,
         ))
+    }
+
+    /// Convert a two's-complement integer of the operand's own width to an
+    /// IEEE value of `size` bytes under an explicit rounding mode.  Only
+    /// inexact is possible; what the conversion means architecturally is the
+    /// caller's business.
+    fn ieee_from_int(value: SizedValue, size: u128, round: Round) -> Option<(SizedValue, Status)> {
+        let source = value.signed_value();
+        let width = usize::from(value.size) * 8;
+        match size {
+            4 => {
+                let converted = Single::from_i128_r(source, round);
+                Some((
+                    SizedValue::from_bits(converted.value.to_bits(), 4),
+                    converted.status,
+                ))
+            }
+            8 => {
+                let converted = Double::from_i128_r(source, round);
+                Some((
+                    SizedValue::from_bits(converted.value.to_bits(), 8),
+                    converted.status,
+                ))
+            }
+            10 => {
+                let converted = X87DoubleExtended::from_i128_r(source, round);
+                Some((
+                    SizedValue::from_bits(converted.value.to_bits(), 10),
+                    converted.status,
+                ))
+            }
+            _ => {
+                let _ = width;
+                None
+            }
+        }
     }
 
     fn ieee_flags(status: Status) -> SizedValue {
@@ -1775,6 +1856,9 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                     let result = float80::scalb_ieee(lhs.as_bits(), steps, round);
                     Some((SizedValue::from_f80_bits(result.bits), result.status))
                 }
+                "float_from_int" | "float_from_int_flags" => {
+                    Self::ieee_from_int(lhs, rhs.as_bits(), round)
+                }
                 _ => Self::ieee_arithmetic(lhs, rhs, round, name.as_ref()),
             };
             if let Some((result, status)) = evaluated {
@@ -1796,26 +1880,57 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         // The explicit IEEE unary operations take their rounding mode as the
         // second operand and report architecture-neutral facts, exactly like
         // their binary counterparts.
-        if lhs.size == 10 {
-            let unary = Self::ieee_rounding_mode(rhs.as_bits()).and_then(|round| {
+        if let (true, Some(round)) = (
+            matches!(lhs.size, 4 | 8 | 10),
+            Self::ieee_rounding_mode(rhs.as_bits()),
+        ) {
+            // Each operation is evaluated in the extended format, which holds
+            // every f32 and f64 exactly; the intermediate is then narrowed back
+            // with its inexactness kept sticky, so a single rounding reaches
+            // the operand's own format.
+            let extended_only = matches!(
+                name.as_ref(),
+                "float_log2" | "float_log2_flags" | "to_bcd" | "to_bcd_flags"
+            );
+            let wide = (!extended_only || lhs.size == 10)
+                .then(|| Self::widen_to_f80(lhs))
+                .flatten();
+            let unary = wide.and_then(|wide| {
+                let wide = wide.to_bits();
                 Some(match name.as_ref() {
-                    "float_sqrt" | "float_sqrt_flags" => float80::sqrt_ieee(lhs.as_bits(), round),
+                    "float_sqrt" | "float_sqrt_flags" => float80::sqrt_ieee(wide, round),
                     "float_round_to_integral" | "float_round_to_integral_flags" => {
-                        float80::round_to_integral_ieee(lhs.as_bits(), round)
+                        float80::round_to_integral_ieee(wide, round)
                     }
-                    "float_log2" | "float_log2_flags" => float80::log2_ieee(lhs.as_bits()),
-                    "to_bcd" | "to_bcd_flags" => float80::to_bcd(lhs.as_bits(), round),
+                    "float_log2" | "float_log2_flags" => float80::log2_ieee(wide),
+                    "to_bcd" | "to_bcd_flags" => float80::to_bcd(wide, round),
                     _ => return None,
                 })
             });
             if let Some(result) = unary {
+                if name.starts_with("to_bcd") {
+                    return Ok(Some(if name.ends_with("_flags") {
+                        Self::ieee_flags(result.status)
+                    } else {
+                        // The packed decimal is ten bytes of digits, not a float.
+                        SizedValue::from_bits(result.bits, 10)
+                    }));
+                }
+                let inexact = result.status.contains(Status::INEXACT);
+                let (value, status) =
+                    match Self::narrow_with_sticky(result.bits, inexact, lhs.size, round) {
+                        Some((value, status)) => {
+                            (value, status | (result.status & !Status::INEXACT))
+                        }
+                        None => (
+                            SizedValue::from_bits(result.bits, lhs.size as usize),
+                            result.status,
+                        ),
+                    };
                 return Ok(Some(if name.ends_with("_flags") {
-                    Self::ieee_flags(result.status)
-                } else if name.starts_with("to_bcd") {
-                    // The packed decimal is ten bytes of digits, not a float.
-                    SizedValue::from_bits(result.bits, 10)
+                    Self::ieee_flags(status)
                 } else {
-                    SizedValue::from_f80_bits(result.bits)
+                    value
                 }));
             }
         }
