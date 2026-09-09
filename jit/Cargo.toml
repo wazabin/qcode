@@ -37,3 +37,6 @@ serde_json = "1"
 
 [[example]]
 name = "qcode-run"
+
+[[example]]
+name = "taint"
