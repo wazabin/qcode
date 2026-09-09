@@ -65,7 +65,9 @@ jobs:
             wazabin-qcode-jit
           do
             echo "::group::$crate"
-            if cargo info "$crate@$RELEASE_VERSION" >/dev/null 2>&1; then
+            # Ask from outside the checkout: inside it, `cargo info` resolves
+            # the workspace member itself and answers "found" for any version.
+            if (cd "$(mktemp -d)" && cargo info "$crate@$RELEASE_VERSION" >/dev/null 2>&1); then
               # Permit a manual re-run after this version has already uploaded.
               echo "$crate@$RELEASE_VERSION is already on crates.io; skipping"
             else
