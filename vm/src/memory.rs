@@ -20,7 +20,7 @@ use qcode_emulator::{DomainMemory, DomainValue, EmulatorErrorKind, EmulatorMemor
 
 use crate::{
     flat::FlatSpaces,
-    mmu::{MemFault, Mmu},
+    mmu::{MemFault, Mmu, MmuSnapshot},
 };
 
 /// Memory for a VM run: an [`Mmu`] for the RAM space, flat storage elsewhere.
@@ -44,9 +44,34 @@ pub struct VmMemory {
     fault: Option<MemFault>,
 }
 
+/// A point-in-time copy of a [`VmMemory`]: guest RAM and every flat space.
+#[derive(Clone)]
+pub struct MemorySnapshot {
+    mmu: MmuSnapshot,
+    flat: FlatSpaces,
+}
+
 impl VmMemory {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Captures RAM and the flat spaces. RAM is shared copy-on-write with the
+    /// snapshot (see [`Mmu::snapshot`]); the flat spaces — registers, mostly —
+    /// are small and copied.
+    pub fn snapshot(&mut self) -> MemorySnapshot {
+        MemorySnapshot {
+            mmu: self.mmu.snapshot(),
+            flat: self.flat.clone(),
+        }
+    }
+
+    /// Puts back what [`snapshot`](Self::snapshot) captured, and forgets any
+    /// fault taken since: it happened in a state that no longer exists.
+    pub fn restore(&mut self, snapshot: &MemorySnapshot) {
+        self.mmu.restore(&snapshot.mmu);
+        self.flat.restore(&snapshot.flat);
+        self.fault = None;
     }
 
     /// Returns and clears the fault recorded by the most recent failed access.

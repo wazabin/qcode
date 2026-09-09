@@ -18,6 +18,8 @@
 //! `RAX` is meaningless, and putting it on this path would add a page lookup to
 //! the hottest operation in the interpreter.
 
+use std::sync::Arc;
+
 use rustc_hash::FxHashMap;
 
 use crate::tlb::TranslationCache;
@@ -144,39 +146,46 @@ pub struct PageData {
 /// `tests::the_permission_array_follows_the_data_array`.
 pub const PAGE_PERM_OFFSET: usize = PAGE_SIZE as usize;
 
+/// A page of guest memory, shared copy-on-write with any snapshot holding it.
+///
+/// Cloning a page shares its allocation; the first mutable access after that
+/// copies it. That is what makes a snapshot cost one pointer per page and a
+/// restore proportional to the pages written since — the `Arc` is the whole
+/// scheme. Every path to the bytes goes through [`DerefMut`] or
+/// [`host_ptr`](Page::host_ptr), both of which unshare first, so a snapshot's
+/// copy can never be written through the live MMU.
+///
+/// [`DerefMut`]: std::ops::DerefMut
 #[derive(Clone)]
 struct Page {
-    inner: Box<PageData>,
+    inner: Arc<PageData>,
 }
 
 impl Page {
     fn unmapped() -> Self {
-        // Allocated zeroed rather than built and moved: a `PageData` is 8 KiB,
-        // and `Box::new(PageData { .. })` would materialise all of it on the
-        // stack first.
-        //
-        // `alloc_zeroed` rather than `Box::<PageData>::new_zeroed()`, which is
-        // stable only since 1.92 and would raise this crate's MSRV. The
-        // allocator hands back zeroed pages either way.
-        //
-        // SAFETY: `PageData` is two `u8` arrays, for which all-zero — no
-        // permissions, no contents — is both a valid value and the one this
-        // constructor means. The layout is non-zero-sized, and a null return
-        // is routed to the allocation-error handler rather than used.
+        // Zeroed in place: a `PageData` is 8 KiB, and building one and
+        // moving it would materialise all of it on the stack first.
+        // (`Arc::new_zeroed` would say this in one call, but is stable only
+        // since 1.92, above this crate's MSRV.)
+        let mut inner = Arc::<PageData>::new_uninit();
+        // SAFETY: the allocation was just made and is uniquely owned, so
+        // `get_mut` cannot fail, and `PageData` is two `u8` arrays, for which
+        // all-zero — no permissions, no contents — is both a valid value and
+        // the one this constructor means.
         let inner = unsafe {
-            let layout = std::alloc::Layout::new::<PageData>();
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<PageData>();
-            if ptr.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-            Box::from_raw(ptr)
+            Arc::get_mut(&mut inner)
+                .expect("a fresh Arc is unshared")
+                .as_mut_ptr()
+                .write_bytes(0, 1);
+            inner.assume_init()
         };
         Self { inner }
     }
 
-    /// The host address of this page's first data byte.
+    /// The host address of this page's first data byte, unshared: the caller
+    /// is about to let compiled code write through it.
     fn host_ptr(&mut self) -> *mut u8 {
-        std::ptr::from_mut(&mut *self.inner).cast()
+        std::ptr::from_mut(Arc::make_mut(&mut self.inner)).cast()
     }
 }
 
@@ -190,7 +199,7 @@ impl std::ops::Deref for Page {
 
 impl std::ops::DerefMut for Page {
     fn deref_mut(&mut self) -> &mut PageData {
-        &mut self.inner
+        Arc::make_mut(&mut self.inner)
     }
 }
 
@@ -226,6 +235,14 @@ pub struct Mmu {
     code_pages: rustc_hash::FxHashSet<u64>,
     /// Code pages a guest write has landed in since they were last taken.
     code_written: rustc_hash::FxHashSet<u64>,
+    /// Pages touched — written, mapped, unmapped, or handed to compiled code —
+    /// since the last snapshot or restore. What a restore to that snapshot
+    /// has to put back; everything else still *is* the snapshot's page.
+    dirty: rustc_hash::FxHashSet<u64>,
+    /// Which snapshot `dirty` is relative to, by the number it was given.
+    baseline: u64,
+    /// The number the next snapshot gets.
+    generation: u64,
 }
 
 /// Cloning an MMU produces one with an empty [`TranslationCache`].
@@ -242,6 +259,9 @@ impl Clone for Mmu {
             tlb: TranslationCache::default(),
             code_pages: self.code_pages.clone(),
             code_written: self.code_written.clone(),
+            dirty: self.dirty.clone(),
+            baseline: self.baseline,
+            generation: self.generation,
         }
     }
 }
@@ -272,6 +292,25 @@ fn page_chunks(addr: u64, len: u64) -> Result<impl Iterator<Item = (u64, usize, 
 impl Mmu {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The page at `index` for writing, if it exists. Noted as dirty: the
+    /// caller is about to change it, or to let compiled code do so.
+    fn page_mut(&mut self, index: u64) -> Option<&mut Page> {
+        let page = self.pages.get_mut(&index)?;
+        self.dirty.insert(index);
+        Some(page)
+    }
+
+    /// The page at `index` for writing, created unmapped if absent.
+    fn page_or_unmapped(&mut self, index: u64) -> &mut Page {
+        self.dirty.insert(index);
+        self.pages.entry(index).or_insert_with(Page::unmapped)
+    }
+
+    fn remove_page(&mut self, index: u64) {
+        self.dirty.insert(index);
+        self.pages.remove(&index);
     }
 
     /// Number of pages currently backed by memory. Mostly a test and telemetry
@@ -337,7 +376,7 @@ impl Mmu {
         if !self.caching_allowed() || self.code_pages.contains(&(addr >> 12)) {
             return false;
         }
-        let Some(page) = self.pages.get_mut(&(addr >> 12)) else {
+        let Some(page) = self.page_mut(addr >> 12) else {
             return false;
         };
         let host = page.host_ptr();
@@ -354,7 +393,7 @@ impl Mmu {
         self.tlb.flush();
         for (index, offset, take) in page_chunks(addr, len)? {
             self.note_code_write(index);
-            let page = self.pages.entry(index).or_insert_with(Page::unmapped);
+            let page = self.page_or_unmapped(index);
             page.data[offset..offset + take].fill(0);
             page.perm[offset..offset + take].fill(permissions | perm::MAP);
         }
@@ -368,16 +407,14 @@ impl Mmu {
     pub fn unmap(&mut self, addr: u64, len: u64) -> Result<(), MemFault> {
         self.tlb.flush();
         for (index, offset, take) in page_chunks(addr, len)? {
-            let Some(page) = self.pages.get_mut(&index) else {
+            self.note_code_write(index);
+            let Some(page) = self.page_mut(index) else {
                 continue;
             };
             page.data[offset..offset + take].fill(0);
             page.perm[offset..offset + take].fill(perm::NONE);
-            if self.code_pages.contains(&index) {
-                self.code_written.insert(index);
-            }
             if page.perm.iter().all(|&p| p == perm::NONE) {
-                self.pages.remove(&index);
+                self.remove_page(index);
             }
         }
         Ok(())
@@ -414,7 +451,7 @@ impl Mmu {
         }
 
         for (index, offset, take) in page_chunks(addr, len)? {
-            let page = self.pages.get_mut(&index).expect("checked above");
+            let page = self.page_mut(index).expect("checked above");
             for byte in offset..offset + take {
                 let init = page.perm[byte] & perm::INIT;
                 page.perm[byte] = permissions | perm::MAP | init;
@@ -524,7 +561,7 @@ impl Mmu {
         let mut written = 0;
         for (index, offset, take) in page_chunks(addr, bytes.len() as u64)? {
             self.note_code_write(index);
-            let page = self.pages.get_mut(&index).expect("checked above");
+            let page = self.page_mut(index).expect("checked above");
             page.data[offset..offset + take].copy_from_slice(&bytes[written..written + take]);
             for byte in offset..offset + take {
                 page.perm[byte] |= perm::INIT;
@@ -545,32 +582,76 @@ impl Mmu {
         let chunks = page_chunks(addr, bytes.len() as u64)
             .expect("write_unchecked range must fit the address space");
         for (index, offset, take) in chunks {
-            let page = self.pages.entry(index).or_insert_with(Page::unmapped);
+            let page = self.page_or_unmapped(index);
             page.data[offset..offset + take].copy_from_slice(&bytes[written..written + take]);
             page.perm[offset..offset + take].fill(permissions | perm::MAP | perm::INIT);
             written += take;
         }
     }
 
-    /// Captures the full contents of the address space.
+    /// Captures the address space.
     ///
-    /// Deliberately a deep copy: correctness first, and a copy-on-write or
-    /// dirty-page scheme is a drop-in replacement behind this same pair of
-    /// methods once snapshot cost shows up in a profile.
-    pub fn snapshot(&self) -> MmuSnapshot {
+    /// Costs one pointer per resident page: pages are shared with the
+    /// snapshot and copied only when next written. Compiled code holding a
+    /// translation would write through it into the shared page, so the
+    /// translation cache is emptied here.
+    pub fn snapshot(&mut self) -> MmuSnapshot {
+        self.tlb.flush();
+        self.generation += 1;
+        self.baseline = self.generation;
+        self.dirty.clear();
         MmuSnapshot {
             pages: self.pages.clone(),
+            generation: self.generation,
         }
     }
 
     /// Restores a snapshot, discarding every change made since it was taken.
+    ///
+    /// Proportional to the pages touched since that snapshot, when it is the
+    /// one the MMU has been tracking against — the last taken or restored.
+    /// Restoring any other snapshot replaces the whole page table, which is
+    /// still one pointer per page, not a copy.
+    ///
+    /// Lifted code over a page this puts back is reported through
+    /// [`take_code_writes`](Mmu::take_code_writes): the bytes under it may
+    /// not be what it was lifted from.
     pub fn restore(&mut self, snapshot: &MmuSnapshot) {
-        self.pages.clone_from(&snapshot.pages);
-        // `clone_from` reuses pages where it can and replaces the rest, so
-        // which allocation backs a given guest page is no longer knowable.
         self.tlb.flush();
-        // The bytes under every lifted instruction may have changed.
-        self.code_written.extend(self.code_pages.iter().copied());
+        if snapshot.generation == self.baseline {
+            for index in std::mem::take(&mut self.dirty) {
+                match snapshot.pages.get(&index) {
+                    Some(page) => {
+                        self.pages.insert(index, page.clone());
+                    }
+                    None => {
+                        self.pages.remove(&index);
+                    }
+                }
+                self.note_code_write(index);
+            }
+            return;
+        }
+        // Whatever this restore changes under lifted code is stale; the
+        // pages that stay the same allocation are exactly the unchanged ones.
+        for &index in &self.code_pages {
+            let same = match (self.pages.get(&index), snapshot.pages.get(&index)) {
+                (Some(live), Some(saved)) => Arc::ptr_eq(&live.inner, &saved.inner),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same {
+                self.code_written.insert(index);
+            }
+        }
+        self.pages.clone_from(&snapshot.pages);
+        self.baseline = snapshot.generation;
+        self.dirty.clear();
+    }
+
+    /// Pages touched since the last snapshot or restore. Telemetry and tests.
+    pub fn dirty_pages(&self) -> usize {
+        self.dirty.len()
     }
 
     /// Records that `len` bytes at `addr` have been lifted to code, so a
@@ -618,9 +699,13 @@ impl Mmu {
 }
 
 /// An opaque point-in-time copy of an [`Mmu`].
+///
+/// Holds every page the MMU had, shared: memory is only copied where the
+/// live MMU writes afterwards.
 #[derive(Clone)]
 pub struct MmuSnapshot {
     pages: FxHashMap<u64, Page>,
+    generation: u64,
 }
 
 #[cfg(test)]
