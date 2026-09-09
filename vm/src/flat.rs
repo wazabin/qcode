@@ -227,6 +227,36 @@ impl FlatSpaces {
         self.configured_space_count = Some(count);
     }
 
+    /// Puts back the contents captured in `snapshot`, keeping this table's
+    /// shape.
+    ///
+    /// Slots are promised stable for the life of these spaces, and a
+    /// compiled block holds the ones it resolved. A snapshot taken before a
+    /// space was first touched has fewer slots, so the table is not replaced
+    /// wholesale: each space the snapshot holds is copied over, and any space
+    /// that has appeared since is reset to untouched.
+    pub fn restore(&mut self, snapshot: &FlatSpaces) {
+        debug_assert!(
+            snapshot
+                .slots
+                .iter()
+                .all(|(space, &slot)| self.slots.get(space) == Some(&slot)),
+            "slots are append-only, so a snapshot's are a prefix of the live table's"
+        );
+        for (index, space) in self.spaces.iter_mut().enumerate() {
+            match snapshot.spaces.get(index) {
+                Some(saved) => {
+                    space.bytes.clone_from(&saved.bytes);
+                    space.written.clone_from(&saved.written);
+                }
+                None => {
+                    space.bytes.fill(0);
+                    space.written.fill(false);
+                }
+            }
+        }
+    }
+
     /// The stable index of `space`'s storage, creating it on first use.
     ///
     /// Resolve this once and address the space with [`base_ptr_at`](Self::base_ptr_at)

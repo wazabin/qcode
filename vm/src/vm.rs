@@ -29,7 +29,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::{
     hook::{AddressHook, BlockEntryHook, WriteWatch},
     inject::CodeInjector,
-    memory::VmMemory,
+    memory::{MemorySnapshot, VmMemory},
     mmu::MemFault,
     stats::Stats,
     table::{
@@ -205,6 +205,62 @@ pub struct Interrupt {
     /// The guest address of the instruction that lifted to the operation.
     pub pc: Option<u64>,
 }
+
+/// A machine captured by [`Vm::snapshot`].
+///
+/// Opaque; hand it back to [`Vm::restore`]. Cheap to hold: guest RAM is
+/// shared with the live machine until either side writes.
+#[derive(Clone)]
+pub struct VmSnapshot {
+    memory: MemorySnapshot,
+    block: BlockId,
+    /// The op at that position — its id and guest address — so it can be
+    /// found again after its block changes shape.
+    op: Option<(LocalInsnId, Option<u64>)>,
+    /// The guest instruction the position starts, if it starts one: where
+    /// the machine can be put by lifting alone.
+    boundary: Option<u64>,
+    /// Values produced before the position that the rest of the block reads.
+    live: Vec<(InstructionId, SizedValue)>,
+}
+
+/// Why [`Vm::snapshot`] refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotError {
+    /// The machine is stopped at an interrupt that has not been resumed.
+    Interrupted,
+}
+
+/// Why [`Vm::restore`] could not put the machine back where it was. Memory
+/// and registers are restored either way.
+#[derive(Debug, Clone)]
+pub enum RestoreError {
+    /// The snapshot was taken part-way through a guest instruction, and the
+    /// block holding it has since been replaced.
+    PositionLost,
+    /// The instruction the snapshot starts could not be lifted again.
+    Unlifted { addr: u64, error: CodeError },
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Interrupted => f.write_str("the machine is stopped at an unresumed interrupt"),
+        }
+    }
+}
+
+impl std::fmt::Display for RestoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PositionLost => f.write_str("the snapshot's position no longer exists"),
+            Self::Unlifted { addr, error } => write!(f, "cannot lift {addr:#x}: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+impl std::error::Error for RestoreError {}
 
 /// Why [`Vm::resume`] refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -916,8 +972,31 @@ impl<S: CodeSource> Vm<S> {
         self.code_written_at = None;
         let pages = self.emu.memory.mmu.take_code_writes()?;
         let resume = now.expect("checked above");
-        let in_written = |addr: u64| pages.contains(&(addr >> 12));
+        if self.evict_pages(&pages) == 0 {
+            return None;
+        }
 
+        // The machine's own block may be among them. Either way it continues
+        // at the instruction it was about to run, from whatever now covers
+        // that address.
+        if self.emu.block_at_address(&self.ctx, resume).is_none()
+            && let Some(exit) = self.discover(resume)
+        {
+            return Some(exit);
+        }
+        self.absorbed_into = None;
+        if let Some(block) = self.emu.block_at_address(&self.ctx, resume) {
+            self.emu.block = block;
+            self.emu.idx = 0;
+            self.emu.invalidate_block_cache();
+        }
+        None
+    }
+
+    /// Empties every lifted block over `pages`, and forgets what the
+    /// executor and the interpreter derived from them. Returns how many.
+    fn evict_pages(&mut self, pages: &FxHashSet<u64>) -> u64 {
+        let in_written = |addr: u64| pages.contains(&(addr >> 12));
         let mut index = self
             .emu
             .take_address_index()
@@ -951,28 +1030,163 @@ impl<S: CodeSource> Vm<S> {
         self.emu.set_address_index(index);
         self.stats.evicted += evicted;
         if evicted == 0 {
-            return None;
+            return 0;
         }
         if let Some(executor) = self.executor.as_mut() {
             executor.invalidate();
         }
         self.emu.invalidate_block_cache();
+        evicted
+    }
 
-        // The machine's own block may be among them. Either way it continues
-        // at the instruction it was about to run, from whatever now covers
-        // that address.
-        if self.emu.block_at_address(&self.ctx, resume).is_none()
-            && let Some(exit) = self.discover(resume)
+    // ---- Snapshots.
+
+    /// The guest instruction the machine is about to start, if it is
+    /// between instructions.
+    ///
+    /// A guest instruction is several operations, and a step budget can
+    /// stop the machine between two of them. A snapshot taken there can
+    /// only be restored while its block survives unchanged (see
+    /// [`restore`](Self::restore)); one taken here can always be restored.
+    /// [`step`](Self::step) the machine until this answers to get there.
+    pub fn instruction_boundary(&self) -> Option<u64> {
+        let block = self.emu.block;
+        let idx = self.emu.idx;
+        let ids = self.ctx.block(block).instruction_ids();
+        let address_of = |local: LocalInsnId| {
+            self.ctx
+                .get_insn(InstructionId::new(block.func, local))
+                .address()
+        };
+        // The op here carries a different address from the op before it, or
+        // is the first of a block that starts at an address of its own.
+        match (idx, ids.get(idx)) {
+            (0, _) => self.ctx.block(block).address,
+            (_, Some(&local)) => {
+                address_of(local).filter(|&addr| address_of(ids[idx - 1]) != Some(addr))
+            }
+            _ => None,
+        }
+    }
+
+    /// Captures the machine: memory, registers, and where it is.
+    ///
+    /// Guest RAM is shared with the snapshot copy-on-write, so this costs
+    /// one pointer per resident page however large the image; see
+    /// [`Mmu::snapshot`](crate::Mmu::snapshot). Lifted code is *not* copied:
+    /// it is a function of the bytes it was lifted from, and a restore that
+    /// changes those bytes throws the affected blocks away.
+    ///
+    /// Refused while the machine is stopped at an interrupt nobody has
+    /// resumed: that stop is the caller's, and a snapshot would carry it.
+    pub fn snapshot(&mut self) -> Result<VmSnapshot, SnapshotError> {
+        if self.pending.is_some() {
+            return Err(SnapshotError::Interrupted);
+        }
+        let block = self.emu.block;
+        let idx = self.emu.idx;
+        let ids = self.ctx.block(block).instruction_ids();
+        let address_of = |local: LocalInsnId| {
+            self.ctx
+                .get_insn(InstructionId::new(block.func, local))
+                .address()
+        };
+        let op = ids.get(idx).map(|&local| (local, address_of(local)));
+        let boundary = self.instruction_boundary();
+        // Values from earlier in the block that the rest of it reads. Only
+        // those: the value table is sized by the module, not by the block,
+        // and the snapshot must not be.
+        let before: FxHashSet<LocalInsnId> = ids[..idx.min(ids.len())].iter().copied().collect();
+        let mut live = Vec::new();
+        let mut seen = FxHashSet::default();
+        for &local in &ids[idx.min(ids.len())..] {
+            let insn = self.ctx.get_insn(InstructionId::new(block.func, local));
+            for operand in insn.operands() {
+                let ValueId::Instruction(id) = operand else {
+                    continue;
+                };
+                if !before.contains(&id.local) || !seen.insert(id) {
+                    continue;
+                }
+                if let Some(value) = self.emu.insn_values.get(&id) {
+                    live.push((id, *value));
+                }
+            }
+        }
+        Ok(VmSnapshot {
+            memory: self.emu.memory.snapshot(),
+            block,
+            op,
+            boundary,
+            live,
+        })
+    }
+
+    /// Puts the machine back where [`snapshot`](Self::snapshot) found it.
+    ///
+    /// Memory and registers are always restored. The position is restored
+    /// exactly when the op it named is still where it was — blocks grow, get
+    /// cleaned and get split between a snapshot and a restore, and the
+    /// snapshot recognises its op by id and address rather than by index.
+    /// When it is gone, the machine is put at the instruction the snapshot
+    /// was about to start, lifted again if need be; a snapshot taken
+    /// part-way through a guest instruction whose block has since gone
+    /// cannot be positioned, and says so — its memory is restored, its
+    /// position is not.
+    pub fn restore(&mut self, snapshot: &VmSnapshot) -> Result<(), RestoreError> {
+        self.emu.memory.restore(&snapshot.memory);
+        self.pending = None;
+        self.offer_rest = false;
+        self.absorbed_into = None;
+        self.code_written_at = None;
+        self.emu.invalidate_block_cache();
+        if let Some(pages) = self.emu.memory.mmu.take_code_writes() {
+            self.evict_pages(&pages);
+        }
+
+        let block = snapshot.block;
+        let position = if !self.ctx.contains_block(block) {
+            None
+        } else {
+            let ids = self.ctx.block(block).instruction_ids();
+            match snapshot.op {
+                // The same op, wherever a cleanup ahead of it has moved it.
+                Some((local, addr)) => ids.iter().position(|&l| l == local).filter(|_| {
+                    self.ctx
+                        .get_insn(InstructionId::new(block.func, local))
+                        .address()
+                        == addr
+                }),
+                // An empty placeholder: still the same one if it has no code.
+                None => ids.is_empty().then_some(0),
+            }
+        };
+        if let Some(idx) = position {
+            self.emu.block = block;
+            self.emu.idx = idx;
+            for &(id, value) in &snapshot.live {
+                self.emu.insn_values.insert(id, value);
+            }
+            return Ok(());
+        }
+        let Some(pc) = snapshot.boundary else {
+            return Err(RestoreError::PositionLost);
+        };
+        let covering = |vm: &mut Self| {
+            vm.emu
+                .block_at_address(&vm.ctx, pc)
+                .filter(|&b| vm.ctx.block(b).address == Some(pc))
+        };
+        if covering(self).is_none()
+            && let Some(VmExit::Unlifted { addr, error }) = self.discover(pc)
         {
-            return Some(exit);
+            return Err(RestoreError::Unlifted { addr, error });
         }
         self.absorbed_into = None;
-        if let Some(block) = self.emu.block_at_address(&self.ctx, resume) {
-            self.emu.block = block;
-            self.emu.idx = 0;
-            self.emu.invalidate_block_cache();
-        }
-        None
+        let block = covering(self).ok_or(RestoreError::PositionLost)?;
+        self.emu.block = block;
+        self.emu.idx = 0;
+        Ok(())
     }
 
     /// Points the emulator at whatever block now covers `addr`, reusing the
