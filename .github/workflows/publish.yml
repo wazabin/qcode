@@ -30,7 +30,7 @@ jobs:
           git clone --depth=1 "https://github.com/${JSTD_REPOSITORY}.git" ../wazabin-jstd
           git clone --depth=1 "https://github.com/${PCODE_TYPES_REPOSITORY}.git" ../wazabin-pcode
           git clone --depth=1 "https://github.com/${BINARY_REPOSITORY}.git" ../wazabin-binary
-          git clone --depth=1 "https://github.com/${SLEIGH_REPOSITORY}.git" ../wazabin-sleigh
+          git clone --depth=1 --recurse-submodules --shallow-submodules "https://github.com/${SLEIGH_REPOSITORY}.git" ../wazabin-sleigh
 
       - uses: dtolnay/rust-toolchain@stable
 

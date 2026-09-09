@@ -108,10 +108,8 @@ pub fn decode_string(data: &[u8]) -> Option<(StringEncoding, String)> {
 
     // UTF-16LE, optionally NUL-terminated.
     if data.len() >= 2 && data.len().is_multiple_of(2) {
-        let units: Vec<u16> = data
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
+        let (pairs, _) = data.as_chunks::<2>();
+        let units: Vec<u16> = pairs.iter().map(|&pair| u16::from_le_bytes(pair)).collect();
         let units = units.strip_suffix(&[0]).unwrap_or(&units);
         // Require printable ASCII-range code units: random binary read as
         // UTF-16 lands in CJK / presentation-form ranges that decode to valid
@@ -203,9 +201,9 @@ pub fn render_bytes_literal(data: &[u8], mode: BytesDisplay) -> String {
             }
         }
         BytesDisplay::Utf16Le => {
-            let mut chunks = data.chunks_exact(2);
-            for c in &mut chunks {
-                let unit = u16::from_le_bytes([c[0], c[1]]);
+            let (pairs, remainder) = data.as_chunks::<2>();
+            for &pair in pairs {
+                let unit = u16::from_le_bytes(pair);
                 match char::from_u32(unit as u32) {
                     Some(ch) if !ch.is_control() => match ch {
                         '"' | '\\' => {
@@ -218,7 +216,7 @@ pub fn render_bytes_literal(data: &[u8], mode: BytesDisplay) -> String {
                 }
             }
             // Trailing odd byte, if any.
-            for &b in chunks.remainder() {
+            for &b in remainder {
                 out.push_str(&format!("\\x{b:02x}"));
             }
         }
