@@ -396,7 +396,9 @@ impl Jit {
             // compiled code, and the interpreter would otherwise redo it. A
             // body cut at an interrupting op has no successor to decide: the
             // interpreter takes over at the op.
-            let next = if chain && !interrupts {
+            // Nor past a block that wrote over lifted code: the successor may
+            // be what it wrote, and the VM has to see the write first.
+            let next = if chain && !interrupts && !emu.memory.mmu.code_written() {
                 self.next_block(ctx, emu, current)
             } else {
                 None
@@ -563,6 +565,14 @@ impl BlockExecutor for Jit {
         chain: bool,
     ) -> Result<Option<Executed>, EmulatorErrorKind> {
         Jit::run_block(self, ctx, emu, block, start, chain)
+    }
+
+    fn invalidate(&mut self) {
+        // The machine code itself stays: `compiled` is only ever reached
+        // through these two tables, and a `JITModule` cannot free a function
+        // anyway.
+        self.cache.clear();
+        self.partial.clear();
     }
 }
 

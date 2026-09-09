@@ -509,6 +509,15 @@ impl<'str, 'ctx, R> BlockRef<'str, 'ctx, R> {
     pub fn id(&self) -> ValueId {
         self.id.into()
     }
+
+    /// Whether the block this names still exists. See
+    /// [`InstructionRef::exists`](crate::value::InstructionRef::exists).
+    pub fn exists(&self) -> bool
+    where
+        R: QCodeView<'ctx, 'str>,
+    {
+        self.view.contains_block(self.id)
+    }
 }
 
 impl<'str, 'ctx> BlockRef<'str, 'ctx> {

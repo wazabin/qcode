@@ -214,6 +214,18 @@ pub struct Mmu {
     /// and a cache that could answer differently from its source would be a
     /// second implementation of permission checking.
     tlb: TranslationCache,
+    /// Pages holding bytes that have been lifted to code. A guest write into
+    /// one is recorded in `code_written`, so whoever holds the lifted form —
+    /// the VM's module, an interpreter's cached block, a JIT's compiled
+    /// function — can throw it away before it is run again. Compiled code
+    /// never reaches these pages inline (see [`cache_translation`]) so every
+    /// store to one passes through [`write`] and is seen.
+    ///
+    /// [`cache_translation`]: Mmu::cache_translation
+    /// [`write`]: Mmu::write
+    code_pages: rustc_hash::FxHashSet<u64>,
+    /// Code pages a guest write has landed in since they were last taken.
+    code_written: rustc_hash::FxHashSet<u64>,
 }
 
 /// Cloning an MMU produces one with an empty [`TranslationCache`].
@@ -228,6 +240,8 @@ impl Clone for Mmu {
             check_uninit: self.check_uninit,
             watchpoints_armed: self.watchpoints_armed,
             tlb: TranslationCache::default(),
+            code_pages: self.code_pages.clone(),
+            code_written: self.code_written.clone(),
         }
     }
 }
@@ -320,7 +334,7 @@ impl Mmu {
     /// caller — compiled code reads them from the page itself — so this says
     /// nothing about whether any particular access is allowed.
     pub fn cache_translation(&mut self, addr: u64) -> bool {
-        if !self.caching_allowed() {
+        if !self.caching_allowed() || self.code_pages.contains(&(addr >> 12)) {
             return false;
         }
         let Some(page) = self.pages.get_mut(&(addr >> 12)) else {
@@ -339,6 +353,7 @@ impl Mmu {
     pub fn map(&mut self, addr: u64, len: u64, permissions: Perm) -> Result<(), MemFault> {
         self.tlb.flush();
         for (index, offset, take) in page_chunks(addr, len)? {
+            self.note_code_write(index);
             let page = self.pages.entry(index).or_insert_with(Page::unmapped);
             page.data[offset..offset + take].fill(0);
             page.perm[offset..offset + take].fill(permissions | perm::MAP);
@@ -358,6 +373,9 @@ impl Mmu {
             };
             page.data[offset..offset + take].fill(0);
             page.perm[offset..offset + take].fill(perm::NONE);
+            if self.code_pages.contains(&index) {
+                self.code_written.insert(index);
+            }
             if page.perm.iter().all(|&p| p == perm::NONE) {
                 self.pages.remove(&index);
             }
@@ -505,6 +523,7 @@ impl Mmu {
 
         let mut written = 0;
         for (index, offset, take) in page_chunks(addr, bytes.len() as u64)? {
+            self.note_code_write(index);
             let page = self.pages.get_mut(&index).expect("checked above");
             page.data[offset..offset + take].copy_from_slice(&bytes[written..written + take]);
             for byte in offset..offset + take {
@@ -550,6 +569,51 @@ impl Mmu {
         // `clone_from` reuses pages where it can and replaces the rest, so
         // which allocation backs a given guest page is no longer knowable.
         self.tlb.flush();
+        // The bytes under every lifted instruction may have changed.
+        self.code_written.extend(self.code_pages.iter().copied());
+    }
+
+    /// Records that `len` bytes at `addr` have been lifted to code, so a
+    /// later guest write to them is reported by [`take_code_writes`].
+    ///
+    /// [`take_code_writes`]: Mmu::take_code_writes
+    pub fn mark_code(&mut self, addr: u64, len: u64) {
+        let first = addr >> 12;
+        let last = addr.saturating_add(len.saturating_sub(1)) >> 12;
+        let mut newly = false;
+        for index in first..=last {
+            newly |= self.code_pages.insert(index);
+        }
+        // Compiled code may hold a translation for a page that was data until
+        // now, and would store through it without this MMU seeing.
+        if newly {
+            self.tlb.flush();
+        }
+    }
+
+    /// Whether a guest write has landed in a code page since the last
+    /// [`take_code_writes`](Mmu::take_code_writes).
+    pub fn code_written(&self) -> bool {
+        !self.code_written.is_empty()
+    }
+
+    /// The indices of the code pages written since the last call, if any.
+    pub fn take_code_writes(&mut self) -> Option<rustc_hash::FxHashSet<u64>> {
+        if self.code_written.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(&mut self.code_written))
+    }
+
+    /// Whether page `index` holds lifted code.
+    pub fn is_code_page(&self, index: u64) -> bool {
+        self.code_pages.contains(&index)
+    }
+
+    fn note_code_write(&mut self, index: u64) {
+        if self.code_pages.contains(&index) {
+            self.code_written.insert(index);
+        }
     }
 }
 

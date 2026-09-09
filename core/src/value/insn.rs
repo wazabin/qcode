@@ -307,6 +307,19 @@ impl<'str, 'ctx, R> InstructionRef<'str, 'ctx, R> {
         self.id.into()
     }
 
+    /// Whether the instruction this names still exists.
+    ///
+    /// A reference is only an id and a view; the arena slot behind it can be
+    /// freed by a pass or a re-lift while the reference is held. Every other
+    /// accessor assumes it is live, so a consumer building a description of
+    /// an instruction it did not just look up checks here first.
+    pub fn exists(&self) -> bool
+    where
+        R: QCodeView<'ctx, 'str>,
+    {
+        self.view.contains_instruction(self.id)
+    }
+
     /// Format this instruction as a string, with the mnemonic and operands.
     pub fn as_statement(&self) -> InstructionStatement<'_, 'str, 'ctx, R> {
         InstructionStatement(self)

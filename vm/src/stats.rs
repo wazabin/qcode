@@ -45,6 +45,8 @@ pub struct Stats {
     /// Blocks folded into a predecessor as a guest basic block was discovered,
     /// each one a unit the machine no longer enters and leaves separately.
     pub absorbed: u64,
+    /// Lifted blocks emptied because the guest wrote over their bytes.
+    pub evicted: u64,
     /// Instruction bytes read from guest memory.
     pub fetch_bytes: u64,
     /// Time spent reading instruction bytes.

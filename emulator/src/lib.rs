@@ -57,7 +57,7 @@ use qcode::{
     context::Context,
     space::MemorySpaceId,
     value::{
-        BlockId, FunctionId, InstructionId, ValueId, Varnode,
+        BlockId, BlockRef, FunctionId, InstructionId, ValueId, Varnode,
         insn::{
             Binary, Binop, Carry, FloatBinop, FloatToFloat, FloatToInt, Gep, InstructionRef,
             IntBinop, IntToFloat, IsFloatNaN, Load, LzCount, Mnemonic, PopCount, Range, SBorrow,
@@ -106,16 +106,35 @@ pub struct EmulatorError {
 }
 
 impl EmulatorError {
+    /// Describes `kind` at `insn`.
+    ///
+    /// Never panics, whatever state the module is in: a diagnostic is built
+    /// on the way out of a failure, often after the block it names has been
+    /// emptied, split or re-lifted, and an id that no longer resolves is
+    /// reported as such rather than indexed.
     pub fn new(kind: EmulatorErrorKind, insn: &InstructionRef<'_, '_>) -> Self {
+        if !insn.exists() {
+            return Self {
+                kind,
+                ctx: format!("Instruction: <dead {:?}>", insn.id),
+                address: None,
+            };
+        }
+        let parent = insn.parent().filter(BlockRef::exists);
+        let block_name = parent.as_ref().map(|block| block.name());
+        let function_name = parent
+            .as_ref()
+            .and_then(|block| block.parent())
+            .map(|f| f.name());
         Self {
             kind,
             ctx: format!(
                 "Instruction: {}\nBlock: {:?}\nFunction: {:?}",
                 insn.as_statement(),
-                insn.parent().map(|b| b.name()),
-                insn.function().map(|f| f.name())
+                block_name,
+                function_name,
             ),
-            address: insn.parent().and_then(|b| b.address()),
+            address: parent.and_then(|block| block.address()),
         }
     }
 }
@@ -604,5 +623,66 @@ pub trait Interpreter {
     ) -> Result<Option<Self::V>> {
         self.interpret_(&insn, mnemonic)
             .map_err(|kind| EmulatorError::new(kind, &insn))
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    use qcode::value::insn::{Binop, IntBinop};
+
+    /// Two instructions, the second using the first, in a block at 0x1000.
+    fn module() -> (Context<'static>, InstructionId, InstructionId) {
+        let mut ctx = Context::new();
+        let one = ctx.get_const(1, 8).id();
+        let source = ctx.builder_at(0x1000).current_block();
+        let target = ctx.get_or_make_block(0x1001, source.func);
+        let mut builder = ctx.builder(source);
+        let first = builder.push_binop(Binop::Int(IntBinop::Add), one, one).id;
+        let second = builder
+            .push_binop(Binop::Int(IntBinop::Add), ValueId::Instruction(first), one)
+            .id;
+        builder.finalize(target);
+        (ctx, first, second)
+    }
+
+    /// An error is built on the way out of a failure, when the module may
+    /// already have lost the instruction it describes. Building and printing
+    /// it must never be what aborts the run.
+    #[test]
+    fn an_error_at_a_dead_instruction_formats() {
+        let (mut ctx, first, _) = module();
+        ctx.body_mut(first.func).remove_instruction(first);
+        let insn = qcode::value::Instruction::from_id(&ctx, first);
+        let error = EmulatorError::new(EmulatorErrorKind::PoisonRead, &insn);
+        let text = error.to_string();
+        assert!(text.contains("dead"), "{text}");
+        assert_eq!(error.address, None);
+    }
+
+    #[test]
+    fn an_error_at_an_instruction_with_a_dead_operand_formats() {
+        let (mut ctx, first, second) = module();
+        ctx.body_mut(first.func).remove_instruction(first);
+        let insn = qcode::value::Instruction::from_id(&ctx, second);
+        let error = EmulatorError::new(EmulatorErrorKind::PoisonRead, &insn);
+        let text = error.to_string();
+        assert!(text.contains("%dead-tmp"), "{text}");
+        assert_eq!(error.address, Some(0x1000));
+    }
+
+    #[test]
+    fn an_error_in_an_emptied_block_formats() {
+        let (mut ctx, first, second) = module();
+        let block = qcode::value::Instruction::from_id(&ctx, second)
+            .parent()
+            .expect("the instruction is in a block")
+            .id;
+        // Emptying purges the instructions; the references are now stale.
+        ctx.body_mut(block.func).clear_block_instructions(block);
+        for id in [first, second] {
+            let insn = qcode::value::Instruction::from_id(&ctx, id);
+            let _ = EmulatorError::new(EmulatorErrorKind::PoisonRead, &insn).to_string();
+        }
     }
 }

@@ -124,6 +124,15 @@ pub trait BlockExecutor {
         start: usize,
         chain: bool,
     ) -> Result<Option<Executed>, EmulatorErrorKind>;
+
+    /// Forgets everything derived from blocks that no longer exist in the
+    /// form they were translated from.
+    ///
+    /// Called when the guest has written over lifted code: the blocks covering
+    /// it are emptied and lifted again from the new bytes, and an executor
+    /// keyed by block id would otherwise serve the translation of the old
+    /// bytes — the id, and often even the instruction count, survive.
+    fn invalidate(&mut self) {}
 }
 
 /// Where an executor left the machine.
@@ -273,6 +282,9 @@ pub struct Vm<S> {
     generation: u64,
     /// Callbacks the run calls itself. See [`crate::table`].
     table: HookTable<S>,
+    /// The guest instruction a write into lifted code was seen under, until
+    /// the machine leaves it. See [`Self::evict_written_code`].
+    code_written_at: Option<Option<u64>>,
 }
 
 impl<S: CodeSource> Vm<S> {
@@ -296,6 +308,7 @@ impl<S: CodeSource> Vm<S> {
             injected: FxHashMap::default(),
             generation: 0,
             table: HookTable::default(),
+            code_written_at: None,
         }
     }
 
@@ -320,6 +333,7 @@ impl<S: CodeSource> Vm<S> {
         })?;
         let mut vm = Self::new(ctx, entry, source);
         vm.emu.memory = memory;
+        vm.emu.memory.mmu.mark_code(addr, MAX_INSN_LEN);
         vm.emu.memory.configure_spaces(&vm.ctx);
         vm.emu.set_address_index(index);
         vm.stats = stats;
@@ -628,6 +642,13 @@ impl<S: CodeSource> Vm<S> {
         // the second failure means the source did not produce the block it
         // claimed to, which is a source bug rather than a discovery step.
         for attempt in 0..2 {
+            // Lifted code the guest has written over goes before anything is
+            // built from it or run.
+            if self.code_written_at.is_some()
+                && let Some(exit) = self.evict_written_code()
+            {
+                return Some(exit);
+            }
             // At its first instruction a block is between runs, which is the
             // one moment a deferred cleanup can be taken without disturbing a
             // position inside it — and it has to happen before the executor
@@ -661,6 +682,7 @@ impl<S: CodeSource> Vm<S> {
                         self.emu.invalidate_block_cache();
                         self.emu.block = run.block;
                         self.emu.idx = run.body;
+                        self.note_code_write();
                     }
                     Ok(None) => {}
                     Err(kind) => {
@@ -673,9 +695,13 @@ impl<S: CodeSource> Vm<S> {
                 }
             }
 
+            let stepped_at = self.current_guest_address();
             match self.emu.step(&self.ctx) {
                 Ok(()) => {
                     self.stats.steps += 1;
+                    if self.code_written_at.is_none() && self.emu.memory.mmu.code_written() {
+                        self.code_written_at = Some(stepped_at);
+                    }
                     return None;
                 }
                 Err(error) => match error.kind {
@@ -848,6 +874,107 @@ impl<S: CodeSource> Vm<S> {
         Ok(())
     }
 
+    /// The guest address of the operation the machine is positioned at, if
+    /// the op records one.
+    fn current_guest_address(&self) -> Option<u64> {
+        let block = self.ctx.block(self.emu.block);
+        let &local = block.instruction_ids().get(self.emu.idx)?;
+        self.ctx
+            .get_insn(InstructionId::new(self.emu.block.func, local))
+            .address()
+    }
+
+    /// Records, after an executor ran, that lifted code was written: the
+    /// machine sits at the end of the block that wrote it, and the eviction
+    /// waits for the terminator's instruction to finish.
+    fn note_code_write(&mut self) {
+        if self.code_written_at.is_none() && self.emu.memory.mmu.code_written() {
+            self.code_written_at = Some(self.current_guest_address());
+        }
+    }
+
+    /// Throws away every lifted block the guest has written over, once the
+    /// instruction that wrote is complete.
+    ///
+    /// A guest instruction is many operations, and the store may not be its
+    /// last; emptying its block part-way through would lose the rest. So the
+    /// write is noted with the instruction it happened under, and acted on at
+    /// the first op that belongs to a different one — which on the
+    /// interpreter is the very next guest instruction, and after compiled
+    /// code is the one past the block it ran. The blocks covering a written
+    /// page are emptied rather than deleted, so every branch into them stays
+    /// valid and each is lifted again from the new bytes when control
+    /// reaches it — the same shape a split leaves behind.
+    fn evict_written_code(&mut self) -> Option<VmExit> {
+        let written_under = self.code_written_at?;
+        let now = self.current_guest_address();
+        // Still inside the instruction that wrote (or inside an op with no
+        // address, which is never the first of a new instruction).
+        if now.is_none() || now == written_under {
+            return None;
+        }
+        self.code_written_at = None;
+        let pages = self.emu.memory.mmu.take_code_writes()?;
+        let resume = now.expect("checked above");
+        let in_written = |addr: u64| pages.contains(&(addr >> 12));
+
+        let mut index = self
+            .emu
+            .take_address_index()
+            .unwrap_or_else(|| AddressIndex::analyze(&self.ctx));
+        let mut evicted = 0u64;
+        for block in self.ctx.block_ids() {
+            let covered = {
+                let block = self.ctx.block(block);
+                block.address.is_some_and(in_written)
+                    || block.extra_addresses.iter().copied().any(in_written)
+            };
+            if !covered || self.ctx.block(block).instruction_ids().is_empty() {
+                continue;
+            }
+            // Its own address stays indexed: an empty block at an address is
+            // this module's request to lift it. Whatever it absorbed is no
+            // longer anyone's, until lifting settles which block covers it.
+            let absorbed = std::mem::take(&mut self.ctx.block_mut(block).extra_addresses);
+            for addr in absorbed {
+                index.forget(addr);
+            }
+            self.ctx
+                .body_mut(block.func)
+                .clear_block_instructions(block);
+            self.injected.remove(&block);
+            if self.dirty == Some(block) {
+                self.dirty = None;
+            }
+            evicted += 1;
+        }
+        self.emu.set_address_index(index);
+        self.stats.evicted += evicted;
+        if evicted == 0 {
+            return None;
+        }
+        if let Some(executor) = self.executor.as_mut() {
+            executor.invalidate();
+        }
+        self.emu.invalidate_block_cache();
+
+        // The machine's own block may be among them. Either way it continues
+        // at the instruction it was about to run, from whatever now covers
+        // that address.
+        if self.emu.block_at_address(&self.ctx, resume).is_none()
+            && let Some(exit) = self.discover(resume)
+        {
+            return Some(exit);
+        }
+        self.absorbed_into = None;
+        if let Some(block) = self.emu.block_at_address(&self.ctx, resume) {
+            self.emu.block = block;
+            self.emu.idx = 0;
+            self.emu.invalidate_block_cache();
+        }
+        None
+    }
+
     /// Points the emulator at whatever block now covers `addr`, reusing the
     /// emulator's own cached index rather than building one.
     fn reposition(&mut self, addr: u64) {
@@ -881,6 +1008,7 @@ impl<S: CodeSource> Vm<S> {
         if let Err(error) = result {
             return Some(VmExit::Unlifted { addr, error });
         }
+        self.emu.memory.mmu.mark_code(addr, MAX_INSN_LEN);
         if self.optimize
             && let Some(block) = self.emu.block_at_address(&self.ctx, addr)
         {
@@ -1127,6 +1255,10 @@ impl<S: CodeSource> Vm<S> {
         VmExit::InstructionLimit
     }
 }
+
+/// The longest instruction any supported architecture encodes, in bytes: the
+/// span marked as code for a lift when the exact length is not known here.
+const MAX_INSN_LEN: u64 = 16;
 
 /// Resolves a guest address to a block against an existing index.
 fn resolve(ctx: &Context<'_>, index: &AddressIndex, addr: u64) -> Option<BlockId> {
