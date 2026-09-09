@@ -254,10 +254,13 @@ pub(crate) struct BlockTranslator<'a, 'ctx> {
     /// Values produced by instructions in this block, and imports already
     /// loaded.
     values: FxHashMap<InstructionId, Value>,
-    /// Instructions before the entry point whose results this code may read
-    /// from the value buffer rather than compute: the ones the interpreter
-    /// retired before handing the block over part-way through.
-    importable: FxHashSet<InstructionId>,
+    /// This block's own instructions. A result read from outside them is an
+    /// import: computed earlier — by the interpreter, or by compiled code
+    /// that exported it — and waiting in the value buffer.
+    own: FxHashSet<InstructionId>,
+    /// Results of this code that instructions outside it read, and so must be
+    /// written to the value buffer when it returns.
+    escaping: Vec<InstructionId>,
     pub(crate) table: SpaceTable,
     /// Values read from the buffer on entry, in slot order. They take the
     /// first slots; exports follow.
@@ -317,7 +320,8 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
             load_slot: None,
             bases: FxHashMap::default(),
             values: FxHashMap::default(),
-            importable: FxHashSet::default(),
+            own: FxHashSet::default(),
+            escaping: Vec::new(),
             table: SpaceTable::default(),
             imports: Vec::new(),
             exports: Vec::new(),
@@ -376,9 +380,6 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
                 if let Some(&value) = self.values.get(&insn) {
                     return Ok(value);
                 }
-                if !self.importable.contains(&insn) {
-                    return Err(Unsupported::Operand("value produced outside this block"));
-                }
                 self.import(insn, size)
             }
             // A varnode or temp used as a *value* is its address, which only
@@ -430,16 +431,19 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
             .iter()
             .position(|&insn| self.interrupts(insn))
             .map_or(body.len(), |offset| start + offset);
-        let own: FxHashSet<InstructionId> = insns.iter().copied().collect();
-        self.importable = body[..start].iter().copied().collect();
+        self.own = insns.iter().copied().collect();
 
         for &insn_id in &body[start..cut] {
             self.translate_one(insn_id)?;
-            self.check_confined(insn_id, &own)?;
+            self.note_escapes(insn_id);
         }
 
+        let own = std::mem::take(&mut self.own);
         for &reader in &insns[cut..] {
             self.export_operands(reader, &own)?;
+        }
+        for &def in &std::mem::take(&mut self.escaping) {
+            self.export(def)?;
         }
         Ok(cut)
     }
@@ -460,28 +464,25 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         )
     }
 
-    /// Declines the block if `insn_id`'s result is read from outside it.
+    /// Notes that `insn_id`'s result is read from outside this block, so it
+    /// has to be exported when the code returns.
     ///
-    /// Compiled code keeps a block-local value in a machine register, so a use
-    /// from another block would read whatever the interpreter's value table
-    /// happened to hold. Lifted guest code does not produce such a use — state
-    /// crosses blocks through registers and uniques, which are memory — but a
-    /// pass that introduced one must make the block decline, not miscompile.
-    fn check_confined(
-        &self,
-        insn_id: InstructionId,
-        own: &FxHashSet<InstructionId>,
-    ) -> Result<(), Unsupported> {
+    /// Compiled code keeps a block-local value in a machine register, which
+    /// another block cannot see; exporting it to the value buffer is what
+    /// lets that block import it. Lifted guest code rarely produces such a
+    /// use — state crosses blocks through registers and uniques, which are
+    /// memory — but an injected hook that splits a block does, and a value it
+    /// computed before the split is read by the code after it.
+    fn note_escapes(&mut self, insn_id: InstructionId) {
         let value = ValueId::Instruction(insn_id);
         if self
             .ctx
             .users_of(value)
             .iter()
-            .any(|user| !own.contains(user))
+            .any(|user| !self.own.contains(user))
         {
-            return Err(Unsupported::Escapes("result used from another block"));
+            self.escaping.push(insn_id);
         }
-        Ok(())
     }
 
     /// Writes every operand of `reader` that compiled code computed into the
@@ -512,31 +513,40 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
             if !own.contains(&def) {
                 continue;
             }
-            if self.exports.iter().any(|export| export.insn == def) {
-                continue;
-            }
-            // Defined in this block but not by compiled code: an instruction
-            // past the cut, which the interpreter computes itself.
-            let Some(&value) = self.values.get(&def) else {
-                continue;
-            };
-            let size = self.width_of(operand)?;
-            // An export slot is a `u64`. A terminator operand is a condition or
-            // a small integer in practice, so this is a decline that has never
-            // been observed rather than a width worth widening the buffer for.
-            if size > std::mem::size_of::<u64>() {
-                return Err(Unsupported::Terminator("operand wider than an export slot"));
-            }
-            let slot = self.imports.len() + self.exports.len();
-            let widened = self.widen_to_u64(value);
-            self.builder.ins().store(
-                MemFlags::trusted(),
-                widened,
-                self.exports_arg,
-                (slot * std::mem::size_of::<u64>()) as i32,
-            );
-            self.exports.push(Export { insn: def, size });
+            self.export(def)?;
         }
+        Ok(())
+    }
+
+    /// Writes the result of `def` into the next value-buffer slot, once,
+    /// if compiled code produced it.
+    ///
+    /// A definition in this block that compiled code did not produce — an
+    /// instruction past the cut — is the interpreter's to compute, and needs
+    /// nothing.
+    fn export(&mut self, def: InstructionId) -> Result<(), Unsupported> {
+        if self.exports.iter().any(|export| export.insn == def) {
+            return Ok(());
+        }
+        let Some(&value) = self.values.get(&def) else {
+            return Ok(());
+        };
+        let size = self.width_of(ValueId::Instruction(def))?;
+        // A slot is a `u64`. A terminator operand or an escaping value is a
+        // condition or a small integer in practice, so this is a decline that
+        // has never been observed rather than a width worth widening for.
+        if size > std::mem::size_of::<u64>() {
+            return Err(Unsupported::Terminator("operand wider than an export slot"));
+        }
+        let slot = self.imports.len() + self.exports.len();
+        let widened = self.widen_to_u64(value);
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            widened,
+            self.exports_arg,
+            (slot * std::mem::size_of::<u64>()) as i32,
+        );
+        self.exports.push(Export { insn: def, size });
         Ok(())
     }
 
@@ -549,8 +559,13 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         }
     }
 
-    /// Loads the result of `insn`, computed by the interpreter before this
-    /// code was entered, from the next value-buffer slot.
+    /// Loads the result of `insn`, computed before this code was entered,
+    /// from the next value-buffer slot.
+    ///
+    /// The result is there whenever the instruction ran: the interpreter
+    /// files every result it computes, and compiled code exports the ones
+    /// read from outside it. SSA guarantees the definition ran before any
+    /// use, so a missing import is a runtime decline, not a wrong value.
     ///
     /// Imports are numbered from zero as they are met, and the exports emitted
     /// at the end of translation take the slots after them.

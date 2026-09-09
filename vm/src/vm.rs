@@ -357,6 +357,12 @@ impl<S: CodeSource> Vm<S> {
         self.generation += 1;
     }
 
+    /// Registers a [`Hook`](crate::hook::Hook): a code rewriter that picks
+    /// its sites and emits through an [`Emitter`](crate::hook::Emitter).
+    pub fn add_hook(&mut self, hook: impl crate::hook::Hook + 'static) {
+        self.add_injector(Box::new(crate::hook::HookInjector::new(hook)));
+    }
+
     /// Runs the injectors over `block` unless the current set already has.
     ///
     /// Only over lifted code: an empty block carrying an address is a request
@@ -828,11 +834,16 @@ impl<S: CodeSource> Vm<S> {
         }
         self.stats.absorbed += 1;
 
-        // Where the machine has to resume, named by instruction rather than by
-        // index: cleaning the enlarged block deletes instructions ahead of that
-        // point, and every index after a deletion shifts. The first of these
-        // still standing afterwards is the one to resume at.
-        let resume: Vec<LocalInsnId> = self.ctx.block(head).instruction_ids()[offset..].to_vec();
+        // What the head has already run: everything it held before the
+        // absorbed instructions were appended. The machine resumes right
+        // after the last of these still standing, whatever cleanup deletes
+        // ahead of that point or injection inserts after it — an interrupt an
+        // injector places before the first absorbed instruction, say, which
+        // has to run before it.
+        let executed: FxHashSet<LocalInsnId> = self.ctx.block(head).instruction_ids()[..offset]
+            .iter()
+            .copied()
+            .collect();
         self.mark_dirty(head);
 
         self.reindex_absorbed(head);
@@ -845,31 +856,15 @@ impl<S: CodeSource> Vm<S> {
             // to execute is not missed the first time.
             self.inject(head);
             let now = self.ctx.block(head).instruction_ids();
-            let mut resumed = resume
+            let resumed = now
                 .iter()
-                .find_map(|wanted| now.iter().position(|have| have == wanted))
-                .unwrap_or(now.len().saturating_sub(1));
-            // An interrupt an injector placed just before the resume point
-            // belongs to the instruction there, and runs first.
-            while resumed > 0
-                && self.is_interrupt_op(InstructionId::new(head.func, now[resumed - 1]))
-            {
-                resumed -= 1;
-            }
+                .rposition(|local| executed.contains(local))
+                .map_or(0, |last| last + 1);
             self.emu.block = head;
             self.emu.idx = resumed;
             self.emu.invalidate_block_cache();
         }
         Some(head)
-    }
-
-    /// Whether `insn` is a [`VM_INTERRUPT`] op.
-    fn is_interrupt_op(&self, insn: InstructionId) -> bool {
-        let insn = qcode::value::Instruction::from_id(&self.ctx, insn);
-        match insn.mnemonic() {
-            Mnemonic::PCodeOp(op) => self.ctx.shared.pcode_ops[op.id].as_ref() == VM_INTERRUPT,
-            _ => false,
-        }
     }
 
     /// Runs until the machine stops, or until `budget` p-code operations have

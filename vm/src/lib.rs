@@ -35,6 +35,7 @@
 //! [`qcode_jit`](https://docs.rs/qcode_jit) is installed on a machine.
 
 pub mod flat;
+pub mod hook;
 pub mod inject;
 pub mod jit_abi;
 pub mod memory;
@@ -44,7 +45,11 @@ pub mod stats;
 pub mod tlb;
 pub mod vm;
 
-pub use inject::{AddressHook, BlockEntryHook, CodeInjector};
+pub use hook::{
+    AddressHook, BlockEntryHook, BlockView, CompareHook, Emitter, Hook, HookInjector, Site,
+    WriteWatch,
+};
+pub use inject::CodeInjector;
 pub use jit_abi::{
     ACCESS_FAULT, ACCESS_OK, qcode_jit_load, qcode_jit_sdiv128, qcode_jit_srem128, qcode_jit_store,
     qcode_jit_udiv128, qcode_jit_urem128,

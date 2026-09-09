@@ -16,9 +16,9 @@
 //! earlier edits and not repeat them. [`is_interrupt`] is what the built-in
 //! injectors use for that.
 //!
-//! The two injectors here are the ones every hook layer needs — stopping at
-//! the entry of a block, and stopping before a given guest instruction — and
-//! the pattern for writing others.
+//! Most hooks are better written against [`crate::hook`], which chooses
+//! sites, hides the builder and handles idempotence; this is the layer
+//! underneath it.
 
 use qcode::{
     context::Context,
@@ -27,7 +27,6 @@ use qcode::{
         insn::{Mnemonic, VM_INTERRUPT},
     },
 };
-use rustc_hash::FxHashSet;
 
 /// Edits a block before it runs. See the [module documentation](self).
 pub trait CodeInjector {
@@ -77,19 +76,18 @@ pub fn is_interrupt(
 /// Inserts `vm.interrupt(code, args...)` into `block`, before `before` or at
 /// the block's start when `before` is `None`. The op declares no result and
 /// is stamped with guest address `address`, which is what the interrupt then
-/// reports as its `pc`.
+/// reports as its `pc`. `args` are any values visible at that point.
 pub fn insert_interrupt(
     ctx: &mut Context<'static>,
     block: BlockId,
     before: Option<InstructionId>,
     address: Option<u64>,
     code: u64,
-    args: &[u64],
+    args: &[ValueId],
 ) -> InstructionId {
     let op = ctx.shared.vm_interrupt_op();
-    let operands: Vec<ValueId> = std::iter::once(code)
+    let operands: Vec<ValueId> = std::iter::once(ctx.shared.get_const(code, 8))
         .chain(args.iter().copied())
-        .map(|value| ctx.shared.get_const(value, 8))
         .collect();
     let mut builder = ctx.builder(block);
     match before {
@@ -100,97 +98,4 @@ pub fn insert_interrupt(
         builder.set_address(address);
     }
     builder.push_pcode_op(op, operands, None, 0).id
-}
-
-/// Whether `addr` lies in `begin..=end`, or anywhere when `begin > end` —
-/// Unicorn's convention for "no range".
-fn in_range(begin: u64, end: u64, addr: u64) -> bool {
-    begin > end || (begin..=end).contains(&addr)
-}
-
-/// Stops at the entry of every block whose address lies in a range, with
-/// `vm.interrupt(code, address)`.
-#[derive(Debug, Clone)]
-pub struct BlockEntryHook {
-    pub begin: u64,
-    pub end: u64,
-    pub code: u64,
-}
-
-impl CodeInjector for BlockEntryHook {
-    fn inject(&mut self, ctx: &mut Context<'static>, block: BlockId) {
-        let Some(addr) = BasicBlock::from_id(ctx, block).address() else {
-            return;
-        };
-        if !in_range(self.begin, self.end, addr) {
-            return;
-        }
-        let first = ctx.block(block).instruction_ids().first().copied();
-        if let Some(first) = first
-            && is_interrupt(
-                ctx,
-                InstructionId::new(block.func, first),
-                self.code,
-                Some(addr),
-            )
-        {
-            return;
-        }
-        insert_interrupt(ctx, block, None, Some(addr), self.code, &[addr]);
-    }
-}
-
-/// Stops before the guest instruction at each of a set of addresses, with
-/// `vm.interrupt(code, address)`.
-#[derive(Debug, Clone)]
-pub struct AddressHook {
-    pub addresses: FxHashSet<u64>,
-    pub code: u64,
-}
-
-impl AddressHook {
-    pub fn new(addresses: impl IntoIterator<Item = u64>, code: u64) -> Self {
-        Self {
-            addresses: addresses.into_iter().collect(),
-            code,
-        }
-    }
-}
-
-impl CodeInjector for AddressHook {
-    fn inject(&mut self, ctx: &mut Context<'static>, block: BlockId) {
-        // Every distinct guest address the block covers, in order, paired with
-        // its first instruction.
-        let mut targets = Vec::new();
-        let mut seen = None;
-        for insn in BasicBlock::from_id(ctx, block).instructions() {
-            let at = insn.address();
-            if at.is_some() && at != seen {
-                seen = at;
-                if let Some(addr) = at
-                    && self.addresses.contains(&addr)
-                {
-                    targets.push((addr, insn.id));
-                }
-            }
-        }
-        for (addr, first) in targets {
-            let ids = ctx.block(block).instruction_ids();
-            let index = ids
-                .iter()
-                .position(|&local| local == first.local)
-                .expect("the instruction was just found in this block");
-            if index > 0
-                && is_interrupt(
-                    ctx,
-                    InstructionId::new(block.func, ids[index - 1]),
-                    self.code,
-                    Some(addr),
-                )
-            {
-                continue;
-            }
-            insert_interrupt(ctx, block, Some(first), Some(addr), self.code, &[addr]);
-        }
-    }
 }

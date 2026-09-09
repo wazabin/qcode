@@ -1467,6 +1467,42 @@ impl<'str> FunctionBody<'str> {
 
     /// Rehome `remove`'s outgoing CFG edges onto `keep`. The direct edge and
     /// `keep`'s forwarding terminator have already been removed by the caller.
+    /// Moves `insn` and everything after it in its block — the terminator
+    /// included — into a fresh block, and returns that block.
+    ///
+    /// The original block keeps its identity, its address, its parameters and
+    /// its incoming edges, and is left *unterminated*: the caller ends it,
+    /// typically with a branch to the new block or a conditional branch that
+    /// reaches the new block one way or another. The outgoing edges follow the
+    /// terminator to the new block. Values defined before the split stay
+    /// visible to the instructions after it, as SSA allows across blocks.
+    ///
+    /// Unlike an address split this moves code rather than discarding it, so
+    /// it is for rewriting a block in place — inserting a conditional detour —
+    /// not for establishing a new branch target in the guest.
+    pub fn split_block_before(&mut self, block: BlockId, insn: InstructionId) -> BlockId {
+        assert_eq!(block.func, self.id(), "block belongs to another function");
+        assert_eq!(
+            insn.func,
+            self.id(),
+            "instruction belongs to another function"
+        );
+        let index = self
+            .block(block)
+            .instructions
+            .iter()
+            .position(|&local| local == insn.local)
+            .expect("split point is not in the block");
+        let tail = self.make_block();
+        let moved: Vec<LocalInsnId> = self.block_mut(block).instructions.split_off(index);
+        for &local in &moved {
+            self.insn_mut(InstructionId::new(self.id(), local)).parent = Some(tail.local);
+        }
+        self.block_mut(tail).instructions = moved;
+        self.rehome_outgoing_edges(tail, block);
+        tail
+    }
+
     pub fn rehome_outgoing_edges(&mut self, keep: BlockId, remove: BlockId) {
         let outgoing: Vec<EdgeId> = {
             let block = self.block(remove);

@@ -753,6 +753,13 @@ impl<'str> Context<'str> {
         tail
     }
 
+    /// Moves `insn` and everything after it into a fresh block of the same
+    /// function, leaving `block` unterminated for the caller to end. See
+    /// [`FunctionBody::split_block_before`].
+    pub fn split_block_before(&mut self, block: BlockId, insn: InstructionId) -> BlockId {
+        self.bodies[block.func].split_block_before(block, insn)
+    }
+
     /// Borrows one function body and creates the concrete body-local builder
     /// positioned at `block`.
     pub fn builder(&mut self, block: BlockId) -> crate::builder::Builder<'str, '_> {
