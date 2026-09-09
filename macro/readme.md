@@ -17,3 +17,7 @@ capture an in-scope Rust `ValueId` named `name`.
 
 For parsing dynamically supplied source, use `qcode::lower::lower_str`
 instead.
+
+## License
+
+Licensed under the [MIT License](LICENSE).

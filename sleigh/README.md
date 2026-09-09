@@ -37,3 +37,7 @@ PCODE_SLEIGH_CANDIDATE_BUDGET=100000 \
 Candidates are emitted as JSON records containing a canonical opcode, rendered instruction, complete constructor path, and newly covered locations. Review them, generate suitable Binit initial states, then execute them with Aegis before inserting results into the shared database. Flattened p-code operation coverage is the next follow-up.
 
 CI restores `tests/fixtures/binit-smoke.sql` after creating Binit's schema. It is a small Aegis-compatible corpus, so ordinary CI needs only PostgreSQL—not KVM. Refreshing or expanding hardware results remains a separate job for a KVM-capable runner.
+
+## License
+
+Licensed under the [MIT License](LICENSE).

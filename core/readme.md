@@ -47,3 +47,7 @@ declared by the source in the surrounding Rust scope.
 - `FunctionBody`: function-local blocks, instructions, and parameters.
 
 See the API documentation for the QCode text format and the builder methods.
+
+## License
+
+Licensed under the [MIT License](LICENSE).

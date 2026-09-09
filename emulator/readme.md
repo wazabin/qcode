@@ -21,4 +21,4 @@ Developed by [Thalium](https://blog.thalium.re/about/).
 
 ## License
 
-Licensed under the [MIT License](../LICENSE).
+Licensed under the [MIT License](LICENSE).

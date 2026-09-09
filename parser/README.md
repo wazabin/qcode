@@ -6,3 +6,7 @@ parse and inspect QCode syntax before lowering it.
 
 It is also used by `wazabin-qcode-macro` to validate QCode literals at compile
 time.
+
+## License
+
+Licensed under the [MIT License](LICENSE).
