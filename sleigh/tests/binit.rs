@@ -2234,7 +2234,7 @@ mod engine {
             });
 
         let bar_style = ProgressStyle::with_template(
-            "worker {prefix} {percent:>3}% {bar:40.cyan/blue} {human_pos:>12}/{human_len:7} [{elapsed}<{eta}, {per_sec}]",
+            "{prefix} {percent:>3}% {bar:40.cyan/blue} {human_pos:>12}/{human_len:7} [{elapsed}<{eta}, {per_sec}]",
         )
         .unwrap()
         .progress_chars("##-");
@@ -2249,7 +2249,13 @@ mod engine {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("candidates/wazabin_mismatches.csv"));
         let mismatches = Mutex::new(MismatchCsv::new(&output));
-        let chunk_size = replay_cases.len().div_ceil(num_threads.max(1));
+        // Cases are pulled from one shared queue, heaviest first: the x87
+        // ST(i) sweeps carry tens of thousands of states each and sit together
+        // in id order, so static per-worker chunks left two threads with most
+        // of the corpus after the other ten had finished.
+        replay_cases.sort_by(|a, b| b.4.cmp(&a.4).then(a.0.cmp(&b.0)));
+        let next_case = AtomicUsize::new(0);
+        let replay_cases = &replay_cases;
 
         eprintln!(
             "[db-fuzz] replaying {} states across {} scalar test cases on {} threads",
@@ -2258,22 +2264,31 @@ mod engine {
             num_threads
         );
 
+        let bar = ProgressBar::new(total_states);
+        bar.set_style(bar_style.clone());
+        bar.set_prefix("all");
+        let bar = multi.add(bar);
+
         std::thread::scope(|s| {
-            for (worker_id, chunk) in replay_cases.chunks(chunk_size).enumerate() {
-                let chunk_states: u64 = chunk.iter().map(|c| c.4).sum();
-                let bar = multi.add(ProgressBar::new(chunk_states));
-                bar.set_style(bar_style.clone());
-                bar.set_prefix(format!("{worker_id}"));
+            for _ in 0..num_threads.max(1) {
+                let bar = bar.clone();
                 let dsn = &dsn;
                 let total_ok = &total_ok;
                 let total_err = &total_err;
                 let total_ignored = &total_ignored;
                 let total_skipped = &total_skipped;
                 let mismatches = &mismatches;
+                let next_case = &next_case;
                 s.spawn(move || {
                     let mut client =
                         Client::connect(dsn, NoTls).expect("worker failed to connect to x86db");
-                    for (tc_id, instruction, opcode, instruction_id, n_states) in chunk {
+                    loop {
+                        let index = next_case.fetch_add(1, Ordering::Relaxed);
+                        let Some((tc_id, instruction, opcode, instruction_id, n_states)) =
+                            replay_cases.get(index)
+                        else {
+                            break;
+                        };
                         if mismatches
                             .lock()
                             .expect("mismatch mutex was poisoned")
@@ -2314,10 +2329,10 @@ mod engine {
                         }
                         bar.inc(*n_states);
                     }
-                    bar.finish();
                 });
             }
         });
+        bar.finish();
 
         let ok = total_ok.load(Ordering::Relaxed);
         let err = total_err.load(Ordering::Relaxed);
