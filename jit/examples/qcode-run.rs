@@ -119,8 +119,12 @@ fn spec_for(arch: &str) -> Result<&'static CompiledSpec, String> {
 
 fn default_registers(arch: &str) -> &'static [&'static str] {
     match arch {
-        "x64" => &["RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RSP", "RBP", "RIP"],
-        "x86" => &["EAX", "EBX", "ECX", "EDX", "ESI", "EDI", "ESP", "EBP", "EIP"],
+        "x64" => &[
+            "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RSP", "RBP", "RIP",
+        ],
+        "x86" => &[
+            "EAX", "EBX", "ECX", "EDX", "ESI", "EDI", "ESP", "EBP", "EIP",
+        ],
         "aarch64" => &["X0", "X1", "X2", "X3", "SP", "PC"],
         "riscv" => &["ra", "sp", "a0", "a1", "a2", "pc"],
         _ => &[],
@@ -129,7 +133,10 @@ fn default_registers(arch: &str) -> &'static [&'static str] {
 
 fn parse_int(what: &str, value: &str) -> Result<u64, String> {
     let value = value.trim();
-    match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+    match value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
         Some(hex) => u64::from_str_radix(hex, 16),
         None => value.parse(),
     }
@@ -138,7 +145,7 @@ fn parse_int(what: &str, value: &str) -> Result<u64, String> {
 
 fn parse_hex(value: &str) -> Result<Vec<u8>, String> {
     let value: String = value.chars().filter(|c| !c.is_whitespace()).collect();
-    if value.is_empty() || value.len() % 2 != 0 {
+    if value.is_empty() || !value.len().is_multiple_of(2) {
         return Err("code must be a non-empty, even-length hex string".to_string());
     }
     (0..value.len())
@@ -179,7 +186,9 @@ fn parse_map(spec: &str) -> Result<Map, String> {
         None => perm::RW_INIT,
     };
     if parts.next().is_some() {
-        return Err(format!("invalid --map '{spec}' (too many ':'-separated parts)"));
+        return Err(format!(
+            "invalid --map '{spec}' (too many ':'-separated parts)"
+        ));
     }
     Ok(Map {
         addr: parse_int("--map address", addr)?,
@@ -235,6 +244,8 @@ fn stop_text(exit: &VmExit) -> String {
         VmExit::Fault(fault) => format!("fault: {fault}"),
         VmExit::Unlifted { addr, .. } => format!("could not lift code at {addr:#x}"),
         VmExit::Error(message) => format!("interpreter error: {message}"),
+        VmExit::Interrupt(interrupt) => format!("interrupt: {interrupt:?}"),
+        VmExit::HookStop(id) => format!("stopped by hook {id:?}"),
     }
 }
 
@@ -257,9 +268,21 @@ fn run(opts: &Opts) -> Result<Output, String> {
         (Some(_), Some(_)) => return Err("give either code or --file, not both".to_string()),
         (None, None) => return Err("give code or --file".to_string()),
     };
-    let maps = opts.map.iter().map(|m| parse_map(m)).collect::<Result<Vec<_>, _>>()?;
-    let regs = opts.reg.iter().map(|r| parse_reg(r)).collect::<Result<Vec<_>, _>>()?;
-    let dumps = opts.dump.iter().map(|d| parse_dump(d)).collect::<Result<Vec<_>, _>>()?;
+    let maps = opts
+        .map
+        .iter()
+        .map(|m| parse_map(m))
+        .collect::<Result<Vec<_>, _>>()?;
+    let regs = opts
+        .reg
+        .iter()
+        .map(|r| parse_reg(r))
+        .collect::<Result<Vec<_>, _>>()?;
+    let dumps = opts
+        .dump
+        .iter()
+        .map(|d| parse_dump(d))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let source = SleighCodeSource::new(spec);
     let ctx = source.new_context();

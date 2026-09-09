@@ -1,11 +1,12 @@
-//! Unicorn-shaped hooks: callbacks the machine calls from inside [`Vm::run`].
+//! Unicorn-shaped hooks: callbacks the machine calls from inside
+//! [`Vm::run`](crate::Vm::run).
 //!
-//! Each registration installs a [`Hook`](crate::hook::Hook) whose interrupt
+//! Each registration installs a [`Hook`] whose interrupt
 //! carries a code from a reserved range, and files the callback under it.
 //! When a run reaches such an interrupt the callback runs with the machine
 //! stopped at the site, the machine resumes, and the run goes on — unless the
 //! callback asks to [`stop`](HookAction::Stop), in which case the run returns
-//! [`VmExit::HookStop`]. Interrupts with any other code, and every other
+//! [`VmExit::HookStop`](crate::VmExit::HookStop). Interrupts with any other code, and every other
 //! exit, come back to the caller as before.
 //!
 //! Several hooks may watch the same site. They fire in registration order,
