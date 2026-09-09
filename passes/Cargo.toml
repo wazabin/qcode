@@ -1,5 +1,5 @@
 [package]
-name = "qcode_passes"
+name = "wazabin-qcode-passes"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -8,9 +8,12 @@ description = "Block-local cleanup passes over the qcode IR: dead-instruction re
 readme = "readme.md"
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.rs/qcode_passes"
+documentation = "https://docs.rs/wazabin-qcode-passes"
 keywords = ["binary-analysis", "compiler", "ir", "optimization", "pcode"]
 categories = ["development-tools::debugging", "compilers"]
+
+[lib]
+name = "qcode_passes"
 
 [dependencies]
 jstd.workspace = true

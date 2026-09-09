@@ -1,8 +1,8 @@
-# qcode_vm
+# wazabin-qcode-vm
 
-The machine layer over the [QCode](https://docs.rs/qcode) interpreter.
+The machine layer over the [QCode](https://docs.rs/wazabin-qcode) interpreter.
 
-[`qcode_emulator`](https://docs.rs/qcode_emulator) evaluates QCode over a
+[`qcode_emulator`](https://docs.rs/wazabin-qcode-emulator) evaluates QCode over a
 pre-lifted, immutable module: it answers *what does this IR compute*. This
 crate adds what a machine needs on top of that, so a guest program can be
 **run** rather than merely evaluated:
@@ -16,12 +16,12 @@ crate adds what a machine needs on top of that, so a guest program can be
 - **Snapshots** — capture and restore machine state.
 
 Blocks are cleaned up as they are lifted (see
-[`qcode_passes`](https://docs.rs/qcode_passes)): SLEIGH emits a great deal of
+[`qcode_passes`](https://docs.rs/wazabin-qcode-passes)): SLEIGH emits a great deal of
 temporary traffic that the interpreter would otherwise re-execute on every pass
 over a block.
 
 Execution strategy is pluggable via `set_block_executor`, which is how
-[`qcode_jit`](https://docs.rs/qcode_jit) is installed.
+[`qcode_jit`](https://docs.rs/wazabin-qcode-jit) is installed.
 
 Developed by [Thalium](https://blog.thalium.re/about/).
 

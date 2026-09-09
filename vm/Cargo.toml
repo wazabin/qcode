@@ -1,16 +1,19 @@
 [package]
-name = "qcode_vm"
+name = "wazabin-qcode-vm"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Virtual machine layer over the qcode emulator: MMU, faults, on-demand lifting and snapshots"
 readme = "readme.md"
-documentation = "https://docs.rs/qcode_vm"
+documentation = "https://docs.rs/wazabin-qcode-vm"
 keywords = ["binary-analysis", "emulator", "mmu", "reverse-engineering", "virtual-machine"]
 categories = ["development-tools::debugging", "emulators"]
 repository.workspace = true
 homepage.workspace = true
+
+[lib]
+name = "qcode_vm"
 
 [dependencies]
 qcode.workspace = true

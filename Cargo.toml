@@ -15,11 +15,11 @@ homepage = "https://github.com/wazabin/qcode"
 wazabin-binary = { version = "0.1.0", path = "../wazabin-binary" }
 jstd = { package = "wazabin-jstd", version = "0.1.0", path = "../wazabin-jstd" }
 pcode-types = { package = "wazabin-pcode", version = "0.1.0", path = "../wazabin-pcode" }
-qcode = { version = "0.1.0", path = "core" }
-qcode_emulator = { version = "0.1.0", path = "emulator" }
-qcode_jit = { version = "0.1.0", path = "jit" }
-qcode_passes = { version = "0.1.0", path = "passes" }
-qcode_vm = { version = "0.1.0", path = "vm" }
+qcode = { package = "wazabin-qcode", version = "0.1.0", path = "core" }
+qcode_emulator = { package = "wazabin-qcode-emulator", version = "0.1.0", path = "emulator" }
+qcode_jit = { package = "wazabin-qcode-jit", version = "0.1.0", path = "jit" }
+qcode_passes = { package = "wazabin-qcode-passes", version = "0.1.0", path = "passes" }
+qcode_vm = { package = "wazabin-qcode-vm", version = "0.1.0", path = "vm" }
 wazabin-qcode-macro = { version = "0.1.0", path = "macro" }
 wazabin-qcode-parser = { version = "0.1.0", path = "parser" }
 

@@ -1,10 +1,10 @@
-# qcode_jit
+# wazabin-qcode-jit
 
 A [Cranelift](https://cranelift.dev/) JIT backend for
-[QCode](https://docs.rs/qcode) — an execution strategy alongside the
+[QCode](https://docs.rs/wazabin-qcode) — an execution strategy alongside the
 interpreter, not a replacement for it.
 
-[`qcode_emulator`](https://docs.rs/qcode_emulator) interprets QCode one
+[`qcode_emulator`](https://docs.rs/wazabin-qcode-emulator) interprets QCode one
 operation at a time: every intermediate value is materialised into its value
 table and every operand resolved through the module. Compiled code does
 neither. A QCode block is already SSA, so it maps onto Cranelift's SSA
@@ -15,7 +15,7 @@ by the interpreter instead, so coverage can grow over time without ever
 becoming a correctness question. `compile::Unsupported` names what was
 declined and why.
 
-Install it on a [`qcode_vm`](https://docs.rs/qcode_vm) machine:
+Install it on a [`qcode_vm`](https://docs.rs/wazabin-qcode-vm) machine:
 
 ```rust
 vm.set_block_executor(Box::new(qcode_jit::Jit::new()));

@@ -7,9 +7,9 @@ basic blocks, functions, and explicitly addressed memory spaces.
 The crate contains the IR and construction/lowering APIs, and nothing else:
 optimization and execution live in separate crates, so consumers that only
 need the language do not take those dependencies. See
-[`qcode_passes`](https://docs.rs/qcode_passes) for block-local cleanup,
-[`qcode_emulator`](https://docs.rs/qcode_emulator) to interpret it, and
-[`qcode_vm`](https://docs.rs/qcode_vm) to run a guest program under an MMU.
+[`qcode_passes`](https://docs.rs/wazabin-qcode-passes) for block-local cleanup,
+[`qcode_emulator`](https://docs.rs/wazabin-qcode-emulator) to interpret it, and
+[`qcode_vm`](https://docs.rs/wazabin-qcode-vm) to run a guest program under an MMU.
 
 ## Quick start
 

@@ -48,12 +48,12 @@ jobs:
           for crate in \
             wazabin-qcode-parser \
             wazabin-qcode-macro \
-            qcode \
-            qcode_emulator \
-            qcode_passes \
-            qcode_vm \
+            wazabin-qcode \
+            wazabin-qcode-emulator \
+            wazabin-qcode-passes \
+            wazabin-qcode-vm \
             wazabin-qcode-sleigh \
-            qcode_jit
+            wazabin-qcode-jit
           do
             echo "::group::$crate"
             if cargo publish -p "$crate"; then

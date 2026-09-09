@@ -1,7 +1,7 @@
 # QCode
 
 [![CI](https://github.com/wazabin/qcode/actions/workflows/ci.yml/badge.svg)](https://github.com/wazabin/qcode/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/qcode.svg)](https://crates.io/crates/qcode)
+[![crates.io](https://img.shields.io/crates/v/wazabin-qcode.svg)](https://crates.io/crates/wazabin-qcode)
 
 **Decode a binary to p-code, then actually run it — in Rust, with no JVM.**
 

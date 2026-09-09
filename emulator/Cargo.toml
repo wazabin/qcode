@@ -1,16 +1,19 @@
 [package]
-name = "qcode_emulator"
+name = "wazabin-qcode-emulator"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Concrete interpreter and emulator for the qcode IR"
 readme = "readme.md"
-documentation = "https://docs.rs/qcode_emulator"
+documentation = "https://docs.rs/wazabin-qcode-emulator"
 keywords = ["binary-analysis", "emulator", "interpreter", "pcode", "reverse-engineering"]
 categories = ["development-tools::debugging", "emulators"]
 repository.workspace = true
 homepage.workspace = true
+
+[lib]
+name = "qcode_emulator"
 
 [dependencies]
 qcode.workspace = true

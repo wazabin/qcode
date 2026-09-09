@@ -1,15 +1,19 @@
 [package]
-name = "qcode"
+name = "wazabin-qcode"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Typed SSA-style p-code IR for binary analysis, modelled after Ghidra's p-code"
 readme = "readme.md"
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.rs/qcode"
+documentation = "https://docs.rs/wazabin-qcode"
 keywords = ["binary-analysis", "ghidra", "ir", "pcode", "reverse-engineering"]
 categories = ["development-tools::debugging", "compilers"]
+
+[lib]
+name = "qcode"
 
 [features]
 testing = []

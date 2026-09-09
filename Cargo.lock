@@ -849,71 +849,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "qcode"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "inventory",
- "log",
- "pest",
- "rustc-hash",
- "serde",
- "smallvec",
- "wazabin-binary",
- "wazabin-jstd",
- "wazabin-pcode",
- "wazabin-qcode-macro",
- "wazabin-qcode-parser",
-]
-
-[[package]]
-name = "qcode_emulator"
-version = "0.1.0"
-dependencies = [
- "qcode",
- "rustc-hash",
- "rustc_apfloat",
- "wazabin-qcode-macro",
-]
-
-[[package]]
-name = "qcode_jit"
-version = "0.1.0"
-dependencies = [
- "cranelift",
- "cranelift-jit",
- "cranelift-module",
- "cranelift-native",
- "qcode",
- "qcode_emulator",
- "qcode_vm",
- "rustc-hash",
- "wazabin-qcode-macro",
- "wazabin-qcode-sleigh",
- "wazabin-sleigh-precompile",
-]
-
-[[package]]
-name = "qcode_passes"
-version = "0.1.0"
-dependencies = [
- "qcode",
- "rustc-hash",
- "wazabin-jstd",
- "wazabin-qcode-macro",
-]
-
-[[package]]
-name = "qcode_vm"
-version = "0.1.0"
-dependencies = [
- "qcode",
- "qcode_emulator",
- "qcode_passes",
- "rustc-hash",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1487,6 +1422,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "wazabin-qcode"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "inventory",
+ "log",
+ "pest",
+ "rustc-hash",
+ "serde",
+ "smallvec",
+ "wazabin-binary",
+ "wazabin-jstd",
+ "wazabin-pcode",
+ "wazabin-qcode-macro",
+ "wazabin-qcode-parser",
+]
+
+[[package]]
+name = "wazabin-qcode-emulator"
+version = "0.1.0"
+dependencies = [
+ "rustc-hash",
+ "rustc_apfloat",
+ "wazabin-qcode",
+ "wazabin-qcode-macro",
+]
+
+[[package]]
+name = "wazabin-qcode-jit"
+version = "0.1.0"
+dependencies = [
+ "cranelift",
+ "cranelift-jit",
+ "cranelift-module",
+ "cranelift-native",
+ "rustc-hash",
+ "wazabin-qcode",
+ "wazabin-qcode-emulator",
+ "wazabin-qcode-macro",
+ "wazabin-qcode-sleigh",
+ "wazabin-qcode-vm",
+ "wazabin-sleigh-precompile",
+]
+
+[[package]]
 name = "wazabin-qcode-macro"
 version = "0.1.0"
 dependencies = [
@@ -1506,21 +1486,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "wazabin-qcode-passes"
+version = "0.1.0"
+dependencies = [
+ "rustc-hash",
+ "wazabin-jstd",
+ "wazabin-qcode",
+ "wazabin-qcode-macro",
+]
+
+[[package]]
 name = "wazabin-qcode-sleigh"
 version = "0.1.0"
 dependencies = [
  "csv",
  "indicatif",
  "postgres",
- "qcode",
- "qcode_emulator",
- "qcode_vm",
  "rustc-hash",
  "serde",
  "serde_json",
  "wazabin-jstd",
+ "wazabin-qcode",
+ "wazabin-qcode-emulator",
+ "wazabin-qcode-vm",
  "wazabin-sleigh",
  "wazabin-sleigh-precompile",
+]
+
+[[package]]
+name = "wazabin-qcode-vm"
+version = "0.1.0"
+dependencies = [
+ "rustc-hash",
+ "wazabin-qcode",
+ "wazabin-qcode-emulator",
+ "wazabin-qcode-passes",
 ]
 
 [[package]]

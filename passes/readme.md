@@ -1,6 +1,6 @@
-# qcode_passes
+# wazabin-qcode-passes
 
-Block-local cleanup passes over the [QCode](https://docs.rs/qcode) IR.
+Block-local cleanup passes over the [QCode](https://docs.rs/wazabin-qcode) IR.
 
 These are the transforms a *lifter* wants while it is still building a
 function: cheap, local, and safe to run on a partially discovered CFG. They

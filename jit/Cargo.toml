@@ -1,5 +1,5 @@
 [package]
-name = "qcode_jit"
+name = "wazabin-qcode-jit"
 edition.workspace = true
 # Higher than the workspace floor: cranelift 0.129 requires 1.91.
 rust-version = "1.91"
@@ -7,11 +7,14 @@ version.workspace = true
 license.workspace = true
 description = "Cranelift JIT backend for the qcode IR: an alternative execution strategy to the interpreter"
 readme = "readme.md"
-documentation = "https://docs.rs/qcode_jit"
+documentation = "https://docs.rs/wazabin-qcode-jit"
 keywords = ["binary-analysis", "cranelift", "emulator", "jit", "reverse-engineering"]
 categories = ["development-tools::debugging", "emulators"]
 repository.workspace = true
 homepage.workspace = true
+
+[lib]
+name = "qcode_jit"
 
 [dependencies]
 qcode.workspace = true
