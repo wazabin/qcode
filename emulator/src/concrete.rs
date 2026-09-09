@@ -10,8 +10,8 @@ use qcode::{
         BasicBlock, BlockId, BlockParamId, BlockRef, FunctionBody, FunctionId, Instruction,
         LocalValueId, Value, ValueId, ValueRef, Varnode,
         insn::{
-            Binary, Binop, Branch, BranchInd, CBranch, Call, CallInd, Callee, Carry, Extract,
-            FloatBinop, InstructionId, InstructionRef, IntBinop,
+            Branch, BranchInd, CBranch, Call, CallInd, Callee, Carry, Extract,
+            InstructionId, InstructionRef, IntBinop,
             LzCount, Mnemonic, PopCount, Range, Return, SBorrow, SCarry, Scan, Sext,
             Store, Tuple, Unop, Zext,
         },
@@ -1536,8 +1536,8 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     }
 
     /// Evaluate one of the explicit IEEE arithmetic p-code operations in the
-    /// format carried by its operands.  Unlike the x87 helpers, this has no
-    /// architectural payload selection or precision-control policy.
+    /// format carried by its operands.  It reports IEEE facts only: no
+    /// architectural payload selection and no precision-control policy.
     fn ieee_arithmetic(
         lhs: SizedValue,
         rhs: SizedValue,
@@ -1701,37 +1701,19 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         let name = ctx.shared.pcode_ops[op.id].clone();
         let func = insn.id.func;
 
-        // The packed-decimal conversions are the only unary user-ops handled
-        // here, and both need the x87 context for rounding and status.
+        // The significand/exponent split is a pure decomposition of the
+        // encoding and needs no context at all.
         if let [src] = op.args.as_slice() {
             let value = self.scalar_value(ctx, src.qualify(func))?;
             if value.size != 10 {
                 return Ok(None);
             }
-            let Some((control_varnode, status_register)) = Self::x87_context(ctx) else {
-                return Ok(None);
-            };
-            let control = self
-                .read_varnode_u128(ctx, control_varnode)
-                .unwrap_or(0x037f) as u16;
             return Ok(match name.as_ref() {
                 "extract_significand" => Some(SizedValue::from_f80_bits(
                     float80::extract_significand(value.as_bits()),
                 )),
                 "extract_exponent" => {
                     Some(SizedValue::from_f80_bits(float80::extract_exponent(value.as_bits()).bits))
-                }
-                "to_bcd" => {
-                    let result = float80::to_bcd(value.as_bits(), control);
-                    self.record_x87_status(
-                        ctx,
-                        control,
-                        status_register,
-                        result.status,
-                        None,
-                        false,
-                    )?;
-                    Some(SizedValue::from_bits(result.bits, 10))
                 }
                 _ => None,
             });
@@ -1743,6 +1725,33 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             let lhs = self.scalar_value(ctx, lhs.qualify(func))?;
             let rhs = self.scalar_value(ctx, rhs.qualify(func))?;
             let rounding_mode = self.scalar_value(ctx, rounding_mode.qualify(func))?;
+
+            // The partial remainder's third operand selects the quotient's
+            // rounding rule rather than the result's: zero truncates it toward
+            // zero, non-zero rounds it to nearest even. The remainder itself is
+            // exact under either rule, so no result rounding mode applies.
+            if matches!(name.as_ref(), "float_rem_partial" | "float_rem_quotient")
+                && lhs.size == 10
+                && rhs.size == 10
+            {
+                let to_nearest = rounding_mode.as_bits() != 0;
+                let result = float80::remainder(lhs.as_bits(), rhs.as_bits(), to_nearest);
+                return Ok(Some(if name.as_ref() == "float_rem_quotient" {
+                    // Bits 0-2 hold the low three bits of the quotient's
+                    // magnitude; bit 3 reports that the reduction was partial,
+                    // in which case no quotient bits are available and bits 0-2
+                    // are zero.
+                    let code = if result.incomplete {
+                        8
+                    } else {
+                        u128::from(result.quotient & 7)
+                    };
+                    SizedValue::from_bits(code, 1)
+                } else {
+                    SizedValue::from_f80_bits(result.bits)
+                }));
+            }
+
             let Some(round) = Self::ieee_rounding_mode(rounding_mode.as_bits()) else {
                 return Ok(None);
             };
@@ -1791,12 +1800,16 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                         float80::round_to_integral_ieee(lhs.as_bits(), round)
                     }
                     "float_log2" | "float_log2_flags" => float80::log2_ieee(lhs.as_bits()),
+                    "to_bcd" | "to_bcd_flags" => float80::to_bcd(lhs.as_bits(), round),
                     _ => return None,
                 })
             });
             if let Some(result) = unary {
                 return Ok(Some(if name.ends_with("_flags") {
                     Self::ieee_flags(result.status)
+                } else if name.starts_with("to_bcd") {
+                    // The packed decimal is ten bytes of digits, not a float.
+                    SizedValue::from_bits(result.bits, 10)
                 } else {
                     SizedValue::from_f80_bits(result.bits)
                 }));
@@ -1813,29 +1826,6 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         };
 
         let value = match name.as_ref() {
-            // FPREM and FPREM1 report the quotient's low three bits in
-            // C0/C3/C1 and an incomplete reduction in C2. The exceptions are
-            // the specification's; only these condition codes are written
-            // here, and they are still to be moved out.
-            "fprem" | "fprem1" if lhs.size == 10 && rhs.size == 10 => {
-                let Some((_, status_register)) = Self::x87_context(ctx) else {
-                    return Ok(None);
-                };
-                let result =
-                    float80::remainder(lhs.as_bits(), rhs.as_bits(), name.as_ref() == "fprem1");
-                let old = self.read_varnode_u128(ctx, status_register).unwrap_or(0) as u16;
-                // C0, C1, C2 and C3 are all operation results here.
-                let mut new = old & !0x4700;
-                if result.incomplete {
-                    new |= 1 << 10;
-                } else {
-                    new |= u16::from(result.quotient as u8 & 1) << 9;
-                    new |= u16::from((result.quotient >> 1) as u8 & 1) << 14;
-                    new |= u16::from((result.quotient >> 2) as u8 & 1) << 8;
-                }
-                self.set_varnode(ctx, status_register, u64::from(new))?;
-                return Ok(Some(SizedValue::from_f80_bits(result.bits)));
-            }
             "pavgb" => average(1),
             "pavgw" => average(2),
             // Unsigned 16x16 multiply per word lane, keeping the high half.
@@ -1912,171 +1902,6 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             out |= (lane(a, b) & mask) << shift;
         }
         Some(SizedValue::from_bits(out, size))
-    }
-
-    fn x87_context(ctx: &Context<'_>) -> Option<(VarnodeId, VarnodeId)> {
-        let ValueId::Varnode(control) = ctx.get_named("FPUControlWord")? else {
-            return None;
-        };
-        let ValueId::Varnode(status) = ctx.get_named("FPUStatusWord")? else {
-            return None;
-        };
-        Some((control, status))
-    }
-
-    /// x87 defaults to masked exceptions.  We always produce APFloat's default
-    /// result and make every exception sticky.  An unmasked exception sets ES,
-    /// but does not yet transfer control to a hardware exception handler; that
-    /// deliberately non-trapping policy keeps the generic emulator API intact
-    /// until architectural trap delivery is modelled.
-    ///
-    /// Not trapping would also let an unmasked instruction commit a result
-    /// hardware discards, but that part is handled a level up: the constructors
-    /// guard their own commit with `fpu_raised_unmasked`, so an aborted FMULP
-    /// never reaches its pop and an aborted FRNDINT never reaches the `round`
-    /// whose precision flag this function would record.  Only IE, DE and ZE
-    /// abort there - #P stores the rounded result before trapping and #O/#U
-    /// store an exponent-scaled one, so those still commit and still come
-    /// through here.
-    ///
-    /// What remains unmodelled is delivery, not the abort: hardware defers the
-    /// trap to the next floating-point instruction.  Both agree that the
-    /// faulting instruction leaves x87 state unmodified, which is all the
-    /// register and status comparisons observe.
-    fn record_x87_status(
-        &mut self,
-        ctx: &Context<'_>,
-        control: u16,
-        status_register: VarnodeId,
-        ap_status: Status,
-        rounded_up: Option<bool>,
-        denormal_operand: bool,
-    ) -> Result<(), EmulatorErrorKind> {
-        // A divide by zero is likewise decided by the zero divisor, not by the
-        // dividend, so a denormal dividend goes unreported: hardware raises ZE
-        // alone.
-        let denormal_operand = denormal_operand && !ap_status.contains(Status::DIV_BY_ZERO);
-        let mut exceptions = u16::from(denormal_operand) << 1;
-        if ap_status.contains(Status::INVALID_OP) {
-            exceptions |= 1 << 0;
-        }
-        if ap_status.contains(Status::DIV_BY_ZERO) {
-            exceptions |= 1 << 2;
-        }
-        if ap_status.contains(Status::OVERFLOW) {
-            exceptions |= 1 << 3;
-        }
-        if ap_status.contains(Status::UNDERFLOW) {
-            exceptions |= 1 << 4;
-        }
-        if ap_status.contains(Status::INEXACT) {
-            exceptions |= 1 << 5;
-        }
-        if exceptions == 0 && rounded_up.is_none() {
-            return Ok(());
-        }
-        let old = self.read_varnode_u128(ctx, status_register).unwrap_or(0) as u16;
-        let mut new = old | exceptions;
-        // C1 records whether an inexact result was rounded away from zero. It
-        // is an operation result, not a sticky exception bit, so an operation
-        // that reports it writes it every time: a result that did not round up
-        // - including an exact one - clears C1 rather than leaving the previous
-        // instruction's answer standing.
-        if let Some(rounded_up) = rounded_up {
-            new = (new & !(1 << 9))
-                | (u16::from(rounded_up && ap_status.contains(Status::INEXACT)) << 9);
-        }
-        if exceptions & !control & 0x003f != 0 {
-            // ES: one or more unmasked exceptions are pending. B mirrors ES on
-            // every processor since the 387 - it reported the 8087's BUSY line,
-            // and is now recomputed from the same condition.
-            new |= (1 << 7) | (1 << 15);
-        }
-        self.set_varnode(ctx, status_register, u64::from(new))
-    }
-
-
-
-    /// Interpret f80 operations with the x87 control/status words in scope.
-    /// Returns `None` for all non-x87 operations so the generic DomainValue
-    /// interpreter remains the implementation for every other architecture.
-    fn interpret_x87_float(
-        &mut self,
-        ctx: &Context<'_>,
-        insn: &InstructionRef<'_, '_>,
-        mnemonic: &Mnemonic,
-    ) -> Result<Option<SizedValue>, EmulatorErrorKind> {
-        // Every instruction on the generic path reaches this function, so the
-        // structural test comes first: resolving "FPUControlWord" and
-        // "FPUStatusWord" by name per p-code operation cost about 8% of run
-        // time in a profile of a loop containing no floating point at all.
-        // These are the only shapes the match below handles.
-        if !matches!(
-            mnemonic,
-            Mnemonic::Binop(Binary {
-                op: Binop::Float(_),
-                ..
-            })
-        ) {
-            return Ok(None);
-        }
-        let Some((control_register, status_register)) = Self::x87_context(ctx) else {
-            return Ok(None);
-        };
-        let control = self
-            .read_varnode_u128(ctx, control_register)
-            .unwrap_or(0x037f) as u16;
-        let func = insn.id.func;
-        match mnemonic {
-            Mnemonic::Binop(Binary {
-                op: Binop::Float(operation),
-                lhs,
-                rhs,
-            }) => {
-                let lhs = self.scalar_value(ctx, lhs.qualify(func))?;
-                let rhs = self.scalar_value(ctx, rhs.qualify(func))?;
-                if lhs.size != 10 || rhs.size != 10 {
-                    return Ok(None);
-                }
-                // Arithmetic is no longer interpreted here: the x87
-                // constructors use the explicit IEEE p-code operations and
-                // apply their own exception policy.
-                //
-                // A comparison is quiet: only a signalling NaN raises invalid
-                // here. x87's *ordered* compares also raise it for a quiet
-                // NaN, which the FCOM constructors add explicitly, because the
-                // p-code is identical for FCOM and FUCOM and cannot
-                // distinguish them. Comparisons keep their generic boolean
-                // result and only update the sticky status word.
-                if !matches!(
-                    operation,
-                    FloatBinop::Equal
-                        | FloatBinop::NotEqual
-                        | FloatBinop::Less
-                        | FloatBinop::LessEqual
-                ) {
-                    return Ok(None);
-                }
-                if float80::is_signaling_nan(lhs.as_bits())
-                    || float80::is_signaling_nan(rhs.as_bits())
-                {
-                    self.record_x87_status(
-                        ctx,
-                        control,
-                        status_register,
-                        Status::INVALID_OP,
-                        None,
-                        false,
-                    )?;
-                }
-                Ok(None)
-            }
-            // FIST/FISTP/FISTTP and FST/FSTP convert through the explicit
-            // `float_to_int` and `float_narrow` operations, which carry no
-            // architectural policy, so a generic conversion reaching here is
-            // some other specification's and must stay generic.
-            _ => Ok(None),
-        }
     }
 
     fn step_with_event(&mut self, ctx: &Context<'_>) -> crate::Result<StepEvent> {
@@ -2462,14 +2287,6 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             _ => {
                 if let Some(value) = self
                     .interpret_packed_pcode_op(ctx, &insn, mnemonic)
-                    .map_err(|kind| self.make_error(ctx, kind))?
-                {
-                    self.insn_values.insert(id, value);
-                    self.idx += 1;
-                    return Ok(StepEvent::Normal);
-                }
-                if let Some(value) = self
-                    .interpret_x87_float(ctx, &insn, mnemonic)
                     .map_err(|kind| self.make_error(ctx, kind))?
                 {
                     self.insn_values.insert(id, value);
@@ -4354,6 +4171,69 @@ mod tests {
         assert_eq!(emu.get_value(result.into()).unwrap().size().unwrap(), 10);
         // Never written: the status word stays untouched by the operation.
         assert_eq!(emu.read_varnode(FPUStatusWord), None);
+    }
+
+    /// An f80 comparison is a pure predicate. A signalling NaN operand is
+    /// invalid under x87's rules, but raising it is the specification's job:
+    /// the emulator writes no status word for a comparison either.
+    #[test]
+    fn f80_comparison_records_no_status() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i16 FPUControlWord;
+            varnode i16 FPUStatusWord;
+            varnode f80 A;
+            varnode f80 B;
+
+        <block>
+            %a = load(A:10, &A);
+            %b = load(B:10, &B);
+            %equal = %a f== %b;
+            goto <0x1001>;
+        "
+        );
+        let mut emu = Emulator::from_block(&ctx, block);
+        emu.set_varnode(FPUControlWord, 0x037f).unwrap();
+        // A signalling NaN: exponent all ones, integer bit set, quiet bit
+        // clear, non-zero fraction.
+        emu.set_varnode_u128(A, 0x7fff_8000_0000_0000_0001).unwrap();
+        emu.set_varnode_u128(B, 0x3fff_8000_0000_0000_0000).unwrap();
+        emu.run_block().unwrap();
+        assert_eq!(emu.get_value(equal.into()).unwrap().value().unwrap(), 0);
+        assert_eq!(emu.read_varnode(FPUStatusWord), None);
+    }
+
+    /// A partial reduction consumes 63 quotient bits per step, leaving the
+    /// remainder exact. Hardware reduces (2 - 2^-63) * 2^16383 modulo 1.0 to
+    /// exactly zero, which only happens when the whole reducible span is
+    /// consumed: a 32-bit partial quotient leaves a large non-zero remainder.
+    #[test]
+    fn float80_partial_remainder_is_exact() {
+        let dividend = 0x7ffe_ffff_ffff_ffff_ffffu128;
+        let one = 0x3fff_8000_0000_0000_0000u128;
+        for ieee in [false, true] {
+            let result = float80::remainder(dividend, one, ieee);
+            assert!(result.incomplete);
+            assert_eq!(result.bits, 0);
+        }
+
+        // One exponent more of span drops a whole 32-bit group of quotient
+        // bits, leaving 32 behind: the remainder is the dividend's low 32
+        // exponents, not zero. Hardware reduces in 32-bit groups.
+        let half = 0x3ffe_8000_0000_0000_0000u128;
+        let result = float80::remainder(dividend, half, false);
+        assert!(result.incomplete);
+        assert_eq!(result.bits, 0x7fdd_ffff_fffe_0000_0000);
+
+        // A span under 64 exponents still completes in one step and reports
+        // the quotient's low bits.
+        let three = 0x4000_c000_0000_0000_0000u128;
+        let result = float80::remainder(three, one, false);
+        assert!(!result.incomplete);
+        assert_eq!(result.bits, 0);
+        assert_eq!(result.quotient & 7, 3);
     }
 
     /// The 80-bit square root is computed on the integer significand, so it

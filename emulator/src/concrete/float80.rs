@@ -1,4 +1,4 @@
-//! Exact IEEE/x87 80-bit floating-point operations for the concrete emulator.
+//! Exact IEEE-754 80-bit floating-point operations for the concrete emulator.
 //!
 //! The emulator stores scalar values as raw little-endian bits.  Keep all
 //! extended-precision interpretation here so the integer/register-memory
@@ -19,104 +19,6 @@ fn result(value: rustc_apfloat::StatusAnd<X87DoubleExtended>) -> Result {
     Result {
         bits: bits(value.value),
         status: value.status,
-    }
-}
-
-pub(super) fn round_from_control(control: u16) -> Round {
-    match (control >> 10) & 3 {
-        0 => Round::NearestTiesToEven,
-        1 => Round::TowardNegative,
-        2 => Round::TowardPositive,
-        _ => Round::TowardZero,
-    }
-}
-
-/// Apply x87's precision-control field after an extended operation.  Unlike
-/// conversion through IEEE single/double, this rounds the f80 significand in
-/// place and therefore retains x87's much wider exponent range.
-fn apply_precision(value: X87DoubleExtended, control: u16, round: Round) -> Result {
-    let precision = match (control >> 8) & 3 {
-        0 => 24,
-        2 => 53,
-        // 11 is extended; 01 is reserved and treated as extended by this
-        // non-trapping interpreter.
-        _ => {
-            return Result {
-                bits: bits(value),
-                status: Status::OK,
-            };
-        }
-    };
-    let raw = bits(value);
-    let sign_exponent = (raw >> 64) as u16;
-    let negative = sign_exponent & 0x8000 != 0;
-    let exponent = sign_exponent & 0x7fff;
-    // Precision control rounds normal finite extended values.  APFloat has
-    // already handled exceptional and denormal results before this stage.
-    if exponent == 0x7fff {
-        return Result {
-            bits: raw,
-            status: Status::OK,
-        };
-    }
-    // A denormal result is rounded like any other significand rather than
-    // kept: an extended denormal sits far below what 24 or 53 bits of
-    // precision can hold, so it normally rounds away to zero. Hardware
-    // reports underflow alongside the inexact result either way.
-    let denormal = exponent == 0;
-    if denormal && raw as u64 == 0 {
-        return Result {
-            bits: raw,
-            status: Status::OK,
-        };
-    }
-    let significand = raw as u64;
-    let discarded_bits = 64 - precision;
-    let discarded_mask = (1u64 << discarded_bits) - 1;
-    let discarded = significand & discarded_mask;
-    if discarded == 0 {
-        let status = if denormal {
-            Status::UNDERFLOW | Status::INEXACT
-        } else {
-            Status::OK
-        };
-        return Result { bits: raw, status };
-    }
-    let retained = significand >> discarded_bits;
-    let increment = match round {
-        Round::NearestTiesToEven => {
-            let halfway = 1u64 << (discarded_bits - 1);
-            discarded > halfway || (discarded == halfway && retained & 1 != 0)
-        }
-        Round::TowardPositive => !negative,
-        Round::TowardNegative => negative,
-        Round::TowardZero => false,
-        // x87 has no ties-away mode, but preserving APFloat's behavior here
-        // makes this helper total if a caller uses it in the future.
-        Round::NearestTiesToAway => discarded >= (1u64 << (discarded_bits - 1)),
-    };
-    let (retained, exponent) = if increment {
-        let (rounded, carry) = retained.overflowing_add(1);
-        if carry || rounded == (1u64 << precision) {
-            (1u64 << (precision - 1), exponent.saturating_add(1))
-        } else {
-            (rounded, exponent)
-        }
-    } else {
-        (retained, exponent)
-    };
-    let rounded = (u128::from(sign_exponent & 0x8000 | exponent) << 64)
-        | (u128::from(retained) << discarded_bits);
-    let mut status = Status::INEXACT;
-    if denormal {
-        status |= Status::UNDERFLOW;
-    }
-    if exponent == 0x7fff {
-        status |= Status::OVERFLOW;
-    }
-    Result {
-        bits: rounded,
-        status,
     }
 }
 
@@ -203,70 +105,6 @@ pub(super) fn round_to_precision(raw: u128, precision: u32, round: Round) -> Res
     }
 }
 
-/// x87's unsupported encodings: a non-zero exponent with the explicit integer
-/// bit clear. An unnormal, and the pseudo-NaN and pseudo-infinity that share
-/// that shape, are not values the FPU will operate on - it reports invalid and
-/// delivers the indefinite rather than computing with them. A zero exponent
-/// with the bit clear is an ordinary denormal and stays valid.
-fn is_unsupported(raw: u128) -> bool {
-    let exponent = (raw >> 64) & 0x7fff;
-    let integer_bit = (raw >> 63) & 1;
-    exponent != 0 && integer_bit == 0
-}
-
-/// The value a masked invalid operation delivers.
-///
-/// x87 propagates a NaN operand rather than the architectural indefinite: the
-/// NaN is quieted in place, so its sign and payload survive. When both
-/// operands are NaNs the one with the larger significand wins. The indefinite
-/// is written only for an invalid operation that has no NaN operand at all -
-/// 0*inf, inf-inf, 0/0, inf/inf and the like.
-fn invalid_result(operands: &[u128]) -> u128 {
-    const INDEFINITE: u128 = 0xffff_c000_0000_0000_0000;
-    const QUIET_BIT: u128 = 1 << 62;
-    let mut winner: Option<u128> = None;
-    for &raw in operands {
-        if !value(raw).is_nan() {
-            continue;
-        }
-        winner = match winner {
-            Some(current) if (current as u64) >= (raw as u64) => Some(current),
-            _ => Some(raw),
-        };
-    }
-    match winner {
-        Some(raw) => raw | QUIET_BIT,
-        None => INDEFINITE,
-    }
-}
-
-fn arithmetic(
-    value: rustc_apfloat::StatusAnd<X87DoubleExtended>,
-    control: u16,
-    round: Round,
-    operands: &[u128],
-) -> Result {
-    let rounded = apply_precision(value.value, control, round);
-    // APFloat computes with an unsupported encoding rather than rejecting it,
-    // so the invalid it never raises has to be added here.
-    let unsupported = operands.iter().copied().any(is_unsupported);
-    let mut status = value.status | rounded.status;
-    if unsupported {
-        status |= Status::INVALID_OP;
-    }
-    // APFloat's operation-specific NaN sign/payload is not what x87 delivers.
-    let bits = if unsupported {
-        // An unsupported operand outranks NaN propagation: there is no
-        // meaningful payload to carry, so the indefinite is delivered.
-        0xffff_c000_0000_0000_0000
-    } else if status.contains(Status::INVALID_OP) {
-        invalid_result(operands)
-    } else {
-        rounded.bits
-    };
-    Result { bits, status }
-}
-
 fn value(bits: u128) -> X87DoubleExtended {
     X87DoubleExtended::from_bits(bits)
 }
@@ -293,18 +131,10 @@ pub(super) fn from_f64(value: f64) -> u128 {
     )
 }
 
+/// FILD's conversion. Every integer x87 loads fits the 64-bit significand
+/// exactly, so this is an exact nearest-even conversion with no status.
 pub(super) fn from_i128(value: i128) -> u128 {
-    from_i128_contextual(value, 0x037f).bits
-}
-
-pub(super) fn from_i128_contextual(value: i128, control: u16) -> Result {
-    let round = round_from_control(control);
-    arithmetic(
-        X87DoubleExtended::from_i128_r(value, round),
-        control,
-        round,
-        &[],
-    )
+    bits(X87DoubleExtended::from_i128_r(value, Round::NearestTiesToEven).value)
 }
 
 pub(super) fn from_f32_bits(raw: u32) -> u128 {
@@ -455,26 +285,28 @@ pub(super) fn round_to_integral_ieee(raw: u128, round: Round) -> Result {
     result(value(raw).round_to_integral(round))
 }
 
-/// The result of FPREM/FPREM1: an exact remainder plus the quotient bits the
-/// condition codes report.
+/// An exact partial remainder, plus the quotient facts a caller may report.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Remainder {
     pub bits: u128,
-    /// Low three bits of the quotient's magnitude, reported in C0/C3/C1.
+    /// Low three bits of the quotient's magnitude.
     pub quotient: u64,
-    /// Set when the reduction did not complete, which x87 reports as C2.
+    /// Set when the reduction was only partial, so no quotient bits exist.
     pub incomplete: bool,
 }
 
-/// FPREM (`ieee` false, quotient truncated toward zero) and FPREM1 (`ieee`
-/// true, quotient rounded to nearest even). The remainder itself is always
-/// exact, so no rounding control applies.
+/// The partial remainder. `ieee` false truncates the quotient toward zero;
+/// `ieee` true rounds it to nearest even. The remainder is exact under either
+/// rule, so no result rounding mode applies.
 ///
-/// x87 reduces at most 63 binary exponents at a time. Beyond that it performs
-/// a partial reduction and sets C2 so the caller loops. No hardware capture in
-/// the corpus reaches that path, so the exact number of exponents consumed per
-/// partial step is not pinned down here; a vector that exercises it should be
-/// captured before this branch is relied on.
+/// At most 63 quotient bits are produced per call, and they are produced 32 at
+/// a time: when the operands' exponent span reaches 64 the reduction is partial
+/// and consumes the largest multiple of 32 quotient bits that leaves at least
+/// 32 of the span behind, so between 32 and 63 bits of span survive each step.
+/// It computes the remainder modulo the divisor scaled by `2^bits`, sets
+/// `incomplete`, and the caller repeats until it clears. The step size is
+/// observable: it decides both the intermediate remainders and whether a
+/// dividend that is an exact multiple of the divisor reduces to zero.
 pub(super) fn remainder(raw: u128, divisor: u128, ieee: bool) -> Remainder {
     let x = value(raw);
     let y = value(divisor);
@@ -484,8 +316,9 @@ pub(super) fn remainder(raw: u128, divisor: u128, ieee: bool) -> Remainder {
         quotient: 0,
         incomplete: false,
     };
-    // A zero divisor or an infinite dividend is invalid, and x87's masked
-    // result is the indefinite QNaN rather than APFloat's NaN.
+    // A zero divisor or an infinite dividend has no remainder. The value a
+    // caller substitutes for such an invalid operation is its own choice; the
+    // default quiet NaN stands in until it does.
     if y.is_zero() || x.is_infinite() {
         return indefinite;
     }
@@ -504,8 +337,9 @@ pub(super) fn remainder(raw: u128, divisor: u128, ieee: bool) -> Remainder {
 
     let exponent_span = x.ilogb() - y.ilogb();
     if exponent_span >= 64 {
-        // Partial reduction: bring the dividend within reach of one more step.
-        let scaled = y.scalbn(exponent_span - 32);
+        // Partial reduction: take as many whole 32-bit groups of quotient bits
+        // as leave at least 32 exponents of span for the following steps.
+        let scaled = y.scalbn((exponent_span - 32) / 32 * 32);
         let value = x.c_fmod(scaled);
         return Remainder {
             bits: bits(value.value),
@@ -552,11 +386,13 @@ const BCD_INDEFINITE: u128 = 0xffff_c000_0000_0000_0000;
 const BCD_MAX: i128 = 999_999_999_999_999_999;
 
 
-/// FBSTP: round to an integer under the rounding control, then pack it as
-/// eighteen decimal digits. A value that will not fit — including a NaN or an
-/// infinity — stores the packed-decimal indefinite and raises invalid.
-pub(super) fn to_bcd(raw: u128, control: u16) -> Result {
-    let rounded = round_to_integral_ieee(raw, round_from_control(control));
+/// Pack a value as eighteen signed decimal digits after rounding it to an
+/// integer under `round`. The conversion is exact when it succeeds and
+/// inexact when rounding discarded a fraction; a value that will not fit -
+/// including a NaN or an infinity - is invalid and yields the packed-decimal
+/// indefinite. Choosing what to do with either fact is the caller's.
+pub(super) fn to_bcd(raw: u128, round: Round) -> Result {
+    let rounded = round_to_integral_ieee(raw, round);
     let mut exact = false;
     let converted = value(rounded.bits).to_i128_r(80, Round::TowardZero, &mut exact);
     let magnitude = converted.value;
@@ -730,13 +566,6 @@ pub(super) fn abs(raw: u128) -> u128 {
 
 pub(super) fn is_nan(raw: u128) -> bool {
     value(raw).is_nan()
-}
-
-/// A signalling NaN raises invalid even for a quiet comparison. x87's ordered
-/// compares additionally raise it for a quiet NaN, which the FCOM
-/// constructors express; the unordered FUCOM forms do not.
-pub(super) fn is_signaling_nan(raw: u128) -> bool {
-    value(raw).is_signaling()
 }
 
 pub(super) fn equal(lhs: u128, rhs: u128) -> bool {
