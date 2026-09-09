@@ -17,7 +17,7 @@ jstd.workspace = true
 qcode.workspace = true
 qcode_vm.workspace = true
 rustc-hash.workspace = true
-sleigh = { package = "wazabin-sleigh", version = "0.1.0", path = "../../wazabin-sleigh/core" }
+sleigh = { package = "wazabin-sleigh", version = "0.1.2", path = "../../wazabin-sleigh/core" }
 
 [[example]]
 name = "qcode-dump"
@@ -26,7 +26,7 @@ path = "examples/qcode_dump.rs"
 [dev-dependencies]
 # The coverage test names the constructors the corpus never reaches, which
 # needs read-only access to the specification's symbolic structures.
-sleigh = { package = "wazabin-sleigh", version = "0.1.0", path = "../../wazabin-sleigh/core", features = ["unstable-introspect"] }
+sleigh = { package = "wazabin-sleigh", version = "0.1.2", path = "../../wazabin-sleigh/core", features = ["unstable-introspect"] }
 qcode_emulator.workspace = true
 sleigh-precompile = { package = "wazabin-sleigh-precompile", path = "../../wazabin-sleigh/precompile" }
 serde.workspace = true

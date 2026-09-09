@@ -64,6 +64,18 @@ which is what lets a harness observe a bad access instead of dying on it.
 The JIT is deliberately partial: a block it declines is interpreted instead, so
 its coverage can grow without ever becoming a correctness question.
 
+## Installation
+
+```toml
+[dependencies]
+qcode = { package = "wazabin-qcode", version = "0.1" }
+qcode_vm = { package = "wazabin-qcode-vm", version = "0.1" }
+```
+
+The published crates are named `wazabin-qcode-*`; their library names are the
+short `qcode_*` forms used throughout the examples. The minimum supported Rust
+version is 1.88 (1.91 for `wazabin-qcode-jit`, which follows Cranelift).
+
 ## Writing IR by hand
 
 QCode has a text format, which is how most of the test suite is written:
@@ -96,7 +108,7 @@ cargo test --workspace --all-features
 ```
 
 The workspace uses the sibling `wazabin-sleigh`, `wazabin-pcode`,
-`wazabin-binary`, and `jstd` checkouts declared in `Cargo.toml`.
+`wazabin-binary`, and `wazabin-jstd` checkouts declared in `Cargo.toml`.
 
 ## License
 

@@ -13,7 +13,7 @@ homepage = "https://github.com/wazabin/qcode"
 
 [workspace.dependencies]
 wazabin-binary = { version = "0.1.0", path = "../wazabin-binary" }
-jstd = { package = "wazabin-jstd", version = "0.1.0", path = "../wazabin-jstd" }
+jstd = { package = "wazabin-jstd", version = "0.2.0", path = "../wazabin-jstd" }
 pcode-types = { package = "wazabin-pcode", version = "0.1.0", path = "../wazabin-pcode" }
 qcode = { package = "wazabin-qcode", version = "0.1.0", path = "core" }
 qcode_emulator = { package = "wazabin-qcode-emulator", version = "0.1.0", path = "emulator" }

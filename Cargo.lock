@@ -1397,7 +1397,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-jstd"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "rustc-hash",
  "serde",
@@ -1406,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-jstd-derive"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1415,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-pcode"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "wazabin-jstd",
@@ -1525,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-sleigh"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pest",
  "pest_derive",
@@ -1537,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-sleigh-precompile"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bincode",
  "serde",
