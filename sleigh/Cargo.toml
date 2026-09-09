@@ -23,14 +23,20 @@ sleigh = { package = "wazabin-sleigh", version = "0.1.2", path = "../../wazabin-
 name = "qcode-dump"
 path = "examples/qcode_dump.rs"
 
+[[example]]
+name = "qcode-lift"
+path = "examples/qcode-lift.rs"
+
 [dev-dependencies]
 # The coverage test names the constructors the corpus never reaches, which
 # needs read-only access to the specification's symbolic structures.
 sleigh = { package = "wazabin-sleigh", version = "0.1.2", path = "../../wazabin-sleigh/core", features = ["unstable-introspect"] }
 qcode_emulator.workspace = true
+qcode_passes.workspace = true
 sleigh-precompile = { package = "wazabin-sleigh-precompile", path = "../../wazabin-sleigh/precompile" }
 serde.workspace = true
 serde_json = "1"
+clap = { version = "4", features = ["derive"] }
 indicatif = "0.18"
 postgres = "0.19"
 csv = "1"

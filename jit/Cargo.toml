@@ -30,3 +30,10 @@ cranelift-native = "0.129"
 wazabin-qcode-macro.workspace = true
 wazabin-qcode-sleigh = { version = "0.1.1", path = "../sleigh" }
 sleigh-precompile = { package = "wazabin-sleigh-precompile", version = "0.1.2", path = "../../wazabin-sleigh/precompile" }
+sleigh = { package = "wazabin-sleigh", version = "0.1.2", path = "../../wazabin-sleigh/core" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[example]]
+name = "qcode-run"
