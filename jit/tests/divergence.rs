@@ -99,6 +99,7 @@ impl BlockExecutor for Recorder {
         ctx: &Context<'_>,
         emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
+        start: usize,
         chain: bool,
     ) -> Result<Option<Executed>, EmulatorErrorKind> {
         let bytes = emu
@@ -128,7 +129,7 @@ impl BlockExecutor for Recorder {
             // decision to stay in it.
             Some(jit) => {
                 let _ = chain;
-                jit.run_block(ctx, emu, block, false)
+                jit.run_block(ctx, emu, block, start, false)
             }
             None => Ok(None),
         }

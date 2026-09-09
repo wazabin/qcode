@@ -107,7 +107,10 @@ fn spec_for(arch: &str) -> Result<&'static CompiledSpec, String> {
 
 fn parse_int(what: &str, value: &str) -> Result<u64, String> {
     let value = value.trim();
-    match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+    match value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
         Some(hex) => u64::from_str_radix(hex, 16),
         None => value.parse(),
     }
@@ -116,7 +119,7 @@ fn parse_int(what: &str, value: &str) -> Result<u64, String> {
 
 fn parse_hex(value: &str) -> Result<Vec<u8>, String> {
     let value: String = value.chars().filter(|c| !c.is_whitespace()).collect();
-    if value.is_empty() || value.len() % 2 != 0 {
+    if value.is_empty() || !value.len().is_multiple_of(2) {
         return Err("bytes must be a non-empty, even-length hex string".to_string());
     }
     (0..value.len())
@@ -150,7 +153,8 @@ fn run(opts: &Opts) -> Result<Output, String> {
     let mut addresses = AddressIndex::analyze(&context);
     // One function gathers every instruction of the walk, as a caller lifting a
     // known body would want; without it the lifter makes one per address.
-    let function = FunctionBody::make_at_addr_indexed(&mut context, &mut addresses, address, None).id;
+    let function =
+        FunctionBody::make_at_addr_indexed(&mut context, &mut addresses, address, None).id;
 
     let limit = opts.count.unwrap_or(usize::MAX);
     let mut instructions = Vec::new();
@@ -210,7 +214,11 @@ fn run(opts: &Opts) -> Result<Output, String> {
         arch: opts.arch.clone(),
         instructions,
         qcode: context.to_string(),
-        functions: if functions.is_empty() { None } else { Some(functions) },
+        functions: if functions.is_empty() {
+            None
+        } else {
+            Some(functions)
+        },
     })
 }
 

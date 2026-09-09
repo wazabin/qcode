@@ -965,6 +965,20 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         Unop::FloatNegate
     );
 
+    /// Creates any integer or float binary operation. Comparisons yield a
+    /// one-byte result; the rest take the operands' width.
+    pub fn push_binop(
+        &mut self,
+        op: Binop,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, BodyView<'_, 'str>> {
+        let (lhs, rhs) = (self.loc(lhs), self.loc(rhs));
+        let size = op.is_comparison().then_some(1);
+        let local = self.push_binop_local(op, lhs, rhs, size);
+        self.insn_ref(local)
+    }
+
     fn push_binop_local(
         &mut self,
         op: Binop,

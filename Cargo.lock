@@ -1509,6 +1509,8 @@ dependencies = [
 [[package]]
 name = "wazabin-binary"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "263595c6b132ac844531d92d3c3eb1b70c22a8195b22df2ca101a43e0d1d0679"
 dependencies = [
  "elf",
  "goblin",
@@ -1518,6 +1520,8 @@ dependencies = [
 [[package]]
 name = "wazabin-jstd"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7124aa05e3bcdc957412b87a34470d75eec08b4a199a11f837d73a72519eca22"
 dependencies = [
  "rustc-hash",
  "serde",
@@ -1527,6 +1531,8 @@ dependencies = [
 [[package]]
 name = "wazabin-jstd-derive"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbd2d9ae9d36fb7cdcad769a72b9721156ded87f847803f6baf70e591f5557de"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1536,6 +1542,8 @@ dependencies = [
 [[package]]
 name = "wazabin-pcode"
 version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c84b12193516e77636e6cdd4cfe8d6ec16f5ba96f97347d67d3363c23f9cda56"
 dependencies = [
  "serde",
  "wazabin-jstd",
@@ -1543,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-qcode"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bincode",
  "inventory",
@@ -1561,7 +1569,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-qcode-emulator"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rustc-hash",
  "rustc_apfloat",
@@ -1571,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-qcode-jit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "cranelift",
@@ -1592,7 +1600,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-qcode-macro"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1603,7 +1611,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-qcode-parser"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "pest",
  "pest_derive",
@@ -1611,7 +1619,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-qcode-passes"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rustc-hash",
  "wazabin-jstd",
@@ -1621,7 +1629,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-qcode-sleigh"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "csv",
@@ -1641,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-qcode-vm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rustc-hash",
  "wazabin-qcode",
@@ -1652,6 +1660,8 @@ dependencies = [
 [[package]]
 name = "wazabin-sleigh"
 version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68b0dcb01974c50cf4c934582d9bd4afe81def5b1e60fcdf1e89556165afd0da"
 dependencies = [
  "pest",
  "pest_derive",
@@ -1664,6 +1674,8 @@ dependencies = [
 [[package]]
 name = "wazabin-sleigh-precompile"
 version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6760e0822e7ff615dce4280e5b6061107ae98c596cced688b7e304f19b13a183"
 dependencies = [
  "bincode",
  "serde",

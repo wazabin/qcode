@@ -18,12 +18,24 @@ use qcode::value::LocalInsnId;
 use qcode::{
     address_index::{AddressIndex, AddressTarget},
     context::Context,
-    value::{BasicBlock, BlockId},
+    value::{
+        BasicBlock, BlockId, InstructionId, ValueId,
+        insn::{Mnemonic, PCodeOpId, VM_INTERRUPT},
+    },
 };
-use qcode_emulator::{EmulatorErrorKind, EmulatorMemory, StandaloneEmulator};
-use rustc_hash::FxHashSet;
+use qcode_emulator::{EmulatorErrorKind, EmulatorMemory, SizedValue, StandaloneEmulator};
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{memory::VmMemory, mmu::MemFault, stats::Stats};
+use crate::{
+    hook::{AddressHook, BlockEntryHook, WriteWatch},
+    inject::CodeInjector,
+    memory::VmMemory,
+    mmu::MemFault,
+    stats::Stats,
+    table::{
+        Callback, CodeRangeHook, HookAction, HookId, HookTable, InsnAction, MemAccess, ReadWatch,
+    },
+};
 
 /// Why a lifting attempt failed.
 #[derive(Debug, Clone)]
@@ -98,11 +110,18 @@ pub trait BlockExecutor {
     /// paying a round trip per block. The caller withholds it when something
     /// needs to observe every block — a breakpoint is set, say — because blocks
     /// crossed this way are never offered to the interpreter.
+    ///
+    /// `start` is the body index to begin at. It is 0 when a block is
+    /// entered, and the instruction after an interrupting op when the
+    /// interpreter has run the block up to there and hands the rest over.
+    /// Results the interpreter already computed for the block are in
+    /// `emu.insn_values`; an executor may read them or decline.
     fn run_block(
         &mut self,
         ctx: &Context<'_>,
         emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
+        start: usize,
         chain: bool,
     ) -> Result<Option<Executed>, EmulatorErrorKind>;
 }
@@ -110,10 +129,11 @@ pub trait BlockExecutor {
 /// Where an executor left the machine.
 #[derive(Debug, Clone, Copy)]
 pub struct Executed {
-    /// The block whose terminator the interpreter still has to run. With
-    /// chaining this is the last of several, not the one that was asked for.
+    /// The block the interpreter continues in. With chaining this is the
+    /// last of several, not the one that was asked for.
     pub block: BlockId,
-    /// How many instructions of that block were retired: its body.
+    /// The body index of that block the interpreter continues from: its
+    /// terminator, or an interrupting op the executor stopped short of.
     pub body: usize,
     /// Operations retired across every block run, for accounting.
     pub retired: u64,
@@ -131,10 +151,73 @@ pub enum VmExit {
     Fault(MemFault),
     /// Code at this address could not be lifted.
     Unlifted { addr: u64, error: CodeError },
+    /// The machine stopped *at* a user p-code operation for the host to act:
+    /// an explicit `vm.interrupt`, or an op the interpreter has no semantics
+    /// for (`syscall`, `cpuid`, `rdtsc`, ...). Everything before the op in
+    /// its block has retired and nothing after it has run. The machine stays
+    /// there until [`Vm::resume`] supplies the op's effect; running again
+    /// without resuming reports the same interrupt.
+    Interrupt(Interrupt),
+    /// A hook registered through the [table](crate::table) asked the run to
+    /// stop. For a code or memory hook the machine is before the hooked
+    /// guest instruction, and running again executes it without notifying
+    /// the hook again. For an instruction hook the user op is still pending,
+    /// as [`Interrupt`] describes, until the caller resumes it.
+    HookStop(HookId),
     /// The interpreter reported something the VM does not model as a guest
-    /// event — an unsupported p-code op, a malformed block.
+    /// event — a malformed block, an internal failure.
     Error(Box<str>),
 }
+
+/// What kind of operation stopped the machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterruptKind {
+    /// An explicit [`VM_INTERRUPT`] placed in the IR by a hook or an injector.
+    /// `code` is its first operand.
+    Explicit { code: u64 },
+    /// An architecture user op with no interpreter semantics, named as in the
+    /// SLEIGH specification.
+    Intrinsic { op: PCodeOpId, name: Box<str> },
+}
+
+/// A stop at a user p-code operation, with what the host needs to act on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Interrupt {
+    pub kind: InterruptKind,
+    /// The operation's instruction: where [`Vm::resume`] files its result.
+    pub insn: InstructionId,
+    /// The width in bytes of the result the operation declares, or 0 when it
+    /// produces nothing.
+    pub size: usize,
+    /// The operation's operands as read at the stop — after `code` for an
+    /// explicit interrupt. `None` where an operand is wider than 64 bits or
+    /// could not be read.
+    pub args: Vec<Option<u64>>,
+    /// The guest address of the instruction that lifted to the operation.
+    pub pc: Option<u64>,
+}
+
+/// Why [`Vm::resume`] refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeError {
+    /// The machine is not stopped at an interrupt.
+    NotInterrupted,
+    /// The operation declares a result of this many bytes and none was given.
+    ResultRequired { size: usize },
+}
+
+impl std::fmt::Display for ResumeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotInterrupted => write!(f, "the machine is not stopped at an interrupt"),
+            Self::ResultRequired { size } => {
+                write!(f, "the interrupted operation needs a {size}-byte result")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResumeError {}
 
 /// A machine: an owned module, a memory, and a position in the code.
 pub struct Vm<S> {
@@ -175,6 +258,21 @@ pub struct Vm<S> {
     /// compiled one, leaving the two strategies running different QCode.
     dirty: Option<BlockId>,
     breakpoints: FxHashSet<u64>,
+    /// The interrupt the machine is stopped at, until it is resumed.
+    pending: Option<Interrupt>,
+    /// Set by a resume: the machine is part-way into a block, and the
+    /// executor gets one chance to take the rest of it.
+    offer_rest: bool,
+    /// Code rewriters, run over each block before it is first entered and
+    /// again when it grows. See [`crate::inject`].
+    injectors: Vec<Box<dyn CodeInjector>>,
+    /// The injector set each block was last rewritten by, so registering an
+    /// injector reaches blocks already lifted the next time they are entered.
+    injected: FxHashMap<BlockId, u64>,
+    /// Bumped by every registration.
+    generation: u64,
+    /// Callbacks the run calls itself. See [`crate::table`].
+    table: HookTable<S>,
 }
 
 impl<S: CodeSource> Vm<S> {
@@ -192,6 +290,12 @@ impl<S: CodeSource> Vm<S> {
             absorbed_into: None,
             dirty: None,
             breakpoints: FxHashSet::default(),
+            pending: None,
+            offer_rest: false,
+            injectors: Vec::new(),
+            injected: FxHashMap::default(),
+            generation: 0,
+            table: HookTable::default(),
         }
     }
 
@@ -263,12 +367,262 @@ impl<S: CodeSource> Vm<S> {
         self.breakpoints.remove(&addr)
     }
 
+    /// Registers a code rewriter. It runs over every block the machine enters
+    /// from now on, including blocks lifted before this call, before the
+    /// block executes or is compiled.
+    pub fn add_injector(&mut self, injector: Box<dyn CodeInjector>) {
+        self.injectors.push(injector);
+        self.generation += 1;
+    }
+
+    /// Registers a [`Hook`](crate::hook::Hook): a code rewriter that picks
+    /// its sites and emits through an [`Emitter`](crate::hook::Emitter).
+    pub fn add_hook(&mut self, hook: impl crate::hook::Hook + 'static) {
+        self.add_injector(Box::new(crate::hook::HookInjector::new(hook)));
+    }
+
+    // ---- Unicorn-shaped hooks. See [`crate::table`].
+
+    /// Calls `callback` with the address at the entry of every block in
+    /// `begin..=end` (anywhere when `begin > end`).
+    pub fn hook_block(
+        &mut self,
+        begin: u64,
+        end: u64,
+        callback: impl FnMut(&mut Self, u64) -> HookAction + 'static,
+    ) -> HookId {
+        let id = self.table.register(Callback::Code(Box::new(callback)));
+        self.add_hook(BlockEntryHook {
+            begin,
+            end,
+            code: HookTable::<S>::code(id),
+        });
+        id
+    }
+
+    /// Calls `callback` before every guest instruction in `begin..=end`.
+    pub fn hook_code(
+        &mut self,
+        begin: u64,
+        end: u64,
+        callback: impl FnMut(&mut Self, u64) -> HookAction + 'static,
+    ) -> HookId {
+        let id = self.table.register(Callback::Code(Box::new(callback)));
+        self.add_hook(CodeRangeHook {
+            begin,
+            end,
+            code: HookTable::<S>::code(id),
+        });
+        id
+    }
+
+    /// Calls `callback` before the guest instruction at `addr`.
+    pub fn hook_address(
+        &mut self,
+        addr: u64,
+        callback: impl FnMut(&mut Self, u64) -> HookAction + 'static,
+    ) -> HookId {
+        let id = self.table.register(Callback::Code(Box::new(callback)));
+        self.add_hook(AddressHook::new([addr], HookTable::<S>::code(id)));
+        id
+    }
+
+    /// Calls `callback` before every store to guest memory in `begin..=end`,
+    /// with the address, width and value.
+    pub fn hook_mem_write(
+        &mut self,
+        begin: u64,
+        end: u64,
+        callback: impl FnMut(&mut Self, &MemAccess) -> HookAction + 'static,
+    ) -> HookId {
+        let id = self.table.register(Callback::Mem(Box::new(callback)));
+        self.add_hook(WriteWatch {
+            begin,
+            end,
+            code: HookTable::<S>::code(id),
+        });
+        id
+    }
+
+    /// Calls `callback` before every load from guest memory in `begin..=end`,
+    /// with the address and width.
+    pub fn hook_mem_read(
+        &mut self,
+        begin: u64,
+        end: u64,
+        callback: impl FnMut(&mut Self, &MemAccess) -> HookAction + 'static,
+    ) -> HookId {
+        let id = self.table.register(Callback::Mem(Box::new(callback)));
+        self.add_hook(ReadWatch {
+            begin,
+            end,
+            code: HookTable::<S>::code(id),
+        });
+        id
+    }
+
+    /// Calls `callback` when the guest reaches the user op called `name` —
+    /// `syscall`, `rdtsc`, `cpuid_basic`, ... — to supply its effect.
+    pub fn hook_insn(
+        &mut self,
+        name: &str,
+        callback: impl FnMut(&mut Self, &Interrupt) -> InsnAction + 'static,
+    ) -> HookId {
+        self.table.register(Callback::Insn {
+            name: Some(Box::from(name)),
+            callback: Box::new(callback),
+        })
+    }
+
+    /// Calls `callback` for every user op the interpreter cannot run, whatever
+    /// its name.
+    pub fn hook_intr(
+        &mut self,
+        callback: impl FnMut(&mut Self, &Interrupt) -> InsnAction + 'static,
+    ) -> HookId {
+        self.table.register(Callback::Insn {
+            name: None,
+            callback: Box::new(callback),
+        })
+    }
+
+    /// Removes a hook. Interrupts it injected stay in the code and resume
+    /// silently; they cost a stop and nothing more.
+    pub fn hook_del(&mut self, id: HookId) -> bool {
+        self.table.remove(id)
+    }
+
+    /// Handles an interrupt the table owns, or an intrinsic a hook answers.
+    ///
+    /// Returns `None` when the run should carry on, and the exit to return
+    /// otherwise. The callbacks are moved out for the duration so they can be
+    /// handed the machine; ones registered meanwhile are kept.
+    fn dispatch(&mut self, interrupt: &Interrupt) -> Option<VmExit> {
+        let owner = HookTable::<S>::owner(interrupt);
+        let intrinsic = match &interrupt.kind {
+            InterruptKind::Intrinsic { name, .. } => Some(name.clone()),
+            InterruptKind::Explicit { .. } => None,
+        };
+        if owner.is_none() && intrinsic.is_none() {
+            return Some(VmExit::Interrupt(interrupt.clone()));
+        }
+        let mut callbacks = std::mem::take(&mut self.table.callbacks);
+        let mut outcome: Option<VmExit> = None;
+        let mut handled = false;
+        for (id, callback) in &mut callbacks {
+            match (callback, owner, &intrinsic) {
+                (Callback::Code(callback), Some(owner), _) if *id == owner => {
+                    let pc = interrupt
+                        .args
+                        .first()
+                        .copied()
+                        .flatten()
+                        .unwrap_or_default();
+                    if callback(self, pc) == HookAction::Stop {
+                        outcome = Some(VmExit::HookStop(*id));
+                    }
+                    handled = true;
+                }
+                (Callback::Mem(callback), Some(owner), _) if *id == owner => {
+                    let arg = |index: usize| interrupt.args.get(index).copied().flatten();
+                    let access = MemAccess {
+                        pc: interrupt.pc,
+                        addr: arg(0).unwrap_or_default(),
+                        size: arg(1).unwrap_or_default(),
+                        value: arg(2),
+                    };
+                    if callback(self, &access) == HookAction::Stop {
+                        outcome = Some(VmExit::HookStop(*id));
+                    }
+                    handled = true;
+                }
+                (Callback::Insn { name, callback }, None, Some(op))
+                    if name.as_ref().is_none_or(|name| name == op) =>
+                {
+                    match callback(self, interrupt) {
+                        InsnAction::Handled(value) => {
+                            if let Err(error) = self.resume(value) {
+                                outcome = Some(VmExit::Error(error.to_string().into()));
+                            }
+                            handled = true;
+                        }
+                        InsnAction::Stop => {
+                            outcome = Some(VmExit::HookStop(*id));
+                            handled = true;
+                        }
+                        InsnAction::Unhandled => continue,
+                    }
+                }
+                _ => continue,
+            }
+            if outcome.is_some() {
+                break;
+            }
+            if intrinsic.is_some() && handled {
+                // One answer per op.
+                break;
+            }
+        }
+        // Hooks registered by a callback were pushed onto the empty table.
+        callbacks.append(&mut self.table.callbacks);
+        self.table.callbacks = callbacks;
+
+        if owner.is_some() {
+            // The table's interrupt is a notification, delivered now (or
+            // owed to a hook since deleted). Whether the run goes on or
+            // stops, the machine is left before the guest instruction, not
+            // at the notification: a later run must not deliver it again.
+            if let Err(error) = self.resume(None) {
+                return Some(VmExit::Error(error.to_string().into()));
+            }
+            return outcome;
+        }
+        if let Some(exit) = outcome {
+            return Some(exit);
+        }
+        if !handled {
+            // An intrinsic no hook answered is the caller's.
+            return Some(VmExit::Interrupt(interrupt.clone()));
+        }
+        None
+    }
+
+    /// Runs the injectors over `block` unless the current set already has.
+    ///
+    /// Only over lifted code: an empty block carrying an address is a request
+    /// to lift it, and its instructions arrive — and get rewritten — once it
+    /// is discovered.
+    fn inject(&mut self, block: BlockId) {
+        if self.injectors.is_empty()
+            || self.injected.get(&block) == Some(&self.generation)
+            || !BasicBlock::from_id(&self.ctx, block).is_terminated()
+        {
+            return;
+        }
+        // Moved out for the duration, so the injectors can be handed the
+        // module without borrowing the machine twice.
+        let mut injectors = std::mem::take(&mut self.injectors);
+        for injector in &mut injectors {
+            injector.inject(&mut self.ctx, block);
+        }
+        self.injectors = injectors;
+        self.injected.insert(block, self.generation);
+        // The interpreter may hold this block's instruction list, and it has
+        // changed.
+        self.emu.invalidate_block_cache();
+    }
+
     /// Executes one instruction, lifting code on demand if control leaves the
     /// part of the module already known.
     ///
     /// Returns `None` when the step was ordinary, and `Some(exit)` when the
     /// machine stopped for a reason worth reporting.
     pub fn step(&mut self) -> Option<VmExit> {
+        // Stopped at an operation nobody has resumed: the machine has not
+        // moved, and stepping it would run the op again without its effect.
+        if let Some(interrupt) = &self.pending {
+            return Some(VmExit::Interrupt(interrupt.clone()));
+        }
         // A branch to unlifted code fails *before* the emulator moves, so the
         // address can be lifted and the same step retried. One retry is enough:
         // the second failure means the source did not produce the block it
@@ -281,18 +635,22 @@ impl<S: CodeSource> Vm<S> {
             if self.emu.idx == 0 {
                 let block = self.emu.block;
                 self.clean_before_entering(block);
+                self.inject(block);
             }
 
-            // At a block's first instruction, an installed executor may run the
-            // whole body at once, leaving the interpreter only the terminator.
-            if self.emu.idx == 0
+            // At a block's first instruction — or just past an interrupt it
+            // resumed from — an installed executor may run the rest of the
+            // body at once, leaving the interpreter only the terminator.
+            if (self.emu.idx == 0 || self.offer_rest)
                 && let Some(executor) = self.executor.as_mut()
             {
+                self.offer_rest = false;
                 let block = self.emu.block;
+                let start = self.emu.idx;
                 // Blocks the executor runs are never offered to the interpreter, so
                 // it may only run past the first when nothing needs to see them.
                 let chain = self.breakpoints.is_empty();
-                match executor.run_block(&self.ctx, &mut self.emu, block, chain) {
+                match executor.run_block(&self.ctx, &mut self.emu, block, start, chain) {
                     Ok(Some(run)) => {
                         // The operations were retired by the executor; they are
                         // counted so throughput stays comparable between strategies.
@@ -309,7 +667,7 @@ impl<S: CodeSource> Vm<S> {
                         let fault = self.emu.memory.take_fault();
                         return Some(match fault {
                             Some(fault) => VmExit::Fault(fault),
-                            None => VmExit::Error(kind.to_string().into()),
+                            None => self.exit_for(kind),
                         });
                     }
                 }
@@ -377,11 +735,117 @@ impl<S: CodeSource> Vm<S> {
                         });
                         return Some(VmExit::Fault(fault));
                     }
-                    kind => return Some(VmExit::Error(kind.to_string().into())),
+                    kind => return Some(self.exit_for(kind)),
                 },
             }
         }
         None
+    }
+
+    /// The exit for an interpreter error that is not a memory fault or a
+    /// discovery request.
+    ///
+    /// A stop at a user operation is a guest event with a typed exit; anything
+    /// else is reported as the error it is.
+    fn exit_for(&mut self, kind: EmulatorErrorKind) -> VmExit {
+        match kind {
+            EmulatorErrorKind::Interrupt | EmulatorErrorKind::UnsupportedPCodeOp(_) => {
+                match self.interrupt_at_position() {
+                    Some(interrupt) => {
+                        self.pending = Some(interrupt.clone());
+                        VmExit::Interrupt(interrupt)
+                    }
+                    // The error named an op, but the machine is not at one:
+                    // an executor stopped somewhere it should not have.
+                    None => VmExit::Error(kind.to_string().into()),
+                }
+            }
+            other => VmExit::Error(other.to_string().into()),
+        }
+    }
+
+    /// Describes the user operation at the machine's position, if that is
+    /// what it is stopped at.
+    fn interrupt_at_position(&mut self) -> Option<Interrupt> {
+        let block = self.emu.block;
+        let idx = self.emu.idx;
+        if !self.ctx.contains_block(block) {
+            return None;
+        }
+        let (insn, size, pc, op, operands) = {
+            let insn = BasicBlock::from_id(&self.ctx, block)
+                .instructions()
+                .nth(idx)?;
+            let Mnemonic::PCodeOp(op) = insn.mnemonic() else {
+                return None;
+            };
+            let operands: Vec<ValueId> =
+                op.args.iter().map(|arg| arg.qualify(block.func)).collect();
+            // An instruction carries the address of the guest instruction it
+            // was lifted from; one built by hand may not, in which case the
+            // block's own address is the best that can be said.
+            let pc = insn
+                .address()
+                .or_else(|| BasicBlock::from_id(&self.ctx, block).address());
+            (insn.id, insn.size(), pc, op.id, operands)
+        };
+        let name = self.ctx.shared.pcode_ops[op].clone();
+        let mut args: Vec<Option<u64>> = operands
+            .into_iter()
+            .map(|value| self.emu.get_value(&self.ctx, value))
+            .collect();
+        let kind = if name.as_ref() == VM_INTERRUPT {
+            let code = if args.is_empty() {
+                0
+            } else {
+                args.remove(0).unwrap_or(0)
+            };
+            InterruptKind::Explicit { code }
+        } else {
+            InterruptKind::Intrinsic { op, name }
+        };
+        Some(Interrupt {
+            kind,
+            insn,
+            size,
+            args,
+            pc,
+        })
+    }
+
+    /// The interrupt the machine is stopped at, if any.
+    pub fn pending_interrupt(&self) -> Option<&Interrupt> {
+        self.pending.as_ref()
+    }
+
+    /// Supplies the effect of the operation the machine is stopped at and
+    /// steps past it.
+    ///
+    /// `value` is the operation's result, required when it declares one
+    /// ([`Interrupt::size`] is non-zero) and ignored otherwise. Any other
+    /// effect — a register written by a system call, memory filled by a host
+    /// service — the caller applies through [`Vm::emulator`] and
+    /// [`Vm::memory_mut`] before resuming. The operation's own instruction is
+    /// not run; the one after it is next.
+    pub fn resume(&mut self, value: Option<u128>) -> Result<(), ResumeError> {
+        let Some(interrupt) = self.pending.as_ref() else {
+            return Err(ResumeError::NotInterrupted);
+        };
+        if interrupt.size > 0 {
+            let Some(value) = value else {
+                return Err(ResumeError::ResultRequired {
+                    size: interrupt.size,
+                });
+            };
+            self.emu
+                .insn_values
+                .insert(interrupt.insn, SizedValue::from_bits(value, interrupt.size));
+        }
+        self.pending = None;
+        self.stats.steps += 1;
+        self.emu.idx += 1;
+        self.offer_rest = true;
+        Ok(())
     }
 
     /// Points the emulator at whatever block now covers `addr`, reusing the
@@ -470,6 +934,8 @@ impl<S: CodeSource> Vm<S> {
     /// Records that `block` has grown and owes a cleanup, cleaning whatever
     /// run was growing before it.
     fn mark_dirty(&mut self, block: BlockId) {
+        // Grown, so it holds guest instructions the injectors have not seen.
+        self.injected.remove(&block);
         if !self.optimize {
             return;
         }
@@ -592,11 +1058,16 @@ impl<S: CodeSource> Vm<S> {
         }
         self.stats.absorbed += 1;
 
-        // Where the machine has to resume, named by instruction rather than by
-        // index: cleaning the enlarged block deletes instructions ahead of that
-        // point, and every index after a deletion shifts. The first of these
-        // still standing afterwards is the one to resume at.
-        let resume: Vec<LocalInsnId> = self.ctx.block(head).instruction_ids()[offset..].to_vec();
+        // What the head has already run: everything it held before the
+        // absorbed instructions were appended. The machine resumes right
+        // after the last of these still standing, whatever cleanup deletes
+        // ahead of that point or injection inserts after it — an interrupt an
+        // injector places before the first absorbed instruction, say, which
+        // has to run before it.
+        let executed: FxHashSet<LocalInsnId> = self.ctx.block(head).instruction_ids()[..offset]
+            .iter()
+            .copied()
+            .collect();
         self.mark_dirty(head);
 
         self.reindex_absorbed(head);
@@ -604,11 +1075,15 @@ impl<S: CodeSource> Vm<S> {
         // The machine stopped at the empty placeholder this lift filled, which
         // absorption has just deleted; its instructions are in the head now.
         if self.emu.block == filled {
+            // The absorbed instructions have not run, and the injectors have
+            // not seen them: rewrite now, so a hook on the instruction about
+            // to execute is not missed the first time.
+            self.inject(head);
             let now = self.ctx.block(head).instruction_ids();
-            let resumed = resume
+            let resumed = now
                 .iter()
-                .find_map(|wanted| now.iter().position(|have| have == wanted))
-                .unwrap_or(now.len().saturating_sub(1));
+                .rposition(|local| executed.contains(local))
+                .map_or(0, |last| last + 1);
             self.emu.block = head;
             self.emu.idx = resumed;
             self.emu.invalidate_block_cache();
@@ -618,6 +1093,10 @@ impl<S: CodeSource> Vm<S> {
 
     /// Runs until the machine stops, or until `budget` p-code operations have
     /// been retired.
+    ///
+    /// Hooks registered through the [table](crate::table) are called from
+    /// here and the machine resumes past them, so the run only returns for
+    /// an exit the caller has to see.
     pub fn run(&mut self, budget: u64) -> VmExit {
         let deadline = self.stats.steps + budget;
         while self.stats.steps < deadline {
@@ -635,8 +1114,14 @@ impl<S: CodeSource> Vm<S> {
             {
                 return VmExit::Breakpoint(pc);
             }
-            if let Some(exit) = self.step() {
-                return exit;
+            match self.step() {
+                None => {}
+                Some(VmExit::Interrupt(interrupt)) => {
+                    if let Some(exit) = self.dispatch(&interrupt) {
+                        return exit;
+                    }
+                }
+                Some(exit) => return exit,
             }
         }
         VmExit::InstructionLimit
@@ -821,5 +1306,108 @@ mod tests {
         let mut out = [0; 3];
         vm.memory().mmu.read(0x4000, &mut out).unwrap();
         assert_eq!(out, [1, 2, 3]);
+    }
+
+    /// A block whose body is one user op, followed by a branch to an empty
+    /// block at the next address, so continuing past the op is observable as
+    /// a discovery request for that address.
+    fn module_with_op(
+        op_name: &str,
+        args: Vec<u64>,
+        size: usize,
+    ) -> (Context<'static>, BlockId, InstructionId) {
+        let (mut ctx, block) = module(0x1000);
+        let op = ctx.shared.pcode_op(op_name);
+        let target = BasicBlock::make(&mut ctx, block.func)
+            .with_address(0x1001)
+            .id;
+        let args = args
+            .into_iter()
+            .map(|value| ctx.shared.get_const(value, 8))
+            .collect();
+        let insn = {
+            let mut builder = ctx.builder(block);
+            let insn = builder.push_pcode_op(op, args, None, size).id;
+            builder.finalize(target);
+            insn
+        };
+        (ctx, block, insn)
+    }
+
+    #[test]
+    fn an_explicit_interrupt_stops_at_the_op_and_reports_its_operands() {
+        let (ctx, block, insn) = module_with_op(VM_INTERRUPT, vec![7, 99], 8);
+        let mut vm = Vm::new(ctx, block, Planned::default());
+        let exit = vm.run(16);
+        let VmExit::Interrupt(interrupt) = exit else {
+            panic!("expected an interrupt, got {exit:?}");
+        };
+        assert_eq!(interrupt.kind, InterruptKind::Explicit { code: 7 });
+        assert_eq!(interrupt.args, vec![Some(99)]);
+        assert_eq!(interrupt.insn, insn);
+        assert_eq!(interrupt.size, 8);
+        assert_eq!(interrupt.pc, Some(0x1000));
+        // The machine is at the op, not past it.
+        assert_eq!(vm.emulator().idx, 0);
+        assert_eq!(vm.pending_interrupt(), Some(&interrupt));
+    }
+
+    #[test]
+    fn running_again_without_resuming_reports_the_same_interrupt() {
+        let (ctx, block, _) = module_with_op(VM_INTERRUPT, vec![1], 0);
+        let mut vm = Vm::new(ctx, block, Planned::default());
+        let first = vm.run(16);
+        let again = vm.run(16);
+        assert!(
+            matches!(&first, VmExit::Interrupt(i) if i.kind == InterruptKind::Explicit { code: 1 })
+        );
+        assert!(
+            matches!(&again, VmExit::Interrupt(i) if i.kind == InterruptKind::Explicit { code: 1 })
+        );
+        assert_eq!(vm.emulator().idx, 0);
+    }
+
+    #[test]
+    fn resume_files_the_result_and_continues_after_the_op() {
+        let (ctx, block, insn) = module_with_op(VM_INTERRUPT, vec![7], 8);
+        let mut vm = Vm::new(ctx, block, Planned::default());
+        assert!(matches!(vm.run(16), VmExit::Interrupt(_)));
+        // The op declares an 8-byte result, so resuming needs one.
+        assert_eq!(
+            vm.resume(None),
+            Err(ResumeError::ResultRequired { size: 8 })
+        );
+        vm.resume(Some(42)).unwrap();
+        assert_eq!(vm.pending_interrupt(), None);
+        assert_eq!(
+            vm.emulator().insn_values.get(&insn).map(|v| v.as_bits()),
+            Some(42)
+        );
+        // Past the op, the branch runs and reaches the next address.
+        assert!(matches!(vm.run(16), VmExit::Unlifted { addr: 0x1001, .. }));
+    }
+
+    #[test]
+    fn resume_needs_an_interrupt() {
+        let (ctx, block) = module(0x1000);
+        let mut vm = Vm::new(ctx, block, Planned::default());
+        assert_eq!(vm.resume(None), Err(ResumeError::NotInterrupted));
+    }
+
+    #[test]
+    fn an_unmodelled_user_op_is_an_intrinsic_interrupt() {
+        let (ctx, block, _) = module_with_op("rdpmc", vec![], 0);
+        let mut vm = Vm::new(ctx, block, Planned::default());
+        let exit = vm.run(16);
+        let VmExit::Interrupt(interrupt) = exit else {
+            panic!("expected an interrupt, got {exit:?}");
+        };
+        assert!(
+            matches!(&interrupt.kind, InterruptKind::Intrinsic { name, .. } if name.as_ref() == "rdpmc")
+        );
+        assert_eq!(interrupt.size, 0);
+        // Nothing to supply for an op with no result.
+        vm.resume(None).unwrap();
+        assert!(matches!(vm.run(16), VmExit::Unlifted { addr: 0x1001, .. }));
     }
 }

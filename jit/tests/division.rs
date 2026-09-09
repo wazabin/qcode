@@ -90,7 +90,7 @@ fn agree_on(code: &[u8], what: &str, seeds: &[(u64, u64, u64)]) {
 
         seed(&mut jitted, &ctx, block, operands);
         let ran = jit
-            .run_block(&ctx, &mut jitted, block, false)
+            .run_block(&ctx, &mut jitted, block, 0, false)
             .expect("compiled code does not fault")
             .is_some();
         if !ran {

@@ -35,14 +35,22 @@
 //! [`qcode_jit`](https://docs.rs/qcode_jit) is installed on a machine.
 
 pub mod flat;
+pub mod hook;
+pub mod inject;
 pub mod jit_abi;
 pub mod memory;
 pub mod mmu;
 pub mod optimize;
 pub mod stats;
+pub mod table;
 pub mod tlb;
 pub mod vm;
 
+pub use hook::{
+    AddressHook, BlockEntryHook, BlockView, CompareHook, Emitter, Hook, HookInjector, Site,
+    WriteWatch,
+};
+pub use inject::CodeInjector;
 pub use jit_abi::{
     ACCESS_FAULT, ACCESS_OK, qcode_jit_load, qcode_jit_sdiv128, qcode_jit_srem128, qcode_jit_store,
     qcode_jit_udiv128, qcode_jit_urem128,
@@ -53,5 +61,9 @@ pub use mmu::{
 };
 pub use optimize::{Cleanup, forward_temp_stores};
 pub use stats::Stats;
+pub use table::{HookAction, HookId, InsnAction, MemAccess, TABLE_CODES};
 pub use tlb::{TLB_ENTRIES, TLB_INDEX_BITS, TlbEntry, TranslationCache};
-pub use vm::{BlockExecutor, CodeError, CodeSource, Executed, Vm, VmExit};
+pub use vm::{
+    BlockExecutor, CodeError, CodeSource, Executed, Interrupt, InterruptKind, ResumeError, Vm,
+    VmExit,
+};
