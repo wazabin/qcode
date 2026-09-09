@@ -120,7 +120,7 @@ fn compile(expr: &Expr, source: &str) -> syn::Result<proc_macro2::TokenStream> {
         .filter(|n| !defined.contains(n.as_str()))
         .collect();
 
-    let qcode = resolve_crate("qcode")?;
+    let qcode = resolve_crate("wazabin-qcode")?;
 
     let capture_inserts = captures.iter().map(|name| {
         let ident = format_ident!("{}", name);
