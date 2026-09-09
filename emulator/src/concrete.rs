@@ -3650,8 +3650,10 @@ mod tests {
 
         let buf = emu.array_values.get(&m).expect("map produced an array");
         let words: Vec<u64> = buf
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&c| u64::from_le_bytes(c))
             .collect();
         // iota(4) = [0,1,2,3]; triple ⇒ [0, 3, 6, 9].
         assert_eq!(words, vec![0, 3, 6, 9]);
@@ -3687,8 +3689,10 @@ mod tests {
 
         let buf = emu.array_values.get(&s).expect("scan produced an array");
         let words: Vec<u64> = buf
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&c| u64::from_le_bytes(c))
             .collect();
         assert_eq!(words, vec![10, 11, 13]);
     }
@@ -3754,8 +3758,10 @@ mod tests {
             .get(&eid)
             .expect("enumerate produced an array");
         let words: Vec<u64> = buf
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&c| u64::from_le_bytes(c))
             .collect();
         assert_eq!(words, vec![0, 10, 1, 20, 2, 30, 3, 40]);
     }
