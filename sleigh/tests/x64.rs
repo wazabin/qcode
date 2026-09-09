@@ -647,7 +647,7 @@ mod tests {
         let half_single_ulp = 0x3fe7_8000_0000_0000_0000u128;
         write_x87_slot(&mut emu, &ctx, 0, one);
         write_x87_slot(&mut emu, &ctx, 1, half_single_ulp);
-        emu.run_block().unwrap();
+        emu.run_until(0x1002).unwrap();
 
         assert_eq!(read_x87_slot(&mut emu, &ctx, 0), one + (1u128 << 40));
         assert_ne!(emu.read_register(x64::FPUSTATUSWORD).unwrap() & 0x20, 0);
@@ -1174,8 +1174,9 @@ mod tests {
         write_x87_slot(&mut emu, &ctx, 1, tiny);
         emu.set_register(x64::FPUCONTROLWORD, 0x087f).unwrap();
         emu.set_register(x64::FPUSTATUSWORD, 0).unwrap();
-        emu.set_register(x64::FPUTAGWORD, 0xffff).unwrap();
-        emu.run_block().unwrap();
+        // Both operands are valid; all-empty tags would be a stack underflow.
+        emu.set_register(x64::FPUTAGWORD, 0).unwrap();
+        emu.run_until(0x1002).unwrap();
 
         assert_eq!(read_x87_slot(&mut emu, &ctx, 0), one + (1u128 << 40));
         assert_eq!(emu.read_register(x64::FPUSTATUSWORD), Some(0x220));
