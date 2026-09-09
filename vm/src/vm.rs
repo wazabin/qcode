@@ -26,7 +26,16 @@ use qcode::{
 use qcode_emulator::{EmulatorErrorKind, EmulatorMemory, SizedValue, StandaloneEmulator};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{inject::CodeInjector, memory::VmMemory, mmu::MemFault, stats::Stats};
+use crate::{
+    hook::{AddressHook, BlockEntryHook, WriteWatch},
+    inject::CodeInjector,
+    memory::VmMemory,
+    mmu::MemFault,
+    stats::Stats,
+    table::{
+        Callback, CodeRangeHook, HookAction, HookId, HookTable, InsnAction, MemAccess, ReadWatch,
+    },
+};
 
 /// Why a lifting attempt failed.
 #[derive(Debug, Clone)]
@@ -149,6 +158,12 @@ pub enum VmExit {
     /// there until [`Vm::resume`] supplies the op's effect; running again
     /// without resuming reports the same interrupt.
     Interrupt(Interrupt),
+    /// A hook registered through the [table](crate::table) asked the run to
+    /// stop. For a code or memory hook the machine is before the hooked
+    /// guest instruction, and running again executes it without notifying
+    /// the hook again. For an instruction hook the user op is still pending,
+    /// as [`Interrupt`] describes, until the caller resumes it.
+    HookStop(HookId),
     /// The interpreter reported something the VM does not model as a guest
     /// event — a malformed block, an internal failure.
     Error(Box<str>),
@@ -256,6 +271,8 @@ pub struct Vm<S> {
     injected: FxHashMap<BlockId, u64>,
     /// Bumped by every registration.
     generation: u64,
+    /// Callbacks the run calls itself. See [`crate::table`].
+    table: HookTable<S>,
 }
 
 impl<S: CodeSource> Vm<S> {
@@ -278,6 +295,7 @@ impl<S: CodeSource> Vm<S> {
             injectors: Vec::new(),
             injected: FxHashMap::default(),
             generation: 0,
+            table: HookTable::default(),
         }
     }
 
@@ -361,6 +379,212 @@ impl<S: CodeSource> Vm<S> {
     /// its sites and emits through an [`Emitter`](crate::hook::Emitter).
     pub fn add_hook(&mut self, hook: impl crate::hook::Hook + 'static) {
         self.add_injector(Box::new(crate::hook::HookInjector::new(hook)));
+    }
+
+    // ---- Unicorn-shaped hooks. See [`crate::table`].
+
+    /// Calls `callback` with the address at the entry of every block in
+    /// `begin..=end` (anywhere when `begin > end`).
+    pub fn hook_block(
+        &mut self,
+        begin: u64,
+        end: u64,
+        callback: impl FnMut(&mut Self, u64) -> HookAction + 'static,
+    ) -> HookId {
+        let id = self.table.register(Callback::Code(Box::new(callback)));
+        self.add_hook(BlockEntryHook {
+            begin,
+            end,
+            code: HookTable::<S>::code(id),
+        });
+        id
+    }
+
+    /// Calls `callback` before every guest instruction in `begin..=end`.
+    pub fn hook_code(
+        &mut self,
+        begin: u64,
+        end: u64,
+        callback: impl FnMut(&mut Self, u64) -> HookAction + 'static,
+    ) -> HookId {
+        let id = self.table.register(Callback::Code(Box::new(callback)));
+        self.add_hook(CodeRangeHook {
+            begin,
+            end,
+            code: HookTable::<S>::code(id),
+        });
+        id
+    }
+
+    /// Calls `callback` before the guest instruction at `addr`.
+    pub fn hook_address(
+        &mut self,
+        addr: u64,
+        callback: impl FnMut(&mut Self, u64) -> HookAction + 'static,
+    ) -> HookId {
+        let id = self.table.register(Callback::Code(Box::new(callback)));
+        self.add_hook(AddressHook::new([addr], HookTable::<S>::code(id)));
+        id
+    }
+
+    /// Calls `callback` before every store to guest memory in `begin..=end`,
+    /// with the address, width and value.
+    pub fn hook_mem_write(
+        &mut self,
+        begin: u64,
+        end: u64,
+        callback: impl FnMut(&mut Self, &MemAccess) -> HookAction + 'static,
+    ) -> HookId {
+        let id = self.table.register(Callback::Mem(Box::new(callback)));
+        self.add_hook(WriteWatch {
+            begin,
+            end,
+            code: HookTable::<S>::code(id),
+        });
+        id
+    }
+
+    /// Calls `callback` before every load from guest memory in `begin..=end`,
+    /// with the address and width.
+    pub fn hook_mem_read(
+        &mut self,
+        begin: u64,
+        end: u64,
+        callback: impl FnMut(&mut Self, &MemAccess) -> HookAction + 'static,
+    ) -> HookId {
+        let id = self.table.register(Callback::Mem(Box::new(callback)));
+        self.add_hook(ReadWatch {
+            begin,
+            end,
+            code: HookTable::<S>::code(id),
+        });
+        id
+    }
+
+    /// Calls `callback` when the guest reaches the user op called `name` —
+    /// `syscall`, `rdtsc`, `cpuid_basic`, ... — to supply its effect.
+    pub fn hook_insn(
+        &mut self,
+        name: &str,
+        callback: impl FnMut(&mut Self, &Interrupt) -> InsnAction + 'static,
+    ) -> HookId {
+        self.table.register(Callback::Insn {
+            name: Some(Box::from(name)),
+            callback: Box::new(callback),
+        })
+    }
+
+    /// Calls `callback` for every user op the interpreter cannot run, whatever
+    /// its name.
+    pub fn hook_intr(
+        &mut self,
+        callback: impl FnMut(&mut Self, &Interrupt) -> InsnAction + 'static,
+    ) -> HookId {
+        self.table.register(Callback::Insn {
+            name: None,
+            callback: Box::new(callback),
+        })
+    }
+
+    /// Removes a hook. Interrupts it injected stay in the code and resume
+    /// silently; they cost a stop and nothing more.
+    pub fn hook_del(&mut self, id: HookId) -> bool {
+        self.table.remove(id)
+    }
+
+    /// Handles an interrupt the table owns, or an intrinsic a hook answers.
+    ///
+    /// Returns `None` when the run should carry on, and the exit to return
+    /// otherwise. The callbacks are moved out for the duration so they can be
+    /// handed the machine; ones registered meanwhile are kept.
+    fn dispatch(&mut self, interrupt: &Interrupt) -> Option<VmExit> {
+        let owner = HookTable::<S>::owner(interrupt);
+        let intrinsic = match &interrupt.kind {
+            InterruptKind::Intrinsic { name, .. } => Some(name.clone()),
+            InterruptKind::Explicit { .. } => None,
+        };
+        if owner.is_none() && intrinsic.is_none() {
+            return Some(VmExit::Interrupt(interrupt.clone()));
+        }
+        let mut callbacks = std::mem::take(&mut self.table.callbacks);
+        let mut outcome: Option<VmExit> = None;
+        let mut handled = false;
+        for (id, callback) in &mut callbacks {
+            match (callback, owner, &intrinsic) {
+                (Callback::Code(callback), Some(owner), _) if *id == owner => {
+                    let pc = interrupt
+                        .args
+                        .first()
+                        .copied()
+                        .flatten()
+                        .unwrap_or_default();
+                    if callback(self, pc) == HookAction::Stop {
+                        outcome = Some(VmExit::HookStop(*id));
+                    }
+                    handled = true;
+                }
+                (Callback::Mem(callback), Some(owner), _) if *id == owner => {
+                    let arg = |index: usize| interrupt.args.get(index).copied().flatten();
+                    let access = MemAccess {
+                        pc: interrupt.pc,
+                        addr: arg(0).unwrap_or_default(),
+                        size: arg(1).unwrap_or_default(),
+                        value: arg(2),
+                    };
+                    if callback(self, &access) == HookAction::Stop {
+                        outcome = Some(VmExit::HookStop(*id));
+                    }
+                    handled = true;
+                }
+                (Callback::Insn { name, callback }, None, Some(op))
+                    if name.as_ref().is_none_or(|name| name == op) =>
+                {
+                    match callback(self, interrupt) {
+                        InsnAction::Handled(value) => {
+                            if let Err(error) = self.resume(value) {
+                                outcome = Some(VmExit::Error(error.to_string().into()));
+                            }
+                            handled = true;
+                        }
+                        InsnAction::Stop => {
+                            outcome = Some(VmExit::HookStop(*id));
+                            handled = true;
+                        }
+                        InsnAction::Unhandled => continue,
+                    }
+                }
+                _ => continue,
+            }
+            if outcome.is_some() {
+                break;
+            }
+            if intrinsic.is_some() && handled {
+                // One answer per op.
+                break;
+            }
+        }
+        // Hooks registered by a callback were pushed onto the empty table.
+        callbacks.append(&mut self.table.callbacks);
+        self.table.callbacks = callbacks;
+
+        if owner.is_some() {
+            // The table's interrupt is a notification, delivered now (or
+            // owed to a hook since deleted). Whether the run goes on or
+            // stops, the machine is left before the guest instruction, not
+            // at the notification: a later run must not deliver it again.
+            if let Err(error) = self.resume(None) {
+                return Some(VmExit::Error(error.to_string().into()));
+            }
+            return outcome;
+        }
+        if let Some(exit) = outcome {
+            return Some(exit);
+        }
+        if !handled {
+            // An intrinsic no hook answered is the caller's.
+            return Some(VmExit::Interrupt(interrupt.clone()));
+        }
+        None
     }
 
     /// Runs the injectors over `block` unless the current set already has.
@@ -869,6 +1093,10 @@ impl<S: CodeSource> Vm<S> {
 
     /// Runs until the machine stops, or until `budget` p-code operations have
     /// been retired.
+    ///
+    /// Hooks registered through the [table](crate::table) are called from
+    /// here and the machine resumes past them, so the run only returns for
+    /// an exit the caller has to see.
     pub fn run(&mut self, budget: u64) -> VmExit {
         let deadline = self.stats.steps + budget;
         while self.stats.steps < deadline {
@@ -886,8 +1114,14 @@ impl<S: CodeSource> Vm<S> {
             {
                 return VmExit::Breakpoint(pc);
             }
-            if let Some(exit) = self.step() {
-                return exit;
+            match self.step() {
+                None => {}
+                Some(VmExit::Interrupt(interrupt)) => {
+                    if let Some(exit) = self.dispatch(&interrupt) {
+                        return exit;
+                    }
+                }
+                Some(exit) => return exit,
             }
         }
         VmExit::InstructionLimit

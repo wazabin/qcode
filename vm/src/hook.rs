@@ -76,30 +76,61 @@ impl BlockView<'_> {
     }
 
     /// The site at the block's entry, if the block starts at a guest address.
+    ///
+    /// Anchored on the first instruction that is not an interrupt an earlier
+    /// hook placed at the entry, so hooks on the same entry fire in
+    /// registration order and a hook recognises its own anchor when asked
+    /// again.
     pub fn entry(&self) -> Option<Site> {
         let address = self.address()?;
-        let anchor = self.first()?;
+        let anchor = BasicBlock::from_id(self.ctx, self.block)
+            .instructions()
+            .find(|insn| !is_interrupt_op(self.ctx, insn.id))
+            .map(|insn| insn.id)?;
         Some(Site::BlockEntry { address, anchor })
     }
 
-    fn first(&self) -> Option<InstructionId> {
-        BasicBlock::from_id(self.ctx, self.block)
-            .instructions()
-            .next()
-            .map(|insn| insn.id)
-    }
-
-    /// Every distinct guest address the block covers, in order, as a site on
-    /// the first instruction lifted from it.
+    /// Every guest instruction that *starts* in the block, in order, as a
+    /// site on the first instruction lifted from it.
+    ///
+    /// One guest instruction's p-code may branch within itself, so a block
+    /// with no address of its own can open with the tail of an instruction
+    /// begun in its predecessor. Those instructions carry the predecessor's
+    /// last address; they are a continuation, not a start, and get no site.
     pub fn addresses(&self) -> Vec<Site> {
+        let block = BasicBlock::from_id(self.ctx, self.block);
+        let continued = if block.address().is_none() {
+            block
+                .predecessors()
+                .filter_map(|(_, pred)| {
+                    BasicBlock::from_id(self.ctx, pred)
+                        .instructions()
+                        .last()
+                        .and_then(|insn| insn.address())
+                })
+                .collect::<Vec<u64>>()
+        } else {
+            Vec::new()
+        };
         let mut sites = Vec::new();
         let mut seen = None;
-        for insn in BasicBlock::from_id(self.ctx, self.block).instructions() {
+        for insn in block.instructions() {
+            // An interrupt a hook placed carries the site's address so the
+            // stop reports it, but it is the hook's instruction, not the
+            // guest's: never the start of a run, never an anchor.
+            if is_interrupt_op(self.ctx, insn.id) {
+                continue;
+            }
             let at = insn.address();
             if at.is_some() && at != seen {
+                let first_run = seen.is_none();
                 seen = at;
+                let address = at.unwrap_or_default();
+                if first_run && continued.contains(&address) {
+                    continue;
+                }
                 sites.push(Site::Address {
-                    address: at.unwrap_or_default(),
+                    address,
                     anchor: insn.id,
                 });
             }
@@ -253,13 +284,14 @@ impl<'a> Emitter<'a> {
     }
 
     /// Emits an integer binary operation before the anchor.
+    ///
+    /// Emitted arithmetic carries no guest address: it is the hook's, not
+    /// the guest instruction's, and stamping it would make it look like the
+    /// start of that instruction to the next hook choosing sites.
     pub fn binop(&mut self, op: IntBinop, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let (block, anchor, address) = (self.block, self.anchor, self.address);
+        let (block, anchor) = (self.block, self.anchor);
         let mut builder = self.ctx.builder(block);
         builder.set_insert_point_before(anchor);
-        if let Some(address) = address {
-            builder.set_address(address);
-        }
         builder.push_binop(Binop::Int(op), lhs, rhs).id()
     }
 
@@ -268,12 +300,9 @@ impl<'a> Emitter<'a> {
         if self.size_of(value) == size {
             return value;
         }
-        let (block, anchor, address) = (self.block, self.anchor, self.address);
+        let (block, anchor) = (self.block, self.anchor);
         let mut builder = self.ctx.builder(block);
         builder.set_insert_point_before(anchor);
-        if let Some(address) = address {
-            builder.set_address(address);
-        }
         builder.push_zext(value, size).id()
     }
 
@@ -314,10 +343,10 @@ impl<'a> Emitter<'a> {
             builder.finalize(rest);
         }
         {
+            // No address on the branch either: the rest of the block then
+            // starts the guest instruction it starts, rather than looking
+            // like a continuation of one.
             let mut builder = self.ctx.builder(block);
-            if let Some(address) = address {
-                builder.set_address(address);
-            }
             builder.push_cbranch(cond, hook, rest);
         }
         self.block = rest;
