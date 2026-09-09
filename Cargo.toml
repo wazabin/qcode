@@ -4,7 +4,7 @@ exclude = ["analysis"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -15,13 +15,13 @@ homepage = "https://github.com/wazabin/qcode"
 wazabin-binary = { version = "0.1.0", path = "../wazabin-binary" }
 jstd = { package = "wazabin-jstd", version = "0.2.0", path = "../wazabin-jstd" }
 pcode-types = { package = "wazabin-pcode", version = "0.1.0", path = "../wazabin-pcode" }
-qcode = { package = "wazabin-qcode", version = "0.1.1", path = "core" }
-qcode_emulator = { package = "wazabin-qcode-emulator", version = "0.1.1", path = "emulator" }
-qcode_jit = { package = "wazabin-qcode-jit", version = "0.1.1", path = "jit" }
-qcode_passes = { package = "wazabin-qcode-passes", version = "0.1.1", path = "passes" }
-qcode_vm = { package = "wazabin-qcode-vm", version = "0.1.1", path = "vm" }
-wazabin-qcode-macro = { version = "0.1.1", path = "macro" }
-wazabin-qcode-parser = { version = "0.1.1", path = "parser" }
+qcode = { package = "wazabin-qcode", version = "0.2.0", path = "core" }
+qcode_emulator = { package = "wazabin-qcode-emulator", version = "0.2.0", path = "emulator" }
+qcode_jit = { package = "wazabin-qcode-jit", version = "0.2.0", path = "jit" }
+qcode_passes = { package = "wazabin-qcode-passes", version = "0.2.0", path = "passes" }
+qcode_vm = { package = "wazabin-qcode-vm", version = "0.2.0", path = "vm" }
+wazabin-qcode-macro = { version = "0.2.0", path = "macro" }
+wazabin-qcode-parser = { version = "0.2.0", path = "parser" }
 
 bincode = { version = "2", features = ["serde"] }
 clang = { version = "2", features = ["clang_10_0"] }
