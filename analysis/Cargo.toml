@@ -1,48 +1,77 @@
+# `qcode_analysis` is not part of the public qcode workspace and is not
+# published to crates.io. It carries its own workspace table so it can be
+# lifted into a private repository as-is; the QCode crates it builds on are
+# consumed as ordinary path dependencies of the sibling checkout.
+[workspace]
+resolver = "2"
+
 [package]
 name = "qcode_analysis"
-edition.workspace = true
-version.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
 description = "Optimization passes for the qcode IR: GVN, DCE, dead-store elimination, alias analysis"
-repository.workspace = true
+repository = "https://github.com/wazabin/qcode"
+publish = false
 
 [features]
 # Forward to cabi's Win32 prototype tables (mingw-w64). Off by default; see cabi.
 win32 = ["cabi/win32"]
 
 [dependencies]
-jstd.workspace = true
-wazabin-binary.workspace = true
-qcode.workspace = true
-cabi.workspace = true
-serde.workspace = true
-bincode.workspace = true
-toml.workspace = true
-cpp_demangle.workspace = true
-inventory.workspace = true
-log.workspace = true
+jstd = { package = "wazabin-jstd", version = "0.1.0", path = "../../wazabin-jstd" }
+wazabin-binary = { version = "0.1.0", path = "../../wazabin-binary" }
+qcode = { version = "0.1.0", path = "../core" }
+qcode_passes = { version = "0.1.0", path = "../passes" }
+cabi = { version = "0.1.0", path = "../../wazabin-cabi" }
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
+toml = "1"
+cpp_demangle = "0.5"
+inventory = "0.3"
+log = "0.4"
 # Fast non-cryptographic hasher for internal int-keyed maps (ValueId/BlockId/...).
 # Profiling showed ~⅓ of analysis CPU was SipHash; FxHashMap also makes map
 # iteration order deterministic (std RandomState reseeds per process).
-rustc-hash.workspace = true
-pollster.workspace = true
+rustc-hash = "2"
+sleigh-precompile = { package = "wazabin-sleigh-precompile", path = "../../wazabin-sleigh/precompile" }
+pollster = "0.4"
 # Pure-function emulation in constant propagation runs the callee body.
-qcode_emulator.workspace = true
+qcode_emulator = { version = "0.1.0", path = "../emulator" }
 # MBA solver backing the `mba_simplify` de-obfuscation pass.
-rumba-core.workspace = true
+rumba-core = "=1.0.0"
 
 [build-dependencies]
-serde.workspace = true
-bincode.workspace = true
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
 # Parse the TEB/PEB layout from `src/teb.h` at build time (same libclang dep cabi uses).
-clang.workspace = true
+clang = { version = "2", features = ["clang_10_0"] }
 
 [dev-dependencies]
-harbinger = { version = "0.1.0", path = "../../wazabin" }
-qcode = { workspace = true, features = ["testing"] }
-wazabin-qcode-macro.workspace = true
-env_logger.workspace = true
+harbinger = { path = "../../wazabin" }
+qcode = { version = "0.1.0", path = "../core", features = ["testing"] }
+wazabin-qcode-macro = { version = "0.1.0", path = "../macro" }
+env_logger = "0.11"
+qcode_jit = { version = "0.1.0", path = "../jit" }
+qcode_vm = { version = "0.1.0", path = "../vm" }
+qcode_emulator = { version = "0.1.0", path = "../emulator" }
+wazabin-qcode-sleigh = { version = "0.1.0", path = "../sleigh" }
+rustc-hash = "2"
+sleigh-precompile = { package = "wazabin-sleigh-precompile", path = "../../wazabin-sleigh/precompile" }
+
+# The published crates depend on the official `rustc_apfloat`; this mirrors the
+# public workspace's local patch. See ../Cargo.toml.
+[patch.crates-io]
+rustc_apfloat = { git = "https://github.com/Garfield1002/rustc_apfloat.git", rev = "9a4a688bc8f2741c5bd43df79c7061ef63142122" }
 
 [[example]]
 name = "qcode-pass"
 path = "examples/qcode_pass.rs"
+
+# The embench harness drives the JIT end to end and measures what the
+# whole-function store elimination buys, so it lives with the analysis passes
+# it exercises rather than with the JIT backend.
+[[example]]
+name = "run-embench"
+path = "examples/run-embench.rs"

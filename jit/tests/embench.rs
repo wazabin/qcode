@@ -149,7 +149,10 @@ fn images() -> Vec<(String, Vec<u8>)> {
 #[ignore = "needs benchmarks/embench/build.sh to have been run"]
 fn embench_verifies_under_both_strategies() {
     let images = images();
-    assert!(!images.is_empty(), "no images; run benchmarks/embench/build.sh");
+    assert!(
+        !images.is_empty(),
+        "no images; run benchmarks/embench/build.sh"
+    );
 
     let mut failures = Vec::new();
     for (name, image) in &images {

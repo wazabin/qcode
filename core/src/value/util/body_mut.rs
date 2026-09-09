@@ -10,7 +10,7 @@
 //! the `&Shared` view, reachable read-only. The inherent verb + read methods below
 //! route each write to the borrowed function's arena; a function pass must not mutate another
 //! function (asserted). The module-scope twin of every verb is an inherent method
-//! on [`Context`](crate::context::Context); the shorter-lived reborrow needed to
+//! on [`Context`]; the shorter-lived reborrow needed to
 //! hand the host to a value that owns it by value (a [`Builder`](crate::builder::Builder)
 //! or a mutation `BaseRef`) is [`BodyMut::reborrow`].
 
@@ -94,7 +94,7 @@ impl<'a, 'str> BodyMut<'a, 'str> {
 
 /// The verb + read surface of a checked-out function pass, delegating to the
 /// owned `FunctionBody`'s inherent verbs and `self.shared`. The module-scope twin of
-/// each verb is an inherent method on [`Context`](crate::context::Context); the
+/// each verb is an inherent method on [`Context`]; the
 /// primitives below (`function{,_mut}`/`shared`/`view`, and the no-op
 /// call-site cache) are the checked-out specializations.
 impl<'a, 'str> BodyMut<'a, 'str> {
@@ -130,19 +130,19 @@ impl<'a, 'str> BodyMut<'a, 'str> {
     }
     // ---- function-scoped read wrappers --------------------------------------
 
-    /// A read [`BlockRef`](crate::value::BlockRef) over `id`, body-routed.
+    /// A read [`BlockRef`] over `id`, body-routed.
     pub fn block_ref(&self, id: BlockId) -> BlockRef<'str, '_, BodyView<'_, 'str>> {
         self.view().block_ref(id)
     }
-    /// A read [`InstructionRef`](crate::value::InstructionRef) over `id`.
+    /// A read [`InstructionRef`] over `id`.
     pub fn insn_ref(&self, id: InstructionId) -> InstructionRef<'str, '_, BodyView<'_, 'str>> {
         self.view().insn_ref(id)
     }
-    /// A read [`BlockParamRef`](crate::value::BlockParamRef) over `id`.
+    /// A read [`BlockParamRef`] over `id`.
     pub fn param_ref(&self, id: BlockParamId) -> BlockParamRef<'str, '_, BodyView<'_, 'str>> {
         self.view().param_ref(id)
     }
-    /// A read [`FunctionRef`](crate::value::FunctionRef) over `id`.
+    /// A read [`FunctionRef`] over `id`.
     pub fn function_ref(&self, id: FunctionId) -> FunctionRef<'str, '_, BodyView<'_, 'str>> {
         self.view().function_ref(id)
     }

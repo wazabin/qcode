@@ -1,6 +1,6 @@
-//! Opaque compile-time byte blobs — constants wider than a [`Literal`] can hold.
+//! Opaque compile-time byte blobs — constants wider than a [`Literal`](crate::value::literal::Literal) can hold.
 //!
-//! A numeric [`Literal`](crate::value::Literal) is a single `u64`; constants
+//! A numeric [`Literal`](crate::value::literal::Literal) is a single `u64`; constants
 //! that exceed 64 bits (SSE/AVX register pools, wide stack/memory reads, the
 //! result of coalescing several adjacent constant stores) cannot be represented
 //! that way without breaking the u64-centric folding pipeline. A [`Bytes`]

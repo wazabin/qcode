@@ -17,7 +17,9 @@ fn report_decline_reasons() {
     let source = SleighCodeSource::new(sleigh_precompile::x64::spec());
     let ctx = source.new_context();
     let mut memory = VmMemory::new();
-    memory.mmu.write_unchecked(0x1000, code, perm::READ | perm::EXEC);
+    memory
+        .mmu
+        .write_unchecked(0x1000, code, perm::READ | perm::EXEC);
     let mut vm = Vm::at_address(ctx, 0x1000, source, memory).expect("entry decodes");
     vm.run(5000);
 

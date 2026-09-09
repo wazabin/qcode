@@ -1,3 +1,58 @@
+//! Concrete execution of the [QCode](https://docs.rs/qcode) IR.
+//!
+//! This crate answers *what does this IR compute*: it evaluates QCode over a
+//! pre-lifted, immutable module against concrete machine state. It is the
+//! reference execution strategy — the one [`qcode_jit`] is differentially
+//! tested against, and the one [`qcode_vm`] builds a machine on top of.
+//!
+//! # Abstract over the domain
+//!
+//! Execution is generic over the *interpretation domain*. [`DomainValue`],
+//! [`DomainMemory`] and [`Interpreter`] describe what a value, a memory and an
+//! evaluator have to provide; concrete execution is one instantiation, and a
+//! symbolic or abstract one is another. [`StandaloneEmulator`] is the concrete
+//! implementation, built on [`SizedValue`].
+//!
+//! # Fidelity
+//!
+//! Floating point goes through [`rustc_apfloat`](https://docs.rs/rustc_apfloat)
+//! rather than the host's `f64`, including correctly rounded 80-bit x87
+//! extended precision, and x87 arithmetic honours the guest's control word for
+//! rounding mode and precision control. Results match hardware rather than
+//! whatever the host FPU happens to do.
+//!
+//! # Example
+//!
+//! ```
+//! use qcode::{context::Context, qcode};
+//! use qcode_emulator::StandaloneEmulator;
+//!
+//! let mut ctx = Context::new();
+//! qcode!(
+//!     ctx,
+//!     "
+//!     <src>
+//!         goto <dst @x=0x2>;
+//!     <dst @x>
+//!         %sum = i64 @x + 0x3;
+//!         goto <0x1001>;
+//!     "
+//! );
+//!
+//! let mut emu = StandaloneEmulator::new(src);
+//! emu.step(&ctx).expect("the branch binds the block parameter");
+//! emu.step(&ctx).expect("the destination uses it");
+//!
+//! assert_eq!(emu.get_value(&ctx, sum.into()), Some(5));
+//! ```
+//!
+//! To *run a guest program* — mapped memory, page permissions, faults
+//! delivered as values, code lifted on demand — see [`qcode_vm`], which layers
+//! those on top of this crate.
+//!
+//! [`qcode_vm`]: https://docs.rs/qcode_vm
+//! [`qcode_jit`]: https://docs.rs/qcode_jit
+
 use qcode::{
     context::Context,
     space::MemorySpaceId,
@@ -14,7 +69,9 @@ use qcode::{
 
 mod concrete;
 
-pub use concrete::{BodyArg, EmulatedMemory, Emulator, EmulatorMemory, SizedValue, StandaloneEmulator};
+pub use concrete::{
+    BodyArg, EmulatedMemory, Emulator, EmulatorMemory, SizedValue, StandaloneEmulator,
+};
 
 #[derive(Debug, Clone)]
 pub struct CallSite {

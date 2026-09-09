@@ -3,7 +3,7 @@
 //! Each submodule defines one family of intrinsics (their evaluators,
 //! recognizers, simplifiers) and self-registers them with the global registry
 //! via [`register_intrinsic!`](crate::register_intrinsic). The registry
-//! machinery, the [`IntrinsicId`] handle and the [`Intrinsic`] mnemonic itself
+//! machinery, the [`IntrinsicId`](crate::value::insn::intrinsic::IntrinsicId) handle and the [`Intrinsic`](crate::value::insn::intrinsic::Intrinsic) mnemonic itself
 //! live in [`crate::value::insn`]; this module is purely the catalogue of
 //! concrete intrinsics.
 //!

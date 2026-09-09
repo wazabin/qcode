@@ -266,6 +266,14 @@ impl<'ctx, 'str> ContextView<'ctx, 'str> {
         self.env
     }
 
+    /// Narrow to the environment-free view the block-local passes in
+    /// [`qcode_passes`] take. Those passes need only the shared IR state and
+    /// the published interfaces; dropping the env is what lets them live in a
+    /// crate below this one.
+    pub fn pass(self) -> qcode_passes::PassCtx<'ctx, 'str> {
+        qcode_passes::PassCtx::from_parts(self.shared, self.interfaces)
+    }
+
     /// The published interface of function `f` (name, address, signature, purity,
     /// clobber/write summaries) — the caller-reasoning surface. Interfaces are
     /// never checked out, so this always reads the shared registry.

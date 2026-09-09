@@ -150,7 +150,7 @@ pub enum Simplified {
 }
 
 /// One intrinsic's registration, submitted via [`inventory::submit!`] (see
-/// [`register_intrinsic!`]) and collected into the global registry.
+/// `register_intrinsic!`) and collected into the global registry.
 pub struct IntrinsicRegistration(pub &'static dyn Intrinsic);
 
 inventory::collect!(IntrinsicRegistration);

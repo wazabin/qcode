@@ -206,7 +206,7 @@ where
     /// The address-space provenance for this instruction's result, if any.
     ///
     /// Returns `Some` only for instructions whose result type is a pointer to a
-    /// known memory space (e.g. [`StackAddress`](crate::types::StackAddress)).
+    /// known memory space (e.g. `StackAddress`).
     pub fn space(&'s self) -> Option<SpaceRef<'ctx>> {
         self.view
             .shared()
@@ -335,7 +335,7 @@ impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
 
     /// Creates an instruction with an explicit [`TypeId`], born into `func`.
     ///
-    /// Pass a [`StackAddress`](crate::types::StackAddress) type id when the
+    /// Pass a `StackAddress` type id when the
     /// result is a stack-space pointer. Register-space provenance is silently
     /// demoted to `Int` (pointer arithmetic on registers is not meaningful).
     pub fn from_mnemonic_with_type(
@@ -352,7 +352,7 @@ impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
     /// Creates an instruction, deriving the result type from an optional space tag.
     ///
     /// This is a migration shim that types the result as `Int(size)` regardless of
-    /// the `space` tag. New code should use [`from_mnemonic_with_type`] directly.
+    /// the `space` tag. New code should use `from_mnemonic_with_type` directly.
     pub fn from_mnemonic_with_space(
         ctx: &'ctx mut Context<'str>,
         func: FunctionId,

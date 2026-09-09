@@ -424,7 +424,7 @@ impl<S: CodeSource> Vm<S> {
             // uses, which is what leaves the surrounding computation dead.
             let started = std::time::Instant::now();
             let cleanup = crate::optimize::forward_temp_stores(&mut self.ctx, block);
-            qcode_analysis::dce::remove_dead_insns(&mut self.ctx, block);
+            qcode_passes::remove_dead_insns(&mut self.ctx, block);
             self.stats.optimize += started.elapsed();
             self.stats.forwarded_loads += cleanup.forwarded_loads as u64;
             self.stats.removed_stores += cleanup.removed_stores as u64;
@@ -505,7 +505,7 @@ impl<S: CodeSource> Vm<S> {
         }
         let started = std::time::Instant::now();
         let cleanup = crate::optimize::forward_temp_stores(&mut self.ctx, block);
-        qcode_analysis::dce::remove_dead_insns(&mut self.ctx, block);
+        qcode_passes::remove_dead_insns(&mut self.ctx, block);
         self.stats.optimize += started.elapsed();
         self.stats.forwarded_loads += cleanup.forwarded_loads as u64;
         self.stats.removed_stores += cleanup.removed_stores as u64;
@@ -535,7 +535,7 @@ impl<S: CodeSource> Vm<S> {
         // a split leaves behind — it re-establishes a block's *start* while
         // everything after it is still lifted — and the shape a back-edge into
         // the middle of a run creates generally.
-        let forward = qcode_analysis::cfg::absorb_straight_line(&mut self.ctx, filled);
+        let forward = qcode_passes::absorb_straight_line(&mut self.ctx, filled);
         self.stats.absorbed += forward as u64;
         if forward > 0 {
             self.reindex_absorbed(filled);
@@ -587,7 +587,7 @@ impl<S: CodeSource> Vm<S> {
             .instruction_ids()
             .len()
             .saturating_sub(1);
-        if qcode_analysis::cfg::absorb_straight_line(&mut self.ctx, head) == 0 {
+        if qcode_passes::absorb_straight_line(&mut self.ctx, head) == 0 {
             return (forward > 0).then_some(filled);
         }
         self.stats.absorbed += 1;

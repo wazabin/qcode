@@ -55,7 +55,7 @@ pub trait MnemonicKind {
 /// | [`Zext`], [`Sext`], [`Range`], [`IntToFloat`], [`FloatToInt`], [`FloatToFloat`] | Type casts and bit extraction |
 /// | [`IsFloatNaN`], [`PopCount`], [`LzCount`], [`Carry`], [`SCarry`], [`SBorrow`] | Bit/flag operations |
 /// | [`PCodeOp`] | User-defined or architecture-specific operation |
-/// | [`Intrinsic`] | Pure named intrinsic function (e.g. `rol`, `ror`) |
+/// | [`Intrinsic`](crate::value::insn::intrinsic::Intrinsic) | Pure named intrinsic function (e.g. `rol`, `ror`) |
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Mnemonic {

@@ -1,7 +1,7 @@
 //! Fluent IR builder: emit instructions into a [`BasicBlock`].
 //!
 //! The [`Builder`] is the primary way to construct IR. It holds a mutable
-//! reference to a block inside a [`Context`] and exposes typed `push_*` methods
+//! reference to a block inside a [`Context`](crate::context::Context) and exposes typed `push_*` methods
 //! for every instruction kind.
 //!
 //! Terminating the block is the caller's responsibility ([`Builder::finalize`]
@@ -293,7 +293,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 
     /// A `Copy` read view over the builder's backing, for arena reads. The builder
-    /// reads through the backing's static [`QCodeView`].
+    /// reads through the backing's static [`QCodeView`](crate::value::QCodeView).
     pub fn view(&self) -> BodyView<'_, 'str> {
         BodyView::new(&*self.body, self.shared, self.interfaces)
     }
@@ -1907,7 +1907,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     // --- Loads & Stores ---
 
     /// Creates a copy instruction from `src` to `dst`.
-    /// Note that `dst` must already exist as a [`Value`] in the current context, and this will not create a new temporary value.
+    /// Note that `dst` must already exist as a [`Value`](crate::value::Value) in the current context, and this will not create a new temporary value.
     /// If `dst` is a varnode, we aren't allowed to write to it, this is a store operation
     /// If `src` is a varnode, we need to read from it first, then write to dst
     /// For values wider than 64 bits (e.g. XMM/YMM/ZMM registers), emits one store per 64-bit lane.
@@ -2337,7 +2337,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 
     /// Tail call to another function's entry — a function-level terminator with
-    /// no intra-function CFG successor (see [`TailCall`](crate::value::insn::TailCall)).
+    /// no intra-function CFG successor (see [`TailCall`]).
     /// Unlike [`push_branch`](Self::push_branch), this wires no CFG edge: control
     /// leaves the function.
     pub fn push_tail_call(
@@ -2456,7 +2456,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         self.insn_ref(local)
     }
 
-    /// Terminate the current block with [`BadInsn`]: bytes that did not decode to
+    /// Terminate the current block with [`BadInsn`](crate::value::insn::BadInsn): bytes that did not decode to
     /// a valid instruction. No successors, no operands.
     pub fn push_bad_insn(&mut self) -> InstructionRef<'str, '_, BodyView<'_, 'str>> {
         let local = self.push_bad_insn_local();

@@ -912,7 +912,7 @@ fn literal_atom_view<'ctx, 'str: 'ctx>(view: impl QCodeView<'ctx, 'str>, id: Lit
 
 /// The token stream for a **shared-leaf** value operand (literal, bytes, varnode),
 /// rendered from only the module's [`Shared`] IR state. The `&Shared` twin of
-/// [`value_tokens`] for the operands a `&Shared`-backed [`ValueRef`] can hold;
+/// [`value_tokens`] for the operands a `&Shared`-backed [`ValueRef`](crate::value::ValueRef) can hold;
 /// symbolic block/function literals fall back to the numeric form (their names
 /// live in bodies/interfaces, out of a `&Shared`'s reach). Panics on
 /// arena-cluster ids, which a shared-leaf ref never carries.

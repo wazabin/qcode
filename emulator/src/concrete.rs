@@ -10,10 +10,9 @@ use qcode::{
         BasicBlock, BlockId, BlockParamId, BlockRef, FunctionBody, FunctionId, Instruction,
         LocalValueId, Value, ValueId, ValueRef, Varnode,
         insn::{
-            Branch, BranchInd, CBranch, Call, CallInd, Callee, Carry, Extract,
-            InstructionId, InstructionRef, IntBinop,
-            LzCount, Mnemonic, PopCount, Range, Return, SBorrow, SCarry, Scan, Sext,
-            Store, Tuple, Unop, Zext,
+            Branch, BranchInd, CBranch, Call, CallInd, Callee, Carry, Extract, InstructionId,
+            InstructionRef, IntBinop, LzCount, Mnemonic, PopCount, Range, Return, SBorrow, SCarry,
+            Scan, Sext, Store, Tuple, Unop, Zext,
         },
         varnode::{VarnodeId, register::RegisterId},
     },
@@ -1712,9 +1711,9 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                 "extract_significand" => Some(SizedValue::from_f80_bits(
                     float80::extract_significand(value.as_bits()),
                 )),
-                "extract_exponent" => {
-                    Some(SizedValue::from_f80_bits(float80::extract_exponent(value.as_bits()).bits))
-                }
+                "extract_exponent" => Some(SizedValue::from_f80_bits(
+                    float80::extract_exponent(value.as_bits()).bits,
+                )),
                 _ => None,
             });
         }
@@ -1766,8 +1765,13 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                     Self::ieee_to_int(lhs, rhs.as_bits(), round)
                 }
                 "float_scalb" | "float_scalb_flags" if lhs.size == 10 => {
-                    let steps = i32::try_from(rhs.as_bits() as i64).unwrap_or(if
-                        (rhs.as_bits() as i64) < 0 { i32::MIN } else { i32::MAX });
+                    let steps = i32::try_from(rhs.as_bits() as i64).unwrap_or(
+                        if (rhs.as_bits() as i64) < 0 {
+                            i32::MIN
+                        } else {
+                            i32::MAX
+                        },
+                    );
                     let result = float80::scalb_ieee(lhs.as_bits(), steps, round);
                     Some((SizedValue::from_f80_bits(result.bits), result.status))
                 }
@@ -4098,12 +4102,8 @@ mod tests {
         // the exponent, and follows the IEEE rounding mode it is given.
         let one_plus_half_single_ulp = one + (1u128 << 39);
         assert_eq!(
-            float80::round_to_precision(
-                one_plus_half_single_ulp,
-                24,
-                Round::NearestTiesToEven
-            )
-            .bits,
+            float80::round_to_precision(one_plus_half_single_ulp, 24, Round::NearestTiesToEven)
+                .bits,
             one
         );
         assert_eq!(
@@ -4112,12 +4112,7 @@ mod tests {
         );
         // 64 significand bits is the identity.
         assert_eq!(
-            float80::round_to_precision(
-                one_plus_half_single_ulp,
-                64,
-                Round::TowardPositive
-            )
-            .bits,
+            float80::round_to_precision(one_plus_half_single_ulp, 64, Round::TowardPositive).bits,
             one_plus_half_single_ulp
         );
 
@@ -4270,8 +4265,7 @@ mod tests {
 
         // A negative operand is invalid. What is delivered in its place is
         // the specification's choice, so the operation returns the operand.
-        let negative =
-            float80::sqrt_ieee(0xbfff_8000_0000_0000_0000, Round::NearestTiesToEven);
+        let negative = float80::sqrt_ieee(0xbfff_8000_0000_0000_0000, Round::NearestTiesToEven);
         assert_eq!(negative.bits, 0xbfff_8000_0000_0000_0000);
         assert!(negative.status.contains(Status::INVALID_OP));
     }

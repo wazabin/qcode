@@ -9,6 +9,41 @@
 //! spaces, registers, and user p-code operations already installed. Reuse an
 //! [`AddressIndex`] with [`SleighLifter::lift_instruction_indexed`] when
 //! lifting multiple instructions.
+//!
+//! # Example
+//!
+//! Decode one x86-64 instruction and lift it into a QCode context:
+//!
+//! ```no_run
+//! use sleigh::Decoder;
+//! use sleigh_precompile::x64;
+//! use qcode::address_index::AddressIndex;
+//! use wazabin_qcode_sleigh::SleighLifter;
+//!
+//! let spec = x64::spec();
+//!
+//! // `48 89 d8` is `MOV RAX, RBX`.
+//! let instruction = Decoder::new(spec)
+//!     .decode_one(0x1000, &[0x48, 0x89, 0xd8], &spec.new_context())
+//!     .expect("the bytes decode");
+//! let flat = instruction.pcode_ops().expect("the semantics emit");
+//!
+//! let lifter = SleighLifter::new(spec);
+//! let mut ctx = lifter.new_context();
+//! let mut addresses = AddressIndex::analyze(&ctx);
+//! lifter
+//!     .lift_pcode_indexed(&mut ctx, &mut addresses, 0x1000, instruction.len(), &flat, None)
+//!     .expect("the p-code lowers");
+//!
+//! println!("{ctx}");
+//! ```
+//!
+//! The `qcode-dump` example prints every stage — disassembly text, SLEIGH AST,
+//! flat p-code, and the resulting QCode:
+//!
+//! ```sh
+//! cargo run --example qcode-dump -- 4889d8
+//! ```
 
 pub mod vm_source;
 

@@ -1,10 +1,16 @@
 [package]
 name = "qcode_emulator"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Concrete interpreter and emulator for the qcode IR"
+readme = "readme.md"
+documentation = "https://docs.rs/qcode_emulator"
+keywords = ["binary-analysis", "emulator", "interpreter", "pcode", "reverse-engineering"]
+categories = ["development-tools::debugging", "emulators"]
 repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 qcode.workspace = true

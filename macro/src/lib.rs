@@ -7,6 +7,39 @@
 //! (functions, blocks, SSA values, varnodes, and block parameters) to a Rust
 //! `let`, so callers can reference it after the invocation. `{capture}` atoms
 //! are resolved from the surrounding Rust scope.
+//!
+//! # Usage
+//!
+//! Depend on [`qcode`], which re-exports this macro; there is no reason to
+//! depend on this crate directly.
+//!
+//! ```ignore
+//! use qcode::{context::Context, qcode};
+//!
+//! let mut ctx = Context::new();
+//! let addend: u64 = 3;
+//!
+//! qcode!(
+//!     ctx,
+//!     "
+//!     fn f:
+//!     <entry>
+//!         %sum = i64 0x2 + {addend};
+//!         goto <exit @r=%sum>;
+//!     <exit @r:i64>
+//!         goto <0x1001>;
+//!     "
+//! );
+//!
+//! // `f`, `entry`, `exit`, `sum` and `r` are now Rust bindings.
+//! assert_eq!(ctx.get_value(sum.into()).is_some(), true);
+//! ```
+//!
+//! The example is not compiled here: `qcode` depends on this crate, so this
+//! crate cannot depend back on it even for a test. The macro's behaviour is
+//! covered by `qcode`'s own test suite.
+//!
+//! [`qcode`]: https://docs.rs/qcode
 
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};

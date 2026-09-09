@@ -42,10 +42,10 @@ mod engine {
     /// legacy image and the existing mem1 word at offset 0x100.
     const SCRATCH_MEMORY_SIZE: usize = 512;
 
-/// Where binit places a bit-index instruction's memory operand within the
-/// scratch window, so a signed `index s>> 3` reaches seeded bytes either side.
-/// Must match `BIT_INDEX_OPERAND_OFFSET` in binit's `make_test_cases.py`.
-const BIT_INDEX_OPERAND_OFFSET: usize = 256;
+    /// Where binit places a bit-index instruction's memory operand within the
+    /// scratch window, so a signed `index s>> 3` reaches seeded bytes either side.
+    /// Must match `BIT_INDEX_OPERAND_OFFSET` in binit's `make_test_cases.py`.
+    const BIT_INDEX_OPERAND_OFFSET: usize = 256;
     const MEMORY_WORDS: &[(&str, u64)] = &[("mem0_value", MEM0_ADDR), ("mem1_value", MEM1_ADDR)];
     const MAX_EMULATED_STEPS: usize = 10_000;
     const SCALAR_REGISTERS: &[&str] = &[
@@ -110,7 +110,7 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
     }
 
     fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
-        if s.is_empty() || s.len() % 2 != 0 {
+        if s.is_empty() || !s.len().is_multiple_of(2) {
             return None;
         }
         (0..s.len())
@@ -1258,7 +1258,11 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
         end_address: u64,
     ) -> Result<(), RunError> {
         for _ in 0..MAX_EMULATED_STEPS {
-            if emu.block().address().is_some_and(|address| address >= end_address) {
+            if emu
+                .block()
+                .address()
+                .is_some_and(|address| address >= end_address)
+            {
                 return Ok(());
             }
             let Some(insn) = emu.insn() else {
@@ -1664,18 +1668,18 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
             if include_x87 {
                 let initial_top =
                     x87_top(pair.initial.regs.get("x87_status").copied().unwrap_or(0) as u64);
-                if let Some(&explicit_top) = pair.initial.regs.get("x87_top") {
-                    if explicit_top as usize != initial_top {
-                        return Err(Box::new(DbMismatch::backend_error(
-                            tc,
-                            state_index,
-                            pair,
-                            final_state,
-                            format!(
-                                "x87_top ({explicit_top}) conflicts with x87_status.TOP ({initial_top})"
-                            ),
-                        )));
-                    }
+                if let Some(&explicit_top) = pair.initial.regs.get("x87_top")
+                    && explicit_top as usize != initial_top
+                {
+                    return Err(Box::new(DbMismatch::backend_error(
+                        tc,
+                        state_index,
+                        pair,
+                        final_state,
+                        format!(
+                            "x87_top ({explicit_top}) conflicts with x87_status.TOP ({initial_top})"
+                        ),
+                    )));
                 }
                 for &(field, register) in X87_CONTROL_FIELDS {
                     let Some(&raw) = pair.initial.regs.get(field) else {
@@ -1746,22 +1750,22 @@ const BIT_INDEX_OPERAND_OFFSET: usize = 256;
             catch_unwind(AssertUnwindSafe(|| {
                 run_to_instruction_boundary(&mut emu, instruction_addr as u64 + bytes.len() as u64)
             }))
-                .map_err(|payload| {
-                    DbMismatch::backend_error(
-                        tc,
-                        state_index,
-                        pair,
-                        final_state,
-                        format!("emulation panicked: {}", panic_message(payload)),
-                    )
-                })?
-                .map_err(|error| match error {
-                    RunError::Emulator(EmulatorError {
-                        kind: EmulatorErrorKind::UnsupportedPCodeOp(operation),
-                        ..
-                    }) => DbMismatch::unsupported(tc, state_index, pair, final_state, &operation),
-                    error => DbMismatch::backend_error(tc, state_index, pair, final_state, error),
-                })?;
+            .map_err(|payload| {
+                DbMismatch::backend_error(
+                    tc,
+                    state_index,
+                    pair,
+                    final_state,
+                    format!("emulation panicked: {}", panic_message(payload)),
+                )
+            })?
+            .map_err(|error| match error {
+                RunError::Emulator(EmulatorError {
+                    kind: EmulatorErrorKind::UnsupportedPCodeOp(operation),
+                    ..
+                }) => DbMismatch::unsupported(tc, state_index, pair, final_state, &operation),
+                error => DbMismatch::backend_error(tc, state_index, pair, final_state, error),
+            })?;
 
             // Compare final general-purpose registers and the control-flow stop RIP.
             for (name, &raw) in &final_state.regs {

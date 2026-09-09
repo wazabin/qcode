@@ -167,7 +167,7 @@ impl<'str> BasicBlock<'str> {
     /// where `clone_into_ctx` builds a semantically independent copy inside the
     /// *same* function (used by the tracer), this reproduces `orig` verbatim in a
     /// *different* function's arenas — preserving each instruction's exact result
-    /// [`TypeId`] and machine address, and the block's own name — so a caller
+    /// [`TypeId`](crate::types::TypeId) and machine address, and the block's own name — so a caller
     /// relocating a reattributed block can then fix up the references in a single
     /// whole-function pass. It records `orig`'s params and instruction results in
     /// `value_map` (old id -> new id) but leaves the new instructions' operands and

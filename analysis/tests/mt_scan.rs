@@ -16,7 +16,7 @@ use qcode::value::{BlockParamId, FunctionId};
 use qcode_analysis::{PipelineEnv, RegisteredPass, make_pass};
 use qcode_emulator::{SizedValue, StandaloneEmulator};
 
-const SOURCE: &str = include_str!("../../examples/qcode/mt19937_init.qcode");
+const SOURCE: &str = include_str!("../examples/qcode/mt19937_init.qcode");
 
 /// MT19937 word count and the base address we place the state array at.
 const N: usize = 624;

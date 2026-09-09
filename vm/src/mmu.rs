@@ -1,7 +1,7 @@
 //! Software MMU: page-granular mapping with per-byte permissions.
 //!
 //! This is the process-memory model the QCode emulator's flat
-//! [`EmulatedSpace`](qcode_emulator::EmulatedSpace) map cannot express. A flat
+//! `EmulatedSpace` map cannot express. A flat
 //! `addr -> byte` map answers "what is here", but a VM needs to answer "may this
 //! access happen at all", and to answer it *without aborting the run* — an
 //! unmapped read is a fault the guest may legitimately take, not an emulator
@@ -141,7 +141,7 @@ pub struct PageData {
 /// Distance from a page's first data byte to its first permission byte.
 ///
 /// Compiled code bakes this in; it is checked against the real layout by
-/// [`tests::the_permission_array_follows_the_data_array`].
+/// `tests::the_permission_array_follows_the_data_array`.
 pub const PAGE_PERM_OFFSET: usize = PAGE_SIZE as usize;
 
 #[derive(Clone)]
@@ -155,10 +155,22 @@ impl Page {
         // and `Box::new(PageData { .. })` would materialise all of it on the
         // stack first.
         //
+        // `alloc_zeroed` rather than `Box::<PageData>::new_zeroed()`, which is
+        // stable only since 1.92 and would raise this crate's MSRV. The
+        // allocator hands back zeroed pages either way.
+        //
         // SAFETY: `PageData` is two `u8` arrays, for which all-zero — no
         // permissions, no contents — is both a valid value and the one this
-        // constructor means.
-        let inner = unsafe { Box::<PageData>::new_zeroed().assume_init() };
+        // constructor means. The layout is non-zero-sized, and a null return
+        // is routed to the allocation-error handler rather than used.
+        let inner = unsafe {
+            let layout = std::alloc::Layout::new::<PageData>();
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<PageData>();
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            Box::from_raw(ptr)
+        };
         Self { inner }
     }
 

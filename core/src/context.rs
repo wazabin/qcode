@@ -143,7 +143,7 @@ pub struct Shared<'str> {
     /// The values available in the context, indexed by their ID
     pub values: ValueRegistry<'str>,
 
-    /// Type registry: owns all [`Type`] objects and hands out [`TypeId`]s.
+    /// Type registry: owns all [`Type`](crate::types::Type) objects and hands out [`TypeId`](crate::types::TypeId)s.
     pub types: TypeManager,
 
     /// Whether the binary's per-segment protection flags are authoritative
@@ -286,7 +286,7 @@ impl<'str> Shared<'str> {
     }
 
     /// Like [`get_bytes`](Self::get_bytes) but with an explicit array/sequence
-    /// [`TypeId`]. Shared-only mirror of [`Context::get_typed_bytes`] returning
+    /// [`TypeId`](crate::types::TypeId). Shared-only mirror of [`Context::get_typed_bytes`] returning
     /// the id directly.
     pub fn get_typed_bytes(&self, data: Vec<u8>, type_id: crate::types::TypeId) -> ValueId {
         ValueId::Bytes(
@@ -327,7 +327,7 @@ impl<'str> Shared<'str> {
         self.values.varnodes.len()
     }
 
-    /// The stored [`TypeId`] of a **shared-leaf** value (literal, bytes, or
+    /// The stored [`TypeId`](crate::types::TypeId) of a **shared-leaf** value (literal, bytes, or
     /// varnode-with-override). Shared-only mirror of [`Context::stored_type_of`]:
     /// instruction/block-param/block/function ids live in function bodies and are
     /// out of a `&Shared`'s reach, so they return `None` here (callers route those
@@ -358,7 +358,7 @@ impl<'str> Context<'str> {
     ///
     /// The default space has a word size of 1 byte and an address size of 8
     /// bytes (suitable for 64-bit architectures). Its [`SpaceId`] is stored in
-    /// [`Context::default_space`].
+    /// `Context::default_space`.
     pub fn new() -> Self {
         let mut ctx = Self::default();
         // SPACE_CONST = SpaceId(0): virtual space for constant/immediate values
@@ -884,7 +884,7 @@ impl<'str> Context<'str> {
     /// Number of varnodes in the context. The varnode registry is append-only, so
     /// this is monotonic and an unchanged value means an unchanged varnode set —
     /// used to validate caches keyed on the register/varnode layout (e.g. the
-    /// alias [`RegisterBase`](../../qcode_analysis/alias/struct.RegisterBase.html)).
+    /// alias `RegisterBase` in the analysis layer).
     pub fn varnode_count(&self) -> usize {
         self.shared.varnode_count()
     }
@@ -1188,7 +1188,7 @@ impl<'str> Context<'str> {
     /// root) or mints a conventional `fn_<addr>` (synthesized interface, unknown ABI
     /// — the optimization pipeline derives its purity/clobber/ABI facts later);
     /// (ii) extracts the tail reachable from `block`, stopping at other function
-    /// entries ([`split_tail`](Self::split_tail)), and reassigns it to `G` (an
+    /// entries (`split_tail`), and reassigns it to `G` (an
     /// absorbed tail may currently be owned by the function that absorbed it);
     /// (iii) rewrites every terminator that statically targeted `block` — in the
     /// absorbing function and in any already-lifted caller — into a function-level
@@ -1518,7 +1518,7 @@ impl<'str> Context<'str> {
     /// Assumes `prop` is true. Returns `false` (and records nothing) if the
     /// proposition is already assumed or known false; returns `true` if it was
     /// recorded or already held with the same polarity (idempotent). The
-    /// recording pass is taken from [`pass_scope`](crate::pass_scope).
+    /// recording pass is taken from [`pass_scope`].
     pub fn assume_true(&mut self, prop: Proposition) -> bool {
         self.assume(prop, true)
     }
@@ -1855,7 +1855,7 @@ impl<'str> Context<'str> {
         Varnode::from_id(self, self.shared.registers[&id])
     }
 
-    /// Creates a [`Value`] representing an integer constant of the given byte width.
+    /// Creates a [`Value`](crate::value::Value) representing an integer constant of the given byte width.
     pub fn get_const(&self, value: u64, size: usize) -> LiteralRef<'str, '_> {
         let type_id = self.shared.types.get_or_make_int(size);
         let id = self
@@ -1876,7 +1876,7 @@ impl<'str> Context<'str> {
         LiteralRef::from_id(self, id)
     }
 
-    /// Mints a fresh typed **poison** value of the given [`TypeId`]. Never
+    /// Mints a fresh typed **poison** value of the given [`TypeId`](crate::types::TypeId). Never
     /// deduped: each call yields a distinct poison so GVN keeps them in separate
     /// congruence classes (see [`poison`](crate::value::poison)).
     pub fn get_poison(&self, type_id: crate::types::TypeId) -> ValueId {
@@ -1885,7 +1885,7 @@ impl<'str> Context<'str> {
 
     /// Creates a typed constant literal.
     ///
-    /// Unlike [`get_const`](Self::get_const) this accepts an arbitrary [`TypeId`],
+    /// Unlike [`get_const`](Self::get_const) this accepts an arbitrary [`TypeId`](crate::types::TypeId),
     /// allowing StackAddress constants (e.g. the stack base) to preserve their
     /// type through constant folding.
     pub fn get_typed_const(
@@ -1915,9 +1915,9 @@ impl<'str> Context<'str> {
     }
 
     /// Like [`get_bytes`](Self::get_bytes) but stamps the blob with an explicit
-    /// array/sequence [`TypeId`] instead of the default `Array(i8, len)`. Mints
+    /// array/sequence [`TypeId`](crate::types::TypeId) instead of the default `Array(i8, len)`. Mints
     /// through the `&self` append path (no post-hoc `type_id` write), so a
-    /// checked-out function pass reading through a [`BodyView`] can materialize a
+    /// checked-out function pass reading through a [`BodyView`](crate::value::BodyView) can materialize a
     /// typed constant array without mutable access to the shared registry.
     pub fn get_typed_bytes(
         &self,
@@ -1932,7 +1932,7 @@ impl<'str> Context<'str> {
         crate::value::BytesRef::from_id(self, id)
     }
 
-    /// Returns the [`TypeId`] of any [`ValueId`] in this context.
+    /// Returns the [`TypeId`](crate::types::TypeId) of any [`ValueId`] in this context.
     ///
     /// Varnodes are typed as `Int(varnode.size())`. Blocks, functions, and other
     /// non-data values return `Int(0)`.
@@ -1960,7 +1960,7 @@ impl<'str> Context<'str> {
         }
     }
 
-    /// Returns the stored [`TypeId`] for value kinds that carry one directly.
+    /// Returns the stored [`TypeId`](crate::types::TypeId) for value kinds that carry one directly.
     ///
     /// Unlike [`Context::type_of`], this never interns fallback integer types,
     /// so it works from immutable formatting and parsing paths. Varnodes,
@@ -2022,7 +2022,7 @@ impl<'str> Context<'str> {
         ModuleView::new(self)
     }
     /// The module's shared IR state ([`Shared`]) — the module-path twin of
-    /// [`ModuleView::shared`]/[`BodyMut::shr`], so a `&mut Context` module walker and
+    /// [`ModuleView::shared`]/[`BodyMut::shr`](crate::value::util::body_mut::BodyMut::shr), so a `&mut Context` module walker and
     /// a checked-out pass spell shared-data reads identically (context-split
     /// stage 5b-ii item #1).
     pub fn shr(&self) -> &Shared<'str> {
@@ -2037,7 +2037,7 @@ impl<'str> Context<'str> {
         &mut self.bodies[f]
     }
 
-    /// A read [`BlockRef`](crate::value::BlockRef) over `id`, module-routed.
+    /// A read [`BlockRef`] over `id`, module-routed.
     pub fn block_ref(&self, id: BlockId) -> BlockRef<'str, '_, ModuleView<'_, 'str>> {
         self.view().block_ref(id)
     }
@@ -2045,7 +2045,7 @@ impl<'str> Context<'str> {
     pub fn insn_ref(&self, id: InstructionId) -> InstructionRef<'str, '_, ModuleView<'_, 'str>> {
         self.view().insn_ref(id)
     }
-    /// A read [`BlockParamRef`](crate::value::BlockParamRef) over `id`.
+    /// A read [`BlockParamRef`] over `id`.
     pub fn param_ref(&self, id: BlockParamId) -> BlockParamRef<'str, '_, ModuleView<'_, 'str>> {
         self.view().param_ref(id)
     }
@@ -2156,7 +2156,7 @@ impl<'str> Context<'str> {
         }
     }
 
-    /// Remove `name` from the name map, keeping the [`get_unique_name`] suffix
+    /// Remove `name` from the name map, keeping the [`get_unique_name`](crate::context::Context::get_unique_name) suffix
     /// hint exact: if `name` is a generated `base_<n>` suffix, lower `base`'s hint
     /// so the freed suffix is reconsidered on the next call (a naive first-free
     /// scan would reuse it, and the hint must not skip it). Un-suffixed names are
@@ -2187,7 +2187,7 @@ impl<'str> Context<'str> {
 /// A name → value reverse map with amortized unique-name minting.
 ///
 /// The context keeps one **global** table for module-scoped values (functions,
-/// varnodes, spaces, p-code ops, byte blobs); each [`FunctionBody`](crate::value::FunctionBody)
+/// varnodes, spaces, p-code ops, byte blobs); each [`FunctionBody`]
 /// keeps its **own** table for its block/instruction/param/Temp names. Keeping those
 /// namespaces independent is a prerequisite for running function passes in
 /// parallel: a worker mints names against its function's table with no global

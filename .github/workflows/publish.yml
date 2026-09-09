@@ -1,0 +1,69 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  JSTD_REPOSITORY: ${{ vars.JSTD_REPOSITORY || format('{0}/jstd', github.repository_owner) }}
+  PCODE_TYPES_REPOSITORY: ${{ vars.PCODE_TYPES_REPOSITORY || format('{0}/wazabin-pcode', github.repository_owner) }}
+  BINARY_REPOSITORY: ${{ vars.BINARY_REPOSITORY || format('{0}/wazabin-binary', github.repository_owner) }}
+  SLEIGH_REPOSITORY: ${{ vars.SLEIGH_REPOSITORY || format('{0}/wazabin-sleigh', github.repository_owner) }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out path dependencies
+        run: |
+          git clone --depth=1 "https://github.com/${JSTD_REPOSITORY}.git" ../jstd
+          git clone --depth=1 "https://github.com/${PCODE_TYPES_REPOSITORY}.git" ../wazabin-pcode
+          git clone --depth=1 "https://github.com/${BINARY_REPOSITORY}.git" ../wazabin-binary
+          git clone --depth=1 "https://github.com/${SLEIGH_REPOSITORY}.git" ../wazabin-sleigh
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify the tag matches the workspace version
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "$tag_version" = "$version" || {
+            echo "Tag $GITHUB_REF_NAME does not match workspace version $version"
+            exit 1
+          }
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+
+      # Dependency order. Each crate must be on crates.io before anything that
+      # depends on it can be verified.
+      - name: Publish the workspace in dependency order
+        run: |
+          set -euo pipefail
+          for crate in \
+            wazabin-qcode-parser \
+            wazabin-qcode-macro \
+            qcode \
+            qcode_emulator \
+            qcode_passes \
+            qcode_vm \
+            wazabin-qcode-sleigh \
+            qcode_jit
+          do
+            echo "::group::$crate"
+            if cargo publish -p "$crate"; then
+              echo "published $crate"
+            elif cargo info "$crate@$RELEASE_VERSION" >/dev/null 2>&1; then
+              # Permit a manual re-run after this version has already uploaded.
+              echo "$crate@$RELEASE_VERSION is already on crates.io; skipping"
+            else
+              echo "::error::failed to publish $crate"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done

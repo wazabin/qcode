@@ -17,7 +17,6 @@ env:
   # Override these repository variables when dependencies are hosted elsewhere.
   BINIT_REPOSITORY: ${{ vars.BINIT_REPOSITORY || format('{0}/binit', github.repository_owner) }}
   BINARY_REPOSITORY: ${{ vars.BINARY_REPOSITORY || format('{0}/wazabin-binary', github.repository_owner) }}
-  CABI_REPOSITORY: ${{ vars.CABI_REPOSITORY || format('{0}/wazabin-cabi', github.repository_owner) }}
   JSTD_REPOSITORY: ${{ vars.JSTD_REPOSITORY || format('{0}/jstd', github.repository_owner) }}
   PCODE_TYPES_REPOSITORY: ${{ vars.PCODE_TYPES_REPOSITORY || format('{0}/wazabin-pcode', github.repository_owner) }}
   SLEIGH_REPOSITORY: ${{ vars.SLEIGH_REPOSITORY || format('{0}/wazabin-sleigh', github.repository_owner) }}
@@ -45,7 +44,6 @@ jobs:
       - name: Check out local path dependencies and Binit schema
         run: |
           git clone --depth=1 "https://github.com/${BINARY_REPOSITORY}.git" ../wazabin-binary
-          git clone --depth=1 "https://github.com/${CABI_REPOSITORY}.git" ../wazabin-cabi
           git clone --depth=1 "https://github.com/${JSTD_REPOSITORY}.git" ../jstd
           git clone --depth=1 "https://github.com/${PCODE_TYPES_REPOSITORY}.git" ../wazabin-pcode
           git clone --depth=1 "https://github.com/${SLEIGH_REPOSITORY}.git" ../wazabin-sleigh

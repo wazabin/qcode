@@ -16,7 +16,7 @@
 //! pass over the block. Forwarding the stored value to the load removes both.
 //!
 //! This is deliberately the *limited* version of store-to-load forwarding, not
-//! [`mem2reg`](qcode_analysis::mem::mem2reg): it is block-local, needs no alias
+//! `mem2reg`: it is block-local, needs no alias
 //! analysis, and is linear in the size of the block, so it can run on every
 //! lifted block without reintroducing the quadratic cost that a whole-function
 //! pass would.
@@ -132,8 +132,8 @@ pub fn forward_temp_stores(ctx: &mut Context<'_>, block_id: BlockId) -> Cleanup 
         // `Mnemonic` owns its argument list, so cloning one allocates; doing it
         // for every instruction of every lifted block made allocation a
         // measurable share of translation time, to read four `Copy` ids.
-        let accessed = match Instruction::from_id(ctx, insn_id).mnemonic() {
-            &Mnemonic::Store(Store {
+        let accessed = match *Instruction::from_id(ctx, insn_id).mnemonic() {
+            Mnemonic::Store(Store {
                 space,
                 ptr,
                 size,
@@ -144,7 +144,7 @@ pub fn forward_temp_stores(ctx: &mut Context<'_>, block_id: BlockId) -> Cleanup 
                 size,
                 src,
             },
-            &Mnemonic::Load(Load { space, ptr, size }) => Access::Load { space, ptr, size },
+            Mnemonic::Load(Load { space, ptr, size }) => Access::Load { space, ptr, size },
             _ => continue,
         };
         match accessed {

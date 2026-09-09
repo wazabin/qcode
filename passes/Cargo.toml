@@ -1,0 +1,21 @@
+[package]
+name = "qcode_passes"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Block-local cleanup passes over the qcode IR: dead-instruction removal and CFG straight-line absorption"
+readme = "readme.md"
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/qcode_passes"
+keywords = ["binary-analysis", "compiler", "ir", "optimization", "pcode"]
+categories = ["development-tools::debugging", "compilers"]
+
+[dependencies]
+jstd.workspace = true
+qcode.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]
+wazabin-qcode-macro.workspace = true

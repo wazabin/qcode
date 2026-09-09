@@ -1,11 +1,12 @@
 [workspace]
-members = ["core", "analysis", "emulator", "jit", "macro", "parser", "sleigh", "vm"]
+members = ["core", "emulator", "jit", "macro", "parser", "passes", "sleigh", "vm"]
+exclude = ["analysis"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/wazabin/qcode"
 homepage = "https://github.com/wazabin/qcode"
@@ -19,6 +20,7 @@ qcode = { version = "0.1.0", path = "core" }
 qcode_analysis = { version = "0.1.0", path = "analysis" }
 qcode_emulator = { version = "0.1.0", path = "emulator" }
 qcode_jit = { version = "0.1.0", path = "jit" }
+qcode_passes = { version = "0.1.0", path = "passes" }
 qcode_vm = { version = "0.1.0", path = "vm" }
 wazabin-qcode-macro = { version = "0.1.0", path = "macro" }
 wazabin-qcode-parser = { version = "0.1.0", path = "parser" }
@@ -34,7 +36,15 @@ pest_derive = "2.8.6"
 pollster = "0.4"
 rumba-core = "=1.0.0"
 rustc-hash = "2"
-rustc_apfloat = { git = "https://github.com/Garfield1002/rustc_apfloat.git", branch = "main" }
+rustc_apfloat = "0.2.3"
 serde = { version = "1", features = ["derive"] }
 smallvec = "1"
 toml = "1"
+
+# The published crates depend on the official `rustc_apfloat`. Until
+# https://github.com/rust-lang/rustc_apfloat/pull/37 (overflow is not signalled
+# when rounding delivers the largest finite value) is released, local builds and
+# CI take the fix from the fork. `[patch]` applies to this workspace only: it is
+# not recorded in published packages and never reaches downstream consumers.
+[patch.crates-io]
+rustc_apfloat = { git = "https://github.com/Garfield1002/rustc_apfloat.git", rev = "9a4a688bc8f2741c5bd43df79c7061ef63142122" }

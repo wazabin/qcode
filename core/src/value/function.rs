@@ -196,7 +196,7 @@ pub struct MemoryChannelState {
     /// materialized (the default and, today, the only state any pass sets).
     ///
     /// The memory analogue of
-    /// [`RegisterChannelState::Materialized`](RegisterChannelState::Materialized).
+    /// [`RegisterChannelState::Materialized`].
     /// Unlike the register channel this is a field rather than a lattice state,
     /// because `coarse` and `precise` are independently ⊤ and materialization is
     /// orthogonal to both.
@@ -320,7 +320,7 @@ pub struct RegisterInterfaceMap {
 /// This is the memory channel's analogue of [`RegisterInterfaceMap`]'s bare
 /// [`VarnodeId`]: a register input needs no descriptor beyond the register
 /// itself, but a memory input has to say *which address* the caller reads. It
-/// generalizes [`ExternSlot`](super::function::signature::ExternSlot), which
+/// generalizes [`ExternSlot`], which
 /// describes the same thing for prototyped externals only.
 ///
 /// Every slot is `mem[base + offset]` of `size` bytes: a memory input is, by
@@ -1958,7 +1958,7 @@ where
     }
 
     /// Resolve a block/instruction/param/Temp `name` within this function's local name
-    /// table (see [`FunctionBody::names`]). `None` if this function has no such name.
+    /// table (see `FunctionBody::names`). `None` if this function has no such name.
     pub fn local_named(&'s self, name: &str) -> Option<ValueId> {
         self.inner().names.get(name).map(|id| id.qualify(self.id))
     }
@@ -1984,7 +1984,7 @@ where
     /// written); `None` conflates "unstamped" and "stamped unbounded" — both are
     /// treated conservatively (may write any space) by consumers. For the
     /// tri-state distinction use [`written_spaces_state`](Self::written_spaces_state).
-    /// See [`FunctionSignature::written_spaces`].
+    /// See `FunctionSignature::written_spaces`.
     pub fn written_spaces(&'s self) -> Option<&'ctx [crate::space::SpaceId]> {
         match &self.interface().effects.memory.coarse {
             WrittenSpacesState::Bounded(spaces) => Some(spaces),
@@ -1994,7 +1994,7 @@ where
 
     /// The tri-state `written_spaces` verdict, distinguishing a never-stamped
     /// fresh mint ([`WrittenSpaces::Unstamped`]) from a deliberately recorded
-    /// ⊤ ([`WrittenSpaces::Unbounded`]). See [`FunctionSignature::written_spaces`].
+    /// ⊤ ([`WrittenSpaces::Unbounded`]). See `FunctionSignature::written_spaces`.
     pub fn written_spaces_state(&'s self) -> WrittenSpaces<'ctx> {
         match &self.interface().effects.memory.coarse {
             WrittenSpacesState::Unstamped => WrittenSpaces::Unstamped,
@@ -2536,7 +2536,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// Records the analysis-computed set of non-register spaces this function may
     /// write. This is always a deliberate stamp: `Some(spaces)` is a bounded
     /// witnessed set, `None` records *stamped unbounded* (⊤) — never clears the
-    /// stamp back to unstamped. See [`FunctionSignature::written_spaces`] and
+    /// stamp back to unstamped. See `FunctionSignature::written_spaces` and
     /// [`FunctionRef::written_spaces_state`].
     pub fn set_written_spaces(&mut self, spaces: Option<Vec<crate::space::SpaceId>>) {
         let coarse = match spaces {

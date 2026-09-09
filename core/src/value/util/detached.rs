@@ -4,7 +4,7 @@
 //! with **no** registry identity yet ([`FunctionBody::detached`]). `DetachedMut`
 //! is that body's exclusive mutation surface while it is being built — a thin
 //! wrapper exposing **only body-local verbs** (`LocalValueId`/`LocalBlockId`/
-//! `LocalInsnId` in and out). Owner values stay composite ([`ValueId`]); minted
+//! `LocalInsnId` in and out). Owner values stay composite ([`ValueId`](crate::value::ValueId)); minted
 //! values are local, so mixing the two is a type error — there is no qualifier in
 //! scope (the detached body's [`id`](FunctionBody::id) panics before install) to
 //! launder an owner id through.

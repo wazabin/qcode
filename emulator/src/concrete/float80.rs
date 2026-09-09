@@ -176,35 +176,19 @@ pub(super) fn truncate_to_i128(raw: u128, width: usize) -> rustc_apfloat::Status
 /// no status reporting.  x87 constructors use `float_{add,sub,mul,div}` with
 /// an explicit rounding mode instead.
 pub(super) fn add(lhs: u128, rhs: u128) -> u128 {
-    bits(
-        value(lhs)
-            .add_r(value(rhs), Round::NearestTiesToEven)
-            .value,
-    )
+    bits(value(lhs).add_r(value(rhs), Round::NearestTiesToEven).value)
 }
 
 pub(super) fn sub(lhs: u128, rhs: u128) -> u128 {
-    bits(
-        value(lhs)
-            .sub_r(value(rhs), Round::NearestTiesToEven)
-            .value,
-    )
+    bits(value(lhs).sub_r(value(rhs), Round::NearestTiesToEven).value)
 }
 
 pub(super) fn mul(lhs: u128, rhs: u128) -> u128 {
-    bits(
-        value(lhs)
-            .mul_r(value(rhs), Round::NearestTiesToEven)
-            .value,
-    )
+    bits(value(lhs).mul_r(value(rhs), Round::NearestTiesToEven).value)
 }
 
 pub(super) fn div(lhs: u128, rhs: u128) -> u128 {
-    bits(
-        value(lhs)
-            .div_r(value(rhs), Round::NearestTiesToEven)
-            .value,
-    )
+    bits(value(lhs).div_r(value(rhs), Round::NearestTiesToEven).value)
 }
 
 /// IEEE scaleB: multiply by two raised to an integral power, rounded once.
@@ -384,7 +368,6 @@ const BCD_INDEFINITE: u128 = 0xffff_c000_0000_0000_0000;
 
 /// The largest magnitude eighteen packed decimal digits can hold.
 const BCD_MAX: i128 = 999_999_999_999_999_999;
-
 
 /// Pack a value as eighteen signed decimal digits after rounding it to an
 /// integer under `round`. The conversion is exact when it succeeds and

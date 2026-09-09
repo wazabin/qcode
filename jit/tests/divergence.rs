@@ -139,7 +139,12 @@ impl BlockExecutor for Recorder {
 ///
 /// `detail` names an entry index whose register bytes — and its predecessor's —
 /// are kept alongside the digests, for the second pass.
-fn trace(image: &[u8], jit: bool, budget: u64, detail: Option<usize>) -> (Vec<Entry>, Vec<Vec<u8>>) {
+fn trace(
+    image: &[u8],
+    jit: bool,
+    budget: u64,
+    detail: Option<usize>,
+) -> (Vec<Entry>, Vec<Vec<u8>>) {
     let source = SleighCodeSource::new(sleigh_precompile::x64::spec());
     let ctx = source.new_context();
     let registers = (0..ctx.space_count())

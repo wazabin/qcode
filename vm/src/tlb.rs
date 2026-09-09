@@ -54,7 +54,7 @@ const INVALID_TAG: u64 = u64::MAX;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TlbEntry {
-    /// The guest page base this entry translates, or [`INVALID_TAG`].
+    /// The guest page base this entry translates, or `INVALID_TAG`.
     pub tag: u64,
     /// Added to a guest address to get the host address of that byte.
     pub guest_to_host_offset: u64,

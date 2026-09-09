@@ -84,7 +84,7 @@ pub enum Proposition {
     /// alias rule (see [`AliasResult::provably_disjoint`]) forward a spilled buffer
     /// pointer's in-loop reload across the very store that writes *through* it,
     /// which `argpromote` needs to region-promote a dynamic-index buffer loop.
-    /// Like [`ArgsDisjointFromCallerFrame`] it is **not** statically sound on its
+    /// Like [`ArgsDisjointFromCallerFrame`](crate::assumption::Proposition::ArgsDisjointFromCallerFrame) it is **not** statically sound on its
     /// own — it fails only for a self-referential pointer (`*pp == &pp`), which real
     /// code does not build — so a pass records it `Assumed`; v1 has no verifier
     /// (nothing currently proves the negation), the checkpoint+replay net catching
@@ -101,7 +101,7 @@ pub enum Proposition {
     /// as `load(src - step)` — the move that removes the carry and exposes the
     /// `map(body, take_while(src))` shape — re-reads memory that the body also
     /// writes through `dst`. That re-read is value-preserving only when the two
-    /// buffers are disjoint. Like [`ArgsDisjointFromCallerFrame`] it is **not**
+    /// buffers are disjoint. Like [`ArgsDisjointFromCallerFrame`](crate::assumption::Proposition::ArgsDisjointFromCallerFrame) it is **not**
     /// statically sound on its own — a caller may pass overlapping pointers — so a
     /// pass records it `Assumed`; v1 has no verifier (the checkpoint+replay net
     /// catches any future refutation).

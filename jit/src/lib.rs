@@ -9,7 +9,35 @@
 //!
 //! The backend is deliberately partial — see [`compile::Unsupported`]. A block
 //! it declines is run by the interpreter instead, so coverage can grow without
-//! ever being a correctness question.
+//! ever being a correctness question.//!
+//! # Installing it
+//!
+//! The JIT is a [`qcode_vm`] block executor; a machine runs identically with
+//! or without it, only faster.
+//!
+//! ```no_run
+//! use qcode_jit::Jit;
+//! use qcode_vm::{Vm, VmMemory, perm};
+//! use wazabin_qcode_sleigh::vm_source::SleighCodeSource;
+//!
+//! # fn run(code: &[u8]) {
+//! let source = SleighCodeSource::new(sleigh_precompile::x64::spec());
+//! let ctx = source.new_context();
+//!
+//! let mut memory = VmMemory::new();
+//! memory.mmu.write_unchecked(0x1000, code, perm::READ | perm::EXEC);
+//!
+//! let mut vm = Vm::at_address(ctx, 0x1000, source, memory).expect("the entry decodes");
+//! vm.set_block_executor(Box::new(Jit::new()));
+//! vm.run(10_000);
+//!
+//! // How much the JIT actually took on, rather than handed back.
+//! println!("compiled {} blocks natively", vm.stats.native_bodies);
+//! # }
+//! ```
+//!
+//! [`qcode_vm`]: https://docs.rs/qcode_vm
+
 pub mod compile;
 pub mod jit;
 

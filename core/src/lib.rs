@@ -3,8 +3,10 @@
 //! `qcode` models the semantics of lifted machine code. It is inspired by
 //! Ghidra's p-code, with additional first-class values for instructions, basic
 //! blocks, functions, and literals. The crate contains the IR, its builder,
-//! the QCode text-format lowering API, and integrity checks; optimization and
-//! recovery passes live separately in [`qcode_analysis`].
+//! the QCode text-format lowering API, and integrity checks. Optimization and
+//! execution live separately: see [`qcode_passes`] for block-local cleanup,
+//! [`qcode_emulator`] to interpret QCode, and [`qcode_vm`] to run a guest
+//! program under an MMU.
 //!
 //! # Getting started
 //!
@@ -37,7 +39,9 @@
 //! the re-exported [`qcode!`] macro performs the same lowering and binds names
 //! declared in the source into the surrounding Rust scope.
 //!
-//! [`qcode_analysis`]: https://docs.rs/qcode_analysis
+//! [`qcode_passes`]: https://docs.rs/qcode_passes
+//! [`qcode_emulator`]: https://docs.rs/qcode_emulator
+//! [`qcode_vm`]: https://docs.rs/qcode_vm
 //! [`Space`]: crate::space::Space
 //! [`ValueId`]: crate::value::ValueId
 //! [`FunctionBody`]: crate::value::FunctionBody

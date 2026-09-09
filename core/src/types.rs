@@ -2,16 +2,16 @@
 //!
 //! Every value (literal, instruction result, block param) carries a [`TypeId`]
 //! that encodes both its size and its semantic kind. Types are interned once in
-//! a [`TypeManager`] attached to the [`Context`]; all passes use [`TypeId`] as
+//! a [`TypeManager`] attached to the [`Context`](crate::context::Context); all passes use [`TypeId`] as
 //! a lightweight `Copy` handle.
 //!
 //! # Type taxonomy
 //!
 //! | Concrete type    | Meaning                                        |
 //! |------------------|------------------------------------------------|
-//! | [`IntType`]      | Plain integer of *n* bytes                     |
-//! | [`BoolType`]     | A byte-stored boolean, domain `{0, 1}`         |
-//! | [`StackAddress`] | Pointer-width address in the stack memory space |
+//! | `IntType`      | Plain integer of *n* bytes                     |
+//! | `BoolType`     | A byte-stored boolean, domain `{0, 1}`         |
+//! | `StackAddress` | Pointer-width address in the stack memory space |
 //!
 //! # Bool
 //!
@@ -97,13 +97,13 @@ pub trait Type: Send + Sync {
         None
     }
 
-    /// The ordered field types, if this is an [`AggregateType`] or nominal
-    /// [`StructType`].
+    /// The ordered field types, if this is an `AggregateType` or nominal
+    /// `StructType`.
     fn fields(&self) -> Option<&[AggregateField]> {
         None
     }
 
-    /// The name of this type, if it is a nominal [`StructType`].
+    /// The name of this type, if it is a nominal `StructType`.
     fn struct_name(&self) -> Option<&str> {
         None
     }
@@ -113,19 +113,19 @@ pub trait Type: Send + Sync {
         None
     }
 
-    /// The pointee type, if this is a [`StructPointer`].
+    /// The pointee type, if this is a `StructPointer`.
     fn pointee(&self) -> Option<TypeId> {
         None
     }
 
-    /// The `(elem, count)` pair, if this is an [`ArrayType`]. Returns `None` for
+    /// The `(elem, count)` pair, if this is an `ArrayType`. Returns `None` for
     /// every other type — this is the *only* discriminator element-aware code
     /// uses to tell an array from the width-N scalar it otherwise looks like.
     fn array(&self) -> Option<(TypeId, usize)> {
         None
     }
 
-    /// The `(elem, bound)` pair, if this is a [`ListType`] — a variable-length
+    /// The `(elem, bound)` pair, if this is a `ListType` — a variable-length
     /// sequence whose `bound` is the static element upper bound (`Some(n)`) or
     /// `None` when unbounded (a pointer-sourced string). Returns `None` (the outer
     /// option) for every non-list type. This is the discriminator that tells a
@@ -178,7 +178,7 @@ pub enum TypeRepr {
         fields: Vec<AggregateField>,
     },
     /// A named, nominal struct with explicit per-field byte offsets — the
-    /// pointee of a [`StructPointer`]. Identity is the `name`, not the field
+    /// pointee of a `StructPointer`. Identity is the `name`, not the field
     /// list, so two structs with coincident layouts stay distinct. Sparse: only
     /// the fields of interest are listed; `size` is the real struct size and
     /// need not equal the fields' extent.
@@ -244,7 +244,7 @@ pub enum TypeRepr {
 ///
 /// Field names are part of aggregate identity. For structural aggregates the
 /// slots are addressed by numeric index and `offset` is informational (the
-/// running byte sum); for nominal [`StructType`]s `offset` is the field's real
+/// running byte sum); for nominal `StructType`s `offset` is the field's real
 /// byte offset and is the key a [`Gep`](crate::value::insn::Gep) resolves on.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AggregateField {
@@ -261,7 +261,7 @@ impl AggregateField {
         Self::new_at(name, type_id, 0)
     }
 
-    /// Field at an explicit byte `offset`. Used by nominal [`StructType`]s.
+    /// Field at an explicit byte `offset`. Used by nominal `StructType`s.
     pub fn new_at(name: impl Into<String>, type_id: TypeId, offset: usize) -> Self {
         Self {
             name: name.into(),
@@ -1084,7 +1084,7 @@ impl TypeManager {
         }
         self.mint(|inner| inner.get_or_make_space_address(size, space))
     }
-    /// Returns the [`TypeId`] for an [`AggregateType`] with default field names
+    /// Returns the [`TypeId`] for an `AggregateType` with default field names
     /// (`field1`, `field2`, ...), creating it if it does not yet exist.
     pub fn get_or_make_aggregate(&self, fields: Vec<TypeId>) -> TypeId {
         self.get_or_make_named_aggregate(default_named_fields(fields))

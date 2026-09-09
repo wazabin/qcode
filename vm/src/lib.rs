@@ -5,6 +5,34 @@
 //! top of that — mapped memory with permissions, faults delivered as values
 //! rather than aborts, code discovered on demand as the guest reaches it, and
 //! snapshots — so that a guest program can be run rather than merely evaluated.
+//!
+//! # Faults are values, not aborts
+//!
+//! A bad guest access is returned to the caller, so a harness can observe it
+//! and carry on rather than dying:
+//!
+//! ```
+//! use qcode_vm::{VmMemory, FaultKind, perm};
+//!
+//! let mut memory = VmMemory::new();
+//! // One read-only page of initialised memory.
+//! memory.mmu.map(0x1000, 0x1000, perm::MAP | perm::READ | perm::INIT).unwrap();
+//!
+//! let mut buffer = [0u8; 4];
+//! assert!(memory.mmu.read(0x1000, &mut buffer).is_ok());
+//!
+//! // Writing it faults, and says why and where.
+//! let fault = memory.mmu.write(0x1000, &[0xff]).unwrap_err();
+//! assert_eq!(fault.kind, FaultKind::WritePerm);
+//! assert_eq!(fault.addr, 0x1000);
+//!
+//! // So does touching an address that was never mapped.
+//! let fault = memory.mmu.read(0x9000, &mut buffer).unwrap_err();
+//! assert_eq!(fault.kind, FaultKind::ReadUnmapped);
+//! ```
+//!
+//! Execution strategy is pluggable through `set_block_executor`, which is how
+//! [`qcode_jit`](https://docs.rs/qcode_jit) is installed on a machine.
 
 pub mod flat;
 pub mod jit_abi;

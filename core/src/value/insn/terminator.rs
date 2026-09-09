@@ -149,11 +149,11 @@ impl MnemonicKind for BranchInd {
 /// A tail call: an unconditional transfer of control to another *function's*
 /// entry (a thunk `jmp realfunc`, or a tail `jmp`/`jcc` that the disassembler
 /// resolved to a sibling function). Unlike [`Branch`], whose target is a
-/// [`BlockId`] *within the same function*, a `TailCall` carries a [`Callee`]:
+/// [`BlockId`](crate::value::BlockId) *within the same function*, a `TailCall` carries a [`Callee`]:
 /// normally a real [`FunctionId`], or temporarily a pass-local minted
 /// placeholder. It is a function-level terminator with no intra-function CFG
 /// successor. This is the honest encoding of cross-function control flow — the
-/// IR never stores a foreign [`BlockId`]. See the context-split design, ruling
+/// IR never stores a foreign [`BlockId`](crate::value::BlockId). See the context-split design, ruling
 /// 2 ("strict IR locality").
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TailCall {
@@ -243,7 +243,7 @@ pub struct Call {
     pub args: Vec<LocalValueId>,
     /// Register / memory locations the call may write or alias (the callee's
     /// clobbered set plus escaping pointer arguments). These are *defs*, not
-    /// reads: they are intentionally excluded from [`MnemonicKind::args`] so
+    /// reads: they are intentionally excluded from `MnemonicKind::args` so
     /// they do not participate in use-def bookkeeping.
     pub clobbers: Vec<LocalValueId>,
     /// Binding-convention tag (argpromote v2). Serialized so rewritten regpure

@@ -264,7 +264,7 @@ pub(crate) struct BlockTranslator<'a, 'ctx> {
 pub struct Helpers {
     pub load: FuncId,
     pub store: FuncId,
-    /// The 128-bit divisions, in [`Division`] order.
+    /// The 128-bit divisions, in `Division` order.
     pub divisions: [FuncId; 4],
 }
 

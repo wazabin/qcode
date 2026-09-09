@@ -32,7 +32,7 @@ use std::collections::BTreeSet;
 ///   The owning function's `users` map is populated at push time from the
 ///   instruction's operands and is not updated if operands are later altered via
 ///   interior mutation. Use
-///   [`Context::replace_all_uses_with`](crate::context::Context::replace_all_uses_with)
+///   `Context::replace_all_uses_with`
 ///   to rewrite operands while keeping `users` consistent.
 ///
 /// - **`users` is managed internally.** The reverse use-def map now lives in
@@ -42,7 +42,7 @@ use std::collections::BTreeSet;
 ///   [`FunctionRef::users_of`](crate::value::FunctionRef::users_of) /
 ///   [`Context::users`](crate::context::Context::users), and remove dead
 ///   instructions via
-///   [`Context::remove_instructions`](crate::context::Context::remove_instructions).
+///   `Context::remove_instructions`.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ValueRegistry<'str> {
     /// Literal (constant) interner. Behind an `RwLock` (see
@@ -110,9 +110,9 @@ impl<'str> ValueRegistry<'str> {
     /// (created via [`push_literal`](Self::push_literal)) are not included in
     /// the intern cache and will not alias with constants produced here.
     ///
-    /// Call [`Context::get_const`] for the common `Int(size)` case; use this
+    /// Call [`Context::get_const`](crate::context::Context::get_const) for the common `Int(size)` case; use this
     /// method directly when you need to preserve a non-`Int` type (e.g.
-    /// [`StackAddress`](crate::types::StackAddress)) through folding.
+    /// `StackAddress`) through folding.
     pub fn get_or_make_typed_literal(&self, value: u64, type_id: TypeId, size: usize) -> LiteralId {
         self.literals
             .get_or_make_typed_literal(value, type_id, size)
@@ -126,7 +126,7 @@ impl<'str> ValueRegistry<'str> {
     }
 
     /// Records a synthetic forward call-graph edge `caller → callee_addr` (see
-    /// [`synthetic_callees`](Self::synthetic_callees)). Returns `true` if the
+    /// `synthetic_callees`). Returns `true` if the
     /// edge was newly added, so callers can drive a fixpoint without spinning.
     pub fn add_synthetic_callee(&mut self, caller: FunctionId, callee_addr: u64) -> bool {
         self.synthetic_callees

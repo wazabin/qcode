@@ -141,7 +141,9 @@ mod tests {
         let source = SleighCodeSource::new(spec());
         let ctx = source.new_context();
         let mut memory = VmMemory::new();
-        memory.mmu.write_unchecked(0x1000, code, perm::READ | perm::EXEC);
+        memory
+            .mmu
+            .write_unchecked(0x1000, code, perm::READ | perm::EXEC);
         memory.mmu.map(0x20000, 0x2000, perm::RW_INIT).unwrap();
         Vm::at_address(ctx, 0x1000, source, memory).expect("the entry decodes")
     }
@@ -380,11 +382,18 @@ mod tests {
     fn optimisation_preserves_architectural_state() {
         let programs: [&[u8]; 4] = [
             // Arithmetic and the flags it writes.
-            &[0xb8, 0x39, 0x05, 0x00, 0x00, 0x01, 0xd8, 0x29, 0xd8, 0x31, 0xd8],
+            &[
+                0xb8, 0x39, 0x05, 0x00, 0x00, 0x01, 0xd8, 0x29, 0xd8, 0x31, 0xd8,
+            ],
             // Shifts and rotates, which lean hard on temporaries.
-            &[0xb8, 0xff, 0x00, 0x00, 0x00, 0xc1, 0xe0, 0x03, 0xd1, 0xe8, 0xc1, 0xc0, 0x05],
+            &[
+                0xb8, 0xff, 0x00, 0x00, 0x00, 0xc1, 0xe0, 0x03, 0xd1, 0xe8, 0xc1, 0xc0, 0x05,
+            ],
             // Multiply, and a byte-granular compare.
-            &[0xb8, 0x07, 0x00, 0x00, 0x00, 0xbb, 0x09, 0x00, 0x00, 0x00, 0x0f, 0xaf, 0xc3, 0x38, 0xd8],
+            &[
+                0xb8, 0x07, 0x00, 0x00, 0x00, 0xbb, 0x09, 0x00, 0x00, 0x00, 0x0f, 0xaf, 0xc3, 0x38,
+                0xd8,
+            ],
             // A loop, so the optimised block is re-entered many times.
             &[0xb9, 0x64, 0x00, 0x00, 0x00, 0xff, 0xc9, 0x75, 0xfc],
         ];
@@ -448,7 +457,10 @@ mod tests {
             .mmu
             .write_unchecked(last, &[0x90], perm::READ | perm::EXEC);
         let vm = Vm::at_address(ctx, last, source, memory);
-        assert!(vm.is_ok(), "a one-byte instruction at a mapping's end decodes");
+        assert!(
+            vm.is_ok(),
+            "a one-byte instruction at a mapping's end decodes"
+        );
     }
 
     #[test]

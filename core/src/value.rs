@@ -137,7 +137,7 @@ pub use view_mut::QCodeMut;
 /// instruction operand lists, use-def chains, and the address/name maps.
 ///
 /// It is `Copy`, cheap to compare, and contains no borrow of the context.
-/// To inspect the value, call [`Context::get_value`] which returns a
+/// To inspect the value, call `Context::get_value` which returns a
 /// [`ValueRef`] tied to the context's lifetime.
 ///
 /// # Exhaustiveness
@@ -149,7 +149,7 @@ pub use view_mut::QCodeMut;
 pub enum ValueId {
     /// A compile-time integer constant, optionally carrying a symbolic label.
     Literal(LiteralId),
-    /// A compile-time opaque byte blob wider than a [`Literal`] can hold.
+    /// A compile-time opaque byte blob wider than a [`Literal`](crate::value::literal::Literal) can hold.
     Bytes(BytesId),
     /// An SSA value produced by an [`Instruction`].
     Instruction(InstructionId),
@@ -550,7 +550,7 @@ pub trait Value<'str, 'ctx>: Display {
 /// A borrowed, type-erased view of any value in a [`Context`].
 ///
 /// `ValueRef` is the runtime-typed counterpart to [`ValueId`]. It is
-/// produced by [`Context::get_value`] and borrows the context for `'ctx`.
+/// produced by `Context::get_value` and borrows the context for `'ctx`.
 /// Use pattern matching to downcast to a concrete reference type.
 pub enum ValueRef<'str, 'ctx, R = ModuleView<'ctx, 'str>> {
     Literal(LiteralRef<'str, 'ctx>),
@@ -692,7 +692,7 @@ where
 
     /// Qualified memory-space provenance. Unlike [`space`](Self::space), this
     /// represents body-local temporary spaces without pretending they are
-    /// shared [`Space`] values.
+    /// shared [`Space`](crate::space::Space) values.
     pub fn memory_space(&self) -> Option<crate::space::MemorySpaceId> {
         match self {
             ValueRef::Varnode(v) => Some(crate::space::MemorySpaceId::Shared(v.space().id)),

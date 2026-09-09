@@ -25,7 +25,7 @@ OPTIONS:
 
 fn parse_hex(value: &str) -> Result<Vec<u8>, String> {
     let value: String = value.chars().filter(|ch| !ch.is_whitespace()).collect();
-    if value.is_empty() || value.len() % 2 != 0 {
+    if value.is_empty() || !value.len().is_multiple_of(2) {
         return Err("hex bytes must contain a non-empty, even number of digits".to_string());
     }
     (0..value.len())

@@ -1,16 +1,22 @@
 [package]
 name = "qcode_vm"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Virtual machine layer over the qcode emulator: MMU, faults, on-demand lifting and snapshots"
+readme = "readme.md"
+documentation = "https://docs.rs/qcode_vm"
+keywords = ["binary-analysis", "emulator", "mmu", "reverse-engineering", "virtual-machine"]
+categories = ["development-tools::debugging", "emulators"]
 repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 qcode.workspace = true
 # A cheap, block-local cleanup round over freshly lifted code. SLEIGH emits a
 # great deal of computation whose result is never read, and the interpreter
 # would otherwise evaluate all of it on every pass.
-qcode_analysis.workspace = true
+qcode_passes.workspace = true
 qcode_emulator.workspace = true
 rustc-hash.workspace = true
