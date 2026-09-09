@@ -15,6 +15,7 @@ use qcode_vm::{
     BlockExecutor, Executed, VmMemory, qcode_jit_load, qcode_jit_sdiv128, qcode_jit_srem128,
     qcode_jit_store, qcode_jit_udiv128, qcode_jit_urem128,
 };
+use rustc_hash::FxHashMap;
 
 use crate::compile::{BLOCK_OK, BlockTranslator, Export, Helpers, SpaceTable, Unsupported};
 
@@ -33,12 +34,15 @@ struct Compiled {
     /// an access faulted and the block stopped there.
     entry: extern "C" fn(*const *mut u8, *mut u64, *mut u8, *mut VmMemory) -> i32,
     table: SpaceTable,
-    /// The terminator operands this block computes, in slot order.
+    /// The results of earlier instructions this code reads on entry, in the
+    /// first value-buffer slots. Empty for a block entered at its start.
+    imports: Vec<Export>,
+    /// The operands of what the interpreter runs next, in the slots after the
+    /// imports.
     exports: Vec<Export>,
-    /// How many body instructions the native code retires: everything but
-    /// the terminator, or everything before the first interrupting user op.
-    /// The caller needs it to position the interpreter, and taking it from
-    /// here saves resolving the block through the module arena again.
+    /// The body index the interpreter continues from once the native code has
+    /// run: the terminator's, or the first interrupting user op's. Taking it
+    /// from here saves resolving the block through the module arena again.
     body_len: usize,
     /// Whether the body stops short at an interrupting op. Such a block ends
     /// in the interpreter's hands, so it is never chained past.
@@ -88,6 +92,9 @@ pub struct Jit {
     /// `(function, local)` pair each time was a measurable share of run time.
     /// Sparse ids cost only an unused slot.
     cache: Vec<Vec<CacheEntry>>,
+    /// The same, for entries part-way into a block — the continuation after
+    /// an interrupt. Rare enough to hash.
+    partial: FxHashMap<(BlockId, usize), (usize, Result<usize, Unsupported>)>,
     /// Reused across runs so a hot block does not allocate to be entered.
     scratch: Vec<*mut u8>,
     /// Likewise for the export buffer compiled code writes its terminator
@@ -182,6 +189,7 @@ impl Jit {
             },
             compiled: Vec::new(),
             cache: Vec::new(),
+            partial: FxHashMap::default(),
             scratch: Vec::new(),
             exports: Vec::new(),
             stats: JitStats::default(),
@@ -192,8 +200,28 @@ impl Jit {
     ///
     /// A decline is remembered, so an unsupported block costs one compilation
     /// attempt over the life of the machine rather than one per execution.
-    fn resolve(&mut self, ctx: &Context<'_>, block: BlockId) -> Result<usize, Unsupported> {
+    fn resolve(
+        &mut self,
+        ctx: &Context<'_>,
+        block: BlockId,
+        start: usize,
+    ) -> Result<usize, Unsupported> {
         let count = ctx.block(block).instruction_ids().len();
+        if start != 0 {
+            if let Some((cached_count, known)) = self.partial.get(&(block, start))
+                && *cached_count == count
+            {
+                return known.clone();
+            }
+            let outcome = self.compile(ctx, block, start);
+            match &outcome {
+                Ok(_) => self.stats.compiled += 1,
+                Err(_) => self.stats.declined += 1,
+            }
+            self.partial
+                .insert((block, start), (count, outcome.clone()));
+            return outcome;
+        }
         let func: usize = block.func.into();
         let local: usize = block.local.into();
         if let Some(Some((cached_count, known))) =
@@ -203,7 +231,7 @@ impl Jit {
             return known.clone();
         }
 
-        let outcome = self.compile(ctx, block);
+        let outcome = self.compile(ctx, block, 0);
         match &outcome {
             Ok(_) => self.stats.compiled += 1,
             Err(_) => self.stats.declined += 1,
@@ -219,7 +247,12 @@ impl Jit {
         outcome
     }
 
-    fn compile(&mut self, ctx: &Context<'_>, block: BlockId) -> Result<usize, Unsupported> {
+    fn compile(
+        &mut self,
+        ctx: &Context<'_>,
+        block: BlockId,
+        start: usize,
+    ) -> Result<usize, Unsupported> {
         let full_body = ctx.block(block).instruction_ids().len().saturating_sub(1);
         let mut signature = self.module.make_signature();
         // spaces, exports, tlb, memory.
@@ -253,7 +286,7 @@ impl Jit {
         // half-built function, which would leave a shared context dirty and
         // trip Cranelift's emptiness assertion on the next compilation.
         let mut builder_ctx = FunctionBuilderContext::new();
-        let (table, exports, body_len) = {
+        let (table, imports, exports, body_len) = {
             let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_ctx);
             let entry = builder.create_block();
             builder.append_block_params_for_function_params(entry);
@@ -261,10 +294,11 @@ impl Jit {
             builder.seal_block(entry);
 
             let mut translator = BlockTranslator::new(ctx, builder, entry, helpers);
-            match translator.translate_body(block) {
+            match translator.translate_body(block, start) {
                 Ok(body_len) => {
                     let compiled = (
                         translator.table.clone(),
+                        translator.imports.clone(),
                         translator.exports.clone(),
                         body_len,
                     );
@@ -302,6 +336,7 @@ impl Jit {
         self.compiled.push(Compiled {
             entry,
             table,
+            imports,
             exports,
             body_len,
             interrupts: body_len < full_body,
@@ -314,25 +349,27 @@ impl Jit {
     ///
     /// For tooling that wants to report coverage over a module.
     pub fn try_compile(&mut self, ctx: &Context<'_>, block: BlockId) -> Result<(), Unsupported> {
-        self.resolve(ctx, block).map(|_| ())
+        self.resolve(ctx, block, 0).map(|_| ())
     }
 
-    /// Runs `block` as native code, if it has any.
+    /// Runs `block` as native code from body index `start`, if it has any.
     ///
     /// Returns `Ok(None)` when the block is not compiled, which is the caller's
-    /// signal to run it on the interpreter instead, and `Ok(Some(n))` when it
-    /// ran, where `n` is the number of body instructions it retired.
+    /// signal to run it on the interpreter instead, and `Ok(Some(_))` when it
+    /// ran, saying where the interpreter continues.
     pub fn run_block(
         &mut self,
         ctx: &Context<'_>,
         emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
+        start: usize,
         chain: bool,
     ) -> Result<Option<Executed>, EmulatorErrorKind> {
         let mut current = block;
+        let mut from = start;
         let mut retired = 0;
         loop {
-            let Ok(index) = self.resolve(ctx, current) else {
+            let Ok(index) = self.resolve(ctx, current, from) else {
                 // Nothing compiled here. If earlier blocks ran, the machine is
                 // already at `current`'s start and the interpreter takes over
                 // from there; otherwise this call did nothing at all.
@@ -342,8 +379,16 @@ impl Jit {
                     retired,
                 }));
             };
-            let (body, interrupts) = self.enter(ctx, emu, index)?;
-            retired += body as u64;
+            let Some((body, interrupts)) = self.enter(ctx, emu, index)? else {
+                // An import the interpreter never produced: not this backend's
+                // block to run right now.
+                return Ok((retired > 0).then_some(Executed {
+                    block: current,
+                    body: 0,
+                    retired,
+                }));
+            };
+            retired += (body - from) as u64;
             self.stats.native_runs += 1;
 
             // Only continue while the successor is one this backend can also
@@ -368,12 +413,13 @@ impl Jit {
             // count. Only the *last* block's terminator is left to the caller.
             retired += 1;
             current = next;
+            from = 0;
         }
     }
 
-    /// Whether `block` has native code, without compiling it.
+    /// Whether `block` has native code from its start, without compiling it.
     fn is_compiled(&mut self, ctx: &Context<'_>, block: BlockId) -> bool {
-        self.resolve(ctx, block).is_ok()
+        self.resolve(ctx, block, 0).is_ok()
     }
 
     /// The successor this block's terminator selects, when that is a decision
@@ -413,15 +459,16 @@ impl Jit {
     }
 
     /// Runs one compiled block, leaving the operands of whatever the
-    /// interpreter runs next where it would have put them. Returns how many
-    /// body instructions it retired, and whether it stopped short at an
-    /// interrupting op.
+    /// interpreter runs next where it would have put them. Returns the body
+    /// index the interpreter continues from, and whether the code stopped
+    /// short at an interrupting op — or `None` when an import the code needs
+    /// is missing from the interpreter's table, in which case nothing ran.
     fn enter(
         &mut self,
         _ctx: &Context<'_>,
         emu: &mut StandaloneEmulator<VmMemory>,
         index: usize,
-    ) -> Result<(usize, bool), EmulatorErrorKind> {
+    ) -> Result<Option<(usize, bool)>, EmulatorErrorKind> {
         let compiled = &mut self.compiled[index];
         // Taken as a raw pointer, and everything below derived from it: the
         // compiled block holds base pointers into the flat spaces *while*
@@ -451,8 +498,17 @@ impl Jit {
             self.scratch
                 .push(unsafe { (*memory).flat_mut().base_ptr_at(slot, required)? });
         }
+        // The value buffer: imports first, filled from the interpreter's
+        // table, then room for the exports.
         self.exports.clear();
-        self.exports.resize(compiled.exports.len(), 0);
+        for import in &compiled.imports {
+            let Some(value) = emu.insn_values.get(&import.insn) else {
+                return Ok(None);
+            };
+            self.exports.push(value.as_bits() as u64);
+        }
+        self.exports
+            .resize(compiled.imports.len() + compiled.exports.len(), 0);
         // The TLB moves only with the memory itself, which is pinned for the
         // duration of the call.
         let tlb = unsafe { (*memory).mmu.tlb_ptr() };
@@ -486,12 +542,13 @@ impl Jit {
 
         // The terminator is still the interpreter's to run, so the operands it
         // reads have to look as though the interpreter had computed them.
-        for (export, &bits) in compiled.exports.iter().zip(&self.exports) {
+        let outputs = &self.exports[compiled.imports.len()..];
+        for (export, &bits) in compiled.exports.iter().zip(outputs) {
             emu.insn_values
                 .insert(export.insn, SizedValue::new(bits, export.size));
         }
 
-        Ok((compiled.body_len, compiled.interrupts))
+        Ok(Some((compiled.body_len, compiled.interrupts)))
     }
 }
 
@@ -502,9 +559,10 @@ impl BlockExecutor for Jit {
         ctx: &Context<'_>,
         emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
+        start: usize,
         chain: bool,
     ) -> Result<Option<Executed>, EmulatorErrorKind> {
-        Jit::run_block(self, ctx, emu, block, chain)
+        Jit::run_block(self, ctx, emu, block, start, chain)
     }
 }
 

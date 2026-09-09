@@ -179,9 +179,21 @@ fn an_intrinsic_interrupt_stops_the_jit_at_the_same_place_as_the_interpreter() {
         assert_eq!(interrupt.pc, Some(0x1005), "jit={jit}");
         assert_eq!(interrupt.size, 8, "jit={jit}: rdtsc yields a 64-bit value");
         stops.push((interrupt.insn, vm.emulator().block, vm.emulator().idx));
+        let native_before = vm.stats.native_bodies;
+        let idx_at_stop = vm.emulator().idx;
 
         vm.resume(Some(tsc)).unwrap();
         vm.run(10_000);
+        if jit {
+            assert!(
+                idx_at_stop > 0,
+                "the interrupt should sit after a compiled prefix in its block"
+            );
+            assert!(
+                vm.stats.native_bodies > native_before,
+                "the rest of the block after rdtsc should have run natively"
+            );
+        }
         let ctx = vm.context().clone();
         let read = |vm: &mut Vm<_>, name: &str| vm.emulator().read_varnode_by_name(&ctx, name);
         results.push((

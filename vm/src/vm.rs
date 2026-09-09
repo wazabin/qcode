@@ -24,9 +24,9 @@ use qcode::{
     },
 };
 use qcode_emulator::{EmulatorErrorKind, EmulatorMemory, SizedValue, StandaloneEmulator};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{memory::VmMemory, mmu::MemFault, stats::Stats};
+use crate::{inject::CodeInjector, memory::VmMemory, mmu::MemFault, stats::Stats};
 
 /// Why a lifting attempt failed.
 #[derive(Debug, Clone)]
@@ -101,11 +101,18 @@ pub trait BlockExecutor {
     /// paying a round trip per block. The caller withholds it when something
     /// needs to observe every block — a breakpoint is set, say — because blocks
     /// crossed this way are never offered to the interpreter.
+    ///
+    /// `start` is the body index to begin at. It is 0 when a block is
+    /// entered, and the instruction after an interrupting op when the
+    /// interpreter has run the block up to there and hands the rest over.
+    /// Results the interpreter already computed for the block are in
+    /// `emu.insn_values`; an executor may read them or decline.
     fn run_block(
         &mut self,
         ctx: &Context<'_>,
         emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
+        start: usize,
         chain: bool,
     ) -> Result<Option<Executed>, EmulatorErrorKind>;
 }
@@ -113,10 +120,11 @@ pub trait BlockExecutor {
 /// Where an executor left the machine.
 #[derive(Debug, Clone, Copy)]
 pub struct Executed {
-    /// The block whose terminator the interpreter still has to run. With
-    /// chaining this is the last of several, not the one that was asked for.
+    /// The block the interpreter continues in. With chaining this is the
+    /// last of several, not the one that was asked for.
     pub block: BlockId,
-    /// How many instructions of that block were retired: its body.
+    /// The body index of that block the interpreter continues from: its
+    /// terminator, or an interrupting op the executor stopped short of.
     pub body: usize,
     /// Operations retired across every block run, for accounting.
     pub retired: u64,
@@ -237,6 +245,17 @@ pub struct Vm<S> {
     breakpoints: FxHashSet<u64>,
     /// The interrupt the machine is stopped at, until it is resumed.
     pending: Option<Interrupt>,
+    /// Set by a resume: the machine is part-way into a block, and the
+    /// executor gets one chance to take the rest of it.
+    offer_rest: bool,
+    /// Code rewriters, run over each block before it is first entered and
+    /// again when it grows. See [`crate::inject`].
+    injectors: Vec<Box<dyn CodeInjector>>,
+    /// The injector set each block was last rewritten by, so registering an
+    /// injector reaches blocks already lifted the next time they are entered.
+    injected: FxHashMap<BlockId, u64>,
+    /// Bumped by every registration.
+    generation: u64,
 }
 
 impl<S: CodeSource> Vm<S> {
@@ -255,6 +274,10 @@ impl<S: CodeSource> Vm<S> {
             dirty: None,
             breakpoints: FxHashSet::default(),
             pending: None,
+            offer_rest: false,
+            injectors: Vec::new(),
+            injected: FxHashMap::default(),
+            generation: 0,
         }
     }
 
@@ -326,6 +349,39 @@ impl<S: CodeSource> Vm<S> {
         self.breakpoints.remove(&addr)
     }
 
+    /// Registers a code rewriter. It runs over every block the machine enters
+    /// from now on, including blocks lifted before this call, before the
+    /// block executes or is compiled.
+    pub fn add_injector(&mut self, injector: Box<dyn CodeInjector>) {
+        self.injectors.push(injector);
+        self.generation += 1;
+    }
+
+    /// Runs the injectors over `block` unless the current set already has.
+    ///
+    /// Only over lifted code: an empty block carrying an address is a request
+    /// to lift it, and its instructions arrive — and get rewritten — once it
+    /// is discovered.
+    fn inject(&mut self, block: BlockId) {
+        if self.injectors.is_empty()
+            || self.injected.get(&block) == Some(&self.generation)
+            || !BasicBlock::from_id(&self.ctx, block).is_terminated()
+        {
+            return;
+        }
+        // Moved out for the duration, so the injectors can be handed the
+        // module without borrowing the machine twice.
+        let mut injectors = std::mem::take(&mut self.injectors);
+        for injector in &mut injectors {
+            injector.inject(&mut self.ctx, block);
+        }
+        self.injectors = injectors;
+        self.injected.insert(block, self.generation);
+        // The interpreter may hold this block's instruction list, and it has
+        // changed.
+        self.emu.invalidate_block_cache();
+    }
+
     /// Executes one instruction, lifting code on demand if control leaves the
     /// part of the module already known.
     ///
@@ -349,18 +405,22 @@ impl<S: CodeSource> Vm<S> {
             if self.emu.idx == 0 {
                 let block = self.emu.block;
                 self.clean_before_entering(block);
+                self.inject(block);
             }
 
-            // At a block's first instruction, an installed executor may run the
-            // whole body at once, leaving the interpreter only the terminator.
-            if self.emu.idx == 0
+            // At a block's first instruction — or just past an interrupt it
+            // resumed from — an installed executor may run the rest of the
+            // body at once, leaving the interpreter only the terminator.
+            if (self.emu.idx == 0 || self.offer_rest)
                 && let Some(executor) = self.executor.as_mut()
             {
+                self.offer_rest = false;
                 let block = self.emu.block;
+                let start = self.emu.idx;
                 // Blocks the executor runs are never offered to the interpreter, so
                 // it may only run past the first when nothing needs to see them.
                 let chain = self.breakpoints.is_empty();
-                match executor.run_block(&self.ctx, &mut self.emu, block, chain) {
+                match executor.run_block(&self.ctx, &mut self.emu, block, start, chain) {
                     Ok(Some(run)) => {
                         // The operations were retired by the executor; they are
                         // counted so throughput stays comparable between strategies.
@@ -554,6 +614,7 @@ impl<S: CodeSource> Vm<S> {
         self.pending = None;
         self.stats.steps += 1;
         self.emu.idx += 1;
+        self.offer_rest = true;
         Ok(())
     }
 
@@ -643,6 +704,8 @@ impl<S: CodeSource> Vm<S> {
     /// Records that `block` has grown and owes a cleanup, cleaning whatever
     /// run was growing before it.
     fn mark_dirty(&mut self, block: BlockId) {
+        // Grown, so it holds guest instructions the injectors have not seen.
+        self.injected.remove(&block);
         if !self.optimize {
             return;
         }
@@ -777,16 +840,36 @@ impl<S: CodeSource> Vm<S> {
         // The machine stopped at the empty placeholder this lift filled, which
         // absorption has just deleted; its instructions are in the head now.
         if self.emu.block == filled {
+            // The absorbed instructions have not run, and the injectors have
+            // not seen them: rewrite now, so a hook on the instruction about
+            // to execute is not missed the first time.
+            self.inject(head);
             let now = self.ctx.block(head).instruction_ids();
-            let resumed = resume
+            let mut resumed = resume
                 .iter()
                 .find_map(|wanted| now.iter().position(|have| have == wanted))
                 .unwrap_or(now.len().saturating_sub(1));
+            // An interrupt an injector placed just before the resume point
+            // belongs to the instruction there, and runs first.
+            while resumed > 0
+                && self.is_interrupt_op(InstructionId::new(head.func, now[resumed - 1]))
+            {
+                resumed -= 1;
+            }
             self.emu.block = head;
             self.emu.idx = resumed;
             self.emu.invalidate_block_cache();
         }
         Some(head)
+    }
+
+    /// Whether `insn` is a [`VM_INTERRUPT`] op.
+    fn is_interrupt_op(&self, insn: InstructionId) -> bool {
+        let insn = qcode::value::Instruction::from_id(&self.ctx, insn);
+        match insn.mnemonic() {
+            Mnemonic::PCodeOp(op) => self.ctx.shared.pcode_ops[op.id].as_ref() == VM_INTERRUPT,
+            _ => false,
+        }
     }
 
     /// Runs until the machine stops, or until `budget` p-code operations have

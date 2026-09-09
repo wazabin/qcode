@@ -48,8 +48,14 @@ impl BlockExecutor for Counter {
         ctx: &Context<'_>,
         _emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
+        start: usize,
         _chain: bool,
     ) -> Result<Option<Executed>, EmulatorErrorKind> {
+        // Only whole blocks are counted; a continuation after an interrupt is
+        // the same block's instructions, already counted at its entry.
+        if start != 0 {
+            return Ok(None);
+        }
         let ids = ctx.block(block).instruction_ids();
         let key = (block, ids.len());
         let count = *self.cache.entry(key).or_insert_with(|| {

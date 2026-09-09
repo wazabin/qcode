@@ -103,7 +103,7 @@ fn agree(code: &[u8], pointer: u64) {
     for pass in 0..2 {
         seed(&mut jitted, &ctx, block, pointer);
         let ran = jit
-            .run_block(&ctx, &mut jitted, block, false)
+            .run_block(&ctx, &mut jitted, block, 0, false)
             .expect("running compiled code does not fault")
             .is_some();
         assert!(
@@ -167,7 +167,7 @@ fn fault_from(code: &[u8], pointer: u64, prepare: impl Fn(&mut VmMemory)) -> Opt
     for _ in 0..2 {
         seed(&mut emu, &ctx, block, pointer);
         prepare(&mut emu.memory);
-        if jit.run_block(&ctx, &mut emu, block, false).is_err() {
+        if jit.run_block(&ctx, &mut emu, block, 0, false).is_err() {
             // The fault is left for the VM to turn into an exit, exactly as an
             // interpreted one is.
             faulted = emu.memory.take_fault().map(|fault| fault.kind);
@@ -207,7 +207,7 @@ fn a_permission_refusal_survives_a_warm_translation() {
 
     // Warm the cache on the writable half.
     seed(&mut emu, &ctx, block, DATA);
-    jit.run_block(&ctx, &mut emu, block, false)
+    jit.run_block(&ctx, &mut emu, block, 0, false)
         .expect("the writable half accepts the store");
     assert!(
         emu.memory.mmu.cache_translation(DATA),
@@ -216,7 +216,7 @@ fn a_permission_refusal_survives_a_warm_translation() {
 
     // Same page, same cached translation, a byte that refuses the write.
     seed(&mut emu, &ctx, block, DATA + PAGE_SIZE / 2);
-    let refused = jit.run_block(&ctx, &mut emu, block, false).is_err();
+    let refused = jit.run_block(&ctx, &mut emu, block, 0, false).is_err();
     assert!(refused, "a compiled store must not bypass permissions");
     let fault = emu.memory.take_fault().expect("the fault was recorded");
     assert_eq!(fault.kind, FaultKind::WritePerm);
@@ -245,7 +245,7 @@ fn a_store_through_compiled_code_marks_its_bytes_initialized() {
         emu.invalidate_block_cache();
         emu.block = block;
         emu.idx = 0;
-        jit.run_block(&ctx, &mut emu, block, false)
+        jit.run_block(&ctx, &mut emu, block, 0, false)
             .expect("the store succeeds");
     }
 

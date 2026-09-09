@@ -251,10 +251,18 @@ pub(crate) struct BlockTranslator<'a, 'ctx> {
     /// Cached base pointer per space slot, loaded once per block rather than per
     /// access.
     bases: FxHashMap<usize, Value>,
-    /// Values produced by instructions in this block.
+    /// Values produced by instructions in this block, and imports already
+    /// loaded.
     values: FxHashMap<InstructionId, Value>,
+    /// Instructions before the entry point whose results this code may read
+    /// from the value buffer rather than compute: the ones the interpreter
+    /// retired before handing the block over part-way through.
+    importable: FxHashSet<InstructionId>,
     pub(crate) table: SpaceTable,
-    /// Values the terminator reads, in export-buffer slot order.
+    /// Values read from the buffer on entry, in slot order. They take the
+    /// first slots; exports follow.
+    pub(crate) imports: Vec<Export>,
+    /// Values the rest of the block reads, in slot order after the imports.
     pub(crate) exports: Vec<Export>,
 }
 
@@ -309,7 +317,9 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
             load_slot: None,
             bases: FxHashMap::default(),
             values: FxHashMap::default(),
+            importable: FxHashSet::default(),
             table: SpaceTable::default(),
+            imports: Vec::new(),
             exports: Vec::new(),
         }
     }
@@ -362,11 +372,15 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
                 // a 16-byte operand loses nothing.
                 Ok(self.constant(ty, u128::from(literal.value())))
             }
-            ValueId::Instruction(insn) => self
-                .values
-                .get(&insn)
-                .copied()
-                .ok_or(Unsupported::Operand("value produced outside this block")),
+            ValueId::Instruction(insn) => {
+                if let Some(&value) = self.values.get(&insn) {
+                    return Ok(value);
+                }
+                if !self.importable.contains(&insn) {
+                    return Err(Unsupported::Operand("value produced outside this block"));
+                }
+                self.import(insn, size)
+            }
             // A varnode or temp used as a *value* is its address, which only
             // appears as a pointer operand and is handled there.
             _ => Err(Unsupported::Operand("not a literal or in-block value")),
@@ -386,26 +400,40 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
     /// operation, or all of it, then emits the exports the rest of the block
     /// will need.
     ///
-    /// Returns how many body instructions the compiled code retires. That is
-    /// the whole body when nothing interrupts, and the index of the
-    /// interrupting op otherwise: compiled code runs the prefix, and the
-    /// interpreter — positioned at the op by that count — raises the
+    /// Returns the body index the interpreter continues from once the
+    /// compiled code has run: the terminator's when nothing interrupts, and
+    /// the interrupting op's otherwise. Compiled code runs the part before it,
+    /// and the interpreter — positioned at the op by that index — raises the
     /// interrupt, exactly as it would have with no compiled code at all. The
-    /// values the op and everything after it read from the prefix are
+    /// values the op and everything after it read from the compiled part are
     /// exported, the same way a terminator's operands are.
-    pub(crate) fn translate_body(&mut self, block: BlockId) -> Result<usize, Unsupported> {
+    ///
+    /// `start` is the body index to begin at: 0 for a whole block, or the
+    /// instruction after an interrupting op when the interpreter has run the
+    /// block up to there and hands the rest back. Results of instructions
+    /// before `start` that the compiled part reads are imported from the value
+    /// buffer, where the caller places them from the interpreter's table.
+    pub(crate) fn translate_body(
+        &mut self,
+        block: BlockId,
+        start: usize,
+    ) -> Result<usize, Unsupported> {
         let insns: Vec<InstructionId> = BasicBlock::from_id(self.ctx, block).instruction_ids();
         if insns.is_empty() {
             return Err(Unsupported::Terminator("block is empty"));
         }
         let body = &insns[..insns.len() - 1];
-        let cut = body
+        if start > body.len() {
+            return Err(Unsupported::Terminator("entry point past the body"));
+        }
+        let cut = body[start..]
             .iter()
             .position(|&insn| self.interrupts(insn))
-            .unwrap_or(body.len());
+            .map_or(body.len(), |offset| start + offset);
         let own: FxHashSet<InstructionId> = insns.iter().copied().collect();
+        self.importable = body[..start].iter().copied().collect();
 
-        for &insn_id in &body[..cut] {
+        for &insn_id in &body[start..cut] {
             self.translate_one(insn_id)?;
             self.check_confined(insn_id, &own)?;
         }
@@ -499,7 +527,7 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
             if size > std::mem::size_of::<u64>() {
                 return Err(Unsupported::Terminator("operand wider than an export slot"));
             }
-            let slot = self.exports.len();
+            let slot = self.imports.len() + self.exports.len();
             let widened = self.widen_to_u64(value);
             self.builder.ins().store(
                 MemFlags::trusted(),
@@ -519,6 +547,33 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         } else {
             self.builder.ins().uextend(types::I64, value)
         }
+    }
+
+    /// Loads the result of `insn`, computed by the interpreter before this
+    /// code was entered, from the next value-buffer slot.
+    ///
+    /// Imports are numbered from zero as they are met, and the exports emitted
+    /// at the end of translation take the slots after them.
+    fn import(&mut self, insn: InstructionId, size: usize) -> Result<Value, Unsupported> {
+        if size > std::mem::size_of::<u64>() {
+            return Err(Unsupported::Operand("import wider than a value slot"));
+        }
+        let slot = self.imports.len();
+        let wide = self.builder.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            self.exports_arg,
+            (slot * std::mem::size_of::<u64>()) as i32,
+        );
+        let ty = int_type(size)?;
+        let value = if ty == types::I64 {
+            wide
+        } else {
+            self.builder.ins().ireduce(ty, wide)
+        };
+        self.imports.push(Export { insn, size });
+        self.values.insert(insn, value);
+        Ok(value)
     }
 
     fn translate_one(&mut self, insn_id: InstructionId) -> Result<(), Unsupported> {
