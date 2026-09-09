@@ -54,6 +54,8 @@ mod engine {
     /// MMX is the low-64 view of the eight physical x87 slots. The SLEIGH
     /// model intentionally has no independent MM register varnodes.
     const X87_PHYSICAL_REGISTERS: usize = 8;
+    /// XMM0..XMM15, the SSE register file exposed by FXSAVE's legacy image.
+    const XMM_REGISTERS: usize = 16;
     const CSV_FIELDNAMES: &[&str] = &[
         "tool",
         "test_case_id",
@@ -508,6 +510,8 @@ mod engine {
     struct DbState {
         regs: HashMap<String, i64>,
         f80: HashMap<String, u128>,
+        /// `xmm0`..`xmm15`, full 128 bits.
+        xmm: HashMap<String, u128>,
         scratch_memory: Option<[u8; SCRATCH_MEMORY_SIZE]>,
     }
 
@@ -536,6 +540,37 @@ mod engine {
     fn format_f80(value: u128) -> String {
         (0..10)
             .map(|index| format!("{:02x}", (value >> (index * 8)) as u8))
+            .collect()
+    }
+
+    /// XMM0..XMM15 travel as 32 lowercase hex digits (16 little-endian bytes),
+    /// mirroring the 20-digit `x87_rN` encoding. Older rows carry a JSON number
+    /// holding only the low 64-bit lane.
+    fn xmm_index(name: &str) -> Option<usize> {
+        name.strip_prefix("xmm")
+            .or_else(|| name.strip_prefix("XMM"))
+            .and_then(|index| index.parse::<usize>().ok())
+            .filter(|&index| index < XMM_REGISTERS)
+    }
+
+    fn parse_xmm(value: &str) -> Option<u128> {
+        let value = value.strip_prefix("0x").unwrap_or(value);
+        if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let mut result = 0u128;
+        for index in 0..16 {
+            let byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+            result |= u128::from(byte) << (index * 8);
+        }
+        Some(result)
+    }
+
+    fn format_xmm(value: u128) -> String {
+        value
+            .to_le_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
             .collect()
     }
 
@@ -904,6 +939,59 @@ mod engine {
             .unwrap_or_else(|_| "postgresql://x86db:x86db@localhost:5432/x86db".to_string())
     }
 
+    /// Decodes one Binit JSON state object into the harness's native form.
+    fn parse_db_state(json: &serde_json::Value) -> DbState {
+        let mut regs = HashMap::new();
+        let mut f80 = HashMap::new();
+        let mut xmm = HashMap::new();
+        let mut scratch_memory = None;
+        if let Some(object) = json.as_object() {
+            assert!(
+                !(object.contains_key("scratch_memory")
+                    && (object.contains_key("mem0_value") || object.contains_key("mem1_value"))),
+                "scratch_memory cannot be mixed with mem0_value or mem1_value"
+            );
+            for (name, value) in object {
+                let is_legacy_logical = name
+                    .strip_prefix("x87_st")
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .is_some_and(|index| index < X87_PHYSICAL_REGISTERS);
+                assert!(
+                    !is_legacy_logical,
+                    "Binit state uses legacy logical {name}; convert it with logical_x87_to_physical_state"
+                );
+                if name == "scratch_memory" {
+                    scratch_memory = value.as_str().and_then(parse_scratch_memory);
+                    assert!(scratch_memory.is_some(), "invalid scratch_memory encoding");
+                } else if x87_physical_slot_index(name).is_some() {
+                    if let Some(value) = value.as_str().and_then(parse_f80) {
+                        f80.insert(name.clone(), value);
+                    }
+                } else if xmm_index(name).is_some() {
+                    // 32 hex digits is the canonical transport; a bare number is
+                    // an older row carrying only the low 64-bit lane.
+                    let parsed = match value {
+                        serde_json::Value::String(text) => parse_xmm(text),
+                        other => other.as_u64().map(u128::from),
+                    };
+                    let parsed = parsed
+                        .unwrap_or_else(|| panic!("invalid xmm state value for {name}: {value}"));
+                    xmm.insert(name.clone(), parsed);
+                } else if let Some(value) =
+                    value.as_i64().or_else(|| value.as_u64().map(|n| n as i64))
+                {
+                    regs.insert(name.clone(), value);
+                }
+            }
+        }
+        DbState {
+            regs,
+            f80,
+            xmm,
+            scratch_memory,
+        }
+    }
+
     fn load_db_test_case(
         client: &mut Client,
         tc_id: i64,
@@ -956,58 +1044,17 @@ mod engine {
             result_map.insert(idx, (exception_kind, final_state));
         }
 
-        fn parse_state(json: &serde_json::Value) -> DbState {
-            let mut regs = HashMap::new();
-            let mut f80 = HashMap::new();
-            let mut scratch_memory = None;
-            if let Some(object) = json.as_object() {
-                assert!(
-                    !(object.contains_key("scratch_memory")
-                        && (object.contains_key("mem0_value")
-                            || object.contains_key("mem1_value"))),
-                    "scratch_memory cannot be mixed with mem0_value or mem1_value"
-                );
-                for (name, value) in object {
-                    let is_legacy_logical = name
-                        .strip_prefix("x87_st")
-                        .and_then(|index| index.parse::<usize>().ok())
-                        .is_some_and(|index| index < X87_PHYSICAL_REGISTERS);
-                    assert!(
-                        !is_legacy_logical,
-                        "Binit state uses legacy logical {name}; convert it with logical_x87_to_physical_state"
-                    );
-                    if name == "scratch_memory" {
-                        scratch_memory = value.as_str().and_then(parse_scratch_memory);
-                        assert!(scratch_memory.is_some(), "invalid scratch_memory encoding");
-                    } else if x87_physical_slot_index(name).is_some() {
-                        if let Some(value) = value.as_str().and_then(parse_f80) {
-                            f80.insert(name.clone(), value);
-                        }
-                    } else if let Some(value) =
-                        value.as_i64().or_else(|| value.as_u64().map(|n| n as i64))
-                    {
-                        regs.insert(name.clone(), value);
-                    }
-                }
-            }
-            DbState {
-                regs,
-                f80,
-                scratch_memory,
-            }
-        }
-
         // Combine initial states with final states.
         let states = initial_states_arr
             .iter()
             .enumerate()
             .map(|(idx, init_json)| {
-                let initial = parse_state(init_json);
+                let initial = parse_db_state(init_json);
                 let final_state = result_map.get(&(idx as i32)).and_then(|(exc, fin)| {
                     if exc.is_some() {
                         None // hardware exception — skip
                     } else {
-                        fin.as_ref().map(parse_state)
+                        fin.as_ref().map(parse_db_state)
                     }
                 });
                 DbStateResult {
@@ -1190,6 +1237,14 @@ mod engine {
                 serde_json::Value::String(format_f80(state.f80[name])),
             );
         }
+        let mut xmm_names: Vec<_> = state.xmm.keys().collect();
+        xmm_names.sort();
+        for name in xmm_names {
+            normalized.insert(
+                name.clone(),
+                serde_json::Value::String(format_xmm(state.xmm[name])),
+            );
+        }
         if let Some(scratch_memory) = &state.scratch_memory {
             normalized.insert(
                 "scratch_memory".to_string(),
@@ -1289,9 +1344,11 @@ mod engine {
         include_mem1: bool,
         include_scratch_memory: bool,
         include_x87: bool,
+        include_xmm: bool,
     ) -> Result<DbState, String> {
         let mut regs = HashMap::new();
         let mut f80 = HashMap::new();
+        let mut xmm = HashMap::new();
         for &name in SCALAR_REGISTERS {
             let id = x64_register(name).ok_or_else(|| format!("unknown register {name}"))?;
             let value = emu
@@ -1341,6 +1398,22 @@ mod engine {
             }
         }
 
+        if include_xmm {
+            for index in 0..XMM_REGISTERS {
+                let name = format!("XMM{index}");
+                let id = x64_register(&name).ok_or_else(|| format!("unknown register {name}"))?;
+                let value = emu
+                    .read_register_u128(id)
+                    .ok_or_else(|| format!("could not read register {name}"))?;
+                xmm.insert(format!("xmm{index}"), value);
+            }
+            let id = x64_register("MXCSR").ok_or_else(|| "unknown register MXCSR".to_string())?;
+            let value = emu
+                .read_register(id)
+                .ok_or_else(|| "could not read register MXCSR".to_string())?;
+            regs.insert("mxcsr".to_string(), value as i64);
+        }
+
         if include_scratch_memory {
             let bytes = emu
                 .inspect_memory(ctx.shared.default_space, MEM0_ADDR, SCRATCH_MEMORY_SIZE)
@@ -1351,6 +1424,7 @@ mod engine {
             return Ok(DbState {
                 regs,
                 f80,
+                xmm,
                 scratch_memory: Some(scratch_memory),
             });
         }
@@ -1371,6 +1445,7 @@ mod engine {
         Ok(DbState {
             regs,
             f80,
+            xmm,
             scratch_memory: None,
         })
     }
@@ -1561,6 +1636,12 @@ mod engine {
                 || X87_CONTROL_FIELDS.iter().any(|&(field, _)| {
                     pair.initial.regs.contains_key(field) || final_state.regs.contains_key(field)
                 });
+            // Any SSE mention switches on the XMM/MXCSR path; without one the
+            // scalar replay stays byte-identical to before.
+            let include_xmm = !pair.initial.xmm.is_empty()
+                || !final_state.xmm.is_empty()
+                || pair.initial.regs.contains_key("mxcsr")
+                || final_state.regs.contains_key("mxcsr");
             // Mismatches that stem from the harness's modeling limits (rather than a
             // wazabin bug) are reclassified so they are recorded distinctly from real
             // state mismatches.
@@ -1620,9 +1701,23 @@ mod engine {
             // value is 0x1f80; it is not transported by the scalar Binit
             // fixture, but FXSAVE exposes it.
             let mxcsr = x64_register("MXCSR").expect("MXCSR is present in the x64 spec");
-            emu.set_register(mxcsr, 0x1f80).map_err(|error| {
+            let mxcsr_value = pair
+                .initial
+                .regs
+                .get("mxcsr")
+                .map_or(0x1f80, |&value| value as u64);
+            emu.set_register(mxcsr, mxcsr_value).map_err(|error| {
                 DbMismatch::backend_error(tc, state_index, pair, final_state, error)
             })?;
+            if include_xmm {
+                for index in 0..XMM_REGISTERS {
+                    let name = format!("XMM{index}");
+                    let id = x64_register(&name).expect("XMM register is present in the x64 spec");
+                    emu.set_register_u128(id, 0).map_err(|error| {
+                        DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                    })?;
+                }
+            }
             for &name in SCALAR_REGISTERS {
                 let id = x64_register(name).expect("scalar register is present in the x64 spec");
                 emu.set_register(id, 0).map_err(|error| {
@@ -1644,6 +1739,7 @@ mod engine {
             for (name, &raw) in &pair.initial.regs {
                 if name == "flag"
                     || name == "rip"
+                    || name == "mxcsr"
                     || mmx_index(name).is_some()
                     || name == "x87_top"
                     || x87_control_register(name).is_some()
@@ -1734,6 +1830,23 @@ mod engine {
                 })?;
             }
 
+            for (name, &value) in &pair.initial.xmm {
+                let Some(index) = xmm_index(name) else {
+                    return Err(Box::new(DbMismatch::backend_error(
+                        tc,
+                        state_index,
+                        pair,
+                        final_state,
+                        format!("invalid xmm state key {name}"),
+                    )));
+                };
+                let id = x64_register(&format!("XMM{index}"))
+                    .expect("XMM register is present in the x64 spec");
+                emu.set_register_u128(id, value).map_err(|error| {
+                    DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                })?;
+            }
+
             // Set initial flags from the "flag" RFLAGS word.
             let rflags = pair.initial.regs.get("flag").copied().unwrap_or(0) as u64;
             for &(flag_name, mask) in FLAGS {
@@ -1788,6 +1901,7 @@ mod engine {
                             include_mem1,
                             include_scratch_memory,
                             include_x87,
+                            include_xmm,
                         )
                         .map_err(|error| {
                             DbMismatch::backend_error(tc, state_index, pair, final_state, error)
@@ -1831,6 +1945,7 @@ mod engine {
                             include_mem1,
                             include_scratch_memory,
                             include_x87,
+                            include_xmm,
                         )
                         .map_err(|error| {
                             DbMismatch::backend_error(tc, state_index, pair, final_state, error)
@@ -1874,6 +1989,7 @@ mod engine {
                             include_mem1,
                             include_scratch_memory,
                             include_x87,
+                            include_xmm,
                         )
                         .map_err(|error| {
                             DbMismatch::backend_error(tc, state_index, pair, final_state, error)
@@ -1899,6 +2015,7 @@ mod engine {
                             include_mem1,
                             include_scratch_memory,
                             include_x87,
+                            include_xmm,
                         )
                         .map_err(|error| {
                             DbMismatch::backend_error(tc, state_index, pair, final_state, error)
@@ -1963,6 +2080,7 @@ mod engine {
                         include_mem1,
                         include_scratch_memory,
                         include_x87,
+                        include_xmm,
                     )
                     .map_err(|error| {
                         DbMismatch::backend_error(tc, state_index, pair, final_state, error)
@@ -2000,6 +2118,7 @@ mod engine {
                         include_mem1,
                         include_scratch_memory,
                         include_x87,
+                        include_xmm,
                     )
                     .map_err(|error| {
                         DbMismatch::backend_error(tc, state_index, pair, final_state, error)
@@ -2008,6 +2127,56 @@ mod engine {
                         actual_state,
                         serde_json::json!({
                             (name): { "actual": format_f80(actual), "expected": format_f80(expected) }
+                        }),
+                    ));
+                }
+            }
+
+            for (name, &expected) in &final_state.xmm {
+                let Some(index) = xmm_index(name) else {
+                    return Err(Box::new(DbMismatch::backend_error(
+                        tc,
+                        state_index,
+                        pair,
+                        final_state,
+                        format!("invalid xmm state key {name}"),
+                    )));
+                };
+                let id = x64_register(&format!("XMM{index}")).ok_or_else(|| {
+                    DbMismatch::backend_error(
+                        tc,
+                        state_index,
+                        pair,
+                        final_state,
+                        format!("XMM{index} missing from x64 spec"),
+                    )
+                })?;
+                let actual = emu.read_register_u128(id).ok_or_else(|| {
+                    DbMismatch::backend_error(
+                        tc,
+                        state_index,
+                        pair,
+                        final_state,
+                        format!("could not read register XMM{index}"),
+                    )
+                })?;
+                if actual != expected {
+                    let actual_state = snapshot_state(
+                        &mut emu,
+                        &ctx,
+                        include_mem0,
+                        include_mem1,
+                        include_scratch_memory,
+                        include_x87,
+                        include_xmm,
+                    )
+                    .map_err(|error| {
+                        DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                    })?;
+                    return Err(classify(
+                        actual_state,
+                        serde_json::json!({
+                            (name): { "actual": format_xmm(actual), "expected": format_xmm(expected) }
                         }),
                     ));
                 }
@@ -2033,6 +2202,7 @@ mod engine {
                         include_mem1,
                         include_scratch_memory,
                         include_x87,
+                        include_xmm,
                     )
                     .map_err(|error| {
                         DbMismatch::backend_error(tc, state_index, pair, final_state, error)
@@ -2090,6 +2260,7 @@ mod engine {
                         include_mem1,
                         include_scratch_memory,
                         include_x87,
+                        include_xmm,
                     )
                     .map_err(|error| {
                         DbMismatch::backend_error(tc, state_index, pair, final_state, error)
@@ -2137,6 +2308,7 @@ mod engine {
                         include_mem1,
                         include_scratch_memory,
                         include_x87,
+                        include_xmm,
                     )
                     .map_err(|error| {
                         DbMismatch::backend_error(tc, state_index, pair, final_state, error)
@@ -2404,11 +2576,68 @@ mod engine {
                     initial: DbState {
                         regs: HashMap::from([("rbx".into(), 1)]),
                         f80: HashMap::new(),
+                        xmm: HashMap::new(),
                         scratch_memory: None,
                     },
                     final_state: Some(DbState {
                         regs: HashMap::from([("rax".into(), 1)]),
                         f80: HashMap::new(),
+                        xmm: HashMap::new(),
+                        scratch_memory: None,
+                    }),
+                }],
+            };
+            run_db_case(&tc).unwrap();
+        }
+
+        #[test]
+        fn xmm_and_mxcsr_states_are_parsed() {
+            let json: serde_json::Value = serde_json::from_str(
+                r#"{
+                    "rax": 7,
+                    "xmm1": "000102030405060708090a0b0c0d0e0f",
+                    "xmm2": 305419896,
+                    "mxcsr": 8064
+                }"#,
+            )
+            .unwrap();
+            let state = parse_db_state(&json);
+
+            // 32 hex digits are 16 little-endian bytes, so byte 0 is the low byte.
+            assert_eq!(state.xmm["xmm1"], 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100);
+            assert_eq!(
+                format_xmm(state.xmm["xmm1"]),
+                "000102030405060708090a0b0c0d0e0f"
+            );
+            // A bare number is an older row carrying only the low 64-bit lane.
+            assert_eq!(state.xmm["xmm2"], 0x1234_5678);
+            // MXCSR is an ordinary scalar, and xmm keys never leak into `regs`.
+            assert_eq!(state.regs["mxcsr"], 0x1f80);
+            assert_eq!(state.regs["rax"], 7);
+            assert!(!state.regs.contains_key("xmm1"));
+            assert!(state.f80.is_empty());
+        }
+
+        #[test]
+        fn xmm_state_round_trips_through_the_emulator() {
+            let value = 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100u128;
+            let tc = DbTestCase {
+                id: 0,
+                instruction_id: 0,
+                instruction: "movaps xmm0, xmm1".into(),
+                opcode: "0f28c1".into(),
+                undefined_flags: HashSet::new(),
+                states: vec![DbStateResult {
+                    initial: DbState {
+                        regs: HashMap::from([("mxcsr".into(), 0x1f80)]),
+                        f80: HashMap::new(),
+                        xmm: HashMap::from([("xmm1".into(), value)]),
+                        scratch_memory: None,
+                    },
+                    final_state: Some(DbState {
+                        regs: HashMap::from([("mxcsr".into(), 0x1f80)]),
+                        f80: HashMap::new(),
+                        xmm: HashMap::from([("xmm0".into(), value), ("xmm1".into(), value)]),
                         scratch_memory: None,
                     }),
                 }],
@@ -2435,11 +2664,13 @@ mod engine {
                             ("rax".into(), 0x1122_3344_5566_7788u64 as i64),
                         ]),
                         f80: HashMap::new(),
+                        xmm: HashMap::new(),
                         scratch_memory: Some(initial_scratch),
                     },
                     final_state: Some(DbState {
                         regs: HashMap::new(),
                         f80: HashMap::new(),
+                        xmm: HashMap::new(),
                         scratch_memory: Some(expected_scratch),
                     }),
                 }],
