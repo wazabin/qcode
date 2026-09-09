@@ -2428,6 +2428,10 @@ mod engine {
         replay_cases.sort_by(|a, b| b.4.cmp(&a.4).then(a.0.cmp(&b.0)));
         let next_case = AtomicUsize::new(0);
         let replay_cases = &replay_cases;
+        // One case is loaded from the database at a time. The heaviest cases
+        // carry tens of megabytes of state JSON each, and twelve concurrent
+        // fetches of those took the Postgres container past its memory limit.
+        let db_gate = Mutex::new(());
 
         eprintln!(
             "[db-fuzz] replaying {} states across {} scalar test cases on {} threads",
@@ -2451,6 +2455,7 @@ mod engine {
                 let total_skipped = &total_skipped;
                 let mismatches = &mismatches;
                 let next_case = &next_case;
+                let db_gate = &db_gate;
                 s.spawn(move || {
                     let mut client =
                         Client::connect(dsn, NoTls).expect("worker failed to connect to x86db");
@@ -2470,13 +2475,16 @@ mod engine {
                             bar.inc(*n_states);
                             continue;
                         }
-                        let tc = load_db_test_case(
-                            &mut client,
-                            *tc_id,
-                            instruction,
-                            opcode,
-                            *instruction_id,
-                        );
+                        let tc = {
+                            let _loading = db_gate.lock().expect("db gate mutex was poisoned");
+                            load_db_test_case(
+                                &mut client,
+                                *tc_id,
+                                instruction,
+                                opcode,
+                                *instruction_id,
+                            )
+                        };
                         match run_db_case(&tc) {
                             Ok(()) => {
                                 total_ok.fetch_add(1, Ordering::Relaxed);
