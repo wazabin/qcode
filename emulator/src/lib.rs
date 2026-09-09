@@ -144,6 +144,10 @@ pub enum EmulatorErrorKind {
     UnknownSpace(MemorySpaceId),
     /// Encountered an architecture-specific p-code operation without an emulator implementation
     UnsupportedPCodeOp(Box<str>),
+    /// Execution reached a `vm.interrupt` op: the machine stopped *at* it, on
+    /// purpose, for the host to act. Not a failure; the VM turns it into a
+    /// resumable exit.
+    Interrupt,
     /// An intrinsic's evaluator could not produce a result (e.g. a trap or
     /// unsupported operand width)
     UnsupportedIntrinsic(Box<str>),
@@ -184,6 +188,7 @@ impl std::fmt::Display for EmulatorErrorKind {
             Self::UnknownRegister(reg) => write!(f, "register {reg:?} not found in context"),
             Self::UnknownSpace(space) => write!(f, "memory space {space:?} not initialised"),
             Self::UnsupportedPCodeOp(op) => write!(f, "unsupported p-code operation `{op}`"),
+            Self::Interrupt => write!(f, "vm.interrupt"),
             Self::UnsupportedIntrinsic(op) => write!(f, "unsupported intrinsic `{op}`"),
             Self::InterceptError(message) => write!(f, "call interceptor failed: {message}"),
             Self::StepBudgetExceeded(budget) => {
@@ -560,6 +565,12 @@ pub trait Interpreter {
                     // The paired markers stay in the IR for analysis consumers
                     // that care which region is atomic; they produce no value.
                     ("LOCK" | "UNLOCK", []) => None,
+                    // The host's stop request. Everything before it in the
+                    // block has retired; the VM reports the stop and, on
+                    // resume, files the op's result itself.
+                    (qcode::value::insn::VM_INTERRUPT, _) => {
+                        return Err(EmulatorErrorKind::Interrupt);
+                    }
                     _ => return Err(EmulatorErrorKind::UnsupportedPCodeOp(name)),
                 }
             }

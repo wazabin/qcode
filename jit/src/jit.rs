@@ -35,10 +35,14 @@ struct Compiled {
     table: SpaceTable,
     /// The terminator operands this block computes, in slot order.
     exports: Vec<Export>,
-    /// How many body instructions this block has — everything but the
-    /// terminator. The caller needs it to position the interpreter, and taking
-    /// it from here saves resolving the block through the module arena again.
+    /// How many body instructions the native code retires: everything but
+    /// the terminator, or everything before the first interrupting user op.
+    /// The caller needs it to position the interpreter, and taking it from
+    /// here saves resolving the block through the module arena again.
     body_len: usize,
+    /// Whether the body stops short at an interrupting op. Such a block ends
+    /// in the interpreter's hands, so it is never chained past.
+    interrupts: bool,
     /// Where each of `table`'s spaces lives in the machine's flat storage.
     ///
     /// Resolved on first execution and kept: a slot is stable for the life of
@@ -216,7 +220,7 @@ impl Jit {
     }
 
     fn compile(&mut self, ctx: &Context<'_>, block: BlockId) -> Result<usize, Unsupported> {
-        let body_len = ctx.block(block).instruction_ids().len().saturating_sub(1);
+        let full_body = ctx.block(block).instruction_ids().len().saturating_sub(1);
         let mut signature = self.module.make_signature();
         // spaces, exports, tlb, memory.
         for _ in 0..4 {
@@ -249,7 +253,7 @@ impl Jit {
         // half-built function, which would leave a shared context dirty and
         // trip Cranelift's emptiness assertion on the next compilation.
         let mut builder_ctx = FunctionBuilderContext::new();
-        let (table, exports) = {
+        let (table, exports, body_len) = {
             let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_ctx);
             let entry = builder.create_block();
             builder.append_block_params_for_function_params(entry);
@@ -258,8 +262,12 @@ impl Jit {
 
             let mut translator = BlockTranslator::new(ctx, builder, entry, helpers);
             match translator.translate_body(block) {
-                Ok(()) => {
-                    let compiled = (translator.table.clone(), translator.exports.clone());
+                Ok(body_len) => {
+                    let compiled = (
+                        translator.table.clone(),
+                        translator.exports.clone(),
+                        body_len,
+                    );
                     translator.finish();
                     compiled
                 }
@@ -296,6 +304,7 @@ impl Jit {
             table,
             exports,
             body_len,
+            interrupts: body_len < full_body,
             slots: Vec::new(),
         });
         Ok(self.compiled.len() - 1)
@@ -333,14 +342,16 @@ impl Jit {
                     retired,
                 }));
             };
-            let body = self.enter(ctx, emu, index)?;
+            let (body, interrupts) = self.enter(ctx, emu, index)?;
             retired += body as u64;
             self.stats.native_runs += 1;
 
             // Only continue while the successor is one this backend can also
             // run: deciding the branch here is what keeps control inside
-            // compiled code, and the interpreter would otherwise redo it.
-            let next = if chain {
+            // compiled code, and the interpreter would otherwise redo it. A
+            // body cut at an interrupting op has no successor to decide: the
+            // interpreter takes over at the op.
+            let next = if chain && !interrupts {
                 self.next_block(ctx, emu, current)
             } else {
                 None
@@ -401,15 +412,16 @@ impl Jit {
         Some(BlockId::new(block.func, target))
     }
 
-    /// Runs one compiled block, leaving its terminator's operands where the
-    /// interpreter would have put them. Returns how many body instructions it
-    /// retired.
+    /// Runs one compiled block, leaving the operands of whatever the
+    /// interpreter runs next where it would have put them. Returns how many
+    /// body instructions it retired, and whether it stopped short at an
+    /// interrupting op.
     fn enter(
         &mut self,
         _ctx: &Context<'_>,
         emu: &mut StandaloneEmulator<VmMemory>,
         index: usize,
-    ) -> Result<usize, EmulatorErrorKind> {
+    ) -> Result<(usize, bool), EmulatorErrorKind> {
         let compiled = &mut self.compiled[index];
         // Taken as a raw pointer, and everything below derived from it: the
         // compiled block holds base pointers into the flat spaces *while*
@@ -479,7 +491,7 @@ impl Jit {
                 .insert(export.insn, SizedValue::new(bits, export.size));
         }
 
-        Ok(compiled.body_len)
+        Ok((compiled.body_len, compiled.interrupts))
     }
 }
 

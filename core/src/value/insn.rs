@@ -52,7 +52,7 @@ pub use intrinsic::{
 pub use map::Map;
 pub use memory::{Load, Store};
 pub use mnemonic::Mnemonic;
-pub use pcode_op::{PCodeOp, PCodeOpId};
+pub use pcode_op::{PCodeOp, PCodeOpId, VM_INTERRUPT};
 pub use scan::Scan;
 pub use terminator::{
     Apply, BadInsn, Branch, BranchInd, CBranch, Call, CallInd, CallTag, Callee, Return,

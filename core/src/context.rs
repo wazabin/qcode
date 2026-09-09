@@ -250,6 +250,24 @@ impl<'str> Shared<'str> {
         ValueId::Literal(self.values.get_or_make_typed_literal(value, type_id, size))
     }
 
+    /// The id of the user p-code op called `name`, registering it if the module
+    /// has none by that name.
+    ///
+    /// SLEIGH's ops keep their specification ids, so a name is looked up before
+    /// it is appended and an op is never registered twice.
+    pub fn pcode_op(&mut self, name: &str) -> PCodeOpId {
+        if let Some(op) = self.pcode_ops.iter().find(|op| op.as_ref() == name) {
+            return op.id;
+        }
+        self.pcode_ops.push(Box::from(name))
+    }
+
+    /// The id of the reserved [`VM_INTERRUPT`](crate::value::insn::VM_INTERRUPT)
+    /// op, registering it on first use.
+    pub fn vm_interrupt_op(&mut self) -> PCodeOpId {
+        self.pcode_op(crate::value::insn::VM_INTERRUPT)
+    }
+
     /// A `bool`-typed constant (`true`/`false`), byte-stored. Shared-only mirror
     /// of [`Context::get_bool_const`] returning the id directly.
     pub fn get_bool_const(&self, value: bool) -> ValueId {

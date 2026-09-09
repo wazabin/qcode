@@ -145,3 +145,64 @@ fn jit_throughput() {
         );
     }
 }
+
+/// A user op the interpreter cannot run — `rdtsc` — stops both strategies at
+/// the same place, and the compiled prefix of its block is still native code.
+#[test]
+fn an_intrinsic_interrupt_stops_the_jit_at_the_same_place_as_the_interpreter() {
+    use qcode_vm::{InterruptKind, VmExit};
+
+    let code: &[u8] = &[
+        0xb8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5
+        0x0f, 0x31, // rdtsc
+        0x89, 0xc3, // mov ebx, eax
+        0x89, 0xd1, // mov ecx, edx
+    ];
+    let tsc: u128 = 0x1122_3344_5566_7788;
+
+    let mut stops = Vec::new();
+    let mut results = Vec::new();
+    for jit in [false, true] {
+        let mut vm = machine(code);
+        if jit {
+            vm.set_block_executor(Box::new(Jit::new()));
+        }
+        let exit = vm.run(10_000);
+        let VmExit::Interrupt(interrupt) = exit else {
+            panic!("jit={jit}: expected an interrupt, got {exit:?}");
+        };
+        assert!(
+            matches!(&interrupt.kind, InterruptKind::Intrinsic { name, .. } if name.as_ref() == "rdtsc"),
+            "jit={jit}: stopped at {:?}",
+            interrupt.kind
+        );
+        assert_eq!(interrupt.pc, Some(0x1005), "jit={jit}");
+        assert_eq!(interrupt.size, 8, "jit={jit}: rdtsc yields a 64-bit value");
+        stops.push((interrupt.insn, vm.emulator().block, vm.emulator().idx));
+
+        vm.resume(Some(tsc)).unwrap();
+        vm.run(10_000);
+        let ctx = vm.context().clone();
+        let read = |vm: &mut Vm<_>, name: &str| vm.emulator().read_varnode_by_name(&ctx, name);
+        results.push((
+            read(&mut vm, "EAX"),
+            read(&mut vm, "EBX"),
+            read(&mut vm, "ECX"),
+        ));
+        if jit {
+            assert!(
+                vm.stats.native_bodies > 0,
+                "the prefix before rdtsc should have run natively"
+            );
+        }
+    }
+    assert_eq!(
+        stops[0], stops[1],
+        "both strategies stop at the same instruction"
+    );
+    assert_eq!(
+        results[0],
+        (Some(0x5566_7788), Some(0x5566_7788), Some(0x1122_3344))
+    );
+    assert_eq!(results[0], results[1]);
+}

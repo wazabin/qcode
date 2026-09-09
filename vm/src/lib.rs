@@ -54,4 +54,7 @@ pub use mmu::{
 pub use optimize::{Cleanup, forward_temp_stores};
 pub use stats::Stats;
 pub use tlb::{TLB_ENTRIES, TLB_INDEX_BITS, TlbEntry, TranslationCache};
-pub use vm::{BlockExecutor, CodeError, CodeSource, Executed, Vm, VmExit};
+pub use vm::{
+    BlockExecutor, CodeError, CodeSource, Executed, Interrupt, InterruptKind, ResumeError, Vm,
+    VmExit,
+};

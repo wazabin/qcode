@@ -382,21 +382,54 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         Ok(self.ctx.shared.types.size_of(ty))
     }
 
-    /// Translates every non-terminator instruction of `block`, then emits the
-    /// exports its terminator will need.
-    pub(crate) fn translate_body(&mut self, block: BlockId) -> Result<(), Unsupported> {
+    /// Translates the body of `block` up to its first interrupting user
+    /// operation, or all of it, then emits the exports the rest of the block
+    /// will need.
+    ///
+    /// Returns how many body instructions the compiled code retires. That is
+    /// the whole body when nothing interrupts, and the index of the
+    /// interrupting op otherwise: compiled code runs the prefix, and the
+    /// interpreter — positioned at the op by that count — raises the
+    /// interrupt, exactly as it would have with no compiled code at all. The
+    /// values the op and everything after it read from the prefix are
+    /// exported, the same way a terminator's operands are.
+    pub(crate) fn translate_body(&mut self, block: BlockId) -> Result<usize, Unsupported> {
         let insns: Vec<InstructionId> = BasicBlock::from_id(self.ctx, block).instruction_ids();
-        let Some((&terminator, body)) = insns.split_last() else {
+        if insns.is_empty() {
             return Err(Unsupported::Terminator("block is empty"));
-        };
+        }
+        let body = &insns[..insns.len() - 1];
+        let cut = body
+            .iter()
+            .position(|&insn| self.interrupts(insn))
+            .unwrap_or(body.len());
         let own: FxHashSet<InstructionId> = insns.iter().copied().collect();
 
-        for &insn_id in body {
+        for &insn_id in &body[..cut] {
             self.translate_one(insn_id)?;
             self.check_confined(insn_id, &own)?;
         }
 
-        self.export_terminator_operands(terminator, &own)
+        for &reader in &insns[cut..] {
+            self.export_operands(reader, &own)?;
+        }
+        Ok(cut)
+    }
+
+    /// Whether the interpreter stops at this instruction for the host: a user
+    /// p-code op with no semantics of its own, which this backend has no way
+    /// to run either. The ops it does model are the ones `translate_one`
+    /// translates in place.
+    fn interrupts(&self, insn_id: InstructionId) -> bool {
+        let insn = qcode::value::Instruction::from_id(self.ctx, insn_id);
+        let Mnemonic::PCodeOp(op) = insn.mnemonic() else {
+            return false;
+        };
+        let name = &self.ctx.shared.pcode_ops[op.id];
+        !matches!(
+            (name.as_ref(), op.args.as_slice()),
+            ("undef", []) | ("LOCK" | "UNLOCK", [])
+        )
     }
 
     /// Declines the block if `insn_id`'s result is read from outside it.
@@ -423,24 +456,25 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         Ok(())
     }
 
-    /// Writes every terminator operand this block defines into the export
-    /// buffer, so the interpreter can read it back before running the
-    /// terminator.
+    /// Writes every operand of `reader` that compiled code computed into the
+    /// export buffer, so the interpreter can read it back before running
+    /// `reader` itself — the terminator, or the tail of a block cut at an
+    /// interrupt.
     ///
     /// Operands the interpreter can already resolve on its own — literals,
     /// varnode and temp addresses, results of earlier blocks it walked — need
     /// nothing, so a terminator that reads only those exports nothing.
-    fn export_terminator_operands(
+    fn export_operands(
         &mut self,
-        terminator: InstructionId,
+        reader: InstructionId,
         own: &FxHashSet<InstructionId>,
     ) -> Result<(), Unsupported> {
-        let insn = qcode::value::Instruction::from_id(self.ctx, terminator);
+        let insn = qcode::value::Instruction::from_id(self.ctx, reader);
         let operands: Vec<ValueId> = insn
             .mnemonic()
             .args()
             .into_iter()
-            .map(|arg| arg.qualify(terminator.func))
+            .map(|arg| arg.qualify(reader.func))
             .collect();
 
         for operand in operands {
@@ -453,10 +487,11 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
             if self.exports.iter().any(|export| export.insn == def) {
                 continue;
             }
-            let value = *self
-                .values
-                .get(&def)
-                .ok_or(Unsupported::Terminator("operand was not compiled"))?;
+            // Defined in this block but not by compiled code: an instruction
+            // past the cut, which the interpreter computes itself.
+            let Some(&value) = self.values.get(&def) else {
+                continue;
+            };
             let size = self.width_of(operand)?;
             // An export slot is a `u64`. A terminator operand is a condition or
             // a small integer in practice, so this is a decline that has never
