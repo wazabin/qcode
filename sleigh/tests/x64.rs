@@ -159,7 +159,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_sar_rcx_cl() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\x48\xd3\xf9")
             .next()
@@ -214,7 +213,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_call_rax() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\xff\xd0")
             .next()
@@ -260,7 +258,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_movaps_xmm0_xmm1() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\x0f\x28\xc1")
             .next()
@@ -270,7 +267,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_movsd_xmm2_ptr_rax() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\xf2\x0f\x10\x10")
             .next()
@@ -280,7 +276,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_addss_xmm3_xmm4() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\xf3\x0f\x58\xdc")
             .next()
@@ -539,7 +534,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_movupd_xmm0_xmm1() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\x66\x0f\x10\xc1")
             .next()
@@ -549,7 +543,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_movsd_xmm2_xmm3() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\xf2\x0f\x10\xd3")
             .next()
@@ -559,7 +552,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_movss_xmm4_xmm5() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\xf3\x0f\x10\xe5")
             .next()
@@ -569,7 +561,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_addpd_xmm6_xmm7() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\x66\x0f\x58\xf7")
             .next()
@@ -579,7 +570,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_addsd_xmm1_xmm2() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\xf2\x0f\x58\xca")
             .next()
@@ -589,7 +579,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_addss_xmm3_xmm4_second() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\xf3\x0f\x58\xdc")
             .next()
@@ -651,6 +640,45 @@ mod tests {
 
         assert_eq!(read_x87_slot(&mut emu, &ctx, 0), one + (1u128 << 40));
         assert_ne!(emu.read_register(x64::FPUSTATUSWORD).unwrap() & 0x20, 0);
+    }
+
+    fn pack_f32x4(lanes: [f32; 4]) -> u128 {
+        lanes.iter().enumerate().fold(0, |packed, (index, lane)| {
+            packed | (u128::from(lane.to_bits()) << (index * 32))
+        })
+    }
+
+    fn unpack_f32x4(value: u128) -> [f32; 4] {
+        std::array::from_fn(|index| f32::from_bits((value >> (index * 32)) as u32))
+    }
+
+    /// `ADDPS` writes each 32-bit lane as a byte-aligned sub-varnode of the
+    /// 16-byte XMM register; a lifter that refuses bit-range writes into
+    /// storage wider than 8 bytes cannot express this at all.
+    #[test]
+    fn test_addps_sums_all_four_single_lanes() {
+        let insn = x64::Disassembler::from_bytes(0x1000, b"\x0f\x58\xc1")
+            .next()
+            .unwrap();
+        assert_eq!(insn.to_string(), "ADDPS XMM0, XMM1");
+
+        let mut ctx = x64::make_context();
+        x64::lift(&mut ctx, &insn, None).unwrap();
+        let mut emu = Emulator::from_address(&ctx, 0x1000);
+        emu.set_register_u128(x64::XMM0, pack_f32x4([1.0, 2.0, 3.0, 4.0]))
+            .unwrap();
+        emu.set_register_u128(x64::XMM1, pack_f32x4([0.5, 1.5, 2.5, 3.5]))
+            .unwrap();
+        emu.run_block().unwrap();
+
+        let result = emu.read_register_u128(x64::XMM0).unwrap();
+        assert_eq!(unpack_f32x4(result), [1.5, 3.5, 5.5, 7.5]);
+        assert_eq!(result, pack_f32x4([1.5, 3.5, 5.5, 7.5]));
+        // The source operand is untouched.
+        assert_eq!(
+            emu.read_register_u128(x64::XMM1).unwrap(),
+            pack_f32x4([0.5, 1.5, 2.5, 3.5])
+        );
     }
 
     /// `FST ST1` must copy through TOP-derived physical slots, including the
