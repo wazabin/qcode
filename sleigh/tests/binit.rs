@@ -1456,9 +1456,11 @@ mod engine {
     /// of the page) rather than a wazabin bug — the lifted qcode is correct.
     fn fixture_limitation_reason(tc: &DbTestCase, pair: &DbStateResult) -> Option<&'static str> {
         let mnemonic = tc.instruction.split_whitespace().next().unwrap_or("");
-        // CMPXCHG16B compares/writes a 16-byte operand; only the low 8 bytes are
-        // modeled, so the unmodeled high 8 bytes drive the divergence.
-        if mnemonic.eq_ignore_ascii_case("cmpxchg16b") {
+        // CMPXCHG16B compares/writes a 16-byte operand. A case seeded through
+        // the 512-byte `scratch_memory` transport models all of it and is a
+        // real result; one carrying only the 8-byte `mem0_value` word predates
+        // that, and its unmodeled high 8 bytes drive the divergence.
+        if mnemonic.eq_ignore_ascii_case("cmpxchg16b") && pair.initial.scratch_memory.is_none() {
             return Some("128-bit memory operand exceeds modeled 8-byte window");
         }
         // BT/BTC/BTR/BTS with a memory operand and a register bit index access the
