@@ -159,7 +159,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_sar_rcx_cl() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\x48\xd3\xf9")
             .next()
@@ -214,7 +213,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_call_rax() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\xff\xd0")
             .next()
@@ -260,7 +258,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_movaps_xmm0_xmm1() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\x0f\x28\xc1")
             .next()
@@ -270,7 +267,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_movsd_xmm2_ptr_rax() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\xf2\x0f\x10\x10")
             .next()
@@ -280,7 +276,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_addss_xmm3_xmm4() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\xf3\x0f\x58\xdc")
             .next()
@@ -539,7 +534,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_movupd_xmm0_xmm1() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\x66\x0f\x10\xc1")
             .next()
@@ -549,7 +543,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_movsd_xmm2_xmm3() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\xf2\x0f\x10\xd3")
             .next()
@@ -559,7 +552,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_movss_xmm4_xmm5() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\xf3\x0f\x10\xe5")
             .next()
@@ -569,7 +561,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_addpd_xmm6_xmm7() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\x66\x0f\x58\xf7")
             .next()
@@ -579,7 +570,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_addsd_xmm1_xmm2() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\xf2\x0f\x58\xca")
             .next()
@@ -589,7 +579,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flat SLEIGH p-code lowering does not yet support this instruction form"]
     fn test_addss_xmm3_xmm4_second() {
         let insn = x64::Disassembler::from_bytes(0x1000, b"\xf3\x0f\x58\xdc")
             .next()
