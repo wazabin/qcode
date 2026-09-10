@@ -21,14 +21,11 @@ use qcode::{
 };
 use qcode_emulator::{EmulatorErrorKind, StandaloneEmulator};
 use qcode_jit::Jit;
-use qcode_vm::{BlockExecutor, Executed, Vm, VmMemory, perm};
+use qcode_userland::bare;
+use qcode_vm::{BlockExecutor, Executed, VmMemory};
 use rustc_hash::FxHashMap;
-use wazabin_qcode_sleigh::vm_source::SleighCodeSource;
 
-const SENTINEL: u64 = 0xdead_0000;
-const STACK: u64 = 0x7fff_0000;
-const STACK_SIZE: u64 = 0x40000;
-const STACK_TOP: u64 = 0x7fff_8000;
+mod support;
 
 /// Counts the guest instructions in every block the VM enters, and declines
 /// each one, so the interpreter runs the program exactly as it would with no
@@ -85,85 +82,14 @@ impl BlockExecutor for Counter {
     }
 }
 
-fn load(image: &[u8], memory: &mut VmMemory) -> u64 {
-    let half = |o: usize| u16::from_le_bytes(image[o..o + 2].try_into().unwrap());
-    let word = |o: usize| u32::from_le_bytes(image[o..o + 4].try_into().unwrap());
-    let long = |o: usize| u64::from_le_bytes(image[o..o + 8].try_into().unwrap());
-
-    let entry = long(24);
-    let phoff = long(32) as usize;
-    let phentsize = half(54) as usize;
-    for i in 0..half(56) as usize {
-        let p = phoff + i * phentsize;
-        if word(p) != 1 {
-            continue;
-        }
-        let flags = word(p + 4);
-        let off = long(p + 8) as usize;
-        let vaddr = long(p + 16);
-        let filesz = long(p + 32) as usize;
-        let memsz = long(p + 40) as usize;
-        let mut bits = perm::READ | perm::INIT;
-        if flags & 1 != 0 {
-            bits |= perm::EXEC;
-        }
-        if flags & 2 != 0 {
-            bits |= perm::WRITE;
-        }
-        let mut bytes = image[off..off + filesz].to_vec();
-        bytes.resize(memsz, 0);
-        memory.mmu.write_unchecked(vaddr, &bytes, bits);
-    }
-    entry
-}
-
-fn images() -> Vec<(String, Vec<u8>)> {
-    // `EMBENCH_DIR` selects an alternative corpus — a build at a larger scale
-    // factor, say, where one-time translation is amortised over enough
-    // execution to show a steady-state rate rather than a warm-up one.
-    let corpus = std::env::var("EMBENCH_DIR").unwrap_or_else(|_| "target/embench".to_owned());
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join(corpus);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<_> = entries
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "elf"))
-        .map(|e| {
-            (
-                e.path().file_stem().unwrap().to_string_lossy().into_owned(),
-                std::fs::read(e.path()).expect("image"),
-            )
-        })
-        .collect();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
-}
-
-fn prepared(image: &[u8]) -> Vm<SleighCodeSource<'static>> {
-    let source = SleighCodeSource::new(sleigh_precompile::x64::spec());
-    let ctx = source.new_context();
-    let mut memory = VmMemory::new();
-    let entry = load(image, &mut memory);
-    memory.mmu.map(STACK, STACK_SIZE, perm::RW_INIT).unwrap();
-    memory
-        .mmu
-        .write_unchecked(STACK_TOP, &SENTINEL.to_le_bytes(), perm::RW_INIT);
-    let mut vm = Vm::at_address(ctx, entry, source, memory).expect("the entry decodes");
-    let ctx = vm.context().clone();
-    vm.emulator()
-        .set_varnode_by_name(&ctx, "RSP", STACK_TOP)
-        .expect("RSP is a register");
-    vm
+fn prepared(image: &[u8]) -> bare::Machine {
+    bare::machine(image).expect("the image loads and its entry decodes")
 }
 
 #[test]
 #[ignore = "diagnostic; needs benchmarks/embench/build.sh to have been run"]
 fn report_guest_instruction_rate() {
-    let images = images();
+    let images = support::images();
     assert!(
         !images.is_empty(),
         "no images; run benchmarks/embench/build.sh"

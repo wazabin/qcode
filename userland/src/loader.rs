@@ -1,9 +1,8 @@
 //! Places a static ELF64 x86-64 executable into guest memory.
 //!
-//! `PT_LOAD` segments come from [`wazabin_binary::elf::ElfBinary`]; the pieces
-//! it does not expose — the file type (`ET_EXEC` versus `ET_DYN`), the program
-//! header table's location for `AT_PHDR`, and `PT_TLS` — are read from the
-//! headers here.
+//! Everything about the file comes from [`wazabin_binary::elf::ElfBinary`]:
+//! the `PT_LOAD` segments, the file type (`ET_EXEC` versus `ET_DYN`), the
+//! program header table's address for `AT_PHDR`, and `PT_TLS`.
 //!
 //! Mappings are page-granular: each segment's `[vaddr, vaddr + memsz)` is
 //! rounded out to pages and mapped zero-filled with the segment's permissions,
@@ -13,17 +12,14 @@
 //! MMU), which is stricter than Linux rather than looser.
 
 use qcode_vm::{Mmu, PAGE_SIZE, perm};
-use wazabin_binary::{Arch, elf::ElfBinary};
+use wazabin_binary::{
+    Arch,
+    elf::{ElfBinary, ElfKind},
+};
 
 /// Where a position-independent executable is placed. Linux picks a random
 /// address near here; the environment is deterministic.
 pub const PIE_BASE: u64 = 0x5555_5555_0000;
-
-const ET_EXEC: u16 = 2;
-const ET_DYN: u16 = 3;
-const PT_LOAD: u32 = 1;
-const PT_PHDR: u32 = 6;
-const PT_TLS: u32 = 7;
 
 /// A `PT_TLS` segment, for a guest that sets up thread-local storage itself.
 #[derive(Debug, Clone, Copy)]
@@ -64,8 +60,7 @@ pub struct LoadedImage {
 pub enum LoadError {
     Parse(String),
     NotX86_64,
-    Truncated,
-    UnsupportedType(u16),
+    UnsupportedKind(ElfKind),
     Map(String),
 }
 
@@ -74,9 +69,8 @@ impl std::fmt::Display for LoadError {
         match self {
             LoadError::Parse(e) => write!(f, "ELF parse error: {e}"),
             LoadError::NotX86_64 => write!(f, "not an x86-64 ELF"),
-            LoadError::Truncated => write!(f, "ELF header is truncated"),
-            LoadError::UnsupportedType(t) => {
-                write!(f, "unsupported ELF type {t} (need ET_EXEC or ET_DYN)")
+            LoadError::UnsupportedKind(kind) => {
+                write!(f, "unsupported ELF type {kind:?} (need ET_EXEC or ET_DYN)")
             }
             LoadError::Map(e) => write!(f, "cannot map segment: {e}"),
         }
@@ -93,56 +87,16 @@ pub fn page_up(addr: u64) -> u64 {
     (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
 
-/// Raw program header fields the loader needs.
-struct Phdr {
-    kind: u32,
-    offset: u64,
-    vaddr: u64,
-    filesz: u64,
-    memsz: u64,
-    align: u64,
-}
-
-fn headers(image: &[u8]) -> Result<(u16, u64, u16, u16, Vec<Phdr>), LoadError> {
-    if image.len() < 64 {
-        return Err(LoadError::Truncated);
-    }
-    let half = |o: usize| u16::from_le_bytes(image[o..o + 2].try_into().unwrap());
-    let word = |o: usize| u32::from_le_bytes(image[o..o + 4].try_into().unwrap());
-    let long = |o: usize| u64::from_le_bytes(image[o..o + 8].try_into().unwrap());
-    let e_type = half(16);
-    let phoff = long(32);
-    let phentsize = half(54);
-    let phnum = half(56);
-    let mut phdrs = Vec::with_capacity(phnum as usize);
-    for i in 0..phnum as usize {
-        let p = phoff as usize + i * phentsize as usize;
-        if p + 56 > image.len() {
-            return Err(LoadError::Truncated);
-        }
-        phdrs.push(Phdr {
-            kind: word(p),
-            offset: long(p + 8),
-            vaddr: long(p + 16),
-            filesz: long(p + 32),
-            memsz: long(p + 40),
-            align: long(p + 48),
-        });
-    }
-    Ok((e_type, phoff, phentsize, phnum, phdrs))
-}
-
 /// Loads `image` into `mmu`.
 pub fn load(image: &[u8], mmu: &mut Mmu) -> Result<LoadedImage, LoadError> {
     let elf = ElfBinary::parse(image).map_err(|e| LoadError::Parse(e.to_string()))?;
     if elf.architecture != Arch::X86_64 {
         return Err(LoadError::NotX86_64);
     }
-    let (e_type, phoff, phentsize, phnum, phdrs) = headers(image)?;
-    let base = match e_type {
-        ET_EXEC => 0,
-        ET_DYN => PIE_BASE,
-        other => return Err(LoadError::UnsupportedType(other)),
+    let base = match elf.kind {
+        ElfKind::Executable => 0,
+        ElfKind::SharedObject => PIE_BASE,
+        other => return Err(LoadError::UnsupportedKind(other)),
     };
 
     let mut segments = Vec::new();
@@ -180,34 +134,20 @@ pub fn load(image: &[u8], mmu: &mut Mmu) -> Result<LoadedImage, LoadError> {
         }
     }
 
-    // AT_PHDR: PT_PHDR names it outright; otherwise the table lives inside the
-    // PT_LOAD that covers its file offset.
-    let phdr = phdrs
-        .iter()
-        .find(|p| p.kind == PT_PHDR)
-        .map(|p| p.vaddr + base)
-        .or_else(|| {
-            phdrs
-                .iter()
-                .filter(|p| p.kind == PT_LOAD)
-                .find(|p| phoff >= p.offset && phoff < p.offset + p.filesz)
-                .map(|p| p.vaddr + (phoff - p.offset) + base)
-        });
-    let tls = phdrs.iter().find(|p| p.kind == PT_TLS).map(|p| Tls {
-        vaddr: p.vaddr + base,
-        filesz: p.filesz,
-        memsz: p.memsz,
-        align: p.align,
-    });
-
+    let table = elf.program_headers;
     Ok(LoadedImage {
         entry: elf.analysis.entrypoint + base,
         base,
-        phdr,
-        phnum,
-        phentsize,
+        phdr: table.vaddr.map(|addr| addr + base),
+        phnum: table.count,
+        phentsize: table.entry_size,
         brk,
-        tls,
+        tls: elf.tls.map(|t| Tls {
+            vaddr: t.vaddr + base,
+            filesz: t.file_size,
+            memsz: t.mem_size,
+            align: t.align,
+        }),
         segments,
     })
 }

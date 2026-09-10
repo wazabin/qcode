@@ -2194,6 +2194,7 @@ version = "0.4.2"
 dependencies = [
  "env_logger",
  "log",
+ "rustc-hash",
  "wazabin-binary",
  "wazabin-qcode",
  "wazabin-qcode-emulator",

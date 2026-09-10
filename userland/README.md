@@ -117,3 +117,10 @@ cargo test
 `tests/corpus.rs` builds the C programs in `tests/corpus/` with the host `gcc`
 (skipping if there is none) and runs each interpreted and with the JIT,
 checking stdout and the exit status. One is built as a static PIE.
+
+The Embench harnesses live here too, on the `bare` module, which runs a
+freestanding image with no process around it: `tests/embench.rs` verifies
+every benchmark under both strategies, `tests/divergence.rs` finds the first
+block a compiled run computes differently, and `tests/guest_rate_probe.rs`
+reports guest instructions per second. All three are ignored by default and
+need the images from `benchmarks/embench/build.sh`.
