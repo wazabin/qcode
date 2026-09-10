@@ -1684,11 +1684,8 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             ));
         }
         let sticky = if inexact { bits | 1 } else { bits };
-        let (mut result, mut status) = Self::ieee_narrow(
-            SizedValue::from_bits(sticky, 10),
-            u128::from(size),
-            round,
-        )?;
+        let (mut result, mut status) =
+            Self::ieee_narrow(SizedValue::from_bits(sticky, 10), u128::from(size), round)?;
         if inexact {
             status |= Status::INEXACT;
         }
@@ -1717,7 +1714,10 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         if signaling {
             status |= Status::INVALID_OP;
         }
-        Some((SizedValue::from_bits(converted.value as u128 & mask, size), status))
+        Some((
+            SizedValue::from_bits(converted.value as u128 & mask, size),
+            status,
+        ))
     }
 
     /// Convert a two's-complement integer of the operand's own width to an
