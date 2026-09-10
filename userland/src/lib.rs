@@ -16,12 +16,14 @@
 //! # Layout
 //!
 //! - [`loader`]: places an ELF64 image into guest memory.
+//! - [`bare`]: runs a freestanding image with no process around it.
 //! - [`stack`]: builds `argc`/`argv`/`envp`/auxv.
 //! - [`fs`]: the file-descriptor table and the (optionally sandboxed) host
 //!   filesystem behind it.
 //! - [`syscall`]: the Linux system call dispatcher.
 //! - [`process`]: the run loop that ties the above to the VM.
 
+pub mod bare;
 pub mod errno;
 pub mod fs;
 pub mod guest;

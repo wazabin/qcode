@@ -8,7 +8,7 @@ single-function loops that flattered both.
 ```sh
 git clone --depth 1 https://github.com/embench/embench-iot.git
 EMBENCH=/path/to/embench-iot ./benchmarks/embench/build.sh
-cargo test --release -p qcode_jit --test embench -- --ignored --nocapture
+cargo test --release -p wazabin-qcode-userland --test embench -- --ignored --nocapture
 ```
 
 Images land in `target/embench/`. Embench itself is not vendored — it is

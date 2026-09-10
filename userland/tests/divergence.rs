@@ -15,40 +15,10 @@
 use qcode::{context::Context, space::MemorySpaceId, value::BlockId};
 use qcode_emulator::{EmulatorErrorKind, StandaloneEmulator};
 use qcode_jit::Jit;
-use qcode_vm::{BlockExecutor, Executed, Vm, VmMemory, perm};
-use wazabin_qcode_sleigh::vm_source::SleighCodeSource;
+use qcode_userland::bare;
+use qcode_vm::{BlockExecutor, Executed, VmMemory};
 
-const SENTINEL: u64 = 0xdead_0000;
-const STACK_TOP: u64 = 0x7fff_8000;
-
-fn load(image: &[u8], memory: &mut VmMemory) -> u64 {
-    let half = |o: usize| u16::from_le_bytes(image[o..o + 2].try_into().unwrap());
-    let word = |o: usize| u32::from_le_bytes(image[o..o + 4].try_into().unwrap());
-    let long = |o: usize| u64::from_le_bytes(image[o..o + 8].try_into().unwrap());
-    let entry = long(24);
-    let phoff = long(32) as usize;
-    let phentsize = half(54) as usize;
-    for i in 0..half(56) as usize {
-        let p = phoff + i * phentsize;
-        if word(p) != 1 {
-            continue;
-        }
-        let flags = word(p + 4);
-        let (off, vaddr) = (long(p + 8) as usize, long(p + 16));
-        let (filesz, memsz) = (long(p + 32) as usize, long(p + 40) as usize);
-        let mut bits = perm::READ | perm::INIT;
-        if flags & 1 != 0 {
-            bits |= perm::EXEC;
-        }
-        if flags & 2 != 0 {
-            bits |= perm::WRITE;
-        }
-        let mut bytes = image[off..off + filesz].to_vec();
-        bytes.resize(memsz, 0);
-        memory.mmu.write_unchecked(vaddr, &bytes, bits);
-    }
-    entry
-}
+mod support;
 
 /// One block entry: where the machine was, and what it held.
 ///
@@ -146,8 +116,8 @@ fn trace(
     budget: u64,
     detail: Option<usize>,
 ) -> (Vec<Entry>, Vec<Vec<u8>>) {
-    let source = SleighCodeSource::new(sleigh_precompile::x64::spec());
-    let ctx = source.new_context();
+    let mut vm = bare::machine(image).expect("the image loads and its entry decodes");
+    let ctx = vm.context().clone();
     let registers = (0..ctx.space_count())
         .map(qcode::space::SpaceId::from)
         .find(|&id| {
@@ -158,18 +128,6 @@ fn trace(
         })
         .map(MemorySpaceId::Shared)
         .expect("the specification has a register space");
-    let mut memory = VmMemory::new();
-    let entry = load(image, &mut memory);
-    memory.mmu.map(0x7fff_0000, 0x40000, perm::RW_INIT).unwrap();
-    memory
-        .mmu
-        .write_unchecked(STACK_TOP, &SENTINEL.to_le_bytes(), perm::RW_INIT);
-
-    let mut vm = Vm::at_address(ctx, entry, source, memory).expect("the entry decodes");
-    let ctx = vm.context().clone();
-    vm.emulator()
-        .set_varnode_by_name(&ctx, "RSP", STACK_TOP)
-        .expect("RSP is a register");
     let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let kept = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     vm.set_block_executor(Box::new(Recorder {
@@ -258,32 +216,23 @@ fn compare(name: &str, image: &[u8], budget: u64) -> bool {
 #[test]
 #[ignore = "needs benchmarks/embench/build.sh to have been run"]
 fn no_program_diverges_under_the_jit() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("target/embench");
     let budget: u64 = std::env::var("BUDGET")
         .ok()
         .and_then(|b| b.parse().ok())
         .unwrap_or(4_000_000_000);
     let only = std::env::var("B").ok();
 
-    let mut images: Vec<_> = std::fs::read_dir(&dir)
-        .expect("images; run benchmarks/embench/build.sh")
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "elf"))
-        .map(|e| e.path())
-        .collect();
-    images.sort();
-    assert!(!images.is_empty(), "no images in {}", dir.display());
+    let images = support::images();
+    assert!(
+        !images.is_empty(),
+        "no images; run benchmarks/embench/build.sh"
+    );
 
     let mut diverged = Vec::new();
-    for path in images {
-        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+    for (name, image) in images {
         if only.as_ref().is_some_and(|want| *want != name) {
             continue;
         }
-        let image = std::fs::read(&path).expect("image");
         if !compare(&name, &image, budget) {
             diverged.push(name);
         }

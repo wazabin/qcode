@@ -29,3 +29,6 @@ sleigh-precompile = { package = "wazabin-sleigh-precompile", version = "0.1.2" }
 wazabin-binary.workspace = true
 log.workspace = true
 env_logger.workspace = true
+
+[dev-dependencies]
+rustc-hash.workspace = true

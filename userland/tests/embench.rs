@@ -26,50 +26,9 @@
 //! commit before any of the JIT work.
 
 use qcode_jit::Jit;
-use qcode_vm::{Vm, VmMemory, perm};
-use wazabin_qcode_sleigh::vm_source::SleighCodeSource;
+use qcode_userland::bare;
 
-/// The address a returning `main` lands on: unmapped, so the run stops there.
-const SENTINEL: u64 = 0xdead_0000;
-const STACK: u64 = 0x7fff_0000;
-const STACK_SIZE: u64 = 0x40000;
-const STACK_TOP: u64 = 0x7fff_8000;
-
-/// Enough of ELF64 to place a freestanding static image.
-fn load(image: &[u8], memory: &mut VmMemory) -> u64 {
-    let half = |o: usize| u16::from_le_bytes(image[o..o + 2].try_into().unwrap());
-    let word = |o: usize| u32::from_le_bytes(image[o..o + 4].try_into().unwrap());
-    let long = |o: usize| u64::from_le_bytes(image[o..o + 8].try_into().unwrap());
-
-    let entry = long(24);
-    let phoff = long(32) as usize;
-    let phentsize = half(54) as usize;
-    for i in 0..half(56) as usize {
-        let p = phoff + i * phentsize;
-        if word(p) != 1 {
-            continue; // PT_LOAD only
-        }
-        let flags = word(p + 4);
-        let off = long(p + 8) as usize;
-        let vaddr = long(p + 16);
-        let filesz = long(p + 32) as usize;
-        let memsz = long(p + 40) as usize;
-
-        let mut bits = perm::READ | perm::INIT;
-        if flags & 1 != 0 {
-            bits |= perm::EXEC;
-        }
-        if flags & 2 != 0 {
-            bits |= perm::WRITE;
-        }
-        // A segment's memory size exceeds its file size exactly where .bss is,
-        // which the loader is responsible for zeroing.
-        let mut bytes = image[off..off + filesz].to_vec();
-        bytes.resize(memsz, 0);
-        memory.mmu.write_unchecked(vaddr, &bytes, bits);
-    }
-    entry
-}
+mod support;
 
 struct Run {
     verified: bool,
@@ -80,20 +39,7 @@ struct Run {
 }
 
 fn run(image: &[u8], jit: bool, budget: u64) -> Run {
-    let source = SleighCodeSource::new(sleigh_precompile::x64::spec());
-    let ctx = source.new_context();
-    let mut memory = VmMemory::new();
-    let entry = load(image, &mut memory);
-    memory.mmu.map(STACK, STACK_SIZE, perm::RW_INIT).unwrap();
-    memory
-        .mmu
-        .write_unchecked(STACK_TOP, &SENTINEL.to_le_bytes(), perm::RW_INIT);
-
-    let mut vm = Vm::at_address(ctx, entry, source, memory).expect("the entry decodes");
-    let ctx = vm.context().clone();
-    vm.emulator()
-        .set_varnode_by_name(&ctx, "RSP", STACK_TOP)
-        .expect("RSP is a register in this specification");
+    let mut vm = bare::machine(image).expect("the image loads and its entry decodes");
     if jit {
         vm.set_block_executor(Box::new(Jit::new()));
     }
@@ -101,44 +47,18 @@ fn run(image: &[u8], jit: bool, budget: u64) -> Run {
     let started = std::time::Instant::now();
     let exit = vm.run(budget);
     let elapsed = started.elapsed();
-    let ctx = vm.context().clone();
     // A run is only meaningful if it ran to the end: `main` returned onto the
     // sentinel. Any other exit — a fault, an unlifted instruction, the budget —
     // means the benchmark did not finish, and its result register is noise.
-    let finished = matches!(
-        &exit,
-        qcode_vm::VmExit::Unlifted { addr, .. } if *addr == SENTINEL
-    );
+    let finished = bare::returned(&exit);
     Run {
         exit: format!("{exit:?}"),
         // Embench's `main` returns 0 when the benchmark verified itself.
-        verified: finished && vm.emulator().read_varnode_by_name(&ctx, "EAX") == Some(0),
+        verified: finished && bare::register(&mut vm, "EAX") == Some(0),
         steps: vm.stats.steps,
         native_bodies: vm.stats.native_bodies,
         elapsed,
     }
-}
-
-fn images() -> Vec<(String, Vec<u8>)> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("target/embench");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<_> = entries
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "elf"))
-        .map(|e| {
-            (
-                e.path().file_stem().unwrap().to_string_lossy().into_owned(),
-                std::fs::read(e.path()).expect("image"),
-            )
-        })
-        .collect();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
 }
 
 /// Every benchmark must verify its own result, with and without the JIT.
@@ -148,7 +68,7 @@ fn images() -> Vec<(String, Vec<u8>)> {
 #[test]
 #[ignore = "needs benchmarks/embench/build.sh to have been run"]
 fn embench_verifies_under_both_strategies() {
-    let images = images();
+    let images = support::images();
     assert!(
         !images.is_empty(),
         "no images; run benchmarks/embench/build.sh"

@@ -1665,9 +1665,9 @@ dependencies = [
 
 [[package]]
 name = "wazabin-binary"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "263595c6b132ac844531d92d3c3eb1b70c22a8195b22df2ca101a43e0d1d0679"
+checksum = "fbd522956ba3af684f8df2a1d2b934fe47c3af06ca831850a98f96d92c01e859"
 dependencies = [
  "elf",
  "goblin",
@@ -1810,6 +1810,7 @@ version = "0.3.0"
 dependencies = [
  "env_logger",
  "log",
+ "rustc-hash",
  "wazabin-binary",
  "wazabin-qcode",
  "wazabin-qcode-emulator",
