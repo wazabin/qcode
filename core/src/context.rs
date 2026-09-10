@@ -577,6 +577,21 @@ impl<'str> Context<'str> {
         self.shared.discoveries.iter()
     }
 
+    /// Every discovery this context has ever queued, with its provenance and
+    /// durable outcome (pending, lifted, failed or skipped). Drained items are
+    /// included, so this is the complete record of what was found and how.
+    pub fn discovery_records(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &crate::discovery::DiscoveryKey,
+            &crate::discovery::Discovery,
+            &crate::discovery::DiscoveryState,
+        ),
+    > + '_ {
+        self.shared.discoveries.records()
+    }
+
     /// True if there are no pending discoveries.
     pub fn has_no_discoveries(&self) -> bool {
         self.shared.discoveries.is_empty()

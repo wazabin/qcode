@@ -207,6 +207,9 @@ pub enum DiscoveryState {
 pub struct DiscoveryQueue {
     pending: BTreeMap<DiscoveryKey, Discovery>,
     states: BTreeMap<DiscoveryKey, DiscoveryState>,
+    /// The first [`Discovery`] recorded for each key, kept after it drains so
+    /// the provenance of a lifted (or failed) address stays inspectable.
+    records: BTreeMap<DiscoveryKey, Discovery>,
 }
 
 impl DiscoveryQueue {
@@ -224,6 +227,9 @@ impl DiscoveryQueue {
             return false;
         }
         let inserted = !self.pending.contains_key(&key);
+        self.records
+            .entry(key.clone())
+            .or_insert_with(|| discovery.clone());
         self.pending.entry(key.clone()).or_insert(discovery);
         self.states.entry(key).or_insert(DiscoveryState::Pending);
         inserted
@@ -273,6 +279,19 @@ impl DiscoveryQueue {
 
     pub fn states(&self) -> impl Iterator<Item = (&DiscoveryKey, &DiscoveryState)> + '_ {
         self.states.iter()
+    }
+
+    /// Every discovery ever recorded, with its current outcome. Unlike
+    /// [`iter`](Self::iter) this includes drained (lifted, failed, skipped)
+    /// items, so it is the complete history of what was found and how.
+    pub fn records(
+        &self,
+    ) -> impl Iterator<Item = (&DiscoveryKey, &Discovery, &DiscoveryState)> + '_ {
+        self.states.iter().filter_map(|(key, state)| {
+            self.records
+                .get(key)
+                .map(|discovery| (key, discovery, state))
+        })
     }
 
     /// Every code address this queue lifted successfully, as a portable
