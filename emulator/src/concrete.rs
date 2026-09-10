@@ -1095,7 +1095,17 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
 
     fn resolve_block_at(ctx: &Context<'_>, index: &AddressIndex, address: u64) -> Option<BlockId> {
         match index.get(address) {
-            Some(AddressTarget::Block(block)) => Some(block),
+            // A block answers for every address it absorbed, so that a branch
+            // to one of them can find the block to split. It is not a place
+            // to enter: control arriving at an absorbed address belongs at
+            // the instruction lifted from it, and entering at the block's
+            // start would rerun everything before it. Only a block that
+            // starts at the address is a target here; anything else is left
+            // for discovery to break apart.
+            Some(AddressTarget::Block(block)) => match BasicBlock::from_id(ctx, block).address() {
+                Some(start) if start != address => None,
+                _ => Some(block),
+            },
             Some(AddressTarget::Function(function)) => FunctionBody::from_id(ctx, function)
                 .root()
                 .map(|root| root.id),
@@ -3682,9 +3692,11 @@ mod tests {
         let mut emulator = StandaloneEmulator::new(block);
 
         assert!(emulator.address_index.is_none());
-        assert_eq!(emulator.block_at(&ctx, 0x2001), Some(block));
-        assert!(emulator.address_index.is_some());
         assert_eq!(emulator.block_at(&ctx, 0x2000), Some(block));
+        assert!(emulator.address_index.is_some());
+        // An absorbed address is indexed, so a lift can find the block to
+        // split, but it is not somewhere the machine may enter.
+        assert_eq!(emulator.block_at(&ctx, 0x2001), None);
     }
 
     #[test]
