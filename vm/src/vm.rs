@@ -694,10 +694,16 @@ impl<S: CodeSource> Vm<S> {
             return Some(VmExit::Interrupt(interrupt.clone()));
         }
         // A branch to unlifted code fails *before* the emulator moves, so the
-        // address can be lifted and the same step retried. One retry is enough:
-        // the second failure means the source did not produce the block it
-        // claimed to, which is a source bug rather than a discovery step.
-        for attempt in 0..2 {
+        // address can be lifted and the same step retried. One step may need
+        // more than one discovery: a direct branch lands in an empty
+        // placeholder, the retry lets an executor run the whole of the block
+        // it filled, and the terminator left to the interpreter can be an
+        // indirect branch to code nobody has lifted either. What ends the
+        // retries is the same address coming back, which means the source
+        // did not produce the block it claimed to: a source bug rather than
+        // a discovery step.
+        let mut discovered: Option<u64> = None;
+        loop {
             // Lifted code the guest has written over goes before anything is
             // built from it or run.
             if self.code_written_at.is_some()
@@ -763,8 +769,9 @@ impl<S: CodeSource> Vm<S> {
                 Err(error) => match error.kind {
                     EmulatorErrorKind::InvalidBlockAddress(addr)
                     | EmulatorErrorKind::UnknownAddress(addr)
-                        if attempt == 0 =>
+                        if discovered != Some(addr) =>
                     {
+                        discovered = Some(addr);
                         if let Some(exit) = self.discover(addr) {
                             return Some(exit);
                         }
@@ -774,12 +781,15 @@ impl<S: CodeSource> Vm<S> {
                     // *empty* block at that address, and execution walks into
                     // it. So an empty block carrying an address is a request to
                     // discover it, not a malformed-IR error.
-                    EmulatorErrorKind::EmptyBlock(block) if attempt == 0 => {
+                    EmulatorErrorKind::EmptyBlock(block) => {
                         let Some(addr) = BasicBlock::from_id(&self.ctx, block).address() else {
                             return Some(VmExit::Error(
                                 EmulatorErrorKind::EmptyBlock(block).to_string().into(),
                             ));
                         };
+                        if discovered == Some(addr) {
+                            return Some(self.exit_for(EmulatorErrorKind::EmptyBlock(block)));
+                        }
                         // The address may already be lifted: a branch back into
                         // known code still gets a fresh placeholder block in the
                         // branching instruction's own function, and lifting it
@@ -792,6 +802,7 @@ impl<S: CodeSource> Vm<S> {
                             self.stats.resolves += 1;
                             continue;
                         }
+                        discovered = Some(addr);
                         if let Some(exit) = self.discover(addr) {
                             return Some(exit);
                         }
@@ -821,7 +832,6 @@ impl<S: CodeSource> Vm<S> {
                 },
             }
         }
-        None
     }
 
     /// The exit for an interpreter error that is not a memory fault or a
