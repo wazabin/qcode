@@ -70,6 +70,10 @@ pub struct Regs {
     /// `FS_OFFSET` register, which every `%fs:`-relative access adds in.
     pub fs_base: Reg,
     pub gs_base: Reg,
+    pub fpu_control: Reg,
+    pub fpu_status: Reg,
+    pub fpu_tag: Reg,
+    pub mxcsr: Reg,
 }
 
 impl Regs {
@@ -96,7 +100,36 @@ impl Regs {
             r15: get("R15")?,
             fs_base: get("FS_OFFSET")?,
             gs_base: get("GS_OFFSET")?,
+            fpu_control: get("FPUControlWord")?,
+            fpu_status: get("FPUStatusWord")?,
+            fpu_tag: get("FPUTagWord")?,
+            mxcsr: get("MXCSR")?,
         })
+    }
+
+    /// Puts the machine in the state a process starts in: every
+    /// general-purpose register zero and the floating-point units as
+    /// `finit` and a reset leave them.
+    ///
+    /// The floating-point state matters more than it looks. The SLEIGH
+    /// semantics of every x87 instruction begin by checking for an unmasked
+    /// exception left pending, and do nothing while there is one. With the
+    /// control word zero every exception is unmasked, and with the tag word
+    /// zero every stack slot is occupied, so the first `fld` is a stack
+    /// overflow that stays pending and every x87 instruction after it is a
+    /// no-op. musl's printf formats floats through long doubles, which is
+    /// how busybox printed `-nan` for zero and `seq` printed nothing.
+    pub fn reset(&self, memory: &mut VmMemory) {
+        for (_, reg) in self.named() {
+            reg.write(memory, 0);
+        }
+        // Precision control 64 bits, round to nearest, all exceptions masked.
+        self.fpu_control.write(memory, 0x037f);
+        self.fpu_status.write(memory, 0);
+        // Two bits per slot, `11` meaning empty.
+        self.fpu_tag.write(memory, 0xffff);
+        // Round to nearest, all exceptions masked.
+        self.mxcsr.write(memory, 0x1f80);
     }
 
     /// All general-purpose registers, in a stable order for dumps.

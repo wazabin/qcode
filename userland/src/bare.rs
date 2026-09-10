@@ -13,6 +13,7 @@ use sleigh_precompile::x64::spec;
 use wazabin_qcode_sleigh::vm_source::SleighCodeSource;
 
 use crate::loader::{self, LoadError};
+use crate::regs::Regs;
 
 /// The address the entry returns to: unmapped, so the run stops there.
 pub const SENTINEL: u64 = 0xdead_0000;
@@ -26,11 +27,13 @@ pub const STACK_TOP: u64 = 0x7fff_8000;
 pub type Machine = Vm<SleighCodeSource<'static>>;
 
 /// Loads `image`, maps the stack with the sentinel on top, and positions the
-/// machine at the entry point with `RSP` set. The interpreter is installed;
-/// the caller sets a block executor if it wants one.
+/// machine at the entry point with the registers in their process-start
+/// state and `RSP` set. The interpreter is installed; the caller sets a
+/// block executor if it wants one.
 pub fn machine(image: &[u8]) -> Result<Machine, LoadError> {
     let source = SleighCodeSource::new(spec());
     let ctx = source.new_context();
+    let regs = Regs::resolve(&ctx).map_err(LoadError::Parse)?;
     let mut memory = VmMemory::new();
     let loaded = loader::load(image, &mut memory.mmu)?;
     memory
@@ -43,10 +46,8 @@ pub fn machine(image: &[u8]) -> Result<Machine, LoadError> {
 
     let mut vm = Vm::at_address(ctx, loaded.entry, source, memory)
         .map_err(|e| LoadError::Parse(format!("cannot lift the entry point: {e:?}")))?;
-    let ctx = vm.context().clone();
-    vm.emulator()
-        .set_varnode_by_name(&ctx, "RSP", STACK_TOP)
-        .expect("RSP is a register in this specification");
+    regs.reset(vm.memory_mut());
+    regs.rsp.write(vm.memory_mut(), STACK_TOP);
     Ok(vm)
 }
 
