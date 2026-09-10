@@ -1850,7 +1850,11 @@ impl<'str> FunctionBody<'str> {
         address: u64,
         name: Option<Cow<'str, str>>,
     ) -> FunctionMutRef<'str, 'ctx> {
+        // Symbol names are not unique in a linked binary (two static functions
+        // of the same name from different translation units); take the first
+        // free `name_<n>` rather than refusing the function.
         let name = name.unwrap_or_else(|| Cow::Owned(format!("fn_{address:x}")));
+        let name = ctx.shared.name_map.unique(name);
         let id = FunctionId::from(ctx.bodies.len());
         let pushed = ctx.push_function(
             FunctionInterface::new(name.clone()),
