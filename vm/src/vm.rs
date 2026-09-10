@@ -683,8 +683,20 @@ impl<S: CodeSource> Vm<S> {
                     | EmulatorErrorKind::UnknownAddress(addr)
                         if attempt == 0 =>
                     {
+                        let from = self.emu.block;
                         if let Some(exit) = self.discover(addr) {
                             return Some(exit);
+                        }
+                        // An indirect branch into the middle of the block it
+                        // is in: discovery split that block, which emptied it,
+                        // terminator included. The branch's target is known,
+                        // so the machine goes there directly instead of
+                        // re-running the block from its start.
+                        if self.ctx.contains_block(from)
+                            && !self.ctx.block(from).has_insns()
+                            && self.emu.block == from
+                        {
+                            self.reposition(addr);
                         }
                     }
                     // A direct branch to code that has not been lifted does not
