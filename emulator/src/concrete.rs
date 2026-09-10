@@ -1946,11 +1946,20 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
                     result.status |= Status::INVALID_OP;
                 }
                 let inexact = result.status.contains(Status::INEXACT);
+                // Round-to-integral already delivers the operand format's own
+                // result, exact in that format, so its inexactness is reported
+                // as is and must not act as a sticky bit for the narrowing: a
+                // directed mode would otherwise move the integer one more ulp.
+                let integral = name.starts_with("float_round_to_integral");
+                let sticky = inexact && !integral;
+                let kept = if integral {
+                    result.status
+                } else {
+                    result.status & !Status::INEXACT
+                };
                 let (value, status) =
-                    match Self::narrow_with_sticky(result.bits, inexact, lhs.size, round) {
-                        Some((value, status)) => {
-                            (value, status | (result.status & !Status::INEXACT))
-                        }
+                    match Self::narrow_with_sticky(result.bits, sticky, lhs.size, round) {
+                        Some((value, status)) => (value, status | kept),
                         None => (
                             SizedValue::from_bits(result.bits, lhs.size as usize),
                             result.status,
