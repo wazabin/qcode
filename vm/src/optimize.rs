@@ -25,9 +25,17 @@
 //!
 //! Only *temporary* spaces are forwarded. A SLEIGH unique is scratch private to
 //! one instruction's semantics: it is written before it is read and does not
-//! outlive the block, so no other block, and no guest-visible memory access, can
-//! observe it. Registers and RAM are left alone, since a call, a fault handler,
-//! or another block legitimately observes those.
+//! outlive the instruction, so no other instruction, and no guest-visible
+//! memory access, can observe it. Registers and RAM are left alone, since a
+//! call, a fault handler, or another block legitimately observes those.
+//!
+//! An instruction is not always one block, though. `cmpxchg`, `rep movs` and
+//! the like lift to a branch inside the instruction, and a unique written
+//! before the branch is read after it, in a block of its own. Those inner
+//! blocks are the ones the lifter names but gives no address, since no guest
+//! instruction starts there. So before a slot's last store is removed, the
+//! address-less blocks this one flows into are checked for a read of that
+//! slot, and a store they read stays.
 //!
 //! Two further restrictions keep it honest:
 //!
@@ -84,6 +92,56 @@ fn constant_address(ctx: &Context<'_>, ptr: ValueId) -> Option<u64> {
         ValueRef::Varnode(varnode) => Some(varnode.address() as u64),
         _ => None,
     }
+}
+
+/// What the rest of the instruction reads from temporary space after
+/// `block_id` ends: the slots loaded, and the spaces loaded through a pointer
+/// this pass cannot resolve, in every address-less block reachable from it.
+///
+/// The walk stops at blocks with an address, since a guest instruction starts
+/// there and a unique never survives into one.
+fn live_out_temps(
+    ctx: &Context<'_>,
+    block_id: BlockId,
+) -> (FxHashSet<(MemorySpaceId, u64)>, FxHashSet<MemorySpaceId>) {
+    let func = block_id.func;
+    let mut slots = FxHashSet::default();
+    let mut spaces = FxHashSet::default();
+    let mut seen: FxHashSet<BlockId> = FxHashSet::default();
+    let mut pending: Vec<BlockId> = BasicBlock::from_id(ctx, block_id)
+        .successors()
+        .map(|(_, succ)| succ)
+        .collect();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let block = BasicBlock::from_id(ctx, id);
+        if block.address().is_some() {
+            continue;
+        }
+        for insn_id in block.instruction_ids() {
+            let Mnemonic::Load(Load { space, ptr, .. }) =
+                *Instruction::from_id(ctx, insn_id).mnemonic()
+            else {
+                continue;
+            };
+            let space = space.qualify(func);
+            if !is_temporary(ctx, space) {
+                continue;
+            }
+            match constant_address(ctx, ptr.qualify(func)) {
+                Some(addr) => {
+                    slots.insert((space, addr));
+                }
+                None => {
+                    spaces.insert(space);
+                }
+            }
+        }
+        pending.extend(block.successors().map(|(_, succ)| succ));
+    }
+    (slots, spaces)
 }
 
 /// Forwards temporary-space stores to the loads that read them back, in
@@ -229,16 +287,27 @@ pub fn forward_temp_stores(ctx: &mut Context<'_>, block_id: BlockId) -> Cleanup 
         resolved.insert(load_result, survivor);
     }
 
+    let (live_slots, live_spaces) = live_out_temps(ctx, block_id);
     let body = ctx.function_mut(func);
     for (load_result, _) in forwards {
         let survivor = resolved[&load_result];
         body.replace_all_uses_with(load_result, survivor);
     }
     // A store goes only when every read of its slot in this block was
-    // forwarded and nothing accessed the space through an unknown pointer.
+    // forwarded and nothing accessed the space through an unknown pointer. The
+    // last store to a slot is also kept when the rest of the instruction, in
+    // the blocks after this one, reads that slot.
+    let is_last = |store: InstructionId, slot: &(MemorySpaceId, u64)| {
+        available.get(slot).is_some_and(|last| last.store == store)
+    };
     let dead_stores: Vec<InstructionId> = redundant
         .iter()
-        .filter(|(_, slot)| !poisoned.contains(&slot.0) && !read_otherwise.contains(slot))
+        .filter(|(store, slot)| {
+            !poisoned.contains(&slot.0)
+                && !read_otherwise.contains(slot)
+                && !(is_last(*store, slot)
+                    && (live_slots.contains(slot) || live_spaces.contains(&slot.0)))
+        })
         .map(|(store, _)| *store)
         .collect();
     // Removed in one pass over the block: unlinking them one at a time walks
