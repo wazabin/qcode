@@ -180,6 +180,11 @@ fn files_under_a_sandbox_root() {
 }
 
 #[test]
+fn x87_arithmetic_from_the_initial_fpu_state() {
+    check("fpu", false, &[], &[], None, "fpu ok\n", 0);
+}
+
+#[test]
 fn thread_local_storage_via_fs_base() {
     check("tls", false, &[], &[], None, "tls ok\n", 0);
 }

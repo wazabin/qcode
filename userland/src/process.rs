@@ -183,9 +183,7 @@ impl Process {
 
         let mut vm = Vm::at_address(ctx, loaded.entry, source, memory)
             .map_err(|e| format!("cannot lift the entry point {:#x}: {e:?}", loaded.entry))?;
-        for (_, reg) in regs.named() {
-            reg.write(vm.memory_mut(), 0);
-        }
+        regs.reset(vm.memory_mut());
         regs.rsp.write(vm.memory_mut(), rsp);
         if config.jit {
             vm.set_block_executor(Box::new(qcode_jit::Jit::new()));
