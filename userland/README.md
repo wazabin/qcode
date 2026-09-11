@@ -85,8 +85,21 @@ To resume, the environment supplies the operation's effect and calls
   `nanosleep`, `clock_nanosleep`, `sched_yield` (no-ops), `getpid`,
   `getppid`, `gettid`, `getuid`, `geteuid`, `getgid`, `getegid`, `uname`,
   `getrandom` (deterministic), `clock_gettime`, `clock_getres`,
-  `gettimeofday`, `time`, `prlimit64`, `exit`, `exit_group`. Anything else
-  returns `-ENOSYS` and logs a warning.
+  `gettimeofday`, `time`, `prlimit64`, `exit`, `exit_group`, `pipe`,
+  `pipe2`, `poll`, `ppoll` (untimed), `fork`, `vfork`, `clone` (with
+  `SIGCHLD` only), `execve`, `wait4`, `unlink`, `unlinkat`, `rmdir`, `mkdir`,
+  `mkdirat`, `rename`, `renameat`. Anything else returns `-ENOSYS` and logs
+  a warning.
+- **Processes**: a `fork` copies the machine — memory, registers, the
+  descriptor table — into a second task with its own pid, positioned after
+  the `syscall`; `execve` boots a fresh machine in place, keeping the
+  descriptors that are not close-on-exec. Tasks are scheduled cooperatively
+  on the host thread: one runs until it exits, forks, or has to wait for a
+  child or on a pipe, then the next runnable one takes over, the child of a
+  fork first. A `wait4` reports an exited child's status; `kill` of another
+  task ends it. Pipes hold 64 KiB; a writer with no reader left gets
+  `SIGPIPE` unless it handles it. If every task is waiting the run ends with
+  a crash naming the deadlock.
 - **Files**: stdin/stdout/stderr on the host's, or captured to buffers
   (`Stdio::Captured`) for harnesses. Other descriptors are host files and
   directories, optionally under a sandbox root.
@@ -98,11 +111,13 @@ To resume, the environment supplies the operation's effect and calls
 - glibc is untested. Static musl binaries (BusyBox) run; the freestanding C
   corpus predates SSE lifting and still builds with `-nostdlib -nostartfiles
   -mno-sse -mno-sse2 -mno-mmx`.
-- Single thread: no `clone`, no `fork`/`execve`; `futex` never blocks.
+- No threads: `clone` with sharing flags is `ENOSYS`; `futex` never blocks.
+  Processes exist (see above) but run one at a time, so a `poll` timeout is
+  not timed and a child's crash is reported as its exit status.
 - Signals are recorded but never delivered; a fault or `ud2` ends the process
   with a diagnostic instead.
 - `mmap` of a file is a private snapshot: writes never reach the host file.
-- `pipe` and sockets are not provided.
+- Sockets are not provided.
 - `int 0x80` is not handled (the emulator panics on it); use `syscall`.
 - x86-64 Linux only.
 
@@ -121,8 +136,10 @@ invocations (`sh -c` loops, `sort`, `awk`, `sha256sum`, `sed`, …) run in a
 sandbox root, interpreted and with the JIT, and compared with the same
 command run natively on the host. It uses `$BUSYBOX`, else the first static
 `busybox` in `/usr/sbin`, `/usr/bin` or `/bin` (Fedora's `busybox`, Debian's
-`busybox-static`), and skips when there is none. Shell pipelines are absent
-because `pipe` and `fork` are.
+`busybox-static`), and skips when there is none. The shell cases cover
+pipelines, command substitution, subshells, redirections and external
+applets on `PATH`, so they exercise `fork`, `execve`, `wait4`, `pipe` and
+`poll`.
 
 The Embench harnesses live here too, on the `bare` module, which runs a
 freestanding image with no process around it: `tests/embench.rs` verifies

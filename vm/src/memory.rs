@@ -24,7 +24,11 @@ use crate::{
 };
 
 /// Memory for a VM run: an [`Mmu`] for the RAM space, flat storage elsewhere.
-#[derive(Default)]
+///
+/// Cloning copies the whole machine state — RAM, registers, temporaries — for
+/// a second machine to run on, as a `fork` needs; the clone's translation
+/// cache starts empty (see [`Mmu`]'s `Clone`).
+#[derive(Default, Clone)]
 pub struct VmMemory {
     /// Guest process memory.
     pub mmu: Mmu,
