@@ -3,14 +3,20 @@
 //! Descriptors 0–2 are wired to the host's stdio, or — for a harness — to
 //! in-memory buffers. Every other descriptor is a host file or directory,
 //! opened under an optional sandbox root: with a root, guest path `/etc/x`
-//! means host `<root>/etc/x`, and `..` cannot climb above the root.
+//! means host `<root>/etc/x`, and `..` cannot climb above the root. Pipes
+//! are in-memory buffers shared between the processes holding their ends.
 
+use std::cell::{Ref, RefCell};
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirEntryExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
-use crate::errno::{self, EBADF, EINVAL, EISDIR, EMFILE, ENOENT, ENOTDIR, ENOTTY, ESPIPE, Errno};
+use crate::errno::{
+    self, EBADF, EINVAL, EISDIR, EMFILE, ENOENT, ENOTDIR, ENOTTY, EPIPE, ESPIPE, Errno,
+};
 
 pub const O_ACCMODE: u32 = 3;
 pub const O_RDONLY: u32 = 0;
@@ -34,6 +40,9 @@ pub const S_IFLNK: u32 = 0o120000;
 /// Highest descriptor number the table hands out.
 const MAX_FDS: usize = 1024;
 
+/// Bytes a pipe holds before a writer blocks, as on Linux.
+pub const PIPE_CAPACITY: usize = 65536;
+
 /// Where descriptors 0–2 go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stdio {
@@ -52,6 +61,56 @@ pub struct Dirent {
     pub name: Vec<u8>,
 }
 
+/// The buffer behind a pipe, and how many ends of each kind are open on it.
+#[derive(Debug, Default)]
+pub struct Pipe {
+    buf: VecDeque<u8>,
+    readers: usize,
+    writers: usize,
+}
+
+/// One end of a pipe. Cloning it (a `dup`, a fork) opens another end of the
+/// same kind; dropping it closes that end, so a reader sees end-of-file once
+/// the last writer is gone and a writer gets `EPIPE` once the last reader is.
+#[derive(Debug)]
+pub struct PipeEnd {
+    pipe: Rc<RefCell<Pipe>>,
+    writer: bool,
+}
+
+impl PipeEnd {
+    fn new(pipe: &Rc<RefCell<Pipe>>, writer: bool) -> Self {
+        let mut p = pipe.borrow_mut();
+        if writer {
+            p.writers += 1;
+        } else {
+            p.readers += 1;
+        }
+        drop(p);
+        Self {
+            pipe: Rc::clone(pipe),
+            writer,
+        }
+    }
+}
+
+impl Clone for PipeEnd {
+    fn clone(&self) -> Self {
+        Self::new(&self.pipe, self.writer)
+    }
+}
+
+impl Drop for PipeEnd {
+    fn drop(&mut self) {
+        let mut p = self.pipe.borrow_mut();
+        if self.writer {
+            p.writers -= 1;
+        } else {
+            p.readers -= 1;
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum FdKind {
     Stdin,
@@ -59,6 +118,16 @@ pub enum FdKind {
     Stderr,
     File(File),
     Dir { entries: Vec<Dirent>, pos: usize },
+    Pipe(PipeEnd),
+}
+
+/// The in-memory stdio of a captured run, shared by every process in it.
+#[derive(Debug, Default)]
+struct Captured {
+    stdin: Vec<u8>,
+    stdin_pos: usize,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -142,6 +211,18 @@ impl Stat {
             ..Default::default()
         }
     }
+
+    fn fifo() -> Self {
+        Self {
+            dev: 0xd,
+            nlink: 1,
+            mode: S_IFIFO | 0o600,
+            uid: 1000,
+            gid: 1000,
+            blksize: 4096,
+            ..Default::default()
+        }
+    }
 }
 
 pub struct Files {
@@ -149,10 +230,7 @@ pub struct Files {
     root: Option<PathBuf>,
     cwd: String,
     stdio: Stdio,
-    stdin: Vec<u8>,
-    stdin_pos: usize,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    captured: Rc<RefCell<Captured>>,
     /// What `/proc/self/exe` resolves to.
     pub exe_path: String,
 }
@@ -177,11 +255,37 @@ impl Files {
             root,
             cwd: "/".to_owned(),
             stdio,
-            stdin: Vec::new(),
-            stdin_pos: 0,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
+            captured: Default::default(),
             exe_path,
+        }
+    }
+
+    /// The table a forked child starts with: every descriptor duplicated,
+    /// sharing the host file (and its offset), pipe or captured buffer.
+    pub fn fork(&self) -> Result<Self, Errno> {
+        let mut fds = Vec::with_capacity(self.fds.len());
+        for fd in &self.fds {
+            fds.push(match fd {
+                Some(fd) => Some(Self::duplicate(fd, fd.cloexec)?),
+                None => None,
+            });
+        }
+        Ok(Self {
+            fds,
+            root: self.root.clone(),
+            cwd: self.cwd.clone(),
+            stdio: self.stdio,
+            captured: Rc::clone(&self.captured),
+            exe_path: self.exe_path.clone(),
+        })
+    }
+
+    /// What `execve` does to the table.
+    pub fn close_on_exec(&mut self) {
+        for fd in &mut self.fds {
+            if fd.as_ref().is_some_and(|fd| fd.cloexec) {
+                *fd = None;
+            }
         }
     }
 
@@ -190,19 +294,91 @@ impl Files {
     }
 
     /// Bytes the guest wrote to descriptor 1, when captured.
-    pub fn stdout(&self) -> &[u8] {
-        &self.stdout
+    pub fn stdout(&self) -> Ref<'_, [u8]> {
+        Ref::map(self.captured.borrow(), |c| c.stdout.as_slice())
     }
 
     /// Bytes the guest wrote to descriptor 2, when captured.
-    pub fn stderr(&self) -> &[u8] {
-        &self.stderr
+    pub fn stderr(&self) -> Ref<'_, [u8]> {
+        Ref::map(self.captured.borrow(), |c| c.stderr.as_slice())
     }
 
     /// What captured stdin will hand the guest.
     pub fn set_stdin(&mut self, bytes: Vec<u8>) {
-        self.stdin = bytes;
-        self.stdin_pos = 0;
+        let mut c = self.captured.borrow_mut();
+        c.stdin = bytes;
+        c.stdin_pos = 0;
+    }
+
+    /// A new pipe; returns the read and write descriptors.
+    pub fn pipe(&mut self, cloexec: bool) -> Result<(i32, i32), Errno> {
+        let pipe = Rc::new(RefCell::new(Pipe::default()));
+        let end = |writer| Fd {
+            kind: FdKind::Pipe(PipeEnd::new(&pipe, writer)),
+            path: "pipe:".to_owned(),
+            cloexec,
+            append: false,
+        };
+        let read = self.install(end(false), 0)?;
+        let write = match self.install(end(true), 0) {
+            Ok(fd) => fd,
+            Err(e) => {
+                let _ = self.close(read);
+                return Err(e);
+            }
+        };
+        Ok((read, write))
+    }
+
+    /// Whether a `read` on `fd` would have to wait for another process: an
+    /// empty pipe that still has a writer.
+    pub fn read_would_block(&self, fd: i32) -> bool {
+        match self.get(fd) {
+            Ok(Fd {
+                kind: FdKind::Pipe(end),
+                ..
+            }) if !end.writer => {
+                let p = end.pipe.borrow();
+                p.buf.is_empty() && p.writers > 0
+            }
+            _ => false,
+        }
+    }
+
+    /// The hang-up and error bits `poll` reports for `fd`: a pipe whose
+    /// other side is gone.
+    pub fn poll_hangup(&self, fd: i32) -> u16 {
+        match self.get(fd) {
+            Ok(Fd {
+                kind: FdKind::Pipe(end),
+                ..
+            }) => {
+                let p = end.pipe.borrow();
+                if end.writer && p.readers == 0 {
+                    0x8 // POLLERR
+                } else if !end.writer && p.writers == 0 {
+                    0x10 // POLLHUP
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    /// Whether a `write` on `fd` would have to wait for another process: a
+    /// full pipe that still has a reader.
+    pub fn write_would_block(&self, fd: i32) -> bool {
+        match self.get(fd) {
+            Ok(Fd {
+                kind: FdKind::Pipe(end),
+                ..
+            }) if end.writer => {
+                let p = end.pipe.borrow();
+                p.buf.len() >= PIPE_CAPACITY && p.readers > 0
+            }
+            _ => false,
+        }
     }
 
     pub fn cwd(&self) -> &str {
@@ -373,16 +549,30 @@ impl Files {
             FdKind::Stdin => match stdio {
                 Stdio::Host => std::io::stdin().read(buf).map_err(|e| errno::from_io(&e)),
                 Stdio::Captured => {
-                    let rest = &self.stdin[self.stdin_pos..];
+                    let mut c = self.captured.borrow_mut();
+                    let rest = &c.stdin[c.stdin_pos..];
                     let n = rest.len().min(buf.len());
                     buf[..n].copy_from_slice(&rest[..n]);
-                    self.stdin_pos += n;
+                    c.stdin_pos += n;
                     Ok(n)
                 }
             },
             FdKind::Stdout | FdKind::Stderr => Err(EBADF),
             FdKind::File(file) => file.read(buf).map_err(|e| errno::from_io(&e)),
             FdKind::Dir { .. } => Err(EISDIR),
+            FdKind::Pipe(end) => {
+                if end.writer {
+                    return Err(EBADF);
+                }
+                // An empty pipe with a writer is the caller's to wait on
+                // (`read_would_block`); here it reads as end-of-file.
+                let mut p = end.pipe.borrow_mut();
+                let n = p.buf.len().min(buf.len());
+                for (slot, byte) in buf[..n].iter_mut().zip(p.buf.drain(..n)) {
+                    *slot = byte;
+                }
+                Ok(n)
+            }
         }
     }
 
@@ -410,7 +600,7 @@ impl Files {
                     Ok(bytes.len())
                 }
                 Stdio::Captured => {
-                    self.stdout.extend_from_slice(bytes);
+                    self.captured.borrow_mut().stdout.extend_from_slice(bytes);
                     Ok(bytes.len())
                 }
             },
@@ -422,12 +612,26 @@ impl Files {
                     Ok(bytes.len())
                 }
                 Stdio::Captured => {
-                    self.stderr.extend_from_slice(bytes);
+                    self.captured.borrow_mut().stderr.extend_from_slice(bytes);
                     Ok(bytes.len())
                 }
             },
             FdKind::File(file) => file.write(bytes).map_err(|e| errno::from_io(&e)),
             FdKind::Dir { .. } => Err(EBADF),
+            FdKind::Pipe(end) => {
+                if !end.writer {
+                    return Err(EBADF);
+                }
+                let mut p = end.pipe.borrow_mut();
+                if p.readers == 0 {
+                    return Err(EPIPE);
+                }
+                // A partial write when the buffer is nearly full; a full one
+                // is the caller's to wait on (`write_would_block`).
+                let n = bytes.len().min(PIPE_CAPACITY.saturating_sub(p.buf.len()));
+                p.buf.extend(&bytes[..n]);
+                Ok(n)
+            }
         }
     }
 
@@ -467,6 +671,7 @@ impl Files {
         let entry = self.get(fd)?;
         match &entry.kind {
             FdKind::Stdin | FdKind::Stdout | FdKind::Stderr => Ok(Stat::tty()),
+            FdKind::Pipe(_) => Ok(Stat::fifo()),
             FdKind::File(file) => file
                 .metadata()
                 .map(|m| Stat::from_metadata(&m))
@@ -514,23 +719,7 @@ impl Files {
     /// `dup`/`dup2`/`dup3`: a new descriptor at or above `min` (or exactly
     /// `at`) sharing the underlying host object.
     pub fn dup(&mut self, fd: i32, at: Option<i32>, cloexec: bool) -> Result<i32, Errno> {
-        let source = self.get(fd)?;
-        let kind = match &source.kind {
-            FdKind::Stdin => FdKind::Stdin,
-            FdKind::Stdout => FdKind::Stdout,
-            FdKind::Stderr => FdKind::Stderr,
-            FdKind::File(file) => FdKind::File(file.try_clone().map_err(|e| errno::from_io(&e))?),
-            FdKind::Dir { entries, pos } => FdKind::Dir {
-                entries: entries.clone(),
-                pos: *pos,
-            },
-        };
-        let copy = Fd {
-            kind,
-            path: source.path.clone(),
-            cloexec,
-            append: source.append,
-        };
+        let copy = Self::duplicate(self.get(fd)?, cloexec)?;
         match at {
             None => self.install(copy, 0),
             Some(target) => {
@@ -545,6 +734,37 @@ impl Files {
                 Ok(target)
             }
         }
+    }
+
+    fn duplicate(source: &Fd, cloexec: bool) -> Result<Fd, Errno> {
+        let kind = match &source.kind {
+            FdKind::Stdin => FdKind::Stdin,
+            FdKind::Stdout => FdKind::Stdout,
+            FdKind::Stderr => FdKind::Stderr,
+            FdKind::File(file) => FdKind::File(file.try_clone().map_err(|e| errno::from_io(&e))?),
+            FdKind::Dir { entries, pos } => FdKind::Dir {
+                entries: entries.clone(),
+                pos: *pos,
+            },
+            FdKind::Pipe(end) => FdKind::Pipe(end.clone()),
+        };
+        Ok(Fd {
+            kind,
+            path: source.path.clone(),
+            cloexec,
+            append: source.append,
+        })
+    }
+
+    /// Whether the descriptor was opened for reading, for `F_GETFL`.
+    pub fn access_mode(&self, fd: i32) -> Result<u32, Errno> {
+        Ok(match &self.get(fd)?.kind {
+            FdKind::Stdin => O_RDONLY,
+            FdKind::Stdout | FdKind::Stderr => O_WRONLY,
+            FdKind::Pipe(end) if end.writer => O_WRONLY,
+            FdKind::Pipe(_) => O_RDONLY,
+            FdKind::File(_) | FdKind::Dir { .. } => O_RDWR,
+        })
     }
 
     /// Whether descriptor `fd` is a terminal, for `ioctl`.

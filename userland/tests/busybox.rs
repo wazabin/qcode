@@ -4,9 +4,10 @@
 //!
 //! The binary is `$BUSYBOX`, or the first static `busybox` found in the usual
 //! places (Fedora's `busybox`, Debian's `busybox-static`). Without one the
-//! tests skip. Every case runs in a sandbox root populated with fixed files,
-//! with the host run's working directory set to that root, so the two runs
-//! see the same relative paths; nothing depends on the clock, the pid or the
+//! tests skip. Every case runs in a sandbox root populated with fixed files
+//! and a `bin` directory of applet symlinks on `PATH`, with the host run's
+//! working directory set to that root, so the two runs see the same relative
+//! paths and the same commands; nothing depends on the clock, the pid or the
 //! machine name.
 
 use std::path::{Path, PathBuf};
@@ -106,6 +107,42 @@ fn root() -> &'static Path {
         std::fs::write(root.join("block.txt"), text_block()).unwrap();
         std::fs::write(root.join("sub/a.txt"), "a\n").unwrap();
         std::fs::write(root.join("sub/b.txt"), "b\n").unwrap();
+        std::fs::write(root.join("large.txt"), text_block().repeat(100)).unwrap();
+        // Cases that create files do so under here, so the listings of the
+        // root and of `sub` stay stable while tests run in parallel.
+        std::fs::create_dir_all(root.join("work")).unwrap();
+        // The shell finds external commands here, on the host and in the
+        // guest alike: each is the busybox binary under an applet's name.
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        if let Some((busybox, _)) = busybox() {
+            for applet in [
+                "cat",
+                "sort",
+                "head",
+                "tail",
+                "wc",
+                "seq",
+                "yes",
+                "tr",
+                "gzip",
+                "gunzip",
+                "sha256sum",
+                "ls",
+                "rm",
+                "mkdir",
+                "mv",
+                "sh",
+                "true",
+                "false",
+                "echo",
+                "grep",
+            ] {
+                let link = bin.join(applet);
+                let _ = std::fs::remove_file(&link);
+                std::os::unix::fs::symlink(busybox, &link).unwrap();
+            }
+        }
         root
     })
 }
@@ -121,6 +158,7 @@ fn native(busybox: &Path, args: &[&str], stdin: &[u8]) -> Outcome {
         .args(args)
         .current_dir(root())
         .env_clear()
+        .env("PATH", root().join("bin"))
         .stdin(HostStdio::piped())
         .stdout(HostStdio::piped())
         .stderr(HostStdio::inherit())
@@ -139,7 +177,7 @@ fn emulated(busybox: &Path, image: &[u8], jit: bool, args: &[&str], stdin: &[u8]
     argv.extend(args.iter().map(|s| s.to_string()));
     let config = Config {
         argv,
-        envp: Vec::new(),
+        envp: vec!["PATH=/bin".to_owned()],
         jit,
         trace: false,
         root: Some(root().to_path_buf()),
@@ -147,18 +185,18 @@ fn emulated(busybox: &Path, image: &[u8], jit: bool, args: &[&str], stdin: &[u8]
         exe_path: busybox.display().to_string(),
     };
     let mut process = Process::new(image, config).expect("busybox loads");
-    process.files.set_stdin(stdin.to_vec());
+    process.files_mut().set_stdin(stdin.to_vec());
     let strategy = if jit { "jit" } else { "interpreter" };
     let code = match process.run(BUDGET) {
         ProcessExit::Exited(code) => code,
         other => panic!(
             "busybox {args:?} ({strategy}) did not exit: {other:?}\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(process.files.stdout()),
-            String::from_utf8_lossy(process.files.stderr()),
+            String::from_utf8_lossy(&process.files().stdout()),
+            String::from_utf8_lossy(&process.files().stderr()),
         ),
     };
     Outcome {
-        stdout: process.files.stdout().to_vec(),
+        stdout: process.files().stdout().to_vec(),
         code,
     }
 }
@@ -328,4 +366,77 @@ fn a_missing_file_is_an_error() {
 #[test]
 fn pwd_in_the_sandbox() {
     check_literal(&["pwd"], b"", "/\n", 0);
+}
+
+#[test]
+fn shell_pipeline() {
+    check(
+        &["sh", "-c", "echo hi | cat; seq 20 | tail -n 3 | sort -rn"],
+        b"",
+    );
+}
+
+#[test]
+fn shell_pipeline_through_an_exec() {
+    // gzip and gunzip are not shell builtins: each is a fork, an execve of
+    // the applet symlink, and a wait.
+    check(&["sh", "-c", "gzip -c hello.txt | gunzip -c"], b"");
+}
+
+#[test]
+fn shell_command_substitution_and_subshell() {
+    check(
+        &[
+            "sh",
+            "-c",
+            "x=$(cat hello.txt); echo \"got $x\"; (exit 5); echo $?; (cd sub; ls)",
+        ],
+        b"",
+    );
+}
+
+#[test]
+fn shell_reads_a_pipe_line_by_line() {
+    check(
+        &["sh", "-c", "seq 3 | while read i; do echo \"l$i\"; done"],
+        b"",
+    );
+}
+
+#[test]
+fn a_writer_with_no_reader_ends_quietly() {
+    // `yes` fills the pipe, `head` leaves, and SIGPIPE ends `yes` without a
+    // complaint on stderr or a non-zero status for the pipeline.
+    check(&["sh", "-c", "yes | head -n 2; echo status=$?"], b"");
+}
+
+#[test]
+fn shell_redirections_and_file_management() {
+    check(
+        &[
+            "sh",
+            "-c",
+            "cd work && mkdir tmpd && echo abc > tmpd/f && mv tmpd/f tmpd/g && cat tmpd/g && ls tmpd && rm -r tmpd && ls tmpd 2>/dev/null; echo done",
+        ],
+        b"",
+    );
+}
+
+#[test]
+fn child_exit_status_reaches_the_parent() {
+    check(
+        &[
+            "sh",
+            "-c",
+            "sh -c 'exit 7'; echo $?; false | true; echo $?; true | false; echo $?",
+        ],
+        b"",
+    );
+}
+
+#[test]
+fn a_pipeline_larger_than_the_pipe_buffer() {
+    // 100 KiB through a 64 KiB pipe: the producer blocks on a full pipe and
+    // the consumer on an empty one, several times over.
+    check(&["sh", "-c", "cat large.txt | wc -c"], b"");
 }

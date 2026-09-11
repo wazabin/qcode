@@ -10,11 +10,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use log::warn;
 use qcode_vm::{PAGE_SIZE, perm};
 
-use crate::errno::{self, EAGAIN, EINVAL, ENOMEM, ENOSYS, ENOTTY, ERANGE, Errno, SysResult};
+use crate::errno::{
+    self, EAGAIN, ECHILD, EINVAL, ENOMEM, ENOSYS, ENOTTY, ERANGE, Errno, SysResult,
+};
 use crate::fs::{AT_FDCWD, O_CLOEXEC};
 use crate::guest;
 use crate::loader::page_up;
-use crate::process::{AddressSpace, Process};
+use crate::process::{AddressSpace, Request, Task};
 
 const PROT_READ: u64 = 1;
 const PROT_WRITE: u64 = 2;
@@ -29,9 +31,18 @@ const ARCH_GET_FS: u64 = 0x1003;
 const ARCH_GET_GS: u64 = 0x1004;
 
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+const AT_REMOVEDIR: u64 = 0x200;
 const AT_EMPTY_PATH: u64 = 0x1000;
 
-const PID: u64 = 4242;
+const SIGCHLD: u64 = 17;
+/// `clone` flags other than the exit signal; any of them asks for sharing a
+/// fork cannot provide.
+const CLONE_FLAGS: u64 = !0xff;
+const WNOHANG: u64 = 1;
+const SIGPIPE: u64 = 13;
+const POLLIN: u16 = 1;
+const POLLOUT: u16 = 4;
+const POLLNVAL: u16 = 0x20;
 
 /// Names and argument counts, for the trace.
 fn describe(nr: u64) -> (&'static str, usize) {
@@ -43,6 +54,7 @@ fn describe(nr: u64) -> (&'static str, usize) {
         4 => ("stat", 2),
         5 => ("fstat", 2),
         6 => ("lstat", 2),
+        7 => ("poll", 3),
         8 => ("lseek", 3),
         9 => ("mmap", 6),
         10 => ("mprotect", 3),
@@ -57,6 +69,11 @@ fn describe(nr: u64) -> (&'static str, usize) {
         20 => ("writev", 3),
         21 => ("access", 2),
         22 => ("pipe", 1),
+        56 => ("clone", 5),
+        57 => ("fork", 0),
+        58 => ("vfork", 0),
+        59 => ("execve", 3),
+        61 => ("wait4", 4),
         24 => ("sched_yield", 0),
         28 => ("madvise", 3),
         32 => ("dup", 1),
@@ -69,6 +86,10 @@ fn describe(nr: u64) -> (&'static str, usize) {
         72 => ("fcntl", 3),
         79 => ("getcwd", 2),
         80 => ("chdir", 1),
+        82 => ("rename", 2),
+        83 => ("mkdir", 2),
+        84 => ("rmdir", 1),
+        87 => ("unlink", 1),
         89 => ("readlink", 3),
         96 => ("gettimeofday", 2),
         102 => ("getuid", 0),
@@ -89,6 +110,10 @@ fn describe(nr: u64) -> (&'static str, usize) {
         231 => ("exit_group", 1),
         234 => ("tgkill", 3),
         257 => ("openat", 4),
+        258 => ("mkdirat", 3),
+        263 => ("unlinkat", 3),
+        264 => ("renameat", 4),
+        271 => ("ppoll", 5),
         262 => ("newfstatat", 4),
         267 => ("readlinkat", 4),
         269 => ("faccessat", 3),
@@ -124,22 +149,22 @@ fn timespec(secs: i64, nanos: i64) -> [u8; 16] {
     out
 }
 
-impl Process {
+impl Task {
     /// Services the `syscall` the machine is stopped at and returns the value
     /// for `RAX`.
     pub(crate) fn syscall(&mut self) -> u64 {
-        let m = self.vm.memory_mut();
-        let nr = self.regs.rax.read(m);
+        let m = self.machine.vm.memory_mut();
+        let nr = self.machine.regs.rax.read(m);
         let args = [
-            self.regs.rdi.read(m),
-            self.regs.rsi.read(m),
-            self.regs.rdx.read(m),
-            self.regs.r10.read(m),
-            self.regs.r8.read(m),
-            self.regs.r9.read(m),
+            self.machine.regs.rdi.read(m),
+            self.machine.regs.rsi.read(m),
+            self.machine.regs.rdx.read(m),
+            self.machine.regs.r10.read(m),
+            self.machine.regs.r8.read(m),
+            self.machine.regs.r9.read(m),
         ];
         let result = self.dispatch(nr, args);
-        if self.trace {
+        if self.trace && self.request != Some(Request::Block) {
             let (name, arity) = describe(nr);
             let shown: Vec<String> = args[..arity].iter().map(|a| format!("{a:#x}")).collect();
             let outcome = match result {
@@ -163,6 +188,11 @@ impl Process {
             4 => self.sys_stat(AT_FDCWD, a[0], a[1], true),
             5 => self.sys_fstat(a[0] as i32, a[1]),
             6 => self.sys_stat(AT_FDCWD, a[0], a[1], false),
+            7 => self.sys_poll(a[0], a[1], a[2] as i64),
+            271 => {
+                let timeout = if a[2] == 0 { -1 } else { 1 };
+                self.sys_poll(a[0], a[1], timeout)
+            }
             8 => self.files.lseek(a[0] as i32, a[1] as i64, a[2] as u32),
             9 => self.sys_mmap(a[0], a[1], a[2], a[3], a[4] as i32, a[5]),
             10 => self.sys_mprotect(a[0], a[1], a[2]),
@@ -176,10 +206,25 @@ impl Process {
             19 => self.sys_readv(a[0] as i32, a[1], a[2]),
             20 => self.sys_writev(a[0] as i32, a[1], a[2]),
             21 => self.sys_access(AT_FDCWD, a[0]),
+            22 => self.sys_pipe(a[0], 0),
+            293 => self.sys_pipe(a[0], a[1]),
             24 | 28 | 35 | 230 => Ok(0),
             32 => self.files.dup(a[0] as i32, None, false).map(|fd| fd as u64),
             33 => self.sys_dup2(a[0] as i32, a[1] as i32),
-            39 | 186 => Ok(PID),
+            39 | 186 => Ok(self.pid),
+            56 => {
+                if a[0] & CLONE_FLAGS != 0 || a[0] & 0xff != SIGCHLD {
+                    return Err(ENOSYS);
+                }
+                self.request = Some(Request::Fork { vfork: false });
+                Ok(0)
+            }
+            57 | 58 => {
+                self.request = Some(Request::Fork { vfork: nr == 58 });
+                Ok(0)
+            }
+            59 => self.sys_execve(a[0], a[1], a[2]),
+            61 => self.sys_wait4(a[0] as i64, a[1], a[2]),
             60 | 231 => {
                 self.exit_code = Some((a[0] & 0xff) as i32);
                 Ok(0)
@@ -192,17 +237,24 @@ impl Process {
                 let path = guest::read_path(self.mmu(), a[0])?;
                 self.files.chdir(&path).map(|()| 0)
             }
+            82 => self.sys_renameat(AT_FDCWD, a[0], AT_FDCWD, a[1]),
+            264 => self.sys_renameat(a[0] as i32, a[1], a[2] as i32, a[3]),
+            83 => self.sys_mkdirat(AT_FDCWD, a[0], a[1]),
+            258 => self.sys_mkdirat(a[0] as i32, a[1], a[2]),
+            84 => self.sys_unlinkat(AT_FDCWD, a[0], AT_REMOVEDIR),
+            87 => self.sys_unlinkat(AT_FDCWD, a[0], 0),
+            263 => self.sys_unlinkat(a[0] as i32, a[1], a[2]),
             89 => self.sys_readlinkat(AT_FDCWD, a[0], a[1], a[2]),
             96 => self.sys_gettimeofday(a[0]),
             102 | 107 => Ok(self.identity.uid),
             104 | 108 => Ok(self.identity.gid),
-            110 => Ok(1),
+            110 => Ok(self.ppid),
             131 => self.sys_sigaltstack(a[1]),
             158 => self.sys_arch_prctl(a[0], a[1]),
             201 => self.sys_time(a[0]),
             202 => self.sys_futex(a[0], a[1], a[2]),
             217 => self.sys_getdents64(a[0] as i32, a[1], a[2]),
-            218 => Ok(PID),
+            218 => Ok(self.pid),
             228 => self.sys_clock_gettime(a[0], a[1]),
             229 => {
                 guest::write(self.mmu(), a[1], &timespec(0, 1))?;
@@ -251,6 +303,10 @@ impl Process {
             let probe = guest::read(self.mmu(), buf, 1)?;
             guest::write(self.mmu(), buf, &probe)?;
         }
+        if self.files.read_would_block(fd) {
+            self.request = Some(Request::Block);
+            return Ok(0);
+        }
         let mut host = vec![0; count];
         let n = self.files.read(fd, &mut host)?;
         guest::write(self.mmu(), buf, &host[..n])?;
@@ -267,7 +323,163 @@ impl Process {
 
     fn sys_write(&mut self, fd: i32, buf: u64, count: u64) -> SysResult {
         let bytes = guest::read(self.mmu(), buf, usize::try_from(count).map_err(|_| EINVAL)?)?;
-        self.files.write(fd, &bytes).map(|n| n as u64)
+        if self.files.write_would_block(fd) {
+            self.request = Some(Request::Block);
+            return Ok(0);
+        }
+        let result = self.files.write(fd, &bytes);
+        // A write with nobody left to read it kills the writer unless it
+        // asked otherwise, which is how `yes | head` ends quietly.
+        if result == Err(errno::EPIPE) && !self.handles(SIGPIPE) {
+            self.exit_code = Some(128 + SIGPIPE as i32);
+        }
+        result.map(|n| n as u64)
+    }
+
+    /// Whether the task installed a handler for `signal` or ignores it.
+    fn handles(&self, signal: u64) -> bool {
+        self.sigactions
+            .get(&signal)
+            .is_some_and(|act| act[..8] != [0; 8])
+    }
+
+    /// `poll`: reports which descriptors are ready, or waits until one is.
+    /// A timeout is not timed; a positive one waits like a negative one.
+    fn sys_poll(&mut self, fds: u64, nfds: u64, timeout: i64) -> SysResult {
+        if nfds > 1024 {
+            return Err(EINVAL);
+        }
+        let mut ready = 0u64;
+        let mut revents = Vec::with_capacity(nfds as usize);
+        for i in 0..nfds {
+            let entry = guest::read(self.mmu(), fds + i * 8, 8)?;
+            let fd = i32::from_le_bytes(entry[..4].try_into().unwrap());
+            let events = u16::from_le_bytes(entry[4..6].try_into().unwrap());
+            let mut out = 0u16;
+            if fd >= 0 {
+                match self.files.get(fd) {
+                    Err(_) => out |= POLLNVAL,
+                    Ok(_) => {
+                        if events & POLLIN != 0 && !self.files.read_would_block(fd) {
+                            out |= POLLIN;
+                        }
+                        if events & POLLOUT != 0 && !self.files.write_would_block(fd) {
+                            out |= POLLOUT;
+                        }
+                        out |= self.files.poll_hangup(fd);
+                    }
+                }
+            }
+            if out != 0 {
+                ready += 1;
+            }
+            revents.push(out);
+        }
+        if ready == 0 && timeout != 0 {
+            self.request = Some(Request::Block);
+            return Ok(0);
+        }
+        for (i, out) in revents.iter().enumerate() {
+            guest::write(self.mmu(), fds + i as u64 * 8 + 6, &out.to_le_bytes())?;
+        }
+        Ok(ready)
+    }
+
+    fn sys_unlinkat(&mut self, dirfd: i32, path: u64, flags: u64) -> SysResult {
+        let path = guest::read_path(self.mmu(), path)?;
+        let host = self.files.resolve(dirfd, &path)?;
+        let result = if flags & AT_REMOVEDIR != 0 {
+            std::fs::remove_dir(&host)
+        } else {
+            std::fs::remove_file(&host)
+        };
+        result.map(|()| 0).map_err(|e| errno::from_io(&e))
+    }
+
+    fn sys_mkdirat(&mut self, dirfd: i32, path: u64, mode: u64) -> SysResult {
+        use std::os::unix::fs::DirBuilderExt;
+        let path = guest::read_path(self.mmu(), path)?;
+        let host = self.files.resolve(dirfd, &path)?;
+        std::fs::DirBuilder::new()
+            .mode(mode as u32 & 0o7777)
+            .create(&host)
+            .map(|()| 0)
+            .map_err(|e| errno::from_io(&e))
+    }
+
+    fn sys_renameat(&mut self, olddir: i32, old: u64, newdir: i32, new: u64) -> SysResult {
+        let old = guest::read_path(self.mmu(), old)?;
+        let new = guest::read_path(self.mmu(), new)?;
+        let from = self.files.resolve(olddir, &old)?;
+        let to = self.files.resolve(newdir, &new)?;
+        std::fs::rename(from, to)
+            .map(|()| 0)
+            .map_err(|e| errno::from_io(&e))
+    }
+
+    fn sys_pipe(&mut self, fds: u64, flags: u64) -> SysResult {
+        // A write into an unmapped array must fail before the pipe exists.
+        guest::read(self.mmu(), fds, 8)?;
+        let (r, w) = self.files.pipe(flags & u64::from(O_CLOEXEC) != 0)?;
+        let mut out = [0u8; 8];
+        out[..4].copy_from_slice(&r.to_le_bytes());
+        out[4..].copy_from_slice(&w.to_le_bytes());
+        guest::write(self.mmu(), fds, &out)?;
+        Ok(0)
+    }
+
+    /// Reads a NUL-terminated array of C strings.
+    fn read_string_vector(&mut self, base: u64) -> Result<Vec<String>, Errno> {
+        let mut out = Vec::new();
+        if base == 0 {
+            return Ok(out);
+        }
+        for i in 0..4096u64 {
+            let ptr = guest::read_u64(self.mmu(), base + i * 8)?;
+            if ptr == 0 {
+                return Ok(out);
+            }
+            out.push(String::from_utf8_lossy(&guest::read_cstr(self.mmu(), ptr)?).into_owned());
+        }
+        Err(errno::E2BIG)
+    }
+
+    fn sys_execve(&mut self, path: u64, argv: u64, envp: u64) -> SysResult {
+        let path = guest::read_path(self.mmu(), path)?;
+        let argv = self.read_string_vector(argv)?;
+        let envp = self.read_string_vector(envp)?;
+        let guest_path = self.files.guest_absolute(AT_FDCWD, &path)?;
+        let host = if guest_path == "/proc/self/exe" {
+            std::path::PathBuf::from(&self.files.exe_path)
+        } else {
+            self.files.resolve(AT_FDCWD, &path)?
+        };
+        let image = std::fs::read(&host).map_err(|e| errno::from_io(&e))?;
+        if std::fs::metadata(&host).is_ok_and(|m| m.is_dir()) {
+            return Err(errno::EACCES);
+        }
+        self.exec(&image, host.display().to_string(), &argv, &envp)?;
+        Ok(0)
+    }
+
+    fn sys_wait4(&mut self, pid: i64, status: u64, options: u64) -> SysResult {
+        let matches = |child: u64| pid == -1 || pid == child as i64;
+        if let Some(i) = self.zombies.iter().position(|&(c, _)| matches(c)) {
+            let (child, code) = self.zombies.remove(i);
+            self.children.retain(|&c| c != child);
+            if status != 0 {
+                guest::write_u32(self.mmu(), status, code as u32)?;
+            }
+            return Ok(child);
+        }
+        if !self.children.iter().any(|&c| matches(c)) {
+            return Err(ECHILD);
+        }
+        if options & WNOHANG != 0 {
+            return Ok(0);
+        }
+        self.request = Some(Request::Block);
+        Ok(0)
     }
 
     fn sys_pwrite(&mut self, fd: i32, buf: u64, count: u64, offset: u64) -> SysResult {
@@ -390,11 +602,14 @@ impl Process {
                 Ok(0)
             }
             // F_GETFL
-            3 => Ok(if self.files.get(fd)?.append {
-                0o2002
-            } else {
-                2
-            }),
+            3 => {
+                let mode = u64::from(self.files.access_mode(fd)?);
+                Ok(if self.files.get(fd)?.append {
+                    mode | 0o2000
+                } else {
+                    mode
+                })
+            }
             // F_SETFL
             4 => {
                 self.files.get(fd)?;
@@ -418,7 +633,7 @@ impl Process {
         }
         let len = page_up(len);
         let bits = prot_to_perm(prot);
-        let mmu = &self.vm.memory_mut().mmu;
+        let mmu = &self.machine.vm.memory_mut().mmu;
         let at = if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
             if addr == 0 {
                 return Err(EINVAL);
@@ -430,7 +645,7 @@ impl Process {
         } else if addr != 0 && AddressSpace::is_free(mmu, addr, len) {
             addr
         } else {
-            self.space.find_free(mmu, len).ok_or(ENOMEM)?
+            self.machine.space.find_free(mmu, len).ok_or(ENOMEM)?
         };
         let mmu = self.mmu();
         if flags & MAP_FIXED != 0 {
@@ -569,20 +784,26 @@ impl Process {
     fn sys_arch_prctl(&mut self, code: u64, addr: u64) -> SysResult {
         match code {
             ARCH_SET_FS => {
-                self.regs.fs_base.write(self.vm.memory_mut(), addr);
+                self.machine
+                    .regs
+                    .fs_base
+                    .write(self.machine.vm.memory_mut(), addr);
                 Ok(0)
             }
             ARCH_SET_GS => {
-                self.regs.gs_base.write(self.vm.memory_mut(), addr);
+                self.machine
+                    .regs
+                    .gs_base
+                    .write(self.machine.vm.memory_mut(), addr);
                 Ok(0)
             }
             ARCH_GET_FS => {
-                let base = self.regs.fs_base.read(self.vm.memory_mut());
+                let base = self.machine.regs.fs_base.read(self.machine.vm.memory_mut());
                 guest::write_u64(self.mmu(), addr, base)?;
                 Ok(0)
             }
             ARCH_GET_GS => {
-                let base = self.regs.gs_base.read(self.vm.memory_mut());
+                let base = self.machine.regs.gs_base.read(self.machine.vm.memory_mut());
                 guest::write_u64(self.mmu(), addr, base)?;
                 Ok(0)
             }
@@ -695,21 +916,27 @@ impl Process {
     }
 
     fn sys_kill(&mut self, a: [u64; 6]) -> SysResult {
-        // kill(pid, sig) or tgkill(tgid, tid, sig): only the process itself
-        // exists to be signalled, and a fatal signal ends it as Linux would —
-        // reported as 128 + signal, the shell's convention.
+        // kill(pid, sig) or tgkill(tgid, tid, sig): a signal is never
+        // delivered, so a fatal one ends its target as Linux would — reported
+        // as 128 + signal, the shell's convention.
         let (target, signal) = if a[2] == 0 && a[1] < 65 {
             (a[0], a[1])
         } else {
             (a[1], a[2])
         };
-        if target != PID && target != 0 {
-            return Err(errno::EPERM);
-        }
         if signal == 0 {
             return Ok(0);
         }
-        self.exit_code = Some(128 + signal as i32);
+        if target == self.pid || target == 0 {
+            self.exit_code = Some(128 + signal as i32);
+            return Ok(0);
+        }
+        // Another task of this process; the scheduler ends it. A pid that is
+        // not one of ours is nobody we may signal.
+        self.request = Some(Request::Kill {
+            pid: target,
+            signal: signal as i32,
+        });
         Ok(0)
     }
 }

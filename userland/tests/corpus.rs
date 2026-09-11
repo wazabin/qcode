@@ -87,7 +87,7 @@ fn run(elf: &Path, jit: bool, args: &[&str], envp: &[&str], root: Option<&Path>)
     let mut process = Process::new(&image, config).expect("the image loads");
     let exit = process.run(BUDGET);
     Outcome {
-        stdout: String::from_utf8_lossy(process.files.stdout()).into_owned(),
+        stdout: String::from_utf8_lossy(&process.files().stdout()).into_owned(),
         exit,
     }
 }
@@ -255,5 +255,5 @@ fn budget_exhaustion_is_resumable() {
     let mut process = Process::new(&image, config).unwrap();
     assert!(matches!(process.run(1), ProcessExit::Budget));
     assert!(matches!(process.run(BUDGET), ProcessExit::Exited(0)));
-    assert_eq!(process.files.stdout(), b"hi\n");
+    assert_eq!(&*process.files().stdout(), b"hi\n");
 }
