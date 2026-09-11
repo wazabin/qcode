@@ -47,3 +47,9 @@ toml = "1"
 # not recorded in published packages and never reaches downstream consumers.
 [patch.crates-io]
 rustc_apfloat = { git = "https://github.com/Garfield1002/rustc_apfloat.git", rev = "9a4a688bc8f2741c5bd43df79c7061ef63142122" }
+
+# Debug builds run the test corpora through the emulator; the SLEIGH lifter and
+# Cranelift live in dependencies and dominate start-up, so optimise those while
+# keeping the workspace crates themselves debuggable.
+[profile.dev.package."*"]
+opt-level = 2
