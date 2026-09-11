@@ -12,12 +12,25 @@ concurrency:
   group: publish
   cancel-in-progress: false
 
+env:
+  JSTD_REPOSITORY: ${{ vars.JSTD_REPOSITORY || format('{0}/jstd', github.repository_owner) }}
+  PCODE_TYPES_REPOSITORY: ${{ vars.PCODE_TYPES_REPOSITORY || format('{0}/pcode', github.repository_owner) }}
+  BINARY_REPOSITORY: ${{ vars.BINARY_REPOSITORY || format('{0}/binary', github.repository_owner) }}
+  SLEIGH_REPOSITORY: ${{ vars.SLEIGH_REPOSITORY || format('{0}/sleigh', github.repository_owner) }}
+
 jobs:
   publish:
     runs-on: ubuntu-latest
     environment: crates-io
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check out path dependencies
+        run: |
+          git clone --depth=1 "https://github.com/${JSTD_REPOSITORY}.git" ../wazabin-jstd
+          git clone --depth=1 "https://github.com/${PCODE_TYPES_REPOSITORY}.git" ../wazabin-pcode
+          git clone --depth=1 "https://github.com/${BINARY_REPOSITORY}.git" ../wazabin-binary
+          git -c url.https://github.com/.insteadOf=git@github.com: clone --depth=1 --recurse-submodules --shallow-submodules "https://github.com/${SLEIGH_REPOSITORY}.git" ../wazabin-sleigh
 
       - uses: dtolnay/rust-toolchain@stable
 

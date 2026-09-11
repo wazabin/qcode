@@ -47,7 +47,9 @@ mod engine {
     /// Must match `BIT_INDEX_OPERAND_OFFSET` in binit's `make_test_cases.py`.
     const BIT_INDEX_OPERAND_OFFSET: usize = 256;
     const MEMORY_WORDS: &[(&str, u64)] = &[("mem0_value", MEM0_ADDR), ("mem1_value", MEM1_ADDR)];
-    const MAX_EMULATED_STEPS: usize = 10_000;
+    // A loop guard, not a budget: the largest straight-line bodies (the byte-wide
+    // PCMP{E,I}STR* aggregations unroll 256 comparisons) run past 10k QCode steps.
+    const MAX_EMULATED_STEPS: usize = 250_000;
     const SCALAR_REGISTERS: &[&str] = &[
         "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "R8", "R9", "RBP", "RSP",
     ];
@@ -1456,9 +1458,11 @@ mod engine {
     /// of the page) rather than a wazabin bug — the lifted qcode is correct.
     fn fixture_limitation_reason(tc: &DbTestCase, pair: &DbStateResult) -> Option<&'static str> {
         let mnemonic = tc.instruction.split_whitespace().next().unwrap_or("");
-        // CMPXCHG16B compares/writes a 16-byte operand; only the low 8 bytes are
-        // modeled, so the unmodeled high 8 bytes drive the divergence.
-        if mnemonic.eq_ignore_ascii_case("cmpxchg16b") {
+        // CMPXCHG16B compares/writes a 16-byte operand. A case seeded through
+        // the 512-byte `scratch_memory` transport models all of it and is a
+        // real result; one carrying only the 8-byte `mem0_value` word predates
+        // that, and its unmodeled high 8 bytes drive the divergence.
+        if mnemonic.eq_ignore_ascii_case("cmpxchg16b") && pair.initial.scratch_memory.is_none() {
             return Some("128-bit memory operand exceeds modeled 8-byte window");
         }
         // BT/BTC/BTR/BTS with a memory operand and a register bit index access the

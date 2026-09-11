@@ -541,6 +541,12 @@ impl<'str> Context<'str> {
         false
     }
 
+    /// A free global name derived from `name`: `name` itself if untaken, else
+    /// the first free `name_<n>` (see [`NameTable::unique`]).
+    pub fn unique_name(&mut self, name: Cow<'str, str>) -> Cow<'str, str> {
+        self.shared.name_map.unique(name)
+    }
+
     /// Record a discovered code address (typed: a new function or a block within
     /// an existing function) for the `lift_new_addresses` pass to lift.
     pub fn discover(&mut self, discovery: crate::discovery::Discovery) -> bool {
@@ -575,6 +581,21 @@ impl<'str> Context<'str> {
     /// Iterate pending discoveries without consuming them.
     pub fn discoveries(&self) -> impl Iterator<Item = &crate::discovery::Discovery> + '_ {
         self.shared.discoveries.iter()
+    }
+
+    /// Every discovery this context has ever queued, with its provenance and
+    /// durable outcome (pending, lifted, failed or skipped). Drained items are
+    /// included, so this is the complete record of what was found and how.
+    pub fn discovery_records(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &crate::discovery::DiscoveryKey,
+            &crate::discovery::Discovery,
+            &crate::discovery::DiscoveryState,
+        ),
+    > + '_ {
+        self.shared.discoveries.records()
     }
 
     /// True if there are no pending discoveries.
