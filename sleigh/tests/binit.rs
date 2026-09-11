@@ -47,7 +47,9 @@ mod engine {
     /// Must match `BIT_INDEX_OPERAND_OFFSET` in binit's `make_test_cases.py`.
     const BIT_INDEX_OPERAND_OFFSET: usize = 256;
     const MEMORY_WORDS: &[(&str, u64)] = &[("mem0_value", MEM0_ADDR), ("mem1_value", MEM1_ADDR)];
-    const MAX_EMULATED_STEPS: usize = 10_000;
+    // A loop guard, not a budget: the largest straight-line bodies (the byte-wide
+    // PCMP{E,I}STR* aggregations unroll 256 comparisons) run past 10k QCode steps.
+    const MAX_EMULATED_STEPS: usize = 250_000;
     const SCALAR_REGISTERS: &[&str] = &[
         "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "R8", "R9", "RBP", "RSP",
     ];
