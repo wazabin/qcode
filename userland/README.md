@@ -95,11 +95,9 @@ To resume, the environment supplies the operation's effect and calls
 
 ## Limitations
 
-- **No SSE, so no glibc.** The emulator does not lift SSE, and every static
-  glibc uses it in start-up code (`memcpy`, `strlen`, IFUNC selection). The
-  corpus therefore uses a freestanding runtime with raw `syscall` wrappers
-  (`tests/corpus/sys.h`); build guests with `-nostdlib -nostartfiles -mno-sse
-  -mno-sse2 -mno-mmx`.
+- glibc is untested. Static musl binaries (BusyBox) run; the freestanding C
+  corpus predates SSE lifting and still builds with `-nostdlib -nostartfiles
+  -mno-sse -mno-sse2 -mno-mmx`.
 - Single thread: no `clone`, no `fork`/`execve`; `futex` never blocks.
 - Signals are recorded but never delivered; a fault or `ud2` ends the process
   with a diagnostic instead.
@@ -117,6 +115,14 @@ cargo test
 `tests/corpus.rs` builds the C programs in `tests/corpus/` with the host `gcc`
 (skipping if there is none) and runs each interpreted and with the JIT,
 checking stdout and the exit status. One is built as a static PIE.
+
+`tests/busybox.rs` is the real-binary corpus: about forty BusyBox applet
+invocations (`sh -c` loops, `sort`, `awk`, `sha256sum`, `sed`, …) run in a
+sandbox root, interpreted and with the JIT, and compared with the same
+command run natively on the host. It uses `$BUSYBOX`, else the first static
+`busybox` in `/usr/sbin`, `/usr/bin` or `/bin` (Fedora's `busybox`, Debian's
+`busybox-static`), and skips when there is none. Shell pipelines are absent
+because `pipe` and `fork` are.
 
 The Embench harnesses live here too, on the `bare` module, which runs a
 freestanding image with no process around it: `tests/embench.rs` verifies
