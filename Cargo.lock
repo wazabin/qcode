@@ -1651,7 +1651,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-sleigh"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "pest",
  "pest_derive",
@@ -1663,7 +1663,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-sleigh-precompile"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bincode",
  "serde",
