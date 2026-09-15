@@ -372,14 +372,15 @@ pub fn verify_body_arena_integrity_scoped(
         }
 
         let stats = body.arena_stats();
-        let max_issued = u32::MAX as usize + 1;
+        // Widened so the bound exists on 32-bit targets (wasm) too.
+        let max_issued = u64::from(u32::MAX) + 1;
         for (kind, issued) in [
             ("instruction", stats.instructions.issued),
             ("block", stats.blocks.issued),
             ("parameter", stats.params.issued),
             ("edge", stats.edges.issued),
         ] {
-            if issued > max_issued {
+            if issued as u64 > max_issued {
                 out.push(format!(
                     "function {fid:?}: {kind} arena issued cursor {issued} exceeds u32 ID space"
                 ));
