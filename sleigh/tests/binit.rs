@@ -16,7 +16,10 @@ mod engine {
 
     use qcode::{
         context::Context,
-        value::{insn::Mnemonic, varnode::register::RegisterId},
+        value::{
+            insn::{InstructionRef, Mnemonic},
+            varnode::register::RegisterId,
+        },
     };
     use qcode_emulator::{Emulator, EmulatorError, EmulatorErrorKind};
     use sleigh::{CompiledSpec, Decoder, Opcode, SymbolKind, Varnode};
@@ -1402,16 +1405,26 @@ mod engine {
         emu: &mut Emulator<'_>,
         end_address: u64,
     ) -> Result<(), RunError> {
+        // The instruction the machine is about to run, followed along its
+        // block's list: a step either advances one link or, past a
+        // terminator, lands the machine at the head of a block. Reading the
+        // position by index (`emu.insn()`) would walk the block every step.
+        let mut cursor: Option<InstructionRef<'_, '_>> = None;
         for _ in 0..MAX_EMULATED_STEPS {
-            if emu
-                .block()
+            let block = emu.block();
+            if block
                 .address()
                 .is_some_and(|address| address >= end_address)
             {
                 return Ok(());
             }
-            let Some(insn) = emu.insn() else {
-                return Err(RunError::StepLimit);
+            let next = cursor.and_then(|insn| insn.next());
+            let insn = match next {
+                Some(next) if next.block().is_some_and(|b| b.id == block.id) => next,
+                _ => match block.instructions().next() {
+                    Some(head) => head,
+                    None => return Err(RunError::StepLimit),
+                },
             };
             if matches!(
                 insn.mnemonic(),
@@ -1423,6 +1436,7 @@ mod engine {
                 return Ok(());
             }
             emu.step().map_err(RunError::Emulator)?;
+            cursor = Some(insn);
         }
         Err(RunError::StepLimit)
     }

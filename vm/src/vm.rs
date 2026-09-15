@@ -1047,12 +1047,7 @@ impl<S: CodeSource> Vm<S> {
         }
         // Where `filled`'s instructions land: the head's own, less the
         // terminator that absorption drops.
-        let offset = self
-            .ctx
-            .block(head)
-            .instruction_ids()
-            .len()
-            .saturating_sub(1);
+        let offset = self.ctx.block(head).insn_count().saturating_sub(1);
         if qcode_passes::absorb_straight_line(&mut self.ctx, head) == 0 {
             return (forward > 0).then_some(filled);
         }
@@ -1064,9 +1059,11 @@ impl<S: CodeSource> Vm<S> {
         // ahead of that point or injection inserts after it — an interrupt an
         // injector places before the first absorbed instruction, say, which
         // has to run before it.
-        let executed: FxHashSet<LocalInsnId> = self.ctx.block(head).instruction_ids()[..offset]
-            .iter()
-            .copied()
+        let executed: FxHashSet<LocalInsnId> = self
+            .ctx
+            .body(head.func)
+            .insn_ids(head.local)
+            .take(offset)
             .collect();
         self.mark_dirty(head);
 
@@ -1079,10 +1076,11 @@ impl<S: CodeSource> Vm<S> {
             // not seen them: rewrite now, so a hook on the instruction about
             // to execute is not missed the first time.
             self.inject(head);
-            let now = self.ctx.block(head).instruction_ids();
-            let resumed = now
-                .iter()
-                .rposition(|local| executed.contains(local))
+            let resumed = self
+                .ctx
+                .body(head.func)
+                .insn_ids(head.local)
+                .rposition(|local| executed.contains(&local))
                 .map_or(0, |last| last + 1);
             self.emu.block = head;
             self.emu.idx = resumed;

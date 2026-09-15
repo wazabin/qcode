@@ -366,7 +366,7 @@ mod tests {
                 .context()
                 .block_ids()
                 .into_iter()
-                .map(|b| vm.context().block(b).instruction_ids().len())
+                .map(|b| vm.context().block(b).insn_count())
                 .sum();
             eprintln!(
                 "optimize={optimize}: steps={} module_insns={insns} forwarded={}",

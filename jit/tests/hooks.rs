@@ -286,7 +286,7 @@ fn a_write_watch_only_leaves_the_vm_for_writes_in_its_range() {
                 for block in qcode::value::FunctionBody::from_id(&ctx, func).block_ids() {
                     if let Err(reason) = jit.try_compile(&ctx, block) {
                         assert!(
-                            ctx.block(block).instruction_ids().is_empty(),
+                            !ctx.block(block).has_insns(),
                             "jit: block {block:?} declined: {reason}"
                         );
                     }

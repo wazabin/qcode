@@ -87,6 +87,15 @@ pub struct Instruction<'str> {
     /// Instructions that are not part of any block (e.g. lifted from data sections) have `None` here.
     pub(crate) parent: Option<LocalBlockId>,
 
+    /// The instructions before and after this one in its block (bare
+    /// body-local indices). A block's instruction order is a doubly linked
+    /// list threaded through its instructions, so inserting one before
+    /// another and unlinking one cost the same however long the block is;
+    /// see [`FunctionBody::link_before`](crate::value::FunctionBody::link_before).
+    /// `None` at either end of the block, and both `None` outside any block.
+    pub(crate) prev: Option<LocalInsnId>,
+    pub(crate) next: Option<LocalInsnId>,
+
     // Address of the binary instruction
     address: Option<u64>,
 
@@ -98,6 +107,8 @@ impl<'str> Instruction<'str> {
         Self {
             name: None,
             parent: None,
+            prev: None,
+            next: None,
             type_id,
             mnemonic,
             address: None,
@@ -107,6 +118,16 @@ impl<'str> Instruction<'str> {
 
     pub fn mnemonic(&self) -> &Mnemonic {
         &self.mnemonic
+    }
+
+    /// The instruction before this one in its block, if any.
+    pub fn prev_in_block(&self) -> Option<LocalInsnId> {
+        self.prev
+    }
+
+    /// The instruction after this one in its block, if any.
+    pub fn next_in_block(&self) -> Option<LocalInsnId> {
+        self.next
     }
 
     /// Mutable access to this instruction's mnemonic (crate-internal; used by the
@@ -168,6 +189,22 @@ where
 
     pub fn block(&'s self) -> Option<BlockRef<'str, 'ctx, R>> {
         self.parent()
+    }
+
+    /// The instruction before this one in its block, if any. Following the
+    /// block's list costs the same wherever in the block this instruction is.
+    pub fn prev(&'s self) -> Option<InstructionRef<'str, 'ctx, R>> {
+        self.inner()
+            .prev
+            .map(|local| InstructionRef::new(self.view, InstructionId::new(self.id.func, local)))
+    }
+
+    /// The instruction after this one in its block, if any; `None` at the
+    /// block's terminator.
+    pub fn next(&'s self) -> Option<InstructionRef<'str, 'ctx, R>> {
+        self.inner()
+            .next
+            .map(|local| InstructionRef::new(self.view, InstructionId::new(self.id.func, local)))
     }
 
     /// The function that this instruction belongs to, if any.

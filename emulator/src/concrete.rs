@@ -966,6 +966,11 @@ pub struct StandaloneEmulator<M = EmulatedMemory> {
     /// on demand creates when it fills a placeholder block and re-enters it.
     cached_block: Option<BlockId>,
     cached_insns: Vec<qcode::value::LocalInsnId>,
+    /// Whether the cache was rebuilt at this block entry. A driver peeks at
+    /// the entry instruction and then steps it, both through
+    /// [`refresh_block_cache`](Self::refresh_block_cache); without this the
+    /// second call would rebuild the list the first just built.
+    cache_primed: bool,
     pub insn_values: InsnValues,
     pub block_param_values: FxHashMap<BlockParamId, SizedValue>,
     /// Block params bound to **poison** (argpromote v2): a symbolic pure-call
@@ -1033,6 +1038,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             sequence_types_checked_at: None,
             cached_block: None,
             cached_insns: Vec::new(),
+            cache_primed: false,
             insn_values: InsnValues::default(),
             block_param_values: FxHashMap::default(),
             poison_params: FxHashSet::default(),
@@ -1057,6 +1063,36 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     /// assumption, and must say so.
     pub fn invalidate_block_cache(&mut self) {
         self.cached_block = None;
+    }
+
+    /// Rebuilds the cached instruction list of the current block when the
+    /// machine has entered it (index 0) or the cache holds another block.
+    /// Idempotent until the next step: a block entry is refreshed once, not
+    /// once per caller that asks while the machine sits at its head.
+    fn refresh_block_cache(&mut self, ctx: &Context<'_>) {
+        let block_id = self.block;
+        let entered = self.idx == 0 && !self.cache_primed;
+        if self.cached_block != Some(block_id) || entered {
+            // The module only gains types while nothing is part-way through a
+            // block — lifting happens on block entry — so this rides the same
+            // refresh as the instruction list rather than paying per step.
+            self.refresh_sequence_types(ctx);
+            self.cached_insns.clear();
+            self.cached_insns
+                .extend(ctx.body(block_id.func).insn_ids(block_id.local));
+            self.cached_block = Some(block_id);
+            self.cache_primed = true;
+        }
+    }
+
+    /// The instruction at position `idx` of the current block, read off the
+    /// same cached list [`step`](Self::step) runs from. A block's order is a
+    /// linked list; this is how a position in it is read without walking it.
+    pub fn insn_at(&mut self, ctx: &Context<'_>, idx: usize) -> Option<InstructionId> {
+        self.refresh_block_cache(ctx);
+        self.cached_insns
+            .get(idx)
+            .map(|&local| InstructionId::new(self.block.func, local))
     }
 
     /// Takes the cached address lookup, leaving the emulator without one.
@@ -1112,11 +1148,11 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
 
     fn make_error(&self, ctx: &Context<'_>, kind: EmulatorErrorKind) -> EmulatorError {
         let block = BasicBlock::from_id(ctx, self.block);
-        let instruction = block
-            .instruction_ids()
+        let ids = block.instruction_ids();
+        let instruction = ids
             .get(self.idx)
+            .or_else(|| ids.last())
             .copied()
-            .or_else(|| block.instruction_ids().last().copied())
             .expect("cannot construct EmulatorError for empty block");
 
         EmulatorError::new(kind, &Instruction::from_id(ctx, instruction))
@@ -2064,16 +2100,9 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     fn step_with_event(&mut self, ctx: &Context<'_>) -> crate::Result<StepEvent> {
         self.memory.configure_spaces(ctx);
         let block_id = self.block;
-        if self.cached_block != Some(block_id) || self.idx == 0 {
-            // The module only gains types while nothing is part-way through a
-            // block — lifting happens on block entry — so this rides the same
-            // refresh as the instruction list rather than paying per step.
-            self.refresh_sequence_types(ctx);
-            self.cached_insns.clear();
-            self.cached_insns
-                .extend_from_slice(ctx.block(block_id).instruction_ids());
-            self.cached_block = Some(block_id);
-        }
+        self.refresh_block_cache(ctx);
+        // The step about to run moves the machine, so the next call re-checks.
+        self.cache_primed = false;
         // A degenerate block — empty, or exhausted without a terminator — is
         // malformed lifter output, not an emulator bug. Report it so a bounded
         // consumer (and a VM running lifted-on-demand code) can stop with a
@@ -2652,10 +2681,10 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
         let mut call_depth: i32 = 0;
 
         let result = loop {
-            let insn_ids = BasicBlock::from_id(ctx, self.block)
-                .instruction_ids()
-                .to_vec();
-            let insn = InstructionRef::from_id(ctx, insn_ids[self.idx]);
+            let id = self
+                .insn_at(ctx, self.idx)
+                .expect("the machine is positioned past the end of its block");
+            let insn = InstructionRef::from_id(ctx, id);
 
             if matches!(insn.mnemonic(), Mnemonic::Return(_)) && call_depth == 0 {
                 break Ok(());
@@ -3210,18 +3239,15 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     ) -> crate::Result<()> {
         let mut steps = 0usize;
         let result = loop {
-            let insn_ids = BasicBlock::from_id(ctx, self.block)
-                .instruction_ids()
-                .to_vec();
             // A well-formed block ends in a terminator, so `self.idx` should always
             // point at a real instruction. Lifting can leave degenerate empty blocks
             // behind, though; bail with a recoverable error instead of indexing out
             // of bounds (which would crash the whole analysis via GVN pure-call
             // folding). `make_error` can't be used here — it also indexes the block.
-            if self.idx >= insn_ids.len() {
+            let Some(id) = self.insn_at(ctx, self.idx) else {
                 break Err(self.make_empty_block_error(ctx));
-            }
-            let insn = InstructionRef::from_id(ctx, insn_ids[self.idx]);
+            };
+            let insn = InstructionRef::from_id(ctx, id);
             if matches!(
                 insn.mnemonic(),
                 Mnemonic::Return(_) | Mnemonic::ReturnValue(_)
@@ -3243,7 +3269,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
 }
 
 fn lambda_return_value(ctx: &Context<'_>, block: BlockId) -> Option<ValueId> {
-    let last = BasicBlock::from_id(ctx, block).iter().last()?;
+    let last = BasicBlock::from_id(ctx, block).iter().next_back()?;
     match last.mnemonic() {
         Mnemonic::ReturnValue(ret) => Some(ret.value.qualify(last.id.func)),
         _ => None,
@@ -3254,7 +3280,7 @@ fn lambda_return_value(ctx: &Context<'_>, block: BlockId) -> Option<ValueId> {
 /// outlined-body form) or a lambda `ReturnValue`. `None` if the block does not
 /// end in a value-carrying return.
 fn body_return_value(ctx: &Context<'_>, block: BlockId) -> Option<ValueId> {
-    let last = BasicBlock::from_id(ctx, block).iter().last()?;
+    let last = BasicBlock::from_id(ctx, block).iter().next_back()?;
     match last.mnemonic() {
         Mnemonic::Return(ret) => ret.value.map(|v| v.qualify(last.id.func)),
         Mnemonic::ReturnValue(ret) => Some(ret.value.qualify(last.id.func)),
@@ -3536,15 +3562,16 @@ impl<'ctx, M: EmulatorMemory + Default> Emulator<'ctx, M> {
         BasicBlock::from_id(self.ctx, self.inner.block)
     }
 
-    /// Gets the current instruction
+    /// Gets the current instruction.
+    ///
+    /// **Costs a walk of the block up to the current position**: a block's
+    /// order is a linked list, so reading position `idx` follows `idx` links.
+    /// Calling this once per [`step`](Self::step) makes running a block
+    /// quadratic in its length. A driver that steps and peeks should hold the
+    /// instruction it last ran and follow [`InstructionRef::next`] instead,
+    /// re-reading the block head only when the machine enters a block.
     pub fn insn(&self) -> Option<InstructionRef<'ctx, 'ctx>> {
-        let block = self.block();
-        if self.inner.idx >= block.instruction_count() {
-            None
-        } else {
-            let id = block.instruction_ids()[self.inner.idx];
-            Some(InstructionRef::from_id(self.ctx, id))
-        }
+        self.block().instructions().nth(self.inner.idx)
     }
 
     /// Executes a single pcode instruction

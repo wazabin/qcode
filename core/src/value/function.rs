@@ -8,6 +8,8 @@ use std::{
 };
 
 mod footprint;
+#[cfg(test)]
+mod insn_order;
 pub use footprint::{Footprint, RamBase, RamField, RamLocations, RamObject, RamRegion};
 
 mod signature;
@@ -21,8 +23,8 @@ use crate::{
     value::{
         BasicBlock, BlockId, BlockRef, Instruction, InstructionId, LocalValueId, ModuleView,
         QCodeView, Temp, TempId, TempSpace, TempSpaceId, Value, ValueId, VarnodeId,
-        block::EdgeData,
         block::cfg::{EdgeId, LocalBlockId},
+        block::{EdgeData, InsnList},
         block_param::{BlockParam, BlockParamId, LocalParamId},
         insn::{LocalInsnId, Mnemonic},
         util::{
@@ -596,6 +598,47 @@ impl<'str> FunctionInterface<'str> {
     }
 }
 
+/// The instructions of a block, in order, walked along their links from
+/// both ends (see [`FunctionBody::insn_ids`]).
+pub struct InsnIds<'a, 'str> {
+    body: &'a FunctionBody<'str>,
+    front: Option<LocalInsnId>,
+    back: Option<LocalInsnId>,
+    remaining: usize,
+}
+
+impl Iterator for InsnIds<'_, '_> {
+    type Item = LocalInsnId;
+
+    fn next(&mut self) -> Option<LocalInsnId> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let local = self.front?;
+        self.remaining -= 1;
+        self.front = self.body.insns[local].next;
+        Some(local)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl DoubleEndedIterator for InsnIds<'_, '_> {
+    fn next_back(&mut self) -> Option<LocalInsnId> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let local = self.back?;
+        self.remaining -= 1;
+        self.back = self.body.insns[local].prev;
+        Some(local)
+    }
+}
+
+impl ExactSizeIterator for InsnIds<'_, '_> {}
+
 impl<'str> FunctionBody<'str> {
     /// Reports the current arena footprint and logical liveness.
     pub fn arena_stats(&self) -> BodyArenaStats {
@@ -621,7 +664,6 @@ impl<'str> FunctionBody<'str> {
         self.edges.shrink_to_fit();
         self.roster.shrink_to_fit();
         for mut block in self.blocks.iter_mut() {
-            block.instructions.shrink_to_fit();
             block.params.shrink_to_fit();
             block.edges.shrink_to_fit();
         }
@@ -1041,7 +1083,12 @@ impl<'str> FunctionBody<'str> {
     /// Push a fresh instruction into this body's arena, recording each operand's
     /// use in the reverse-use map, and return its **body-local** id. The id-less
     /// twin of [`push_insn`](Self::push_insn), usable on a detached body.
-    pub fn push_insn_local(&mut self, insn: Instruction<'str>) -> LocalInsnId {
+    pub fn push_insn_local(&mut self, mut insn: Instruction<'str>) -> LocalInsnId {
+        // A caller may clone a linked instruction as its template; the copy is
+        // a new value in no block, whatever the original's links said.
+        insn.parent = None;
+        insn.prev = None;
+        insn.next = None;
         let args: Vec<LocalValueId> = insn.mnemonic().args().into_iter().collect();
         let local = self.insns.push(insn);
         for arg in args {
@@ -1114,8 +1161,147 @@ impl<'str> FunctionBody<'str> {
     /// parent (id-free; the mutation twin of [`BaseRef::push_insn`], usable on a
     /// detached body).
     pub fn append_insn_local(&mut self, block: LocalBlockId, insn: LocalInsnId) {
-        self.insns[insn].parent = Some(block);
-        self.blocks[block].instructions.push(insn);
+        self.link_last(block, insn);
+    }
+
+    // ---- the instruction list of a block ------------------------------------
+    //
+    // A block's instruction order is a doubly linked list threaded through
+    // the instructions (`Instruction::prev`/`next`), the block holding its
+    // ends and length (`InsnList`). Linking before an instruction, after
+    // one, at the end, and unlinking cost the same however long the block
+    // is; walking it costs its length. These four verbs are the only ones
+    // that touch the links, and keep `parent` in step: linked means in a
+    // block, unlinked means in none. Linking an instruction that is in a
+    // block moves it: the verbs unlink first, so no list is ever left with
+    // a member whose links lead elsewhere.
+
+    /// The instructions of `block`, in order.
+    pub fn insn_ids(&self, block: LocalBlockId) -> InsnIds<'_, 'str> {
+        let list = self.blocks[block].instructions;
+        InsnIds {
+            body: self,
+            front: list.first,
+            back: list.last,
+            remaining: list.len,
+        }
+    }
+
+    /// The instructions of `block`, in order, qualified.
+    pub fn block_insn_ids(&self, block: BlockId) -> Vec<InstructionId> {
+        let func = self.id();
+        self.insn_ids(block.local)
+            .map(|local| InstructionId::new(func, local))
+            .collect()
+    }
+
+    /// Links `insn` at the end of `block`, taking it out of the block it was
+    /// in, if any.
+    pub fn link_last(&mut self, block: LocalBlockId, insn: LocalInsnId) {
+        self.unlink(insn);
+        let last = self.blocks[block].instructions.last;
+        {
+            let i = &mut self.insns[insn];
+            i.parent = Some(block);
+            i.prev = last;
+            i.next = None;
+        }
+        match last {
+            Some(last) => self.insns[last].next = Some(insn),
+            None => self.blocks[block].instructions.first = Some(insn),
+        }
+        let list = &mut self.blocks[block].instructions;
+        list.last = Some(insn);
+        list.len += 1;
+    }
+
+    /// Links `insn` immediately before `before`, which must be in `block`,
+    /// taking `insn` out of the block it was in, if any.
+    pub fn link_before(&mut self, block: LocalBlockId, before: LocalInsnId, insn: LocalInsnId) {
+        if insn == before {
+            return;
+        }
+        self.unlink(insn);
+        debug_assert_eq!(
+            self.insns[before].parent,
+            Some(block),
+            "{before:?} is not in {block:?}"
+        );
+        let prev = self.insns[before].prev;
+        {
+            let i = &mut self.insns[insn];
+            i.parent = Some(block);
+            i.prev = prev;
+            i.next = Some(before);
+        }
+        self.insns[before].prev = Some(insn);
+        match prev {
+            Some(prev) => self.insns[prev].next = Some(insn),
+            None => self.blocks[block].instructions.first = Some(insn),
+        }
+        self.blocks[block].instructions.len += 1;
+    }
+
+    /// Links `insn` immediately after `after`, which must be in `block`.
+    pub fn link_after(&mut self, block: LocalBlockId, after: LocalInsnId, insn: LocalInsnId) {
+        debug_assert_eq!(
+            self.insns[after].parent,
+            Some(block),
+            "{after:?} is not in {block:?}"
+        );
+        match self.insns[after].next {
+            Some(next) => self.link_before(block, next, insn),
+            None => self.link_last(block, insn),
+        }
+    }
+
+    /// Takes `insn` out of its block's list, leaving it in no block. The
+    /// instruction itself stays in the arena, with its uses.
+    pub fn unlink(&mut self, insn: LocalInsnId) {
+        let (block, prev, next) = {
+            let i = &mut self.insns[insn];
+            let Some(block) = i.parent.take() else {
+                return;
+            };
+            (block, i.prev.take(), i.next.take())
+        };
+        match prev {
+            Some(prev) => self.insns[prev].next = next,
+            None => self.blocks[block].instructions.first = next,
+        }
+        match next {
+            Some(next) => self.insns[next].prev = prev,
+            None => self.blocks[block].instructions.last = prev,
+        }
+        self.blocks[block].instructions.len -= 1;
+    }
+
+    /// Links `insn` at position `index` of `block`, walking to it.
+    pub fn insert_insn_at(&mut self, block: LocalBlockId, index: usize, insn: LocalInsnId) {
+        match self.insn_ids(block).nth(index) {
+            Some(at) => self.link_before(block, at, insn),
+            None => {
+                assert_eq!(
+                    index, self.blocks[block].instructions.len,
+                    "index past the end"
+                );
+                self.link_last(block, insn);
+            }
+        }
+    }
+
+    /// Empties `block`'s list, returning its instructions in order, each
+    /// now in no block.
+    pub fn take_insns(&mut self, block: LocalBlockId) -> Vec<LocalInsnId> {
+        let ids: Vec<LocalInsnId> = self.insn_ids(block).collect();
+        for &id in &ids {
+            let i = &mut self.insns[id];
+            i.parent = None;
+            i.prev = None;
+            i.next = None;
+        }
+        self.blocks[block].instructions = InsnList::default();
+        ids
     }
 
     /// Mint an `Int(size)`-typed instruction with `mnemonic` (the type is minted
@@ -1160,16 +1346,16 @@ impl<'str> FunctionBody<'str> {
         before: InstructionId,
         insn: InstructionId,
     ) {
-        let index = self
-            .block(block)
-            .instructions
-            .iter()
-            .position(|&local| InstructionId::new(block.func, local) == before)
-            .expect("before not in block");
-        self.insn_mut(insn).parent = Some(block.local);
-        self.block_mut(block)
-            .instructions
-            .insert(index, insn.localize(block.func));
+        assert_eq!(
+            self.insn(before).parent,
+            Some(block.local),
+            "before not in block"
+        );
+        self.link_before(
+            block.local,
+            before.localize(block.func),
+            insn.localize(block.func),
+        );
     }
 
     /// Move the live, non-terminator instruction `insn` immediately before the
@@ -1192,39 +1378,16 @@ impl<'str> FunctionBody<'str> {
             "moving a terminator requires updating its CFG edges"
         );
 
-        let source = self
-            .insn(insn)
-            .parent
-            .map(|local| BlockId::new(id, local))
-            .expect("moved instruction must belong to a block");
+        assert!(
+            self.insn(insn).parent.is_some(),
+            "moved instruction must belong to a block"
+        );
         let target = self
             .insn(before)
             .parent
-            .map(|local| BlockId::new(id, local))
             .expect("anchor instruction must belong to a block");
-        let source_index = self
-            .block(source)
-            .instructions
-            .iter()
-            .position(|&local| local == insn.local)
-            .expect("moved instruction missing from its parent block");
-        let before_index = self
-            .block(target)
-            .instructions
-            .iter()
-            .position(|&local| local == before.local)
-            .expect("anchor instruction missing from its parent block");
-        let insert_index = if source == target && source_index < before_index {
-            before_index - 1
-        } else {
-            before_index
-        };
-
-        self.block_mut(source).instructions.remove(source_index);
-        self.block_mut(target)
-            .instructions
-            .insert(insert_index, insn.local);
-        self.insn_mut(insn).parent = Some(target.local);
+        self.unlink(insn.local);
+        self.link_before(target, before.local, insn.local);
     }
 
     /// Add a directed CFG edge `from -> to`, stored in this body's edge arena and
@@ -1354,9 +1517,7 @@ impl<'str> FunctionBody<'str> {
         };
 
         if let Some(block_id) = parent {
-            self.block_mut(block_id)
-                .instructions
-                .retain(|&local| local != id.localize(block_id.func));
+            self.unlink(id.local);
             if is_terminator {
                 let mut succ: Vec<EdgeId> = {
                     let block = self.block(block_id);
@@ -1394,11 +1555,12 @@ impl<'str> FunctionBody<'str> {
 
     /// Removes several non-terminator instructions of one block at once.
     ///
-    /// [`remove_instruction`](Self::remove_instruction) walks the block's
-    /// instruction list to unlink each one, so removing *n* of them costs
-    /// `n × block`. Lifting an absorbed guest basic block deletes hundreds of
-    /// instructions from a block hundreds long, and that product was a real
-    /// share of translation time. Here the list is walked once however many go.
+    /// Each comes out of the block's list in constant time either way; what
+    /// this saves over [`remove_instruction`](Self::remove_instruction) is
+    /// the reverse-use map, where each operand's user list is pruned once
+    /// rather than once per dead user. Lifting an absorbed guest basic block
+    /// deletes hundreds of instructions sharing a few operands, and that
+    /// product was a real share of translation time.
     ///
     /// Terminators are rejected rather than handled: removing one has to tear
     /// down CFG edges too, and no caller of this deletes one — dead-code
@@ -1426,9 +1588,9 @@ impl<'str> FunctionBody<'str> {
             }
         }
 
-        self.block_mut(block_id)
-            .instructions
-            .retain(|local| !dead.contains(local));
+        for &id in dead {
+            self.unlink(id);
+        }
         self.purge_instructions(dead, names);
     }
 
@@ -1436,9 +1598,7 @@ impl<'str> FunctionBody<'str> {
     /// and drops their payloads.
     ///
     /// The shared tail of removing instructions in bulk. It does not touch any
-    /// block's instruction list — the caller has already dealt with that, which
-    /// is the whole point: doing it per instruction is what makes removal
-    /// quadratic in the size of the block.
+    /// block's instruction list — the caller has already unlinked them.
     fn purge_instructions(&mut self, dead: &FxHashSet<LocalInsnId>, names: Vec<Cow<'str, str>>) {
         for name in names {
             self.names.forget(name.as_ref());
@@ -1487,18 +1647,22 @@ impl<'str> FunctionBody<'str> {
             self.id(),
             "instruction belongs to another function"
         );
-        let index = self
-            .block(block)
-            .instructions
-            .iter()
-            .position(|&local| local == insn.local)
-            .expect("split point is not in the block");
+        assert_eq!(
+            self.insn(insn).parent,
+            Some(block.local),
+            "split point is not in the block"
+        );
         let tail = self.make_block();
-        let moved: Vec<LocalInsnId> = self.block_mut(block).instructions.split_off(index);
-        for &local in &moved {
-            self.insn_mut(InstructionId::new(self.id(), local)).parent = Some(tail.local);
+        let mut moved: Vec<LocalInsnId> = Vec::new();
+        let mut at = Some(insn.local);
+        while let Some(local) = at {
+            at = self.insns[local].next;
+            moved.push(local);
         }
-        self.block_mut(tail).instructions = moved;
+        for &local in &moved {
+            self.unlink(local);
+            self.link_last(tail.local, local);
+        }
         self.rehome_outgoing_edges(tail, block);
         tail
     }
@@ -1613,11 +1777,10 @@ impl<'str> FunctionBody<'str> {
             self.remove_cfg_edge(edge);
         }
         // The list is emptied in one move and the instructions purged as a
-        // set. Removing them one at a time means re-scanning the very list
-        // being emptied for each one, which is quadratic — and the blocks this
-        // clears are absorbed guest basic blocks, thousands of instructions
-        // long. Splitting one used to cost more than lifting it did.
-        let insns = std::mem::take(&mut self.block_mut(block).instructions);
+        // set, each operand's user list pruned once: the blocks this clears
+        // are absorbed guest basic blocks, thousands of instructions long,
+        // sharing a few operands.
+        let insns = self.take_insns(block.local);
         let dead: FxHashSet<LocalInsnId> = insns.iter().copied().collect();
         let names: Vec<Cow<'str, str>> = insns
             .iter()
@@ -1633,13 +1796,7 @@ impl<'str> FunctionBody<'str> {
         for edge in edges {
             self.remove_cfg_edge(edge);
         }
-        let insns: Vec<InstructionId> = self
-            .block(block)
-            .instructions
-            .iter()
-            .map(|&local| InstructionId::new(self.id(), local))
-            .collect();
-        for insn in insns {
+        for insn in self.block_insn_ids(block) {
             self.remove_instruction(insn);
         }
         let params: Vec<BlockParamId> = self
@@ -1672,10 +1829,9 @@ impl<'str> FunctionBody<'str> {
         );
         let (branch_id, branch_args) = self
             .block(keep)
-            .instructions
-            .last()
+            .last_insn()
             .and_then(
-                |&local| match self.insn(InstructionId::new(keep.func, local)).mnemonic() {
+                |local| match self.insn(InstructionId::new(keep.func, local)).mnemonic() {
                     Mnemonic::Branch(branch) if BlockId::new(keep.func, branch.target) == other => {
                         Some((InstructionId::new(keep.func, local), branch.args.clone()))
                     }
@@ -1703,11 +1859,9 @@ impl<'str> FunctionBody<'str> {
         }
         self.remove_cfg_edge(edge_ab);
         self.remove_instruction(branch_id);
-        let b_insns = std::mem::take(&mut self.block_mut(other).instructions);
-        for &local in &b_insns {
-            self.insn_mut(InstructionId::new(other.func, local)).parent = Some(keep.local);
+        for local in self.take_insns(other.local) {
+            self.link_last(keep.local, local);
         }
-        self.block_mut(keep).instructions.extend(b_insns);
         self.rehome_outgoing_edges(keep, other);
         let (b_addr, b_extra, b_name) = {
             let b = self.block(other);

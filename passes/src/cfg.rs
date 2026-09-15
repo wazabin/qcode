@@ -302,10 +302,10 @@ fn try_bypass_empty_block<'a, 'str>(
     // B must hold exactly one instruction, an unconditional branch.
     let (term_id, target, b_args) = {
         let b = cx.body_view(body).block(b_id);
-        if b.instruction_ids().len() != 1 {
+        if b.insn_count() != 1 {
             return false;
         }
-        let term_id = InstructionId::new(b_id.func, b.instruction_ids()[0]);
+        let term_id = InstructionId::new(b_id.func, b.first_insn().expect("one instruction"));
         match body.insn(term_id).mnemonic() {
             Mnemonic::Branch(br) => (term_id, br.target, br.args.clone()),
             _ => return false,
@@ -373,13 +373,7 @@ fn try_bypass_empty_block<'a, 'str>(
     // through a rewritable terminator that names B with a matching arg count on
     // each arm that targets B.
     for &p in &preds {
-        let Some(p_term) = cx
-            .body_view(body)
-            .block(p)
-            .instruction_ids()
-            .last()
-            .copied()
-        else {
+        let Some(p_term) = cx.body_view(body).block(p).last_insn() else {
             return false;
         };
         let p_term = InstructionId::new(p.func, p_term);
@@ -414,13 +408,7 @@ fn try_bypass_empty_block<'a, 'str>(
     // Rewrite each predecessor to branch straight to `target`, substituting B's
     // params with the arguments that predecessor supplied.
     for &p in &preds {
-        let p_term = cx
-            .body_view(body)
-            .block(p)
-            .instruction_ids()
-            .last()
-            .copied()
-            .unwrap();
+        let p_term = cx.body_view(body).block(p).last_insn().unwrap();
         let p_term = InstructionId::new(p.func, p_term);
         let new_mnemonic = match body.insn(p_term).mnemonic().clone() {
             Mnemonic::Branch(br) => Mnemonic::Branch(Branch {
@@ -921,7 +909,7 @@ mod tests {
 
         let mut seen = rustc_hash::FxHashSet::default();
         for block_id in ctx.block_ids() {
-            for &local in ctx.block(block_id).instruction_ids() {
+            for local in ctx.body(block_id.func).insn_ids(block_id.local) {
                 let insn = InstructionId::new(block_id.func, local);
                 assert!(
                     seen.insert(insn),
