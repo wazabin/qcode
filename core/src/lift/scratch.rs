@@ -131,7 +131,7 @@ mod tests {
     use super::*;
     use crate::{
         lift::{ExitArm, ExitKind, Recorder},
-        value::{QCodeView, ValueId},
+        value::ValueId,
     };
 
     /// Lifts one two-instruction "instruction" at `address` storing
