@@ -2267,6 +2267,12 @@ impl<'str, Id: Copy + Eq> NameTable<'str, Id> {
         self.map.contains_key(name)
     }
 
+    /// Forgets every name, keeping the table's capacity.
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+        self.suffix_hint.clear();
+    }
+
     /// Register `name` for `id`, forgetting `old_name` first. Errors if `name`
     /// is already taken (callers pre-check via [`get`](Self::get), so this only
     /// fires defensively).

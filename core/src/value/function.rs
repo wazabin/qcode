@@ -1021,6 +1021,25 @@ impl<'str> FunctionBody<'str> {
         TempId::new(self.id(), local)
     }
 
+    /// Empties the body and starts a new epoch of its arenas: every id is
+    /// invalid, and will be issued again, from zero.
+    ///
+    /// Only a [`ScratchStore`](crate::lift::ScratchStore) may call this — the
+    /// one owner that can vouch no id of the previous epoch survives.
+    pub(crate) fn start_epoch(&mut self) {
+        self.insns.clear();
+        self.blocks.clear();
+        self.params.clear();
+        self.edges.clear();
+        self.roster.clear();
+        self.root = None;
+        self.temps.truncate(0);
+        self.temp_spaces.truncate(0);
+        self.instruction_addrs.clear();
+        self.names.clear();
+        self.users.clear();
+    }
+
     /// Drops the temporaries and temporary spaces appended since the body had
     /// `temps` and `temp_spaces` of them, with their names.
     ///

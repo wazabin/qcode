@@ -67,6 +67,12 @@ impl AddressIndex {
         }
     }
 
+    /// Forgets every address and boundary, keeping the index's capacity.
+    pub fn clear(&mut self) {
+        self.targets.clear();
+        self.boundaries.clear();
+    }
+
     /// Recomputes this index after a structural mutation that changes several
     /// addresses at once (for example function splitting or block rehoming).
     pub fn refresh(&mut self, ctx: &Context<'_>) {

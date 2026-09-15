@@ -20,8 +20,10 @@
 //! A result is valid until the IR it describes is mutated. Consume it before
 //! running passes over the function.
 
+pub mod scratch;
 pub mod target;
 
+pub use scratch::ScratchStore;
 pub use target::{Construction, LiftTarget, TargetError};
 
 use crate::value::{BlockId, InstructionId};
