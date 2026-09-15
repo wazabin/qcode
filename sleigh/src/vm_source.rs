@@ -19,12 +19,13 @@
 use qcode::{
     address_index::AddressIndex,
     context::Context,
+    lift::LiftTarget,
     value::{FunctionBody, FunctionId},
 };
 use qcode_vm::{CodeError, CodeSource, Stats, VmMemory};
-use sleigh::{CompiledSpec, Decoder};
+use sleigh::CompiledSpec;
 
-use crate::SleighLifter;
+use crate::{SleighLifter, decode::FixedDecoder};
 
 /// The longest instruction any supported architecture encodes. x86-64's 15-byte
 /// limit is the largest; a shorter-instruction architecture simply never uses
@@ -34,6 +35,11 @@ pub const MAX_INSTRUCTION_LEN: usize = 16;
 /// Decodes and lifts guest memory on demand.
 pub struct SleighCodeSource<'spec> {
     lifter: SleighLifter<'spec>,
+    /// Every fetch decodes with the specification's default context. A
+    /// guest's mode changes are not address-keyed history, so nothing here
+    /// remembers one fetch's effects for the next; a machine that changes
+    /// mode keys its decoding explicitly.
+    decoder: FixedDecoder<'spec>,
     /// The function every lifted instruction is placed in.
     ///
     /// Guest code is flat: it has branch targets, not call graphs the lifter can
@@ -52,6 +58,7 @@ impl<'spec> SleighCodeSource<'spec> {
             // The VM runs code; it does not need a call graph. See
             // `SleighLifter::with_flat_control_flow`.
             lifter: SleighLifter::new(spec).with_flat_control_flow(),
+            decoder: FixedDecoder::new(spec),
             function: None,
         }
     }
@@ -103,9 +110,9 @@ impl CodeSource for SleighCodeSource<'_> {
         stats.fetch_bytes += bytes.len() as u64;
         let lift_started = std::time::Instant::now();
 
-        let decode_context = self.lifter.spec().new_context();
-        let instruction = Decoder::new(self.lifter.spec())
-            .decode_one(addr, &bytes, &decode_context)
+        let instruction = self
+            .decoder
+            .decode(addr, &bytes)
             .map_err(|error| CodeError::Decode(error.to_string().into()))?;
 
         let function = match self.function {
@@ -117,9 +124,12 @@ impl CodeSource for SleighCodeSource<'_> {
             }
         };
 
-        let result = self
-            .lifter
-            .lift_instruction_indexed(ctx, index, &instruction, Some(function))
+        // The VM owns its context and keeps its index current across the
+        // optimizations it runs between lifts, so it binds them for each
+        // instruction rather than handing them to a session.
+        let result = LiftTarget::bind_indexed(ctx, index, function)
+            .map_err(crate::LiftError::from)
+            .and_then(|mut target| self.lifter.lift_into(&mut target, &instruction))
             .map_err(|error| CodeError::Decode(format!("{error:?}").into()));
         stats.decode_lift += lift_started.elapsed();
         result?;
