@@ -235,8 +235,8 @@ pub enum Mnemonic {
     Unop(Unary),
     /// A binary integer, float, or boolean operation.
     ///
-    /// Both operands have the same type except for shifts, whose count may be
-    /// any integer width. Arithmetic results have the operands' type;
+    /// Both operands have the same width; a literal takes the width of the
+    /// other operand. Arithmetic results have the operands' type;
     /// comparisons produce `bool`. The operators are listed under *Integer
     /// operators* and *Float operators*.
     #[langref(

@@ -5,38 +5,12 @@
 //! exactly the form the reference shows.
 
 use qcode::{
-    context::Context,
-    langref::{InsnDoc, entries, example_program},
+    langref::{InsnDoc, entries, example_context, example_program},
     lower::lower_str,
-    types::{AggregateField, TypeRequest},
 };
 
-/// A context with the sequence types the intrinsic examples resolve to. An
-/// intrinsic's result type must exist before it is applied; a lift publishes
-/// these as it goes, the text lowerer does not.
-fn context() -> Context<'static> {
-    let mut ctx = Context::new();
-    let types = &mut ctx.shared.types;
-    for bytes in [1, 2, 4, 8, 16] {
-        types.get_or_make_int(bytes);
-    }
-    let i32_ty = types.get_or_make_int(4);
-    let i64_ty = types.get_or_make_int(8);
-    let index_elem = vec![
-        AggregateField::new("index", i64_ty),
-        AggregateField::new("elem", i64_ty),
-    ];
-    types.create_requested_types(&[
-        TypeRequest::list(i32_ty, None),
-        TypeRequest::list(i64_ty, None),
-        TypeRequest::array(i64_ty, 1),
-        TypeRequest::aggregate(index_elem),
-    ]);
-    ctx
-}
-
 fn lower(program: &str) -> Result<String, String> {
-    let mut ctx = context();
+    let mut ctx = example_context();
     lower_str(&mut ctx, program).map_err(|e| e.to_string())?;
     Ok(ctx.to_string())
 }

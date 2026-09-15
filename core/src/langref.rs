@@ -10,7 +10,11 @@
 //!
 //! [`Intrinsic::doc`]: crate::value::insn::Intrinsic::doc
 
-use crate::value::insn::{FloatBinop, IntBinop, IntrinsicId, Mnemonic, Unop};
+use crate::{
+    context::Context,
+    types::{AggregateField, TypeRequest},
+    value::insn::{FloatBinop, IntBinop, IntrinsicId, Mnemonic, Unop},
+};
 
 /// One reference entry: an instruction, an operator, or an intrinsic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +119,31 @@ fn ends_block(example: &str) -> bool {
     ]
     .iter()
     .any(|kw| last.starts_with(kw))
+}
+
+/// A context the examples lower in: one with the sequence types the
+/// intrinsic examples resolve to. An intrinsic's result type must exist
+/// before it is applied; a lift publishes these as it goes, the text lowerer
+/// does not.
+pub fn example_context() -> Context<'static> {
+    let mut ctx = Context::new();
+    let types = &mut ctx.shared.types;
+    for bytes in [1, 2, 4, 8, 16] {
+        types.get_or_make_int(bytes);
+    }
+    let i32_ty = types.get_or_make_int(4);
+    let i64_ty = types.get_or_make_int(8);
+    let index_elem = vec![
+        AggregateField::new("index", i64_ty),
+        AggregateField::new("elem", i64_ty),
+    ];
+    types.create_requested_types(&[
+        TypeRequest::list(i32_ty, None),
+        TypeRequest::list(i64_ty, None),
+        TypeRequest::array(i64_ty, 1),
+        TypeRequest::aggregate(index_elem),
+    ]);
+    ctx
 }
 
 /// The introduction of each section that is one enum: its category and

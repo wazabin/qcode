@@ -53,11 +53,22 @@ fn render(entries: &[&InsnDoc]) -> String {
         "```qcode\n{EXAMPLE_PRELUDE}fn example:\n{EXAMPLE_ENTRY}\n    # the example\n{EXAMPLE_TARGETS}```\n"
     );
 
+    // Heading anchors are assigned in page order, and a repeated heading
+    // (`Equal` as an integer and as a float operator) gets a `-N` suffix as
+    // mdBook gives it.
+    let mut anchors = std::collections::HashMap::new();
+    let mut anchor_of = |heading: &str| -> String {
+        let base = anchor(heading);
+        let n = anchors.entry(base.clone()).or_insert(0usize);
+        let anchor = if *n == 0 { base } else { format!("{base}-{n}") };
+        *n += 1;
+        anchor
+    };
     out.push_str("## Contents\n\n");
     for category in &categories {
-        let _ = writeln!(out, "- [{category}](#{})", anchor(category));
+        let _ = writeln!(out, "- [{category}](#{})", anchor_of(category));
         for entry in entries.iter().filter(|e| e.category == *category) {
-            let _ = writeln!(out, "  - [`{}`](#{})", entry.name, anchor(entry.name));
+            let _ = writeln!(out, "  - [`{}`](#{})", entry.name, anchor_of(entry.name));
         }
     }
     out.push('\n');

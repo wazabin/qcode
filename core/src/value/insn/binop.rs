@@ -60,8 +60,8 @@ impl Binop {
 /// Operands are bit patterns of one width; an operator's `s` prefix selects
 /// the two's-complement interpretation, the bare form the unsigned one.
 /// Arithmetic wraps modulo `2^bits` and the result has the operands' type;
-/// comparisons produce `bool`. Shifts take the count as an unsigned integer
-/// of any width.
+/// comparisons produce `bool`. A shift count is unsigned; at or past the
+/// width it shifts every bit out.
 #[non_exhaustive]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, LangRef,
