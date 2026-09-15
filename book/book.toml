@@ -1,0 +1,21 @@
+[book]
+title = "QCode"
+description = "A typed SSA-style p-code IR for binary analysis: language reference, concepts, and an x86-64 playground"
+authors = ["Thalium"]
+language = "en"
+src = "src"
+
+[build]
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/wazabin/qcode"
+edit-url-template = "https://github.com/wazabin/qcode/edit/main/book/{path}"
+additional-css = ["theme/qcode.css"]
+additional-js = ["theme/qcode.js"]
+default-theme = "light"
+preferred-dark-theme = "navy"
+
+[output.html.fold]
+enable = true
+level = 1
