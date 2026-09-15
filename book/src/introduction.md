@@ -22,6 +22,8 @@ This site is in three parts.
 
 The [API documentation](api.md) covers the Rust crates.
 
+{{#include langref.md:counts}}
+
 ## A first look
 
 ```qcode
