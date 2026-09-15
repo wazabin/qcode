@@ -191,7 +191,7 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
 /// # let lifter = SleighLifter::new(spec).with_flat_control_flow();
 /// let mut session = ScratchSession::new(&lifter).unwrap();
 /// let lifted = session.lift(0x1000, b"\x48\x89\xd8").unwrap();
-/// let epoch = session.store().epoch(); // `lifted` still borrows the session
+/// let epoch = session.epoch(); // `lifted` still borrows the session
 /// let _ = lifted.entry();
 /// ```
 pub struct ScratchSession<'l, 'spec> {
@@ -233,9 +233,26 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
         self
     }
 
-    /// The storage, for measuring what it retains.
-    pub fn store(&self) -> &ScratchStore {
-        &self.store
+    /// How many instructions have been lifted and discarded. Every handle
+    /// obtained before the latest lift belongs to an earlier epoch.
+    pub fn epoch(&self) -> u64 {
+        self.store.epoch()
+    }
+
+    /// How many times the backing context was rebuilt to bound its memory.
+    pub fn rebuilds(&self) -> u64 {
+        self.store.rebuilds()
+    }
+
+    /// Constants interned since the context was built or last rebuilt.
+    pub fn interned_literals(&self) -> usize {
+        self.store.interned_literals()
+    }
+
+    /// The host function's arena footprint, for measuring what one
+    /// instruction's worth of storage retains.
+    pub fn arena_stats(&self) -> qcode::value::BodyArenaStats {
+        self.store.arena_stats()
     }
 
     /// Discards the previous instruction, then decodes the one at `address`
@@ -601,7 +618,7 @@ mod tests {
         assert_eq!(taken.address(), Some(0x1008));
         assert_eq!(not_taken.address(), None);
         assert_eq!(lifted.blocks().nth(1), Some(not_taken));
-        assert_eq!(session.store().epoch(), 2);
+        assert_eq!(session.epoch(), 2);
     }
 
     #[test]
@@ -634,12 +651,12 @@ mod tests {
             };
             let lifted = session.lift(0x1000 + u64::from(i) * 7, &bytes).unwrap();
             assert!(lifted.falls_through());
-            let stats = session.store().arena_stats();
+            let stats = session.arena_stats();
             peak = peak.max(stats.instructions.issued);
             assert!(stats.blocks.issued <= 4, "{stats:?}");
-            assert!(session.store().interned_literals() <= 1001);
+            assert!(session.interned_literals() <= 1001);
         }
         assert!(peak < 32, "{peak} instructions for one guest instruction");
-        assert!(session.store().rebuilds() > 0);
+        assert!(session.rebuilds() > 0);
     }
 }

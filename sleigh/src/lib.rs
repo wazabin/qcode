@@ -101,6 +101,9 @@ pub enum LiftError {
     /// The context was not built by this lifter's specification, or not by
     /// one with the same spaces and registers.
     IncompatibleContext,
+    /// The decoded instruction was produced by a different specification than
+    /// this lifter's, so its varnodes name registers this lifter cannot map.
+    IncompatibleSpec,
     /// The bytes did not decode.
     Decode(sleigh::DecodeError),
     /// A scratch session needs a lifter that lowers calls as jumps; see
@@ -140,6 +143,9 @@ impl std::fmt::Display for LiftError {
             Self::Target(error) => error.fmt(f),
             Self::IncompatibleContext => {
                 f.write_str("the context was not built for this specification")
+            }
+            Self::IncompatibleSpec => {
+                f.write_str("the instruction was decoded by another specification")
             }
             Self::Decode(error) => error.fmt(f),
             Self::ScratchNeedsFlatControlFlow => {
@@ -332,6 +338,11 @@ impl<'spec> SleighLifter<'spec> {
         instruction: &Instruction<'_, '_>,
         function: Option<FunctionId>,
     ) -> Result<Lifted, LiftError> {
+        // Both checks precede `function_for`, so a refused instruction never
+        // leaves even a host function behind.
+        if !std::ptr::eq(instruction.spec(), self.spec) {
+            return Err(LiftError::IncompatibleSpec);
+        }
         self.check_compatible(ctx)?;
         let function = self.function_for(ctx, addresses, instruction.address(), function);
         let mut target = LiftTarget::bind_indexed(ctx, addresses, function)?;
@@ -349,6 +360,13 @@ impl<'spec> SleighLifter<'spec> {
         target: &mut LiftTarget<'_, 'static>,
         instruction: &Instruction<'_, '_>,
     ) -> Result<Lifted, LiftError> {
+        // The instruction's own varnodes only mean what this lifter's register
+        // and storage map says if it was decoded by this specification. A
+        // foreign-spec instruction would otherwise be lowered against the wrong
+        // registers, silently.
+        if !std::ptr::eq(instruction.spec(), self.spec) {
+            return Err(LiftError::IncompatibleSpec);
+        }
         self.check_compatible(target.context())?;
         let mut construction = target.begin(instruction.address(), instruction.len())?;
         // The plan carries every fact needed before the builder borrows the
@@ -1437,6 +1455,26 @@ mod tests {
                 .lift_instruction(&mut ctx, &instruction, None)
                 .unwrap_err(),
             super::LiftError::IncompatibleContext
+        );
+        assert_eq!(ctx.functions().count(), 0, "nothing was created first");
+    }
+
+    #[test]
+    fn an_instruction_of_another_specification_is_refused() {
+        // A compatible destination, but the instruction was decoded by x86, so
+        // its varnodes do not name this x64 lifter's registers.
+        let x64 = sleigh_precompile::x64::spec();
+        let x86 = sleigh_precompile::x86::spec();
+        let instruction = Decoder::new(x86)
+            .decode_one(0x1000, b"\x89\xd8", &x86.new_context())
+            .unwrap();
+        let lifter = SleighLifter::new(x64);
+        let mut ctx = lifter.new_context();
+        assert_eq!(
+            lifter
+                .lift_instruction(&mut ctx, &instruction, None)
+                .unwrap_err(),
+            super::LiftError::IncompatibleSpec
         );
         assert_eq!(ctx.functions().count(), 0, "nothing was created first");
     }

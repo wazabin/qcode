@@ -80,6 +80,13 @@ impl ScratchStore {
 
     /// The context, holding at most the instruction lifted since the last
     /// reset.
+    ///
+    /// This is a raw handle onto scratch storage: any `BlockId` or other id
+    /// read from it names storage that [`reset`](Self::reset) reissues, so
+    /// nothing read here may be used after the next reset. The safe boundary is
+    /// [`ScratchSession`](../../../wazabin_qcode_sleigh/session/struct.ScratchSession.html),
+    /// whose views carry a borrow that forbids exactly that; prefer it, and
+    /// treat this accessor as a building block for such a facade.
     pub fn context(&self) -> &Context<'static> {
         &self.ctx
     }

@@ -109,15 +109,41 @@ pub struct LiftTarget<'a, 'str> {
 }
 
 impl<'a, 'str> LiftTarget<'a, 'str> {
-    /// Binds `addresses`, which the caller built for `ctx` and has kept
+    /// Binds `addresses` after rebuilding it from `ctx`, so it is complete and
     /// current, and selects `function` as the host.
     ///
-    /// This is the binding for callers that own their index across mutations
-    /// the target does not see, such as an emulator that lifts on demand. The
-    /// index cannot be proven to match `ctx` here; what the target does is
-    /// check every entry it acts on against the context and refuse a stale
-    /// one, so a mismatch surfaces as a [`TargetError::StaleIndex`] at the
-    /// address it concerns rather than as a block in the wrong place.
+    /// This is the safe binding: because the index is rebuilt here, an address
+    /// the context already covers is always found, so no construction creates a
+    /// second block or function at an address that already has one. Use it
+    /// wherever the caller cannot cheaply prove its index is current — a fresh
+    /// analysis, a Python wrapper, a one-off lift.
+    ///
+    /// The rebuild is O(module). A caller that lifts in a hot loop and keeps
+    /// its index current itself uses [`bind_indexed`](Self::bind_indexed).
+    pub fn bind(
+        ctx: &'a mut Context<'str>,
+        addresses: &'a mut AddressIndex,
+        function: FunctionId,
+    ) -> Result<Self, TargetError> {
+        addresses.refresh(ctx);
+        Self::bind_indexed(ctx, addresses, function)
+    }
+
+    /// Binds a caller-maintained `addresses` without rebuilding it, and selects
+    /// `function` as the host.
+    ///
+    /// This is the advanced, hot-path binding for a caller that owns its index
+    /// across every mutation and keeps it current — an emulator that lifts on
+    /// demand, or a session that threads one index through a run. **The index
+    /// must reflect every address-bearing entity in `ctx`.** The target checks
+    /// each entry it acts on against the context and refuses a stale one
+    /// ([`TargetError::StaleIndex`]), but it cannot detect an entity the index
+    /// *omits*: an address the index does not list is taken to be free, and a
+    /// construction there would make a second block or function beside the one
+    /// already in the context. Where that guarantee is not cheap to uphold, use
+    /// [`bind`](Self::bind), which rebuilds the index first. Establishing
+    /// provenance without a rebuild needs context/index revision tracking,
+    /// which does not exist yet.
     pub fn bind_indexed(
         ctx: &'a mut Context<'str>,
         addresses: &'a mut AddressIndex,
@@ -175,6 +201,7 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
             entry: BlockId::new(self.function, LocalBlockId::default()),
             entry_created: false,
             placeholders: Vec::new(),
+            splits: Vec::new(),
             minted: Vec::new(),
             insns: body.insns.issued_len(),
             blocks: body.blocks.issued_len(),
@@ -183,17 +210,21 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
             temps: body.temps.len(),
             temp_spaces: body.temp_spaces.len(),
         };
-        let (entry, created) = self.resolve_block(address)?;
-        if !created && self.ctx.bodies[self.function].block(entry).has_insns() {
+        let (entry, resolved) = self.resolve_block(address)?;
+        if resolved == Resolved::Existing && self.ctx.bodies[self.function].block(entry).has_insns()
+        {
             return Err(TargetError::AlreadyLifted {
                 address,
                 block: entry,
             });
         }
         journal.entry = entry;
-        journal.entry_created = created;
-        if let Some(placeholder) = journal.placeholders.pop() {
-            debug_assert_eq!(placeholder.block, entry);
+        journal.entry_created = resolved == Resolved::Created;
+        // A split leaves the entry as a fresh empty tail whose original half was
+        // already emptied; the split is a committed, consistent change (see
+        // [`Resolved::Split`]) and is not rolled back.
+        if resolved == Resolved::Split {
+            journal.splits.push(entry);
         }
         FunctionBody::from_id_mut(self.ctx, self.function).add_block(entry);
         Ok(Construction {
@@ -203,9 +234,9 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
         })
     }
 
-    /// The block of the host at `address`, made if none is there. Returns
-    /// whether it was made.
-    fn resolve_block(&mut self, address: u64) -> Result<(BlockId, bool), TargetError> {
+    /// The block of the host at `address`, made if none is there. Reports how
+    /// it was resolved so the construction can journal it.
+    fn resolve_block(&mut self, address: u64) -> Result<(BlockId, Resolved), TargetError> {
         let function = self.function;
         match self.addresses.get(address) {
             Some(AddressTarget::Function(owner)) => {
@@ -218,8 +249,8 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
                     return Err(TargetError::OwnedByFunction { address, owner });
                 }
                 match self.ctx.bodies[function].root_id() {
-                    Some(root) => Ok((BlockId::new(function, root), false)),
-                    None => Ok((self.make_block(address), true)),
+                    Some(root) => Ok((BlockId::new(function, root), Resolved::Existing)),
+                    None => Ok((self.make_block(address), Resolved::Created)),
                 }
             }
             Some(AddressTarget::Block(block)) => {
@@ -244,11 +275,11 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
                     let tail = self
                         .ctx
                         .split_block_at_address(self.addresses, block, address);
-                    return Ok((tail, false));
+                    return Ok((tail, Resolved::Split));
                 }
-                Ok((block, false))
+                Ok((block, Resolved::Existing))
             }
-            None => Ok((self.make_block(address), true)),
+            None => Ok((self.make_block(address), Resolved::Created)),
         }
     }
 
@@ -258,6 +289,20 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
             .with_address_indexed(self.addresses, address)
             .id
     }
+}
+
+/// How [`resolve_block`](LiftTarget::resolve_block) satisfied an address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolved {
+    /// A block that was already there and covers the address exactly.
+    Existing,
+    /// A fresh block the construction made at a free address.
+    Created,
+    /// An existing block was split because the address was interior to it.
+    /// Both halves are now empty placeholders asking to be lifted again — a
+    /// consistent state whether or not this construction succeeds — so the
+    /// split is committed and survives a rollback.
+    Split,
 }
 
 /// A placeholder block the construction made for an address.
@@ -277,6 +322,10 @@ struct Journal {
     /// block that existed before, whose contents alone are the construction's.
     entry_created: bool,
     placeholders: Vec<Placeholder>,
+    /// Blocks born from splitting an existing block at an interior address.
+    /// Committed on sight (see [`Resolved::Split`]); a rollback keeps them and
+    /// their index entries rather than deleting them.
+    splits: Vec<BlockId>,
     /// Callees the construction promised, by minted slot, to create at commit.
     minted: Vec<u64>,
     // The body's issued lengths when the construction began.
@@ -326,11 +375,16 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
     /// The block of the host at `address`, for a branch target or the
     /// fall-through, made as a placeholder if none is there.
     pub fn block_at(&mut self, address: u64) -> Result<BlockId, TargetError> {
-        let (block, created) = self.target.resolve_block(address)?;
-        if created {
-            self.journal
+        let (block, resolved) = self.target.resolve_block(address)?;
+        match resolved {
+            Resolved::Created => self
+                .journal
                 .placeholders
-                .push(Placeholder { address, block });
+                .push(Placeholder { address, block }),
+            // A split is committed and kept on rollback; the emptied original
+            // and the new tail are both consistent placeholders already.
+            Resolved::Split => self.journal.splits.push(block),
+            Resolved::Existing => {}
         }
         Ok(block)
     }
@@ -455,18 +509,26 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
         let ctx = &mut *self.target.ctx;
         let addresses = &mut *self.target.addresses;
 
+        // Blocks born from a split are kept: the split already emptied their
+        // pre-existing half, so both are consistent placeholders whether or
+        // not this construction lands (see [`Resolved::Split`]).
+        let preserved: rustc_hash::FxHashSet<LocalBlockId> =
+            self.journal.splits.iter().map(|b| b.local).collect();
+
         // The entry keeps its identity when it existed before: branches from
-        // other instructions already name it.
+        // other instructions already name it. A split entry is preserved, so
+        // clearing it here empties this construction's emissions and leaves the
+        // consistent placeholder behind.
         if !self.journal.entry_created {
             ctx.bodies[function].clear_block_instructions(self.journal.entry);
         }
-        // Every block the construction made, its own and the placeholders,
-        // was issued after the mark. Deleting them drops their instructions,
-        // edges and names.
+        // Every other block the construction made — its own and the branch/
+        // fall-through placeholders — was issued after the mark. Deleting them
+        // drops their instructions, edges and names. Split blocks are skipped.
         let body = &mut ctx.bodies[function];
         for raw in (self.journal.blocks..body.blocks.issued_len()).rev() {
             let local: LocalBlockId = raw.into();
-            if body.blocks.contains(local) {
+            if body.blocks.contains(local) && !preserved.contains(&local) {
                 body.delete_block(BlockId::new(function, local));
             }
         }
@@ -492,9 +554,13 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
                 .all(|raw| !body.edges.contains(raw.into()));
         if intact {
             body.insns.truncate_issued(self.journal.insns);
-            body.blocks.truncate_issued(self.journal.blocks);
             body.params.truncate_issued(self.journal.params);
             body.edges.truncate_issued(self.journal.edges);
+            // Only reclaim block ids when none above the mark is preserved; a
+            // kept split tail lives above it and must keep its id.
+            if preserved.is_empty() {
+                body.blocks.truncate_issued(self.journal.blocks);
+            }
         } else {
             self.target.poisoned = true;
         }
@@ -684,6 +750,65 @@ mod tests {
         assert_eq!(addresses.function_at(0x2000), None);
         let root = ctx.function(function).root_id();
         assert!(root.is_none_or(|root| !ctx.block(BlockId::new(function, root)).has_insns()));
+    }
+
+    #[test]
+    fn a_rollback_keeps_a_split_but_undoes_the_instruction() {
+        let mut ctx = Context::new();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        // A function whose root block absorbed a straight-line run: it starts
+        // at 0x1000 and also covers the interior address 0x1004.
+        let function =
+            FunctionBody::make_at_addr_indexed(&mut ctx, &mut addresses, 0x1000, None).id;
+        let root = BasicBlock::make(&mut ctx, function)
+            .with_address_indexed(&mut addresses, 0x1000)
+            .id;
+        ctx.block_mut(root).extra_addresses.push(0x1004);
+        let zero = ctx.shared.get_const(0, 8);
+        ctx.builder(root).push_branchind(zero);
+        addresses.refresh(&ctx);
+        assert_eq!(addresses.block_at(0x1004), Some(root));
+
+        {
+            let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+            // A new instruction at 0x2000 whose branch lands interior to root,
+            // forcing a split; then the construction is abandoned.
+            let mut construction = target.begin(0x2000, 2).unwrap();
+            let entry = construction.entry();
+            let tail = construction.block_at(0x1004).unwrap();
+            assert_ne!(tail, root, "the split makes a new tail block");
+            construction.builder(entry).push_branch(tail);
+            construction.abort();
+            assert!(!target.is_poisoned());
+        }
+
+        // The split survives: the tail still exists and 0x1004 resolves to it,
+        // and the original block was not restored to its folded state — both
+        // are the empty, re-liftable placeholders the split established.
+        let tail = addresses
+            .block_at(0x1004)
+            .expect("split tail kept in the index");
+        assert_ne!(tail, root);
+        assert!(ctx.body(function).blocks.contains(tail.local));
+        assert!(!ctx.block(tail).has_insns());
+        assert!(
+            !ctx.block(root).has_insns(),
+            "the split emptied the original"
+        );
+        // The instruction's own work is gone: its entry block and address.
+        assert_eq!(addresses.block_at(0x2000), None);
+        assert_eq!(addresses.function_at(0x2000), None);
+        // The module is still walkable and a later lift at 0x1004 works.
+        let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+        let mut construction = target.begin(0x1004, 1).unwrap();
+        assert_eq!(construction.entry(), tail);
+        let entry = construction.entry();
+        let mut recorder = Recorder::new(0x1004, 1, entry);
+        let zero = construction.context().shared.get_const(0, 8);
+        let site = construction.builder(entry).push_branchind(zero).id;
+        recorder.exit(site, ExitArm::Unconditional, ExitKind::BranchInd);
+        construction.commit(recorder.finish()).unwrap();
+        assert!(ctx.block(tail).has_insns());
     }
 
     #[test]
