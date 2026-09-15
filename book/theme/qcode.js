@@ -15,7 +15,7 @@
       contains: [
         hljs.COMMENT("#", "$"),
         { className: "comment", begin: "// ->", end: "$" },
-        { className: "qcode-label", begin: "<", end: ">", contains: [
+        { className: "qcode-label", begin: "<(?=[A-Za-z0-9_])", end: ">", contains: [
           { className: "qcode-param", begin: "@[A-Za-z_][A-Za-z0-9_]*" },
           { className: "qcode-value", begin: "%[A-Za-z_][A-Za-z0-9_]*" },
           { className: "qcode-type", begin: "\\b(i|f)[0-9]+\\b|\\bbool\\b" },
@@ -24,10 +24,18 @@
         { className: "qcode-value", begin: "%[A-Za-z_][A-Za-z0-9_]*" },
         { className: "qcode-param", begin: "@[A-Za-z_][A-Za-z0-9_]*" },
         { className: "qcode-intrinsic", begin: "\\$[A-Za-z_][A-Za-z0-9_]*" },
+        { className: "qcode-op", begin: "(?<= )(?:s?(?:<<|>>|<=|==|!=|[<>+\\-^&|*\\/%])|f(?:==|!=|<=|<|\\+|-|\\*|\\/)|~|<\\$>)(?= )" },
         { className: "qcode-type", begin: "\\b(i|f)[0-9]+\\b|\\bbool\\b|\\b[A-Za-z_][A-Za-z0-9_]*\\*" },
         { className: "number", begin: "\\b0x[0-9a-fA-F]+\\b|\\b[0-9]+\\b" }
       ]
     };
+  }
+
+  // mdBook bundles highlight.js 10.1, which has `highlightBlock` (not the
+  // later `highlightElement`) and has already run over every block by the
+  // time this script loads; re-running it on the qcode blocks is harmless.
+  function highlightBlock(el) {
+    (hljs.highlightElement || hljs.highlightBlock).call(hljs, el);
   }
 
   function highlightQcode() {
@@ -36,10 +44,10 @@
     document.querySelectorAll("code.language-qcode").forEach(function (el) {
       if (el.textContent.trim() === "") return;
       el.removeAttribute("data-highlighted");
-      el.classList.remove("hljs");
-      hljs.highlightElement(el);
+      highlightBlock(el);
     });
   }
+  window.qcodeHighlight = highlightBlock;
 
   // Reference anchors: the langref headings are the Rust names, so the
   // textual keyword or operator has to be mapped onto them.
@@ -63,42 +71,30 @@
     "f-": "sub-1", "f*": "mul-1", "f/": "div-1", "<$>": "map"
   };
 
-  function escapeHtml(s) {
-    return s.replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; });
-  }
-
   var UNARY = { "-": "intnegate", "~": "intnot", "f-": "floatnegate" };
 
-  // Wraps each instruction keyword / operator of a printed qcode line in a
-  // link to the reference, leaving everything else as text. Names, labels
-  // and literals are skipped whole so their characters are never operators.
-  function linkLine(line, base) {
-    var out = "";
-    var re = /([%@][A-Za-z_][A-Za-z0-9_]*|<\$>|<-|<[A-Za-z0-9_][^>]*>|0x[0-9a-fA-F]+|(?<= )(?:s?(?:<<|>>|<=|==|!=|[<>+\-^&|*\/%])|f(?:==|!=|<=|<|\+|-|\*|\/)|~)(?= )|\$?[A-Za-z_][A-Za-z0-9_]*)/g;
-    var last = 0, m;
-    while ((m = re.exec(line)) !== null) {
-      var tok = m[0];
-      var before = line.slice(last, m.index);
-      out += escapeHtml(before);
+  // Wraps the highlighted keywords, intrinsics and operators of a code
+  // element in links to the reference.
+  function linkReference(code, base) {
+    var spans = code.querySelectorAll(".hljs-keyword, .hljs-qcode-intrinsic, .hljs-qcode-op");
+    spans.forEach(function (span) {
+      var tok = span.textContent;
+      var before = span.previousSibling && span.previousSibling.nodeType === 3 ? span.previousSibling.textContent : "";
       var anchor = null;
-      if (/^[%@<0]/.test(tok) && tok !== "<$>") {
-        anchor = null;
-      } else if (tok === "<$>") {
-        anchor = "map";
-      } else if (LANGREF[tok]) {
-        anchor = LANGREF[tok];
-      } else if (OPERATORS[tok] || UNARY[tok]) {
+      if (span.classList.contains("hljs-qcode-op")) {
         anchor = /= $/.test(before) ? UNARY[tok] : OPERATORS[tok];
+      } else {
+        anchor = LANGREF[tok];
+        // A keyword is only an instruction in statement position, not a
+        // space or register name inside parentheses (`load(register:8, …)`).
+        if (/[(,:]\s*$/.test(before)) anchor = null;
       }
-      // A keyword is only an instruction in statement position, not a
-      // space or register name inside parentheses (`load(register:8, …)`).
-      if (anchor && /^[A-Za-z$]/.test(tok) && /[(,:]\s*$/.test(before)) anchor = null;
-      out += anchor
-        ? '<a href="' + base + "#" + anchor + '">' + escapeHtml(tok) + "</a>"
-        : escapeHtml(tok);
-      last = m.index + tok.length;
-    }
-    return out + escapeHtml(line.slice(last));
+      if (!anchor) return;
+      var a = document.createElement("a");
+      a.href = base + "#" + anchor;
+      span.parentNode.insertBefore(a, span);
+      a.appendChild(span);
+    });
   }
 
   var PRESETS = [
@@ -164,7 +160,9 @@
       asm.textContent = result.instructions.map(function (i) {
         return i.address + "  " + i.bytes.padEnd(16) + " " + i.text;
       }).join("\n");
-      qcode.innerHTML = result.qcode.split("\n").map(function (l) { return linkLine(l, "langref.html"); }).join("\n");
+      qcode.textContent = result.qcode;
+      highlightBlock(qcode);
+      linkReference(qcode, "langref.html");
     }
 
     hex.addEventListener("input", function () { clearTimeout(timer); timer = setTimeout(run, 150); });

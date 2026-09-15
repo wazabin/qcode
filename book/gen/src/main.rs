@@ -8,8 +8,11 @@
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
-use qcode::langref::{
-    EXAMPLE_ENTRY, EXAMPLE_PRELUDE, EXAMPLE_TARGETS, InsnDoc, category_intros, entries,
+use qcode::{
+    langref::{
+        EXAMPLE_ENTRY, EXAMPLE_PRELUDE, EXAMPLE_TARGETS, InsnDoc, LangRef, category_intros, entries,
+    },
+    value::insn::{FloatBinop, IntBinop, IntrinsicId, Mnemonic, Unop},
 };
 
 fn main() {
@@ -48,6 +51,19 @@ fn render(entries: &[&InsnDoc]) -> String {
 
     let mut out = String::new();
     out.push_str(HEADER);
+    // The counts sit between anchors so the introduction can include them.
+    let _ = writeln!(
+        out,
+        "<!-- ANCHOR: counts -->\nQCode has **{} instructions**, {} unary and {} integer and {} float \
+         operators, and {} intrinsics: {} entries in all.\n<!-- ANCHOR_END: counts -->\n",
+        Mnemonic::ENTRIES.len(),
+        Unop::ENTRIES.len(),
+        IntBinop::ENTRIES.len(),
+        FloatBinop::ENTRIES.len(),
+        IntrinsicId::all().count(),
+        entries.len(),
+    );
+    out.push_str(CONVENTIONS);
     let _ = writeln!(
         out,
         "```qcode\n{EXAMPLE_PRELUDE}fn example:\n{EXAMPLE_ENTRY}\n    # the example\n{EXAMPLE_TARGETS}```\n"
@@ -183,6 +199,9 @@ definitions in the `qcode` crate: the prose is each item's documentation, the
 syntax and examples are declared next to it, and the examples are checked by
 the crate's tests.
 
+";
+
+const CONVENTIONS: &str = "\
 ## Conventions
 
 A statement binds a result with `T %name = …`, where `T` is the result type:

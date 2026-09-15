@@ -66,6 +66,17 @@ Every `load` after a `store` to the same location is redundant, and the
 first cleanup pass removes them; but the raw form is the faithful one, and it
 is what the emulator checks against hardware.
 
+## From memory to values
+
+Raw lifted code keeps every register in the `register` space, so a value
+that a program carries in `rax` across ten instructions is ten `load`/`store`
+pairs. The analysis toolchain has a *mem2reg* pass that promotes such
+locations to SSA values: a register (or a fixed stack slot) that is written
+and later read becomes a `%value`, and where control flow merges it becomes a
+[block parameter](block-arguments.md). Its result is the form the reference
+examples are written in. The pass lives in the analysis crate, which is not
+yet published; this site will document it when it is.
+
 ## Aliasing and order
 
 Loads and stores to the same space are ordered as written. Two spaces never
