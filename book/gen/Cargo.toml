@@ -1,0 +1,15 @@
+[package]
+name = "qcode-langref"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Renders the QCode language reference from the tables `qcode::langref` collects"
+
+[[bin]]
+name = "qcode-langref"
+path = "src/main.rs"
+
+[dependencies]
+qcode.workspace = true

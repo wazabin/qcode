@@ -11,6 +11,8 @@
 //! * `at(singleton(v), _) = v`   (a one-lane array has only lane 0),
 //! * `at(concat(a, b), const j) = at(a, j)` / `at(b, j - len a)`   (side pick).
 
+use crate::LangRef;
+use crate::langref::{InsnDoc, LangRefEntry};
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::ValueId;
@@ -18,6 +20,16 @@ use crate::value::insn::{Intrinsic, IntrinsicId, Mnemonic, Simplified};
 use crate::value::{BodyView, QCodeView};
 
 /// `at` — read a sequence lane at a dynamic index.
+///
+/// `$at(arr, i)` is element `i` of the sequence `arr`, of the element type.
+/// It is the value-level counterpart of a constant-index `extract`: the
+/// index may be computed. Reading past the sequence is unspecified.
+#[derive(LangRef)]
+#[langref(
+    category = "Intrinsics",
+    syntax = "T %r = $at(arr, i)",
+    example = "%arr = $iota(i64 0x8);\n%v = $at(%arr, i64 0x3);"
+)]
 struct At;
 
 /// Whether two index operands are provably equal, provably distinct, or unknown.
@@ -44,6 +56,9 @@ fn index_rel(view: BodyView<'_, '_>, a: ValueId, b: ValueId) -> IdxRel {
 impl Intrinsic for At {
     fn name(&self) -> &'static str {
         "at"
+    }
+    fn doc(&self) -> &'static InsnDoc {
+        &Self::ENTRY
     }
 
     fn arity(&self) -> usize {

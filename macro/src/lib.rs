@@ -1,4 +1,4 @@
-//! The `qcode!` macro.
+//! The `qcode!` macro and the `LangRef` derive.
 //!
 //! At compile time, this crate parses QCode source with
 //! [`wazabin_qcode_parser`] and validates its syntax. At run time, the emitted
@@ -41,6 +41,8 @@
 //!
 //! [`qcode`]: https://docs.rs/qcode
 
+mod langref;
+
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
 use quote::{format_ident, quote};
@@ -75,6 +77,17 @@ pub fn qcode(input: TokenStream) -> TokenStream {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
+}
+
+/// Derive language-reference tables from an item's rustdoc and
+/// `#[langref(category, syntax, example)]` attributes; see `qcode::langref`.
+#[proc_macro_derive(LangRef, attributes(langref))]
+pub fn derive_langref(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::DeriveInput);
+    resolve_crate("wazabin-qcode")
+        .and_then(|krate| langref::derive(input, krate))
+        .unwrap_or_else(|err| err.to_compile_error())
+        .into()
 }
 
 /// The set of names a program binds, partitioned by kind, in first-seen order.

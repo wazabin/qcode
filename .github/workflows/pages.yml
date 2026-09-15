@@ -1,0 +1,64 @@
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "book/**"
+      - "web/**"
+      - "core/**"
+      - "parser/**"
+      - "sleigh/**"
+      - "macro/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  JSTD_REPOSITORY: ${{ vars.JSTD_REPOSITORY || format('{0}/jstd', github.repository_owner) }}
+  PCODE_TYPES_REPOSITORY: ${{ vars.PCODE_TYPES_REPOSITORY || format('{0}/pcode', github.repository_owner) }}
+  BINARY_REPOSITORY: ${{ vars.BINARY_REPOSITORY || format('{0}/binary', github.repository_owner) }}
+  SLEIGH_REPOSITORY: ${{ vars.SLEIGH_REPOSITORY || format('{0}/sleigh', github.repository_owner) }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out path dependencies
+        run: |
+          git clone --depth=1 "https://github.com/${JSTD_REPOSITORY}.git" ../wazabin-jstd
+          git clone --depth=1 "https://github.com/${PCODE_TYPES_REPOSITORY}.git" ../wazabin-pcode
+          git clone --depth=1 "https://github.com/${BINARY_REPOSITORY}.git" ../wazabin-binary
+          git -c url.https://github.com/.insteadOf=git@github.com: clone --depth=1 --recurse-submodules --shallow-submodules "https://github.com/${SLEIGH_REPOSITORY}.git" ../wazabin-sleigh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack,mdbook
+      - name: Check the reference examples
+        run: cargo test -p wazabin-qcode --test langref && cargo test -p qcode-langref
+      - name: Build the site
+        run: book/build.sh
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: book/book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

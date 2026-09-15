@@ -1,5 +1,6 @@
 use std::fmt::{Display, Formatter};
 
+use crate::LangRef;
 use crate::value::LocalValueId;
 
 use super::mnemonic::{Args, MnemonicKind};
@@ -54,27 +55,82 @@ impl Binop {
     }
 }
 
+/// The integer operators of a [`Binary`] instruction.
+///
+/// Operands are bit patterns of one width; an operator's `s` prefix selects
+/// the two's-complement interpretation, the bare form the unsigned one.
+/// Arithmetic wraps modulo `2^bits` and the result has the operands' type;
+/// comparisons produce `bool`. A shift count is unsigned; at or past the
+/// width it shifts every bit out.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, LangRef,
+)]
+#[langref(category = "Integer operators")]
 pub enum IntBinop {
+    /// Bitwise equality.
+    #[langref(syntax = "bool %r = a == b", example = "bool %r = i32 @x == i32 @y;")]
     Equal,
+    /// Bitwise inequality.
+    #[langref(syntax = "bool %r = a != b", example = "bool %r = i32 @x != i32 @y;")]
     NotEqual,
+    /// Unsigned less-than.
+    #[langref(syntax = "bool %r = a < b", example = "bool %r = i32 @x < i32 @y;")]
     Less,
+    /// Signed less-than.
+    #[langref(syntax = "bool %r = a s< b", example = "bool %r = i32 @x s< i32 @y;")]
     SLess,
+    /// Unsigned less-than-or-equal.
+    #[langref(syntax = "bool %r = a <= b", example = "bool %r = i32 @x <= i32 @y;")]
     LessEqual,
+    /// Signed less-than-or-equal.
+    #[langref(syntax = "bool %r = a s<= b", example = "bool %r = i32 @x s<= i32 @y;")]
     SLessEqual,
+    /// Addition, wrapping. The carry out is available separately as
+    /// [`carry`](super::Carry) / [`scarry`](super::SCarry).
+    #[langref(syntax = "T %r = a + b", example = "i32 %r = i32 @x + i32 @y;")]
     Add,
+    /// Subtraction, wrapping. The signed overflow is available as
+    /// [`sborrow`](super::SBorrow).
+    #[langref(syntax = "T %r = a - b", example = "i32 %r = i32 @x - i32 @y;")]
     Sub,
+    /// Bitwise exclusive or.
+    #[langref(syntax = "T %r = a ^ b", example = "i32 %r = i32 @x ^ i32 @y;")]
     Xor,
+    /// Bitwise and.
+    #[langref(syntax = "T %r = a & b", example = "i32 %r = i32 @x & i32 @y;")]
     And,
+    /// Bitwise or.
+    #[langref(syntax = "T %r = a | b", example = "i32 %r = i32 @x | i32 @y;")]
     Or,
+    /// Shift left by `b` bits, filling with zeros. A count at or beyond the
+    /// operand's width yields `0`.
+    #[langref(syntax = "T %r = a << b", example = "i32 %r = i32 @x << i32 @y;")]
     ShiftLeft,
+    /// Logical shift right by `b` bits, filling with zeros. A count at or
+    /// beyond the operand's width yields `0`.
+    #[langref(syntax = "T %r = a >> b", example = "i32 %r = i32 @x >> i32 @y;")]
     ShiftRight,
+    /// Arithmetic shift right by `b` bits, filling with the sign bit. A count
+    /// at or beyond the operand's width yields `0` or all ones by sign.
+    #[langref(syntax = "T %r = a s>> b", example = "i32 %r = i32 @x s>> i32 @y;")]
     SShiftRight,
+    /// Multiplication, wrapping: the low `bits` of the product, which is the
+    /// same for signed and unsigned operands.
+    #[langref(syntax = "T %r = a * b", example = "i32 %r = i32 @x * i32 @y;")]
     Mul,
+    /// Unsigned division, truncating. Division by zero yields `0`.
+    #[langref(syntax = "T %r = a / b", example = "i32 %r = i32 @x / i32 @y;")]
     Div,
+    /// Unsigned remainder. A zero divisor yields `0`.
+    #[langref(syntax = "T %r = a % b", example = "i32 %r = i32 @x % i32 @y;")]
     Rem,
+    /// Signed division, truncating toward zero. Division by zero yields `0`;
+    /// `MIN s/ -1` wraps to `MIN`.
+    #[langref(syntax = "T %r = a s/ b", example = "i32 %r = i32 @x s/ i32 @y;")]
     Sdiv,
+    /// Signed remainder, with the dividend's sign. A zero divisor yields `0`.
+    #[langref(syntax = "T %r = a s% b", example = "i32 %r = i32 @x s% i32 @y;")]
     Srem,
 }
 
@@ -187,16 +243,41 @@ impl Display for IntBinop {
     }
 }
 
+/// The floating-point operators of a [`Binary`] instruction.
+///
+/// Operands are IEEE 754 values of one width (`f32`, `f64`, or the 80-bit
+/// `f80`). Arithmetic rounds to nearest even and has the operands' type;
+/// comparisons produce `bool` and are `false` whenever an operand is NaN,
+/// except `f!=`, which is then `true`.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, LangRef,
+)]
+#[langref(category = "Float operators")]
 pub enum FloatBinop {
+    /// Floating-point equality (`+0 == -0`; NaN equals nothing).
+    #[langref(syntax = "bool %r = a f== b", example = "bool %r = i64 %f f== i64 %g;")]
     Equal,
+    /// Floating-point inequality; `true` when either operand is NaN.
+    #[langref(syntax = "bool %r = a f!= b", example = "bool %r = i64 %f f!= i64 %g;")]
     NotEqual,
+    /// Floating-point less-than.
+    #[langref(syntax = "bool %r = a f< b", example = "bool %r = i64 %f f< i64 %g;")]
     Less,
+    /// Floating-point less-than-or-equal.
+    #[langref(syntax = "bool %r = a f<= b", example = "bool %r = i64 %f f<= i64 %g;")]
     LessEqual,
+    /// Floating-point addition.
+    #[langref(syntax = "T %r = a f+ b", example = "i64 %r = i64 %f f+ i64 %g;")]
     Add,
+    /// Floating-point subtraction.
+    #[langref(syntax = "T %r = a f- b", example = "i64 %r = i64 %f f- i64 %g;")]
     Sub,
+    /// Floating-point multiplication.
+    #[langref(syntax = "T %r = a f* b", example = "i64 %r = i64 %f f* i64 %g;")]
     Mul,
+    /// Floating-point division. `x f/ 0` is an infinity (or NaN for `0 f/ 0`).
+    #[langref(syntax = "T %r = a f/ b", example = "i64 %r = i64 %f f/ i64 %g;")]
     Div,
 }
 

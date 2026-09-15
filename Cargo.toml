@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "emulator", "jit", "macro", "parser", "passes", "sleigh", "vm"]
+members = ["book/gen", "core", "emulator", "jit", "macro", "parser", "passes", "sleigh", "vm"]
 exclude = ["analysis"]
 resolver = "2"
 

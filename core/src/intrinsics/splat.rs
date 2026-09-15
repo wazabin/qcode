@@ -11,6 +11,8 @@
 //! larger splats stay `$splat(x, n)`. `at(splat(x, _)) = x` (see `at.rs`) recovers
 //! any lane without ever expanding the array.
 
+use crate::LangRef;
+use crate::langref::{InsnDoc, LangRefEntry};
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::ValueId;
@@ -22,11 +24,23 @@ use crate::value::{BodyView, QCodeView};
 pub const SPLAT_LITERAL_MAX: usize = 100;
 
 /// `splat` — the constant array `[x; n]`.
+///
+/// `$splat(x, n)` is the array of `n` elements all equal to `x`. It stays
+/// symbolic for large `n`; `$at($splat(x, n), i)` is `x` for any `i`.
+#[derive(LangRef)]
+#[langref(
+    category = "Intrinsics",
+    syntax = "T %r = $splat(x, n)",
+    example = "%zs = $splat(i32 @x, i64 0x8);"
+)]
 struct Splat;
 
 impl Intrinsic for Splat {
     fn name(&self) -> &'static str {
         "splat"
+    }
+    fn doc(&self) -> &'static InsnDoc {
+        &Self::ENTRY
     }
 
     fn arity(&self) -> usize {

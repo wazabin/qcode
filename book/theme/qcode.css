@@ -1,0 +1,40 @@
+/* QCode book additions: the playground and the qcode highlighting. */
+
+.playground { margin: 1.5em 0; }
+.playground-input { display: flex; flex-wrap: wrap; gap: 1em; align-items: center; }
+.playground-input label { display: flex; gap: .5em; align-items: center; }
+.playground-input input {
+  font-family: var(--mono-font, monospace);
+  font-size: .95em;
+  padding: .3em .5em;
+  border: 1px solid var(--table-border-color, #ccc);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+}
+#pg-hex { flex: 1; min-width: 14em; }
+.playground-presets { display: flex; flex-wrap: wrap; gap: .4em; margin: .8em 0; }
+.playground-presets button {
+  font-family: var(--mono-font, monospace);
+  font-size: .85em;
+  padding: .2em .6em;
+  border: 1px solid var(--table-border-color, #ccc);
+  border-radius: 999px;
+  background: var(--sidebar-bg);
+  color: var(--fg);
+  cursor: pointer;
+}
+.playground-presets button:hover { border-color: var(--links); color: var(--links); }
+.playground-status { font-size: .9em; color: var(--icons); margin: .5em 0; }
+.playground-status.error { color: #c0392b; }
+.playground-asm { font-size: .9em; }
+.playground-asm:empty, .playground-qcode:empty { display: none; }
+.playground-qcode a { color: inherit; text-decoration: underline dotted; }
+.playground-qcode a:hover { color: var(--links); }
+
+/* qcode tokens (highlight.js classes) */
+.hljs-qcode-value { color: #2f7ac2; }
+.hljs-qcode-param { color: #b5650a; }
+.hljs-qcode-label { color: #8e44ad; }
+.hljs-qcode-type { color: #1c8a6e; }
+.hljs-qcode-intrinsic { color: #b5650a; font-weight: 600; }

@@ -6,16 +6,30 @@
 //! `[T; 1]` array has the same bit pattern as `x`, so a constant `x` folds
 //! straight through [`eval`](Intrinsic::eval).
 
+use crate::LangRef;
+use crate::langref::{InsnDoc, LangRefEntry};
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::insn::Intrinsic;
 
 /// `singleton` — wrap a scalar as a one-element array.
+///
+/// `$singleton(v)` is the array `[v]`, whose bit pattern is `v`'s own. It
+/// lifts a scalar so it can be `$concat`ed with a sequence.
+#[derive(LangRef)]
+#[langref(
+    category = "Intrinsics",
+    syntax = "T %r = $singleton(v)",
+    example = "%one = $singleton(i64 @n);"
+)]
 struct Singleton;
 
 impl Intrinsic for Singleton {
     fn name(&self) -> &'static str {
         "singleton"
+    }
+    fn doc(&self) -> &'static InsnDoc {
+        &Self::ENTRY
     }
 
     fn arity(&self) -> usize {

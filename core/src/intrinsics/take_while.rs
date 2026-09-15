@@ -34,16 +34,27 @@
 //!
 //! [`Builder::push_intrinsic`]: crate::builder::Builder::push_intrinsic
 
+use crate::LangRef;
+use crate::langref::{InsnDoc, LangRefEntry};
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::insn::Intrinsic;
 
 /// `take_while` — the nonzero (NUL-terminated) prefix of an array.
+///
+/// `$take_while(arr)` is the longest prefix of `arr` whose elements are all
+/// non-zero: `arr` truncated at its first zero element. The result is a list
+/// bounded by `arr`'s length; `$len` of it is the position of that zero.
+#[derive(LangRef)]
+#[langref(category = "Intrinsics", syntax = "T %r = $take_while(arr)")]
 struct TakeWhile;
 
 impl Intrinsic for TakeWhile {
     fn name(&self) -> &'static str {
         "take_while"
+    }
+    fn doc(&self) -> &'static InsnDoc {
+        &Self::ENTRY
     }
 
     fn arity(&self) -> usize {

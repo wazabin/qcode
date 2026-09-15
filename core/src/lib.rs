@@ -60,6 +60,7 @@ pub mod context;
 pub mod discovery;
 pub mod error;
 pub mod intrinsics;
+pub mod langref;
 pub mod lower;
 pub mod memory_image;
 pub mod obligation;
@@ -69,7 +70,7 @@ pub mod types;
 pub mod value;
 
 pub use arena_integrity::{verify_body_arena_integrity, verify_body_arena_integrity_scoped};
-pub use wazabin_qcode_macro::qcode;
+pub use wazabin_qcode_macro::{LangRef, qcode};
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

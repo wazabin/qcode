@@ -28,6 +28,7 @@ use std::sync::OnceLock;
 use super::binop::IntBinop;
 use super::mnemonic::{Args, MnemonicKind};
 use crate::{
+    langref::InsnDoc,
     types::{TypeId, TypeManager},
     value::{BodyView, InstructionId, LocalValueId, QCodeView, ValueId, ValueRef},
 };
@@ -55,6 +56,11 @@ impl IntrinsicId {
     /// The [`Intrinsic`] definition this id resolves to.
     pub fn desc(self) -> &'static dyn Intrinsic {
         registry().descs[self.0]
+    }
+
+    /// Every registered intrinsic, in id (name) order.
+    pub fn all() -> impl Iterator<Item = Self> {
+        (0..registry().descs.len()).map(Self)
     }
 }
 
@@ -90,6 +96,9 @@ pub enum RootOp {
 pub trait Intrinsic: Sync {
     /// Textual name, e.g. `"rol"`. Unique across the registry.
     fn name(&self) -> &'static str;
+
+    /// This intrinsic's language reference entry; see [`crate::langref`].
+    fn doc(&self) -> &'static InsnDoc;
 
     /// Number of operands the intrinsic takes.
     fn arity(&self) -> usize;

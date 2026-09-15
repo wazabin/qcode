@@ -11,6 +11,8 @@
 //! DCE/GVN/alias treat it correctly with no special classification. Its dual
 //! reader `at(arr, i)` forwards through it: `at(insert(a, i, v), i) = v`.
 
+use crate::LangRef;
+use crate::langref::{InsnDoc, LangRefEntry};
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::ValueId;
@@ -18,11 +20,24 @@ use crate::value::insn::{Intrinsic, IntrinsicId, Simplified};
 use crate::value::{BodyView, QCodeView};
 
 /// `insert` — functional single-lane array update.
+///
+/// `$insert(arr, i, v)` is a copy of `arr` with element `i` replaced by `v`.
+/// `arr` itself is unchanged; the result is a new array value of the same
+/// type. `$at($insert(arr, i, v), i)` is `v`.
+#[derive(LangRef)]
+#[langref(
+    category = "Intrinsics",
+    syntax = "T %r = $insert(arr, i, v)",
+    example = "%arr = $iota(i64 0x8);\n%upd = $insert(%arr, i64 0x3, i64 @n);"
+)]
 struct Insert;
 
 impl Intrinsic for Insert {
     fn name(&self) -> &'static str {
         "insert"
+    }
+    fn doc(&self) -> &'static InsnDoc {
+        &Self::ENTRY
     }
 
     fn arity(&self) -> usize {

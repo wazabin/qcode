@@ -5,10 +5,23 @@
 //! list with the summed bound when both bounds are known, or an unbounded list
 //! otherwise.
 
+use crate::LangRef;
+use crate::langref::{InsnDoc, LangRefEntry};
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::insn::Intrinsic;
 
+/// `concat` — append two sequences of one element type.
+///
+/// `$concat(a, b)` is the sequence holding `a`'s elements followed by
+/// `b`'s. Two fixed arrays give a fixed array of summed length; a list on
+/// either side gives a list.
+#[derive(LangRef)]
+#[langref(
+    category = "Intrinsics",
+    syntax = "T %r = $concat(a, b)",
+    example = "%a = $iota(i64 0x4);\n%b = $iota(i64 0x4);\n%ab = $concat(%a, %b);"
+)]
 struct Concat;
 
 fn seq_or_list(types: &TypeManager, id: TypeId) -> Option<(TypeId, Option<usize>, bool)> {
@@ -21,6 +34,9 @@ fn seq_or_list(types: &TypeManager, id: TypeId) -> Option<(TypeId, Option<usize>
 impl Intrinsic for Concat {
     fn name(&self) -> &'static str {
         "concat"
+    }
+    fn doc(&self) -> &'static InsnDoc {
+        &Self::ENTRY
     }
 
     fn arity(&self) -> usize {
