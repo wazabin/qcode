@@ -45,6 +45,8 @@
 //! cargo run --example qcode-dump -- 4889d8
 //! ```
 
+pub mod decode;
+pub mod session;
 pub mod vm_source;
 
 use std::borrow::Cow;
@@ -99,6 +101,11 @@ pub enum LiftError {
     /// The context was not built by this lifter's specification, or not by
     /// one with the same spaces and registers.
     IncompatibleContext,
+    /// The bytes did not decode.
+    Decode(sleigh::DecodeError),
+    /// A scratch session needs a lifter that lowers calls as jumps; see
+    /// [`session::ScratchSession::new`].
+    ScratchNeedsFlatControlFlow,
 }
 
 impl std::fmt::Display for LiftError {
@@ -134,7 +141,17 @@ impl std::fmt::Display for LiftError {
             Self::IncompatibleContext => {
                 f.write_str("the context was not built for this specification")
             }
+            Self::Decode(error) => error.fmt(f),
+            Self::ScratchNeedsFlatControlFlow => {
+                f.write_str("a scratch session needs flat control flow")
+            }
         }
+    }
+}
+
+impl From<sleigh::DecodeError> for LiftError {
+    fn from(error: sleigh::DecodeError) -> Self {
+        Self::Decode(error)
     }
 }
 
@@ -282,9 +299,7 @@ impl<'spec> SleighLifter<'spec> {
         function: Option<FunctionId>,
     ) -> Result<Lifted, LiftError> {
         let decode_context = self.spec.new_context();
-        let instruction = Decoder::new(self.spec)
-            .decode_one(address, bytes, &decode_context)
-            .map_err(|error| LiftError::Sleigh(error.to_string()))?;
+        let instruction = Decoder::new(self.spec).decode_one(address, bytes, &decode_context)?;
         self.lift_instruction_indexed(ctx, addresses, &instruction, function)
     }
 
