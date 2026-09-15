@@ -11,11 +11,13 @@
 //! ```
 
 use clap::Parser;
-use qcode::{address_index::AddressIndex, value::function::FunctionBody};
 use serde::{Deserialize, Serialize};
 use sleigh::{CompiledSpec, Decoder};
 use std::{fs, process};
-use wazabin_qcode_sleigh::SleighLifter;
+use wazabin_qcode_sleigh::{
+    SleighLifter,
+    session::{Host, LiftSession},
+};
 
 /// Decode bytes with an embedded SLEIGH specification and lift them to QCode.
 #[derive(Parser)]
@@ -149,12 +151,9 @@ fn run(opts: &Opts) -> Result<Output, String> {
 
     let decoder = Decoder::new(spec);
     let lifter = SleighLifter::new(spec);
-    let mut context = lifter.new_context();
-    let mut addresses = AddressIndex::analyze(&context);
     // One function gathers every instruction of the walk, as a caller lifting a
-    // known body would want; without it the lifter makes one per address.
-    let function =
-        FunctionBody::make_at_addr_indexed(&mut context, &mut addresses, address, None).id;
+    // known body would want.
+    let mut session = LiftSession::new(&lifter, Host::At(address));
 
     let limit = opts.count.unwrap_or(usize::MAX);
     let mut instructions = Vec::new();
@@ -175,8 +174,8 @@ fn run(opts: &Opts) -> Result<Output, String> {
         let flat = instruction
             .pcode_ops()
             .map_err(|e| format!("SLEIGH p-code emission failed at {at:#x}: {e}"))?;
-        lifter
-            .lift_pcode_indexed(&mut context, &mut addresses, at, len, &flat, Some(function))
+        session
+            .lift_pcode(at, len, &flat)
             .map_err(|e| format!("QCode lowering failed at {at:#x}: {e}"))?;
         instructions.push(Insn {
             address: format!("{at:#x}"),
@@ -189,6 +188,7 @@ fn run(opts: &Opts) -> Result<Output, String> {
         cursor += len;
     }
 
+    let mut context = session.into_context();
     if opts.passes {
         let block_ids: Vec<_> = context.blocks().map(|b| b.id).collect();
         for block_id in block_ids {

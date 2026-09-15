@@ -7,10 +7,12 @@
 
 use std::{env, process};
 
-use qcode::address_index::AddressIndex;
 use sleigh::Decoder;
 use sleigh_precompile::x64;
-use wazabin_qcode_sleigh::SleighLifter;
+use wazabin_qcode_sleigh::{
+    SleighLifter,
+    session::{Host, LiftSession},
+};
 
 const HELP: &str = "\
 qcode-dump — decode an x86-64 instruction and print its SLEIGH and QCode lowering
@@ -97,19 +99,11 @@ fn run() -> Result<(), String> {
     }
 
     let lifter = SleighLifter::new(spec);
-    let mut context = lifter.new_context();
-    let mut addresses = AddressIndex::analyze(&context);
-    lifter
-        .lift_pcode_indexed(
-            &mut context,
-            &mut addresses,
-            address,
-            instruction.len(),
-            &flat,
-            None,
-        )
+    let mut session = LiftSession::new(&lifter, Host::At(address));
+    session
+        .lift_pcode(address, instruction.len(), &flat)
         .map_err(|error| format!("QCode lowering failed: {error}"))?;
-    println!("\nQCODE:\n{context}");
+    println!("\nQCODE:\n{}", session.into_context());
     Ok(())
 }
 

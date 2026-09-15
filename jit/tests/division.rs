@@ -10,11 +10,14 @@
 //! also cover the width the host has no instruction for and the runtime
 //! performs.
 
-use qcode::{address_index::AddressIndex, context::Context, value::BlockId};
+use qcode::{context::Context, value::BlockId};
 use qcode_emulator::{EmulatorMemory, StandaloneEmulator};
 use qcode_jit::Jit;
 use qcode_vm::VmMemory;
-use wazabin_qcode_sleigh::SleighLifter;
+use wazabin_qcode_sleigh::{
+    SleighLifter,
+    session::{Host, LiftSession},
+};
 
 const WATCHED: &[&str] = &["RAX", "RDX", "RBX"];
 
@@ -24,13 +27,11 @@ fn lifter() -> &'static SleighLifter<'static> {
 }
 
 fn lift(code: &[u8]) -> (Context<'static>, BlockId) {
-    let lifter = lifter();
-    let mut ctx = lifter.new_context();
-    let mut index = AddressIndex::analyze(&ctx);
-    let block = lifter
-        .decode_and_lift_indexed(&mut ctx, &mut index, 0x1000, code, None)
+    let mut session = LiftSession::new(lifter(), Host::At(0x1000));
+    let lifted = session
+        .lift(0x1000, code)
         .expect("the instruction decodes and lifts");
-    (ctx, block.entry())
+    (session.into_context(), lifted.entry())
 }
 
 fn seed(

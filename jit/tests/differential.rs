@@ -5,11 +5,14 @@
 //! as long as every block the compiler *accepts* agrees with the interpreter,
 //! and every block it declines is run by the interpreter unchanged.
 
-use qcode::{address_index::AddressIndex, context::Context, value::BlockId};
+use qcode::{context::Context, value::BlockId};
 use qcode_emulator::{EmulatorMemory, StandaloneEmulator};
 use qcode_jit::Jit;
 use qcode_vm::VmMemory;
-use wazabin_qcode_sleigh::SleighLifter;
+use wazabin_qcode_sleigh::{
+    SleighLifter,
+    session::{Host, LiftSession},
+};
 
 /// Registers compared after each run: the architectural state an x86-64
 /// integer instruction can touch.
@@ -24,13 +27,11 @@ fn lifter() -> &'static SleighLifter<'static> {
 
 /// Lifts one instruction at 0x1000 and returns its block.
 fn lift(code: &[u8]) -> (Context<'static>, BlockId) {
-    let lifter = lifter();
-    let mut ctx = lifter.new_context();
-    let mut index = AddressIndex::analyze(&ctx);
-    let block = lifter
-        .decode_and_lift_indexed(&mut ctx, &mut index, 0x1000, code, None)
+    let mut session = LiftSession::new(lifter(), Host::At(0x1000));
+    let lifted = session
+        .lift(0x1000, code)
         .expect("the instruction decodes and lifts");
-    (ctx, block.entry())
+    (session.into_context(), lifted.entry())
 }
 
 /// Seeds the registers both runs start from.
