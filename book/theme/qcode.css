@@ -38,3 +38,5 @@
 .hljs-qcode-label { color: #8e44ad; }
 .hljs-qcode-type { color: #1c8a6e; }
 .hljs-qcode-intrinsic { color: #b5650a; font-weight: 600; }
+.hljs-qcode-op { font-weight: 600; }
+.playground-qcode a, .playground-qcode a:hover { text-decoration: underline dotted; }
