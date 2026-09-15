@@ -1083,7 +1083,12 @@ impl<'str> FunctionBody<'str> {
     /// Push a fresh instruction into this body's arena, recording each operand's
     /// use in the reverse-use map, and return its **body-local** id. The id-less
     /// twin of [`push_insn`](Self::push_insn), usable on a detached body.
-    pub fn push_insn_local(&mut self, insn: Instruction<'str>) -> LocalInsnId {
+    pub fn push_insn_local(&mut self, mut insn: Instruction<'str>) -> LocalInsnId {
+        // A caller may clone a linked instruction as its template; the copy is
+        // a new value in no block, whatever the original's links said.
+        insn.parent = None;
+        insn.prev = None;
+        insn.next = None;
         let args: Vec<LocalValueId> = insn.mnemonic().args().into_iter().collect();
         let local = self.insns.push(insn);
         for arg in args {
