@@ -54,9 +54,11 @@ use qcode::{
     address_index::AddressIndex,
     builder::Builder,
     context::Context,
+    lift::{CallTarget, Continuation, ExitArm, ExitKind, Lifted, Recorder},
     space::SpaceType,
     value::{
-        BasicBlock, BlockId, FunctionBody, FunctionId, QCodeView, Renameable, Value, ValueId,
+        BasicBlock, BlockId, FunctionBody, FunctionId, InstructionId, QCodeView, Renameable, Value,
+        ValueId,
         insn::PCodeOpId,
         varnode::{Varnode as QcodeVarnode, VarnodeId},
     },
@@ -240,7 +242,7 @@ impl<'spec> SleighLifter<'spec> {
         address: u64,
         bytes: &[u8],
         function: Option<FunctionId>,
-    ) -> Result<BlockId, LiftError> {
+    ) -> Result<Lifted, LiftError> {
         let mut addresses = AddressIndex::analyze(ctx);
         self.decode_and_lift_indexed(ctx, &mut addresses, address, bytes, function)
     }
@@ -254,7 +256,7 @@ impl<'spec> SleighLifter<'spec> {
         address: u64,
         bytes: &[u8],
         function: Option<FunctionId>,
-    ) -> Result<BlockId, LiftError> {
+    ) -> Result<Lifted, LiftError> {
         let decode_context = self.spec.new_context();
         let instruction = Decoder::new(self.spec)
             .decode_one(address, bytes, &decode_context)
@@ -271,7 +273,7 @@ impl<'spec> SleighLifter<'spec> {
         ctx: &mut Context<'static>,
         instruction: &Instruction<'_, '_>,
         function: Option<FunctionId>,
-    ) -> Result<BlockId, LiftError> {
+    ) -> Result<Lifted, LiftError> {
         let mut addresses = AddressIndex::analyze(ctx);
         self.lift_instruction_indexed(ctx, &mut addresses, instruction, function)
     }
@@ -284,7 +286,7 @@ impl<'spec> SleighLifter<'spec> {
         addresses: &mut AddressIndex,
         instruction: &Instruction<'_, '_>,
         function: Option<FunctionId>,
-    ) -> Result<BlockId, LiftError> {
+    ) -> Result<Lifted, LiftError> {
         let address = instruction.address();
         let length = instruction.len();
         let function = self.function_for(ctx, addresses, address, function);
@@ -353,6 +355,7 @@ impl<'spec> SleighLifter<'spec> {
             branches,
             calls,
             address,
+            length,
             plan,
             self.flat_control_flow,
         )
@@ -368,7 +371,7 @@ impl<'spec> SleighLifter<'spec> {
         length: usize,
         pcode: &InstructionPcode,
         function: Option<FunctionId>,
-    ) -> Result<BlockId, LiftError> {
+    ) -> Result<Lifted, LiftError> {
         self.lift_pcode_ops_indexed(ctx, addresses, address, length, &pcode.ops, function)
     }
 
@@ -387,7 +390,7 @@ impl<'spec> SleighLifter<'spec> {
         length: usize,
         pcode: &[PcodeOp],
         function: Option<FunctionId>,
-    ) -> Result<BlockId, LiftError> {
+    ) -> Result<Lifted, LiftError> {
         let function = self.function_for(ctx, addresses, address, function);
         let plan = Self::plan_from_ops(pcode, self.flat_control_flow)?;
         let mut emitter = self.emitter(ctx, addresses, address, length, function, &plan.plan);
@@ -486,13 +489,15 @@ struct FlatEmitter<'spec, 'str, 'ctx> {
     calls: HashMap<u64, FunctionId>,
     /// Blocks for the plan's instruction-local labels, made on first mention.
     labels: Vec<Option<BlockId>>,
-    entry: BlockId,
     next: BlockId,
     address: u64,
     fallthrough: usize,
     /// Lower the guest's calls and returns as jumps. See
     /// [`SleighLifter::with_flat_control_flow`].
     flat: bool,
+    /// The instruction's blocks and exits, recorded at the operations that
+    /// open and take them — before `flat` decides what they lower to.
+    record: Recorder,
     /// A sink cannot fail, so the first failure is latched and the rest of the
     /// instruction is ignored; its caller discards a partial instruction.
     error: Option<LiftError>,
@@ -509,6 +514,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         branches: HashMap<u64, BlockId>,
         calls: HashMap<u64, FunctionId>,
         address: u64,
+        length: usize,
         plan: &PcodePlan,
         flat: bool,
     ) -> Self {
@@ -523,31 +529,36 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             labels: (0..plan.labels().len())
                 .map(|index| plan.is_terminal(LabelId::from_index(index)).then_some(next))
                 .collect(),
-            entry,
             next,
             address,
             fallthrough: 0,
             flat,
+            record: Recorder::new(address, length, entry),
             error: None,
         }
     }
 
-    /// Closes the instruction and returns its entry block.
-    fn finish(mut self) -> Result<BlockId, LiftError> {
+    /// Closes the instruction. Running off the end of its p-code is a
+    /// fall-through.
+    fn finish(mut self) -> Result<Lifted, LiftError> {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
         if !self.builder.is_terminated() {
-            self.builder.push_branch(self.next);
+            let site = self.builder.push_branch(self.next).id;
+            self.record
+                .exit(site, ExitArm::Unconditional, ExitKind::Fallthrough);
         }
-        Ok(self.entry)
+        Ok(self.record.finish())
     }
 
     /// Branches to the instruction's fall-through, the target of a local
     /// branch past the last operation.
     fn branch_next(&mut self, opcode: Opcode, condition: Option<Varnode>) {
         let next = self.next;
-        self.branch_to(opcode, next, condition);
+        if let Some((site, arm)) = self.branch_to(opcode, next, condition) {
+            self.record.exit(site, arm, ExitKind::Fallthrough);
+        }
     }
 
     fn block_for(&mut self, label: LabelId) -> BlockId {
@@ -560,34 +571,47 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             label.index()
         )));
         self.labels[label.index()] = Some(block);
+        self.record.block(block);
         block
     }
 
-    fn branch_to(&mut self, opcode: Opcode, target: BlockId, condition: Option<Varnode>) {
+    /// Terminates the current block with a branch to `target`, conditionally
+    /// if `opcode` says so, and continues in the not-taken block. Returns the
+    /// branch and which of its arms reaches `target`, or nothing once the
+    /// instruction has failed.
+    fn branch_to(
+        &mut self,
+        opcode: Opcode,
+        target: BlockId,
+        condition: Option<Varnode>,
+    ) -> Option<(InstructionId, ExitArm)> {
         let condition = match (opcode, condition) {
             (Opcode::CBranch, Some(condition)) => match self.value(condition) {
                 Ok(condition) => Some(self.ensure_bool(condition)),
-                Err(error) => return self.fail(error),
+                Err(error) => {
+                    self.fail(error);
+                    return None;
+                }
             },
             (Opcode::CBranch, None) => {
-                return self.fail(LiftError::InvalidArity {
+                self.fail(LiftError::InvalidArity {
                     opcode,
                     expected: 2,
                     actual: 1,
                 });
+                return None;
             }
             _ => None,
         };
-        match condition {
+        Some(match condition {
             Some(condition) => {
                 let fallthrough = self.open_fallthrough();
-                self.builder.push_cbranch(condition, target, fallthrough);
+                let site = self.builder.push_cbranch(condition, target, fallthrough).id;
                 self.builder.switch_to_block(fallthrough);
+                (site, ExitArm::Taken)
             }
-            None => {
-                self.builder.push_branch(target);
-            }
-        }
+            None => (self.builder.push_branch(target).id, ExitArm::Unconditional),
+        })
     }
 
     fn fail(&mut self, error: LiftError) {
@@ -600,15 +624,19 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             self.address, self.fallthrough
         )));
         self.fallthrough += 1;
+        self.record.block(label);
         label
     }
 
+    /// Opens a block for p-code that follows a terminator: the continuation
+    /// of a call, or code only local branches reach.
     fn open_continuation(&mut self) {
         if !self.builder.is_terminated() {
             return;
         }
         let label = self.open_fallthrough();
         self.builder.switch_to_block(label);
+        self.record.continue_in(label);
     }
 
     fn input(&mut self, op: &OpRef<'_>, index: usize) -> Result<ValueId, LiftError> {
@@ -787,7 +815,9 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             Branch | CBranch => self.direct_branch(op),
             BranchInd => {
                 let target = self.input(op, 0)?;
-                self.builder.push_branchind(target);
+                let site = self.builder.push_branchind(target).id;
+                self.record
+                    .exit(site, ExitArm::Unconditional, ExitKind::BranchInd);
                 Ok(())
             }
             Call => {
@@ -799,41 +829,58 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
                 // The return address is already on the guest's stack by now —
                 // SLEIGH wrote it with ordinary p-code — so in flat mode all
                 // that is left of the call is the jump.
-                if self.flat {
+                let site = if self.flat {
                     let block = self
                         .branches
                         .get(&target.offset)
                         .copied()
                         .ok_or(LiftError::InvalidDirectTarget(op.opcode))?;
-                    self.builder.push_branch(block);
-                    return Ok(());
-                }
-                let callee = self
-                    .calls
-                    .get(&target.offset)
-                    .copied()
-                    .ok_or(LiftError::InvalidDirectTarget(op.opcode))?;
-                self.builder.push_call(callee);
+                    self.builder.push_branch(block).id
+                } else {
+                    let callee = self
+                        .calls
+                        .get(&target.offset)
+                        .copied()
+                        .ok_or(LiftError::InvalidDirectTarget(op.opcode))?;
+                    self.builder.push_call(callee).id
+                };
+                self.record.exit(
+                    site,
+                    ExitArm::Unconditional,
+                    ExitKind::Call {
+                        callee: CallTarget::Address(target.offset),
+                        continuation: Continuation::Next,
+                    },
+                );
                 Ok(())
             }
             CallInd => {
                 let target = self.input(op, 0)?;
-                if self.flat {
-                    self.builder.push_branchind(target);
-                    return Ok(());
-                }
-                self.builder.push_call_ind(target);
+                let site = if self.flat {
+                    self.builder.push_branchind(target).id
+                } else {
+                    self.builder.push_call_ind(target).id
+                };
+                self.record.exit(
+                    site,
+                    ExitArm::Unconditional,
+                    ExitKind::CallInd {
+                        continuation: Continuation::Next,
+                    },
+                );
                 Ok(())
             }
             Return => {
                 let target = self.input(op, 0)?;
                 // The stack has already been popped into this value; returning
                 // is a jump to it.
-                if self.flat {
-                    self.builder.push_branchind(target);
-                    return Ok(());
-                }
-                self.builder.push_return(target);
+                let site = if self.flat {
+                    self.builder.push_branchind(target).id
+                } else {
+                    self.builder.push_return(target).id
+                };
+                self.record
+                    .exit(site, ExitArm::Unconditional, ExitKind::Return);
                 Ok(())
             }
             _ => Err(LiftError::UnsupportedOpcode(op.opcode)),
@@ -914,7 +961,15 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             .get(&target.offset)
             .ok_or(LiftError::InvalidDirectTarget(op.opcode))?;
         let condition = op.inputs.get(1).copied();
-        self.branch_to(op.opcode, block, condition);
+        if let Some((site, arm)) = self.branch_to(op.opcode, block, condition) {
+            self.record.exit(
+                site,
+                arm,
+                ExitKind::Branch {
+                    target: target.offset,
+                },
+            );
+        }
         Ok(())
     }
 }
@@ -951,6 +1006,7 @@ impl PcodeSink for FlatEmitter<'_, '_, '_> {
             self.builder.push_branch(block);
         }
         self.builder.switch_to_block(block);
+        self.record.continue_in(block);
     }
 
     fn branch_label(&mut self, opcode: Opcode, label: LabelId, condition: Option<Varnode>) {
@@ -960,7 +1016,12 @@ impl PcodeSink for FlatEmitter<'_, '_, '_> {
         self.open_continuation();
         self.builder.set_address(self.address);
         let target = self.block_for(label);
-        self.branch_to(opcode, target, condition);
+        if target == self.next {
+            // A branch to the terminal label leaves the instruction.
+            self.branch_next(opcode, condition);
+        } else {
+            self.branch_to(opcode, target, condition);
+        }
         self.builder.clear_address();
     }
 }
@@ -969,8 +1030,223 @@ impl PcodeSink for FlatEmitter<'_, '_, '_> {
 mod tests {
     use super::SleighLifter;
     use qcode::address_index::AddressIndex;
+    use qcode::lift::{CallTarget, Continuation, Exit, ExitArm, ExitKind, Lifted};
+    use qcode::value::{BasicBlock, Instruction};
     use qcode_emulator::Emulator;
-    use sleigh::{Compiler, Decoder, SourceDb};
+    use sleigh::{CompiledSpec, Compiler, Decoder, SourceDb};
+
+    /// Lifts one x86-64 instruction at 0x1000 in both lowering modes.
+    fn lift_x64_both_modes(bytes: &[u8]) -> [(qcode::context::Context<'static>, Lifted); 2] {
+        let spec = sleigh_precompile::x64::spec();
+        [
+            SleighLifter::new(spec),
+            SleighLifter::new(spec).with_flat_control_flow(),
+        ]
+        .map(|lifter| {
+            let instruction = Decoder::new(spec)
+                .decode_one(0x1000, bytes, &spec.new_context())
+                .unwrap();
+            let mut ctx = lifter.new_context();
+            let lifted = lifter
+                .lift_instruction(&mut ctx, &instruction, None)
+                .unwrap();
+            (ctx, lifted)
+        })
+    }
+
+    fn kinds(lifted: &Lifted) -> Vec<(ExitArm, ExitKind)> {
+        lifted
+            .exits()
+            .iter()
+            .map(|exit| (exit.arm(), exit.kind().clone()))
+            .collect()
+    }
+
+    /// The opcode of the instruction an exit is recorded at.
+    fn site_opcode(ctx: &qcode::context::Context<'static>, exit: &Exit) -> &'static str {
+        Instruction::from_id(ctx, exit.site()).mnemonic().opcode()
+    }
+
+    fn tiny_spec(constructors: &str) -> CompiledSpec {
+        let mut sources = SourceDb::new();
+        let root = sources.add_file(
+            "tiny.slaspec",
+            &format!(
+                "define endian=little;
+                 define space ram type=ram_space size=4 default;
+                 define space register type=register_space size=4;
+                 define register offset=0 size=4 [ r0 ];
+                 define token instr(8) op=(0,7);
+                 {constructors}"
+            ),
+        );
+        Compiler::new(&mut sources).compile(root).unwrap()
+    }
+
+    fn lift_tiny(
+        spec: &CompiledSpec,
+        byte: u8,
+        flat: bool,
+    ) -> (qcode::context::Context<'static>, Lifted) {
+        let bytes = [byte];
+        let instruction = Decoder::new(spec)
+            .decode_one(0x1000, &bytes, &spec.new_context())
+            .unwrap();
+        let mut lifter = SleighLifter::new(spec);
+        if flat {
+            lifter = lifter.with_flat_control_flow();
+        }
+        let mut ctx = lifter.new_context();
+        let lifted = lifter
+            .lift_instruction(&mut ctx, &instruction, None)
+            .unwrap();
+        (ctx, lifted)
+    }
+
+    #[test]
+    fn a_jump_to_its_own_address_is_a_machine_transfer() {
+        for (bytes, name) in [(b"\xeb\xfe".as_slice(), "jmp $"), (b"\xf4", "hlt")] {
+            for (_, lifted) in lift_x64_both_modes(bytes) {
+                assert_eq!(
+                    kinds(&lifted),
+                    [(ExitArm::Unconditional, ExitKind::Branch { target: 0x1000 })],
+                    "{name}"
+                );
+                assert_eq!(lifted.blocks(), &[lifted.entry()], "{name}");
+                assert!(!lifted.falls_through(), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_conditional_jump_reports_its_taken_arm_and_the_fallthrough() {
+        // `jz +5`, then the same with a branch-hint prefix, one byte longer.
+        for (bytes, target, next) in [
+            (b"\x74\x05".as_slice(), 0x1007, 0x1002),
+            (b"\x2e\x74\x05", 0x1008, 0x1003),
+        ] {
+            for (ctx, lifted) in lift_x64_both_modes(bytes) {
+                assert_eq!(lifted.next_address(), next);
+                assert_eq!(
+                    kinds(&lifted),
+                    [
+                        (ExitArm::Taken, ExitKind::Branch { target }),
+                        (ExitArm::Unconditional, ExitKind::Fallthrough),
+                    ],
+                    "{bytes:02x?}"
+                );
+                assert_eq!(site_opcode(&ctx, &lifted.exits()[0]), "cbranch");
+                assert_eq!(site_opcode(&ctx, &lifted.exits()[1]), "branch");
+                // The entry and the not-taken block; the target and the next
+                // instruction's placeholders are not the instruction's.
+                assert_eq!(lifted.blocks().len(), 2, "{bytes:02x?}");
+                assert!(lifted.falls_through());
+            }
+        }
+    }
+
+    #[test]
+    fn calls_and_returns_keep_their_kind_under_flat_control_flow() {
+        let cases: [(&[u8], ExitKind); 4] = [
+            (
+                b"\xe8\x10\x00\x00\x00",
+                ExitKind::Call {
+                    callee: CallTarget::Address(0x1015),
+                    continuation: Continuation::Next,
+                },
+            ),
+            (
+                b"\xff\xd0",
+                ExitKind::CallInd {
+                    continuation: Continuation::Next,
+                },
+            ),
+            (b"\xc3", ExitKind::Return),
+            (b"\xff\xe0", ExitKind::BranchInd),
+        ];
+        for (bytes, kind) in cases {
+            let [(structured, lifted), (flat, flat_lifted)] = lift_x64_both_modes(bytes);
+            assert_eq!(kinds(&lifted), [(ExitArm::Unconditional, kind.clone())]);
+            assert_eq!(kinds(&flat_lifted), kinds(&lifted), "{bytes:02x?}");
+            assert!(!lifted.falls_through());
+
+            let expected = match kind {
+                ExitKind::Call { .. } => ("call", "branch"),
+                ExitKind::CallInd { .. } => ("callind", "branchind"),
+                ExitKind::Return => ("return", "branchind"),
+                _ => ("branchind", "branchind"),
+            };
+            assert_eq!(site_opcode(&structured, &lifted.exits()[0]), expected.0);
+            assert_eq!(site_opcode(&flat, &flat_lifted.exits()[0]), expected.1);
+        }
+    }
+
+    #[test]
+    fn rep_movsb_leaves_by_its_count_check_and_returns_to_itself() {
+        for (_, lifted) in lift_x64_both_modes(b"\xf3\xa4") {
+            assert_eq!(
+                kinds(&lifted),
+                [
+                    (ExitArm::Taken, ExitKind::Branch { target: 0x1002 }),
+                    (ExitArm::Unconditional, ExitKind::Branch { target: 0x1000 }),
+                ]
+            );
+            assert!(lifted.falls_through(), "an exhausted count continues");
+        }
+    }
+
+    #[test]
+    fn a_call_followed_by_pcode_continues_in_the_instruction() {
+        let spec = tiny_spec(":callx is op=3 { call 0x2000; r0 = 1:4; }");
+        for flat in [false, true] {
+            let (ctx, lifted) = lift_tiny(&spec, 3, flat);
+            let [call, fallthrough] = lifted.exits() else {
+                panic!("{:?}", lifted.exits());
+            };
+            let ExitKind::Call {
+                callee: CallTarget::Address(0x2000),
+                continuation: Continuation::Block(block),
+            } = call.kind().clone()
+            else {
+                panic!("{call:?}");
+            };
+            assert_eq!(fallthrough.kind(), &ExitKind::Fallthrough);
+            assert_eq!(lifted.blocks(), &[lifted.entry(), block]);
+            // The continuation holds the rest of the p-code and leaves by the
+            // fall-through.
+            let continuation = BasicBlock::from_id(&ctx, block);
+            assert_eq!(
+                Instruction::from_id(&ctx, fallthrough.site())
+                    .block()
+                    .map(|b| b.id),
+                Some(continuation.id)
+            );
+        }
+    }
+
+    #[test]
+    fn a_conditional_branch_to_the_terminal_label_is_a_taken_fallthrough() {
+        let spec = tiny_spec(":cset is op=4 { if (r0 == 0:4) goto <skip>; r0 = 1:4; <skip> }");
+        let (ctx, lifted) = lift_tiny(&spec, 4, false);
+        assert_eq!(
+            kinds(&lifted),
+            [
+                (ExitArm::Taken, ExitKind::Fallthrough),
+                (ExitArm::Unconditional, ExitKind::Fallthrough),
+            ]
+        );
+        assert_eq!(site_opcode(&ctx, &lifted.exits()[0]), "cbranch");
+        assert_eq!(lifted.blocks().len(), 2);
+    }
+
+    #[test]
+    fn an_internal_loop_has_no_exits() {
+        let spec = tiny_spec(":spin is op=5 { <again> r0 = r0 + 1:4; goto <again>; }");
+        let (_, lifted) = lift_tiny(&spec, 5, false);
+        assert!(lifted.exits().is_empty(), "{:?}", lifted.exits());
+        assert!(!lifted.falls_through());
+        assert_eq!(lifted.blocks().len(), 2, "the entry and the loop block");
+    }
 
     /// The streamed path and the already-flattened path must lower the same
     /// instruction to the same QCode.
@@ -994,14 +1270,14 @@ mod tests {
                 .unwrap();
 
             let mut streamed = lifter.new_context();
-            lifter
+            let streamed_lifted = lifter
                 .lift_instruction(&mut streamed, &instruction, None)
                 .unwrap();
 
             let pcode = instruction.pcode_ops().unwrap();
             let mut flat = lifter.new_context();
             let mut addresses = AddressIndex::analyze(&flat);
-            lifter
+            let flat_lifted = lifter
                 .lift_pcode_indexed(
                     &mut flat,
                     &mut addresses,
@@ -1016,6 +1292,10 @@ mod tests {
                 streamed.to_string(),
                 flat.to_string(),
                 "{bytes:02x?} lifts differently"
+            );
+            assert_eq!(
+                streamed_lifted, flat_lifted,
+                "{bytes:02x?} reports different results"
             );
         }
     }

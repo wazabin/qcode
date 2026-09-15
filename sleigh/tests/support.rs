@@ -28,7 +28,9 @@ pub mod x64 {
         instruction: &Instruction<'_, '_>,
         function: Option<FunctionId>,
     ) -> Result<BlockId, LiftError> {
-        lifter().lift_instruction(ctx, instruction, function)
+        lifter()
+            .lift_instruction(ctx, instruction, function)
+            .map(|lifted| lifted.entry())
     }
 
     pub struct Disassembler {
@@ -82,7 +84,9 @@ pub mod x86 {
         instruction: &Instruction<'_, '_>,
         function: Option<FunctionId>,
     ) -> Result<BlockId, LiftError> {
-        lifter().lift_instruction(ctx, instruction, function)
+        lifter()
+            .lift_instruction(ctx, instruction, function)
+            .map(|lifted| lifted.entry())
     }
 
     pub struct Disassembler {

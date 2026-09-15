@@ -33,7 +33,7 @@ fn lift(code: &[u8]) -> (Context<'static>, BlockId) {
     let block = lifter
         .decode_and_lift_indexed(&mut ctx, &mut index, CODE, code, None)
         .expect("the instruction decodes and lifts");
-    (ctx, block)
+    (ctx, block.entry())
 }
 
 /// Puts the machine back to its starting state: a known data page, `RBX`

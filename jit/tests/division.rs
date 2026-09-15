@@ -30,7 +30,7 @@ fn lift(code: &[u8]) -> (Context<'static>, BlockId) {
     let block = lifter
         .decode_and_lift_indexed(&mut ctx, &mut index, 0x1000, code, None)
         .expect("the instruction decodes and lifts");
-    (ctx, block)
+    (ctx, block.entry())
 }
 
 fn seed(
