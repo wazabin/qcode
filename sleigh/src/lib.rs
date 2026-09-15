@@ -394,10 +394,18 @@ impl<'spec> SleighLifter<'spec> {
     /// Refuses a context whose architecture is not this lifter's.
     ///
     /// A context is compatible when it was cloned from this lifter's base, or
-    /// from the base of a lifter for the same specification. The check is
-    /// the cheap shape of that: the same default space, the same spaces by
-    /// id and name, and as many registers, a couple of the lifter's stored
-    /// where it expects them.
+    /// from the base of a lifter for the same specification. This verifies the
+    /// full architectural shape: the same default space, the same spaces by id
+    /// and name, the same register count, and **every** register the lifter
+    /// knows mapped to the same location in the destination — not a sample. A
+    /// context of another specification is therefore rejected unless it happens
+    /// to match this one register-for-register, which for two distinct real
+    /// specifications does not occur.
+    ///
+    /// This is a structural identity check, not a provenance token. A cheaper,
+    /// exact identity — stamping each context with the spec that built it — is
+    /// the same deferred work as context/index revision tracking; until then
+    /// this full comparison is what stands in for it.
     fn check_compatible(&self, ctx: &Context<'static>) -> Result<(), LiftError> {
         let base = &self.base.shared;
         let shared = &ctx.shared;
@@ -419,9 +427,9 @@ impl<'spec> SleighLifter<'spec> {
                 && stored.address() == varnode.offset as i64
                 && stored.size() == varnode.size
         };
-        // Two registers are enough to tell a context of another architecture
-        // from one of this; a hash map's first entries are as good as any.
-        if self.storage.iter().take(2).any(|r| !same_register(r)) {
+        // Every register the lifter maps must land where it expects in the
+        // destination — a full comparison, not a sample.
+        if self.storage.iter().any(|r| !same_register(r)) {
             return Err(LiftError::IncompatibleContext);
         }
         Ok(())

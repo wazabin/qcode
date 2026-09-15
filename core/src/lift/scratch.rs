@@ -19,10 +19,15 @@
 //!
 //! The host function is emptied whole, but the module's shared arenas are
 //! not: every distinct immediate an instruction mentions is interned as a
-//! literal, and the interner only grows. The store watches that growth and,
-//! past a [budget](ScratchStore::with_literal_budget), rebuilds its context
-//! from the architecture base it was made from. Memory is bounded by the
-//! budget, not by the corpus.
+//! literal. The interner is **never rebuilt or reset** — it is append-only and
+//! deduped — so a [`LiteralId`](crate::value::LiteralId) means the same value
+//! for the whole life of the store, and resolving one obtained from an earlier
+//! instruction is always sound, never an alias for a different value. The cost
+//! is that the interner grows with the number of *distinct* constants seen
+//! (see [`interned_literals`](ScratchStore::interned_literals)); the recycled
+//! per-instruction IR is what keeps total memory flat regardless. A stable
+//! interner is chosen over a budget-triggered rebuild precisely because a
+//! rebuild would reissue literal ids and make a retained id alias.
 
 use crate::{
     address_index::AddressIndex,
@@ -31,46 +36,29 @@ use crate::{
     value::{BodyArenaStats, FunctionId},
 };
 
-/// The default number of literals interned past the base before the context
-/// is rebuilt.
-pub const DEFAULT_LITERAL_BUDGET: usize = 1 << 16;
-
 /// See the [module documentation](self).
 pub struct ScratchStore {
     ctx: Context<'static>,
-    /// The context as it was before any instruction: what a rebuild restores.
-    base: Context<'static>,
     base_literals: usize,
-    literal_budget: usize,
     addresses: AddressIndex,
     function: FunctionId,
     epoch: u64,
-    rebuilds: u64,
 }
 
 impl ScratchStore {
     /// Makes a store over `base`, which carries the architecture (spaces,
     /// registers, user operations) and nothing an instruction depends on.
     pub fn new(base: Context<'static>) -> Self {
-        let mut ctx = base.clone();
+        let base_literals = base.shared.values.literals.len();
+        let mut ctx = base;
         let function = ctx.anon_function();
         Self {
-            base_literals: base.shared.values.literals.len(),
-            base,
-            literal_budget: DEFAULT_LITERAL_BUDGET,
+            base_literals,
             addresses: AddressIndex::analyze(&ctx),
             ctx,
             function,
             epoch: 0,
-            rebuilds: 0,
         }
-    }
-
-    /// Rebuilds the context once instructions have interned `budget` more
-    /// literals than the base holds.
-    pub fn with_literal_budget(mut self, budget: usize) -> Self {
-        self.literal_budget = budget;
-        self
     }
 
     /// The host every instruction is lifted into.
@@ -91,15 +79,11 @@ impl ScratchStore {
         &self.ctx
     }
 
-    /// How many resets have happened. Every handle obtained before a reset
-    /// belongs to an earlier epoch.
+    /// How many resets have happened. Every block/instruction/temp handle
+    /// obtained before a reset belongs to an earlier epoch and must not be
+    /// used after it. (Literal ids are exempt: the interner is stable.)
     pub fn epoch(&self) -> u64 {
         self.epoch
-    }
-
-    /// How many times the context was rebuilt from its base.
-    pub fn rebuilds(&self) -> u64 {
-        self.rebuilds
     }
 
     /// The host's arena footprint.
@@ -107,23 +91,18 @@ impl ScratchStore {
         self.ctx.bodies[self.function].arena_stats()
     }
 
-    /// Literals interned since the context was built or last rebuilt.
+    /// Distinct constants interned since the store was made. This is the only
+    /// per-corpus growth; it rises with the number of distinct immediates and
+    /// never shrinks, because the interner is stable (see the module docs).
     pub fn interned_literals(&self) -> usize {
         self.ctx.shared.values.literals.len() - self.base_literals
     }
 
-    /// Empties the host and starts a new epoch.
+    /// Empties the host function and starts a new epoch, reusing its arena
+    /// capacity. The shared literal interner is deliberately left intact.
     pub fn reset(&mut self) {
         self.epoch += 1;
-        if self.interned_literals() > self.literal_budget {
-            self.ctx = self.base.clone();
-            let function = self.ctx.anon_function();
-            debug_assert_eq!(function, self.function, "the host keeps its id");
-            self.function = function;
-            self.rebuilds += 1;
-        } else {
-            self.ctx.bodies[self.function].start_epoch();
-        }
+        self.ctx.bodies[self.function].start_epoch();
         self.addresses.clear();
     }
 
@@ -191,16 +170,17 @@ mod tests {
     }
 
     #[test]
-    fn varying_immediates_are_bounded_by_the_literal_budget() {
-        let mut store = ScratchStore::new(Context::new()).with_literal_budget(100);
+    fn varying_immediates_keep_the_ir_flat_and_grow_only_the_interner() {
+        let mut store = ScratchStore::new(Context::new());
         for i in 0..10_000u64 {
             store.reset();
             lift_one(&mut store, 0x1000, 0x1_0000 + i);
-            assert!(store.interned_literals() <= 101, "epoch {i}");
         }
-        assert!(store.rebuilds() >= 90, "{}", store.rebuilds());
-        assert_eq!(store.context().functions().count(), 1);
+        // The per-instruction IR never grows; only the deduped constant
+        // interner does, by one per distinct immediate.
+        assert_eq!(store.arena_stats().blocks.issued, 3);
         assert_eq!(store.context().block_ids().len(), 3);
+        assert_eq!(store.interned_literals(), 10_000);
     }
 
     #[test]
@@ -210,7 +190,34 @@ mod tests {
             store.reset();
             lift_one(&mut store, 0x1000, 42);
         }
-        assert_eq!(store.rebuilds(), 0);
         assert_eq!(store.interned_literals(), 1);
+    }
+
+    #[test]
+    fn a_literal_id_stays_valid_across_later_lifts() {
+        let mut store = ScratchStore::new(Context::new());
+        lift_one(&mut store, 0x1000, 0xdead_beef);
+        // The literal id of the first instruction's immediate.
+        let id = store
+            .context()
+            .shared
+            .values
+            .literals
+            .iter()
+            .find(|l| l.inner.value == 0xdead_beef)
+            .expect("the immediate was interned")
+            .id;
+
+        // Many more instructions with distinct immediates — no rebuild, so the
+        // interner never reissues that id.
+        for i in 0..5_000u64 {
+            store.reset();
+            lift_one(&mut store, 0x2000, 0x10_0000 + i);
+        }
+        assert_eq!(
+            store.context().get_literal_value(id),
+            0xdead_beef,
+            "a retained literal id still resolves to its original value"
+        );
     }
 }

@@ -222,29 +222,15 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
         Ok(self)
     }
 
-    /// Rebuilds the context once instructions have interned this many
-    /// literals; see [`ScratchStore::with_literal_budget`].
-    pub fn with_literal_budget(mut self, budget: usize) -> Self {
-        self.store = std::mem::replace(
-            &mut self.store,
-            ScratchStore::new(self.lifter.new_context()),
-        )
-        .with_literal_budget(budget);
-        self
-    }
-
-    /// How many instructions have been lifted and discarded. Every handle
-    /// obtained before the latest lift belongs to an earlier epoch.
+    /// How many instructions have been lifted and discarded. Every block or
+    /// instruction handle obtained before the latest lift belongs to an
+    /// earlier epoch.
     pub fn epoch(&self) -> u64 {
         self.store.epoch()
     }
 
-    /// How many times the backing context was rebuilt to bound its memory.
-    pub fn rebuilds(&self) -> u64 {
-        self.store.rebuilds()
-    }
-
-    /// Constants interned since the context was built or last rebuilt.
+    /// Distinct constants interned over the session's life; see
+    /// [`ScratchStore::interned_literals`].
     pub fn interned_literals(&self) -> usize {
         self.store.interned_literals()
     }
@@ -636,9 +622,7 @@ mod tests {
     #[test]
     fn ten_thousand_scratch_lifts_retain_one_instruction() {
         let lifter = lifter().with_flat_control_flow();
-        let mut session = ScratchSession::new(&lifter)
-            .unwrap()
-            .with_literal_budget(1000);
+        let mut session = ScratchSession::new(&lifter).unwrap();
         // `mov rax, imm32` with a different immediate, address and, every
         // other time, a different instruction and size.
         let mut peak = 0;
@@ -654,9 +638,10 @@ mod tests {
             let stats = session.arena_stats();
             peak = peak.max(stats.instructions.issued);
             assert!(stats.blocks.issued <= 4, "{stats:?}");
-            assert!(session.interned_literals() <= 1001);
         }
+        // The per-instruction IR stays flat; the stable interner grew only with
+        // the distinct immediates, and never reissued an id.
         assert!(peak < 32, "{peak} instructions for one guest instruction");
-        assert!(session.rebuilds() > 0);
+        assert!(session.interned_literals() >= 5_000);
     }
 }

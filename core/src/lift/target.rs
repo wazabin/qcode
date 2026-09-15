@@ -16,17 +16,26 @@
 //! instruction added to the function, every placeholder block it registered
 //! for a branch target or fall-through, and the entry block's contents if the
 //! entry existed before. Callees are only created at commit, so a failed
-//! instruction never leaves a function behind either. Two things stay:
+//! instruction never leaves a function behind either. One thing stays:
+//! constants interned in the module's shared arenas, which are immutable and
+//! unowned, so a spare one is invisible.
 //!
-//! - Constants interned in the module's shared arenas. They are immutable
-//!   and unowned, so a spare one is invisible.
-//! - A block that was split because a branch target fell inside it. Both
-//!   halves are already empty placeholders asking to be lifted again, which
-//!   is a consistent module whether or not this instruction succeeds.
+//! # Splitting is not rolled back — it poisons
 //!
-//! If a rollback finds state it cannot account for, the target is poisoned:
-//! every further construction is refused until the target is discarded, so
-//! the inconsistency is reported rather than built on.
+//! Resolving a branch target that falls *interior* to an already-lifted block
+//! splits that block, and the split discards its optimized instructions
+//! (`split_block_at_address` cannot recover a faithful per-address boundary).
+//! That mutates state older than this construction, and no rollback can put it
+//! back. So a construction that split and then fails does not silently pretend
+//! to have rolled back: it **poisons** the target. The module is left
+//! structurally walkable — both halves are empty, re-liftable placeholders —
+//! but every further construction is refused until the target is discarded.
+//! On the success path the split simply stands as part of the committed lift.
+//! Consumers bind a fresh target per instruction, so a poison is contained to
+//! the failing lift.
+//!
+//! If a rollback otherwise finds state it cannot account for, the target is
+//! likewise poisoned, so the inconsistency is reported rather than built on.
 
 use std::fmt;
 
@@ -564,6 +573,19 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
         } else {
             self.target.poisoned = true;
         }
+
+        // A split discarded a pre-existing block's optimized instructions
+        // (`split_block_at_address` cannot recover them — see its docs), which
+        // no rollback can restore. That is a mutation of state older than this
+        // construction, so the transaction did not truly roll back: poison the
+        // target. The module is left structurally walkable (both halves are
+        // empty, re-liftable placeholders), but the target refuses further
+        // constructions until it is discarded, per the failure-atomicity
+        // contract. Consumers bind a fresh target per instruction, so this is
+        // contained to the failing lift.
+        if !self.journal.splits.is_empty() {
+            self.target.poisoned = true;
+        }
     }
 }
 
@@ -753,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rollback_keeps_a_split_but_undoes_the_instruction() {
+    fn a_failed_split_poisons_the_target_but_leaves_it_walkable() {
         let mut ctx = Context::new();
         let mut addresses = AddressIndex::analyze(&ctx);
         // A function whose root block absorbed a straight-line run: it starts
@@ -779,12 +801,18 @@ mod tests {
             assert_ne!(tail, root, "the split makes a new tail block");
             construction.builder(entry).push_branch(tail);
             construction.abort();
-            assert!(!target.is_poisoned());
+            // The split mutated pre-existing IR that the rollback cannot
+            // restore, so the target is poisoned and refuses further work.
+            assert!(target.is_poisoned());
+            assert_eq!(target.begin(0x3000, 1).err(), Some(TargetError::Poisoned));
         }
 
-        // The split survives: the tail still exists and 0x1004 resolves to it,
-        // and the original block was not restored to its folded state — both
-        // are the empty, re-liftable placeholders the split established.
+        // The instruction's own work is gone: its entry block and address.
+        assert_eq!(addresses.block_at(0x2000), None);
+        assert_eq!(addresses.function_at(0x2000), None);
+        // The module is left structurally walkable: the split tail exists and
+        // 0x1004 resolves to it, and both halves are empty re-liftable
+        // placeholders.
         let tail = addresses
             .block_at(0x1004)
             .expect("split tail kept in the index");
@@ -795,10 +823,8 @@ mod tests {
             !ctx.block(root).has_insns(),
             "the split emptied the original"
         );
-        // The instruction's own work is gone: its entry block and address.
-        assert_eq!(addresses.block_at(0x2000), None);
-        assert_eq!(addresses.function_at(0x2000), None);
-        // The module is still walkable and a later lift at 0x1004 works.
+
+        // A fresh target lifts 0x1004 into the surviving tail.
         let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
         let mut construction = target.begin(0x1004, 1).unwrap();
         assert_eq!(construction.entry(), tail);
