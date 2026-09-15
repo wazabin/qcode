@@ -54,12 +54,14 @@ use qcode::{
     address_index::AddressIndex,
     builder::Builder,
     context::Context,
-    lift::{CallTarget, Continuation, ExitArm, ExitKind, Lifted, Recorder},
+    lift::{
+        CallTarget, Construction, Continuation, ExitArm, ExitKind, LiftTarget, Lifted, Recorder,
+        TargetError,
+    },
     space::SpaceType,
     value::{
-        BasicBlock, BlockId, FunctionBody, FunctionId, InstructionId, QCodeView, Renameable, Value,
-        ValueId,
-        insn::PCodeOpId,
+        BlockId, FunctionBody, FunctionId, InstructionId, QCodeView, Renameable, Value, ValueId,
+        insn::{Callee, PCodeOpId},
         varnode::{Varnode as QcodeVarnode, VarnodeId},
     },
 };
@@ -91,6 +93,12 @@ pub enum LiftError {
     InvalidSubPiece { offset: usize, size: usize },
     /// SLEIGH could not expand or flatten an instruction's semantics.
     Sleigh(String),
+    /// The destination refused the instruction: its address is taken, a
+    /// target belongs to another function, or the index is stale.
+    Target(TargetError),
+    /// The context was not built by this lifter's specification, or not by
+    /// one with the same spaces and registers.
+    IncompatibleContext,
 }
 
 impl std::fmt::Display for LiftError {
@@ -122,11 +130,27 @@ impl std::fmt::Display for LiftError {
                 )
             }
             Self::Sleigh(error) => f.write_str(error),
+            Self::Target(error) => error.fmt(f),
+            Self::IncompatibleContext => {
+                f.write_str("the context was not built for this specification")
+            }
         }
     }
 }
 
 impl std::error::Error for LiftError {}
+
+impl From<TargetError> for LiftError {
+    fn from(error: TargetError) -> Self {
+        Self::Target(error)
+    }
+}
+
+impl From<sleigh::EmitError> for LiftError {
+    fn from(error: sleigh::EmitError) -> Self {
+        Self::Sleigh(error.to_string())
+    }
+}
 
 /// Specification-specific state reused across all lifting sessions.
 ///
@@ -280,6 +304,12 @@ impl<'spec> SleighLifter<'spec> {
 
     /// Lowers a decoded instruction while reusing `addresses` across a lifting
     /// session.
+    ///
+    /// This is the indexed entry point: `addresses` must be current for `ctx`,
+    /// which is the caller's to keep. Without `function`, the instruction is
+    /// lowered into the function at its address, made if there is none — a
+    /// function per isolated instruction, which bulk lifters avoid by naming
+    /// their host. See [`lift_into`](Self::lift_into) for the checked form.
     pub fn lift_instruction_indexed(
         &self,
         ctx: &mut Context<'static>,
@@ -287,17 +317,31 @@ impl<'spec> SleighLifter<'spec> {
         instruction: &Instruction<'_, '_>,
         function: Option<FunctionId>,
     ) -> Result<Lifted, LiftError> {
-        let address = instruction.address();
-        let length = instruction.len();
-        let function = self.function_for(ctx, addresses, address, function);
+        self.check_compatible(ctx)?;
+        let function = self.function_for(ctx, addresses, instruction.address(), function);
+        let mut target = LiftTarget::bind_indexed(ctx, addresses, function)?;
+        self.lift_into(&mut target, instruction)
+    }
+
+    /// Lowers a decoded instruction into a bound target.
+    ///
+    /// This is the one lowering of decoded input: every byte-oriented and
+    /// indexed entry point decodes or binds and then comes here. The
+    /// instruction is constructed transactionally — see
+    /// [`qcode::lift::target`] — so an error leaves the target as it was.
+    pub fn lift_into(
+        &self,
+        target: &mut LiftTarget<'_, 'static>,
+        instruction: &Instruction<'_, '_>,
+    ) -> Result<Lifted, LiftError> {
+        self.check_compatible(target.context())?;
+        let mut construction = target.begin(instruction.address(), instruction.len())?;
         // The plan carries every fact needed before the builder borrows the
         // function body, so no flat p-code vector is built or re-scanned.
-        instruction
-            .pcode_ops_streamed(|plan| {
-                self.emitter(ctx, addresses, address, length, function, plan)
-            })
-            .map_err(|error| LiftError::Sleigh(error.to_string()))?
-            .finish()
+        let lifted = instruction
+            .try_pcode_ops_streamed(|plan| self.emitter(&mut construction, plan))?
+            .finish()?;
+        Ok(construction.commit(lifted)?)
     }
 
     /// Resolves the function an instruction at `address` belongs to.
@@ -314,42 +358,72 @@ impl<'spec> SleighLifter<'spec> {
         }
     }
 
+    /// Refuses a context whose architecture is not this lifter's.
+    ///
+    /// A context is compatible when it was cloned from this lifter's base, or
+    /// from the base of a lifter for the same specification. The check is
+    /// the cheap shape of that: the same default space, the same spaces by
+    /// id and name, and as many registers, a couple of the lifter's stored
+    /// where it expects them.
+    fn check_compatible(&self, ctx: &Context<'static>) -> Result<(), LiftError> {
+        let base = &self.base.shared;
+        let shared = &ctx.shared;
+        let same_spaces = shared.default_space == base.default_space
+            && shared.spaces().count() == base.spaces().count()
+            && shared
+                .spaces()
+                .zip(base.spaces())
+                .all(|(a, b)| a.id == b.id && a.name == b.name);
+        if !same_spaces
+            || shared.registers.len() != base.registers.len()
+            || shared.values.varnodes.len() < base.values.varnodes.len()
+        {
+            return Err(LiftError::IncompatibleContext);
+        }
+        let same_register = |(varnode, id): (&Varnode, &VarnodeId)| {
+            let stored = QcodeVarnode::from_id(ctx, *id);
+            stored.space().id == varnode.space
+                && stored.address() == varnode.offset as i64
+                && stored.size() == varnode.size
+        };
+        // Two registers are enough to tell a context of another architecture
+        // from one of this; a hash map's first entries are as good as any.
+        if self.storage.iter().take(2).any(|r| !same_register(r)) {
+            return Err(LiftError::IncompatibleContext);
+        }
+        Ok(())
+    }
+
     /// Creates the emitter for one instruction, resolving all module-owned
     /// blocks and callees from `plan` before borrowing the function body.
-    fn emitter<'ctx>(
+    fn emitter<'c, 'a>(
         &self,
-        ctx: &'ctx mut Context<'static>,
-        addresses: &mut AddressIndex,
-        address: u64,
-        length: usize,
-        function: FunctionId,
+        construction: &'c mut Construction<'_, 'a, 'static>,
         plan: &PcodePlan,
-    ) -> FlatEmitter<'_, 'static, 'ctx> {
-        let entry = ctx.get_or_make_block_indexed(addresses, address, function);
-        BasicBlock::from_id_mut(ctx, entry).in_function(function);
+    ) -> Result<FlatEmitter<'_, 'static, 'c>, LiftError> {
+        let address = construction.address();
+        let length = construction.length();
+        let entry = construction.entry();
 
         let mut branches = HashMap::default();
         for &target in plan.direct_branches() {
-            let block = ctx.get_or_make_block_indexed(addresses, target, function);
-            branches.insert(target, block);
+            branches.insert(target, construction.block_at(target)?);
         }
         let mut calls = HashMap::default();
         for &target in plan.direct_calls() {
             if self.flat_control_flow {
                 // Just another branch target, resolved in this same function.
-                let block = ctx.get_or_make_block_indexed(addresses, target, function);
-                branches.insert(target, block);
+                branches.insert(target, construction.block_at(target)?);
             } else {
-                let callee = FunctionBody::from_addr_or_create_indexed(ctx, addresses, target).id;
-                calls.insert(target, callee);
+                calls.insert(target, construction.callee_at(target)?);
             }
         }
-        let next = ctx.get_or_make_block_indexed(addresses, address + length as u64, function);
+        let next = construction.block_at(address + length as u64)?;
 
-        FlatEmitter::new(
+        Ok(FlatEmitter::new(
             entry,
             next,
-            ctx.builder(entry),
+            construction.builder(entry),
             &self.storage,
             self.unique_space,
             branches,
@@ -358,7 +432,7 @@ impl<'spec> SleighLifter<'spec> {
             length,
             plan,
             self.flat_control_flow,
-        )
+        ))
     }
 
     /// Lowers already-flattened p-code. This is useful for cached or
@@ -372,7 +446,22 @@ impl<'spec> SleighLifter<'spec> {
         pcode: &InstructionPcode,
         function: Option<FunctionId>,
     ) -> Result<Lifted, LiftError> {
-        self.lift_pcode_ops_indexed(ctx, addresses, address, length, &pcode.ops, function)
+        self.check_compatible(ctx)?;
+        let function = self.function_for(ctx, addresses, address, function);
+        let mut target = LiftTarget::bind_indexed(ctx, addresses, function)?;
+        self.lift_pcode_ops_into(&mut target, address, length, &pcode.ops)
+    }
+
+    /// Lowers already-flattened p-code into a bound target. See
+    /// [`lift_pcode_indexed`](Self::lift_pcode_indexed).
+    pub fn lift_pcode_into(
+        &self,
+        target: &mut LiftTarget<'_, 'static>,
+        address: u64,
+        length: usize,
+        pcode: &InstructionPcode,
+    ) -> Result<Lifted, LiftError> {
+        self.lift_pcode_ops_into(target, address, length, &pcode.ops)
     }
 
     /// Lowers a borrowed flat p-code operation sequence. This is kept private
@@ -382,18 +471,17 @@ impl<'spec> SleighLifter<'spec> {
     /// Unlike the streamed path this has no plan, so it recovers the same facts
     /// by scanning the operations: their direct targets, and the operation
     /// indices local branches resolve to.
-    fn lift_pcode_ops_indexed(
+    fn lift_pcode_ops_into(
         &self,
-        ctx: &mut Context<'static>,
-        addresses: &mut AddressIndex,
+        target: &mut LiftTarget<'_, 'static>,
         address: u64,
         length: usize,
         pcode: &[PcodeOp],
-        function: Option<FunctionId>,
     ) -> Result<Lifted, LiftError> {
-        let function = self.function_for(ctx, addresses, address, function);
+        self.check_compatible(target.context())?;
         let plan = Self::plan_from_ops(pcode, self.flat_control_flow)?;
-        let mut emitter = self.emitter(ctx, addresses, address, length, function, &plan.plan);
+        let mut construction = target.begin(address, length)?;
+        let mut emitter = self.emitter(&mut construction, &plan.plan)?;
         for (index, op) in pcode.iter().enumerate() {
             if let Some(&label) = plan.labels.get(&index) {
                 emitter.label(label);
@@ -414,7 +502,8 @@ impl<'spec> SleighLifter<'spec> {
                 _ => emitter.op(op.opcode, op.output, &op.inputs),
             }
         }
-        emitter.finish()
+        let lifted = emitter.finish()?;
+        Ok(construction.commit(lifted)?)
     }
 
     /// Rebuilds the plan facts of an already-flattened instruction.
@@ -486,7 +575,7 @@ struct FlatEmitter<'spec, 'str, 'ctx> {
     /// must not be shared, because SLEIGH's unique space is instruction-local.
     unique_storage: HashMap<Varnode, ValueId>,
     branches: HashMap<u64, BlockId>,
-    calls: HashMap<u64, FunctionId>,
+    calls: HashMap<u64, Callee>,
     /// Blocks for the plan's instruction-local labels, made on first mention.
     labels: Vec<Option<BlockId>>,
     next: BlockId,
@@ -512,7 +601,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         base_storage: &'spec HashMap<Varnode, VarnodeId>,
         unique_space: SpaceId,
         branches: HashMap<u64, BlockId>,
-        calls: HashMap<u64, FunctionId>,
+        calls: HashMap<u64, Callee>,
         address: u64,
         length: usize,
         plan: &PcodePlan,
@@ -1071,7 +1160,7 @@ mod tests {
         let mut sources = SourceDb::new();
         let root = sources.add_file(
             "tiny.slaspec",
-            &format!(
+            format!(
                 "define endian=little;
                  define space ram type=ram_space size=4 default;
                  define space register type=register_space size=4;
@@ -1237,6 +1326,123 @@ mod tests {
         );
         assert_eq!(site_opcode(&ctx, &lifted.exits()[0]), "cbranch");
         assert_eq!(lifted.blocks().len(), 2);
+    }
+
+    #[test]
+    fn a_failed_instruction_leaves_the_context_as_it_was() {
+        let spec = tiny_spec(
+            ":bad is op=6 { r0 = 1:4; r0 = newobject(r0); }
+             :good is op=7 { r0 = 2:4; }",
+        );
+        let instruction = Decoder::new(&spec)
+            .decode_one(0x1000, &[6], &spec.new_context())
+            .unwrap();
+        assert!(
+            instruction
+                .pcode_ops()
+                .unwrap()
+                .ops
+                .iter()
+                .any(|op| op.opcode == sleigh::Opcode::New),
+            "the fixture relies on NEW being unsupported"
+        );
+        let lifter = SleighLifter::new(&spec);
+        let mut ctx = lifter.new_context();
+        let function = ctx.anon_function();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let before = ctx.to_string();
+
+        let error = lifter
+            .lift_instruction_indexed(&mut ctx, &mut addresses, &instruction, Some(function))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            super::LiftError::UnsupportedOpcode(sleigh::Opcode::New)
+        );
+        assert_eq!(
+            ctx.to_string(),
+            before,
+            "the partial instruction was undone"
+        );
+        assert!(addresses.is_empty(), "no placeholder survived");
+
+        // The address lifts afterwards, and so does another instruction.
+        let good = Decoder::new(&spec)
+            .decode_one(0x1000, &[7], &spec.new_context())
+            .unwrap();
+        let lifted = lifter
+            .lift_instruction_indexed(&mut ctx, &mut addresses, &good, Some(function))
+            .unwrap();
+        assert!(lifted.falls_through());
+        assert_eq!(addresses.block_at(0x1000), Some(lifted.entry()));
+    }
+
+    #[test]
+    fn an_address_is_lifted_once() {
+        let spec = sleigh_precompile::x64::spec();
+        let lifter = SleighLifter::new(spec);
+        let instruction = Decoder::new(spec)
+            .decode_one(0x1000, b"\x48\x89\xd8", &spec.new_context())
+            .unwrap();
+        let mut ctx = lifter.new_context();
+        let function = ctx.anon_function();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let lifted = lifter
+            .lift_instruction_indexed(&mut ctx, &mut addresses, &instruction, Some(function))
+            .unwrap();
+        let again = lifter
+            .lift_instruction_indexed(&mut ctx, &mut addresses, &instruction, Some(function))
+            .unwrap_err();
+        assert_eq!(
+            again,
+            super::LiftError::Target(qcode::lift::TargetError::AlreadyLifted {
+                address: 0x1000,
+                block: lifted.entry()
+            })
+        );
+        // The fall-through placeholder is empty and takes its instruction.
+        let next = Decoder::new(spec)
+            .decode_one(0x1003, b"\x48\x89\xd8", &spec.new_context())
+            .unwrap();
+        lifter
+            .lift_instruction_indexed(&mut ctx, &mut addresses, &next, Some(function))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_context_of_another_specification_is_refused() {
+        let tiny = tiny_spec(":set is op=1 { r0 = 1:4; }");
+        let x64 = sleigh_precompile::x64::spec();
+        let instruction = Decoder::new(x64)
+            .decode_one(0x1000, b"\x48\x89\xd8", &x64.new_context())
+            .unwrap();
+        let mut ctx = SleighLifter::new(&tiny).new_context();
+        assert_eq!(
+            SleighLifter::new(x64)
+                .lift_instruction(&mut ctx, &instruction, None)
+                .unwrap_err(),
+            super::LiftError::IncompatibleContext
+        );
+        assert_eq!(ctx.functions().count(), 0, "nothing was created first");
+    }
+
+    #[test]
+    fn a_function_of_another_context_is_refused() {
+        let spec = sleigh_precompile::x64::spec();
+        let lifter = SleighLifter::new(spec);
+        let instruction = Decoder::new(spec)
+            .decode_one(0x1000, b"\x48\x89\xd8", &spec.new_context())
+            .unwrap();
+        let mut other = lifter.new_context();
+        other.anon_function();
+        let foreign = other.anon_function();
+        let mut ctx = lifter.new_context();
+        assert_eq!(
+            lifter
+                .lift_instruction(&mut ctx, &instruction, Some(foreign))
+                .unwrap_err(),
+            super::LiftError::Target(qcode::lift::TargetError::UnknownFunction(foreign))
+        );
     }
 
     #[test]
