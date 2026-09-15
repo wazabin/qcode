@@ -191,6 +191,22 @@ where
         self.parent()
     }
 
+    /// The instruction before this one in its block, if any. Following the
+    /// block's list costs the same wherever in the block this instruction is.
+    pub fn prev(&'s self) -> Option<InstructionRef<'str, 'ctx, R>> {
+        self.inner()
+            .prev
+            .map(|local| InstructionRef::new(self.view, InstructionId::new(self.id.func, local)))
+    }
+
+    /// The instruction after this one in its block, if any; `None` at the
+    /// block's terminator.
+    pub fn next(&'s self) -> Option<InstructionRef<'str, 'ctx, R>> {
+        self.inner()
+            .next
+            .map(|local| InstructionRef::new(self.view, InstructionId::new(self.id.func, local)))
+    }
+
     /// The function that this instruction belongs to, if any.
     pub fn function(&'s self) -> Option<FunctionRef<'str, 'ctx, R>> {
         self.parent().and_then(|block| block.parent())
