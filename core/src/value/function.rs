@@ -1172,7 +1172,9 @@ impl<'str> FunctionBody<'str> {
     // one, at the end, and unlinking cost the same however long the block
     // is; walking it costs its length. These four verbs are the only ones
     // that touch the links, and keep `parent` in step: linked means in a
-    // block, unlinked means in none.
+    // block, unlinked means in none. Linking an instruction that is in a
+    // block moves it: the verbs unlink first, so no list is ever left with
+    // a member whose links lead elsewhere.
 
     /// The instructions of `block`, in order.
     pub fn insn_ids(&self, block: LocalBlockId) -> InsnIds<'_, 'str> {
@@ -1193,12 +1195,10 @@ impl<'str> FunctionBody<'str> {
             .collect()
     }
 
-    /// Links `insn` at the end of `block`.
+    /// Links `insn` at the end of `block`, taking it out of the block it was
+    /// in, if any.
     pub fn link_last(&mut self, block: LocalBlockId, insn: LocalInsnId) {
-        debug_assert!(
-            self.insns[insn].parent.is_none(),
-            "{insn:?} is in a block already"
-        );
+        self.unlink(insn);
         let last = self.blocks[block].instructions.last;
         {
             let i = &mut self.insns[insn];
@@ -1215,12 +1215,13 @@ impl<'str> FunctionBody<'str> {
         list.len += 1;
     }
 
-    /// Links `insn` immediately before `before`, which must be in `block`.
+    /// Links `insn` immediately before `before`, which must be in `block`,
+    /// taking `insn` out of the block it was in, if any.
     pub fn link_before(&mut self, block: LocalBlockId, before: LocalInsnId, insn: LocalInsnId) {
-        debug_assert!(
-            self.insns[insn].parent.is_none(),
-            "{insn:?} is in a block already"
-        );
+        if insn == before {
+            return;
+        }
+        self.unlink(insn);
         debug_assert_eq!(
             self.insns[before].parent,
             Some(block),
