@@ -1021,6 +1021,21 @@ impl<'str> FunctionBody<'str> {
         TempId::new(self.id(), local)
     }
 
+    /// Drops the temporaries and temporary spaces appended since the body had
+    /// `temps` and `temp_spaces` of them, with their names.
+    ///
+    /// For a construction taking back an instruction it could not finish:
+    /// nothing may still refer to the dropped temporaries.
+    pub(crate) fn take_back_temps(&mut self, temps: usize, temp_spaces: usize) {
+        for raw in temps..self.temps.len() {
+            if let Some(name) = &self.temps[crate::value::LocalTempId::from(raw)].name {
+                self.names.forget(name);
+            }
+        }
+        self.temps.truncate(temps);
+        self.temp_spaces.truncate(temp_spaces);
+    }
+
     /// Resolves a qualified temporary-space ID against this body.
     #[track_caller]
     pub fn temp_space(&self, id: TempSpaceId) -> &TempSpace {
