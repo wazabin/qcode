@@ -12,6 +12,8 @@
 //!   `emulate_map` constant-projection path exactly like any other constant
 //!   array. Any start offset is baked into the scanned body, so `iota` is unary.
 
+use crate::LangRef;
+use crate::langref::{InsnDoc, LangRefEntry};
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::ValueId;
@@ -19,11 +21,24 @@ use crate::value::insn::{Intrinsic, IntrinsicId, Simplified};
 use crate::value::{BodyView, QCodeView};
 
 /// `iota` — the index driver array `[0, 1, …, n-1]` of `i64` elements.
+///
+/// `$iota(n)` is the array of the first `n` non-negative integers as `i64`
+/// elements. Its length is the value `n`, so its type is the unbounded list
+/// `[i64; *]`; a constant `n` folds it to a literal array.
+#[derive(LangRef)]
+#[langref(
+    category = "Intrinsics",
+    syntax = "T %r = $iota(n)",
+    example = "%arr = $iota(i64 0x8);"
+)]
 struct Iota;
 
 impl Intrinsic for Iota {
     fn name(&self) -> &'static str {
         "iota"
+    }
+    fn doc(&self) -> &'static InsnDoc {
+        &Self::ENTRY
     }
 
     fn arity(&self) -> usize {

@@ -4,6 +4,8 @@
 //! `rol` additionally recognizes the `(x << c1) | (x >> c2)` idiom; `ror`'s
 //! constant form shares that shape and is normalised into a `rol`.
 
+use crate::LangRef;
+use crate::langref::{InsnDoc, LangRefEntry};
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::ValueId;
@@ -212,11 +214,24 @@ fn rotate_result_type(types: &TypeManager, args: &[TypeId]) -> TypeId {
 }
 
 /// `rol` — rotate left. Recognizes the `(x << c1) | (x >> c2)` idiom.
+///
+/// `$rol(x, k)` rotates the bits of `x` left by `k mod bits(x)` positions:
+/// bits shifted out at the top re-enter at the bottom. The result has `x`'s
+/// type; `k` may have any integer width.
+#[derive(LangRef)]
+#[langref(
+    category = "Intrinsics",
+    syntax = "T %r = $rol(x, k)",
+    example = "i32 %r = $rol(i32 @x, i32 0x5);"
+)]
 struct Rol;
 
 impl Intrinsic for Rol {
     fn name(&self) -> &'static str {
         "rol"
+    }
+    fn doc(&self) -> &'static InsnDoc {
+        &Self::ENTRY
     }
     fn arity(&self) -> usize {
         2
@@ -246,11 +261,24 @@ impl Intrinsic for Rol {
 
 /// `ror` — rotate right. Its constant idiom is normalised into a `rol` by the
 /// recognizer, so it has no `root_op` of its own.
+///
+/// `$ror(x, k)` rotates the bits of `x` right by `k mod bits(x)` positions:
+/// bits shifted out at the bottom re-enter at the top. The result has `x`'s
+/// type; `k` may have any integer width.
+#[derive(LangRef)]
+#[langref(
+    category = "Intrinsics",
+    syntax = "T %r = $ror(x, k)",
+    example = "i32 %r = $ror(i32 @x, i32 0x5);"
+)]
 struct Ror;
 
 impl Intrinsic for Ror {
     fn name(&self) -> &'static str {
         "ror"
+    }
+    fn doc(&self) -> &'static InsnDoc {
+        &Self::ENTRY
     }
     fn arity(&self) -> usize {
         2

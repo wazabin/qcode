@@ -1,3 +1,4 @@
+use crate::LangRef;
 use crate::value::{
     LocalValueId,
     function::FunctionId,
@@ -57,82 +58,414 @@ pub trait MnemonicKind {
 /// | [`PCodeOp`] | User-defined or architecture-specific operation |
 /// | [`Intrinsic`](crate::value::insn::intrinsic::Intrinsic) | Pure named intrinsic function (e.g. `rol`, `ror`) |
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, LangRef)]
 pub enum Mnemonic {
     /// Load a value from a memory space.
+    ///
+    /// Reads `N` bytes at address `ptr` in the named space (`ram`, a register
+    /// space, or a `$tempK` scratch space) and produces them as an `N`-byte
+    /// value, little-endian. The result type is the sized integer `iN` unless
+    /// a later pass retypes it; the address type is the space's address width.
+    ///
+    /// Loads observe every earlier `store` to an aliasing address in program
+    /// order; they are the only instruction other than `call` that reads
+    /// memory.
+    #[langref(
+        category = "Memory",
+        syntax = "T %r = load(space:N, ptr)",
+        example = "i32 %v = load(ram:4, i64 @p);"
+    )]
     Load(Load),
     /// Store a value to a memory space.
+    ///
+    /// Writes the `N`-byte value `v` at address `ptr` in the named space,
+    /// little-endian. `N` must equal `v`'s byte width. A store has no result.
+    #[langref(
+        category = "Memory",
+        syntax = "store(space:N, ptr <- v)",
+        example = "store(ram:4, i64 @p <- i32 @x);"
+    )]
     Store(Store),
     /// Unconditional direct branch to a static target block.
+    ///
+    /// Transfers control to `bb`, binding each of `bb`'s block parameters to
+    /// the argument named for it. Every parameter of the target must be
+    /// supplied; the argument's type must match the parameter's. See the
+    /// *block arguments* concept page for how this replaces φ-nodes.
+    #[langref(
+        category = "Control flow",
+        syntax = "goto <bb @param=v …>",
+        example = "goto <next>;",
+        example = "goto <loop @i=i32 @x @acc=i32 @y>;"
+    )]
     Branch(Branch),
     /// Conditional branch: taken when the condition operand is non-zero.
+    ///
+    /// `c` is a `bool` (or any 1-byte value). Control goes to the first target
+    /// when `c` is non-zero and to the second otherwise. Each target carries
+    /// its own argument list, so the two successors may bind different values
+    /// to their parameters.
+    #[langref(
+        category = "Control flow",
+        syntax = "if c goto <bb1 @param=v …> else goto <bb2 @param=v …>",
+        example = "bool %lt = i32 @x < i32 @y;\nif bool %lt goto <next> else goto <other>;",
+        example = "bool %lt = i32 @x < i32 @y;\nif bool %lt goto <loop @i=i32 @x @acc=i32 @y> else goto <loop @i=i32 @y @acc=i32 @x>;"
+    )]
     CBranch(CBranch),
     /// Unconditional indirect branch to a dynamically-computed address.
+    ///
+    /// Jumps to the code at address `ptr`. The successors are not encoded in
+    /// the instruction; a CFG analysis may attach the edges it resolves as an
+    /// `// -> <bb>, …` hint after the statement. A resolved jump table is
+    /// rewritten to a [`Switch`](Self::Switch).
+    #[langref(
+        category = "Control flow",
+        syntax = "goto [ptr]",
+        example = "goto [i64 @p];"
+    )]
     BranchInd(BranchInd),
     /// Multi-way dispatch on an integer scrutinee — a resolved jump table.
+    ///
+    /// Compares `v` against each case constant and transfers control to the
+    /// matching arm's block, binding that block's parameters from the arm's
+    /// argument list. `default` receives every unlisted value; it may be
+    /// omitted when a preceding bounds check makes the listed cases total.
+    /// Case constants are pairwise distinct.
+    #[langref(
+        category = "Control flow",
+        syntax = "switch v { K => <bb @param=v …>, …, default => <bb …> }",
+        example = "switch i32 @x { 0x0 => <next>, 0x1 => <other>, default => <next> };"
+    )]
     Switch(Switch),
     /// Direct call to a known function.
+    ///
+    /// Transfers control to function `f`'s entry, passing one argument per
+    /// callee parameter by name, and resumes at the fall-through block on
+    /// return. A call is a terminator: the return point is the block that
+    /// follows (or an explicit `// -> <bb>` hint). Freshly lifted calls have
+    /// no arguments; interface inference fills them in. The callee's clobbered
+    /// registers and any escaping pointer arguments are treated as written by
+    /// the call.
+    #[langref(
+        category = "Control flow",
+        syntax = "call fn f(@param=v, …)",
+        example = "call fn callee(@a=i32 @x, @b=i32 @y);"
+    )]
     Call(Call),
     /// Tail call: a function-level transfer of control to another function's
-    /// entry (thunk / tail jump). Carries a [`FunctionId`], never a foreign
-    /// block — see [`TailCall`].
+    /// entry (thunk / tail jump).
+    ///
+    /// Control leaves the current function for `f` and never returns to it;
+    /// `f`'s return is this function's return. Arguments are positional, one
+    /// per callee input. Unlike [`Branch`](Self::Branch), whose target is a
+    /// block of the same function, the target here is a function: the IR
+    /// never names a block of another function. See [`TailCall`].
+    #[langref(
+        category = "Control flow",
+        syntax = "tailcall fn f(v, …)",
+        example = "tailcall fn callee(i32 @x, i32 @y);"
+    )]
     TailCall(TailCall),
     /// Value-level application of a pure lambda function.
+    ///
+    /// Evaluates the lambda `f` on the positional arguments and yields its
+    /// [`return`](Self::ReturnValue) value as an ordinary SSA result. `apply`
+    /// is not a terminator and has no effect on memory or registers: a lambda
+    /// is a pure function of its inputs.
+    #[langref(
+        category = "Control flow",
+        syntax = "T %r = apply f(v, …)",
+        example = "i32 %r = apply inc(i32 @x);"
+    )]
     Apply(Apply),
     /// Indirect call through a computed function pointer.
+    ///
+    /// Calls the code at address `ptr`, then resumes at the fall-through
+    /// block. Positional arguments, when present, are the inferred inputs of
+    /// the callee. Successor edges may be attached as an `// -> <bb>` hint.
+    #[langref(
+        category = "Control flow",
+        syntax = "call [ptr](v, …)",
+        example = "call [i64 @p];",
+        example = "call [i64 @p](i32 @x, i32 @y);"
+    )]
     CallInd(CallInd),
     /// Return from the current function.
+    ///
+    /// Transfers control to the return address `ptr` (the value popped from
+    /// the stack or read from the link register). With a value, `return v at
+    /// ptr` additionally makes `v` the function's SSA return value once the
+    /// call interface is known.
+    #[langref(
+        category = "Control flow",
+        syntax = "return at ptr",
+        syntax = "return v at ptr",
+        example = "return at i64 @p;",
+        example = "return i32 @x at i64 @p;"
+    )]
     Return(Return),
     /// Value return from a lambda function.
+    ///
+    /// Ends a lambda and yields `v` to the [`apply`](Self::Apply) (or `map` /
+    /// `scanl`) that invoked it. Lambdas have no return address.
+    #[langref(
+        category = "Control flow",
+        syntax = "return v",
+        example = "return i32 @x;"
+    )]
     ReturnValue(ReturnValue),
     /// Bytes that do not decode to a valid instruction. A terminator with no
     /// successors (see [`BadInsn`]).
+    ///
+    /// The analogue of LLVM's `unreachable`: it records that lifting could not
+    /// continue past this point. Executing it is an error.
+    #[langref(category = "Control flow", syntax = "badinsn", example = "badinsn;")]
     BadInsn(BadInsn),
     /// A unary integer, float, or boolean operation.
+    ///
+    /// The result has the operand's type. The operators are listed under
+    /// *Unary operators*.
+    #[langref(
+        category = "Arithmetic",
+        syntax = "T %r = <op> v",
+        syntax = "T %r = <op>(v)",
+        example = "i32 %neg = - i32 @x;",
+        example = "i64 %a = abs(i64 %f);"
+    )]
     Unop(Unary),
     /// A binary integer, float, or boolean operation.
+    ///
+    /// Both operands have the same type except for shifts, whose count may be
+    /// any integer width. Arithmetic results have the operands' type;
+    /// comparisons produce `bool`. The operators are listed under *Integer
+    /// operators* and *Float operators*.
+    #[langref(
+        category = "Arithmetic",
+        syntax = "T %r = a <op> b",
+        example = "i32 %r = i32 @x + i32 @y;",
+        example = "bool %lt = i32 @x s< i32 @y;"
+    )]
     Binop(Binary),
     /// Extract a contiguous byte range from a value.
+    ///
+    /// `v[start:end]` is bytes `[start, end)` of `v` (little-endian, so
+    /// `v[0:1]` is the least significant byte), as an `end - start` byte
+    /// integer. `start` defaults to `0` and `end` to `v`'s width.
+    #[langref(
+        category = "Casts",
+        syntax = "iN %r = v[start:end]",
+        example = "i16 %lo = i32 @x[0:2];",
+        example = "i8 %hi = i32 @x[3:4];"
+    )]
     Range(Range),
     /// Convert an integer to a floating-point value.
+    ///
+    /// Interprets `v` as a signed integer and rounds it to the nearest `fN`
+    /// (round to nearest even).
+    #[langref(
+        category = "Casts",
+        syntax = "fN %r = int2float(fN, v)",
+        example = "i64 %d = int2float(f64, i32 @x);"
+    )]
     IntToFloat(IntToFloat),
     /// Convert a floating-point value to a different float width.
+    ///
+    /// Widening is exact; narrowing rounds to nearest even and may overflow to
+    /// an infinity. NaN converts to NaN.
+    #[langref(
+        category = "Casts",
+        syntax = "fN %r = float2float(fN, v)",
+        example = "i32 %s = float2float(f32, i64 %f);"
+    )]
     FloatToFloat(FloatToFloat),
     /// Convert a floating-point value to an integer (truncate toward zero).
+    ///
+    /// The result is the signed integer nearest to zero, `iN` wide. Values
+    /// outside `iN`'s range and NaN produce an unspecified value.
+    #[langref(
+        category = "Casts",
+        syntax = "iN %r = trunc(iN, v)",
+        example = "i32 %int = trunc(i32, i64 %f);"
+    )]
     FloatToInt(FloatToInt),
     /// Zero-extend a value to a wider integer.
+    ///
+    /// The upper `N - width(v)` bytes of the result are zero. `iN` must be at
+    /// least as wide as `v`.
+    #[langref(
+        category = "Casts",
+        syntax = "iN %r = zext(iN, v)",
+        example = "i64 %w = zext(i64, i32 @x);"
+    )]
     Zext(Zext),
     /// Sign-extend a value to a wider integer.
+    ///
+    /// The upper bytes of the result are copies of `v`'s sign bit. `iN` must
+    /// be at least as wide as `v`.
+    #[langref(
+        category = "Casts",
+        syntax = "iN %r = sext(iN, v)",
+        example = "i64 %w = sext(i64, i32 @x);"
+    )]
     Sext(Sext),
     /// Test whether a floating-point value is NaN.
+    ///
+    /// The result is the byte `1` when `v` is a NaN and `0` otherwise.
+    #[langref(
+        category = "Bit and flag operations",
+        syntax = "i8 %r = nan(v)",
+        example = "i8 %isnan = nan(i64 %f);"
+    )]
     IsFloatNaN(IsFloatNaN),
     /// Count the number of set bits (population count / Hamming weight).
+    ///
+    /// The result width is chosen by the producer (the p-code output size);
+    /// the text form makes it one byte.
+    #[langref(
+        category = "Bit and flag operations",
+        syntax = "iN %r = popcount(v)",
+        example = "i8 %bits = popcount(i32 @x);"
+    )]
     PopCount(PopCount),
     /// Count leading zero bits.
+    ///
+    /// The number of zero bits above the most significant set bit of `v`;
+    /// `width(v) * 8` when `v` is zero. The result width is chosen by the
+    /// producer (the p-code output size); the text form makes it one byte.
+    #[langref(
+        category = "Bit and flag operations",
+        syntax = "iN %r = lzcount(v)",
+        example = "i8 %lz = lzcount(i32 @x);"
+    )]
     LzCount(LzCount),
     /// Unsigned addition carry-out flag.
+    ///
+    /// The byte `1` when `a + b` does not fit in the operands' width, i.e.
+    /// the unsigned addition carries out of the top bit, else `0`. This is
+    /// the x86 `CF` after `add`.
+    #[langref(
+        category = "Bit and flag operations",
+        syntax = "i8 %r = carry(a, b)",
+        example = "i8 %cf = carry(i32 @x, i32 @y);"
+    )]
     Carry(Carry),
     /// Signed addition carry-out (overflow) flag.
+    ///
+    /// The byte `1` when the two's-complement sum `a + b` overflows (both
+    /// operands have the same sign and the result's sign differs), else `0`.
+    /// This is the x86 `OF` after `add`.
+    #[langref(
+        category = "Bit and flag operations",
+        syntax = "i8 %r = scarry(a, b)",
+        example = "i8 %of = scarry(i32 @x, i32 @y);"
+    )]
     SCarry(SCarry),
     /// Signed subtraction borrow flag.
+    ///
+    /// The byte `1` when the two's-complement difference `a - b` overflows,
+    /// else `0`. This is the x86 `OF` after `sub` or `cmp`.
+    #[langref(
+        category = "Bit and flag operations",
+        syntax = "i8 %r = sborrow(a, b)",
+        example = "i8 %of = sborrow(i32 @x, i32 @y);"
+    )]
     SBorrow(SBorrow),
     /// Assert when resolving an execution trace
+    ///
+    /// Declares that `c` holds on every execution reaching this point. It has
+    /// no effect on the machine state; analyses may assume it, and the
+    /// emulator checks it.
+    #[langref(
+        category = "Verification",
+        syntax = "assert c",
+        example = "bool %lt = i32 @x < i32 @y;\nassert bool %lt;"
+    )]
     Assert(Assert),
     /// A user-defined or architecture-specific p-code operation.
+    ///
+    /// An opaque operation declared by the SLEIGH specification (a
+    /// `define pcodeop`), such as a CPUID query or a system call. Its
+    /// arguments and optional result are values; its semantics are whatever
+    /// the environment provides. `vm.interrupt` is the reserved op that hands
+    /// control to the host. There is no textual form for user ops.
+    #[langref(
+        category = "Extensions",
+        syntax = "T %r = opname(v, …)",
+        syntax = "opname(v, …)"
+    )]
     PCodeOp(PCodeOp),
     /// A pure named intrinsic function (e.g. `rol`, `ror`). Categorically pure:
     /// no memory or observable side effects.
+    ///
+    /// Applies a registered intrinsic to its operands. Intrinsics either name
+    /// an idiom recognized from machine code (`$rol`) or a sequence operation
+    /// that has no p-code counterpart (`$iota`, `$at`). Each is listed under
+    /// *Intrinsics*.
+    #[langref(
+        category = "Extensions",
+        syntax = "T %r = $name(v, …)",
+        example = "i32 %r = $rol(i32 @x, i32 0x5);"
+    )]
     Intrinsic(IntrinsicApp),
     /// Build an aggregate (tuple) value from ordered fields.
+    ///
+    /// The result is the aggregate of the named fields, laid out in order.
+    /// Fields are read back with [`extract`](Self::Extract). Tuples let one
+    /// instruction produce several values (e.g. a call's return value together
+    /// with its register write-set) without a multi-result instruction.
+    #[langref(
+        category = "Aggregates",
+        syntax = "T %r = pack(field=v, …)",
+        example = "i64 %t = pack(lo=i32 @x, hi=i32 @y);"
+    )]
     Tuple(Tuple),
     /// Project a single field out of an aggregate value.
+    ///
+    /// The result is the named field, with that field's type.
+    #[langref(
+        category = "Aggregates",
+        syntax = "T %r = extract(agg.field)",
+        example = "i64 %t = pack(lo=i32 @x, hi=i32 @y);\ni32 %lo = extract(%t.lo);"
+    )]
     Extract(Extract),
     /// Compute the address of a struct field (typed, named pointer arithmetic).
+    ///
+    /// `gep(base.field)` is `base + offset(field)`, typed as a pointer to the
+    /// field. It performs no memory access: the field's value is a separate
+    /// `load` of the result. `base` must be a pointer to a struct declared
+    /// with `type name { field: size, … }`; a value is given that type by
+    /// declaring it as `name* %v = …`.
+    #[langref(
+        category = "Aggregates",
+        syntax = "T* %r = gep(base.field)",
+        example = "point* %pt = i64 @p + i64 0x0;\n%py = gep(%pt.y);"
+    )]
     Gep(Gep),
     /// Total element-wise map over an array value (a projectable loop).
+    ///
+    /// `body <$> src` is the array `out[i] = body(src[i], captures…)`, the
+    /// same length as `src`. `body` is a unary lambda applied to each element;
+    /// captures are loop-invariant values it also receives. The element type
+    /// of the result is the body's return type.
+    #[langref(
+        category = "Sequences",
+        syntax = "T %r = body <$> src",
+        syntax = "T %r = (body capture …) <$> src",
+        example = "%src = $iota(i64 0x8);\n%out = inc64 <$> %src;"
+    )]
     Map(Map),
     /// Total left-scan (prefix fold) over an array value: a projectable loop
     /// whose per-element write depends on the previous iteration's result.
+    ///
+    /// `scanl @body init src` is the array `out[i] = acc(i+1)` where
+    /// `acc(0) = init` and `acc(i+1) = body(acc(i), src[i], captures…)`.
+    /// `body` is a binary lambda `(accumulator, element)`.
+    #[langref(
+        category = "Sequences",
+        syntax = "T %r = scanl @body init src",
+        syntax = "T %r = scanl (@body capture …) init src",
+        example = "%src = $iota(i64 0x8);\n%out = scanl @step i64 @n %src;"
+    )]
     Scan(Scan),
 }
 

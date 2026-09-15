@@ -13,6 +13,8 @@
 //!
 //! This is the missing half of `strlen`: `strlen(s) = len(take_while(s))`.
 
+use crate::LangRef;
+use crate::langref::{InsnDoc, LangRefEntry};
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::ValueId;
@@ -20,11 +22,24 @@ use crate::value::insn::{Intrinsic, IntrinsicId, Mnemonic, Simplified};
 use crate::value::{BodyView, QCodeView};
 
 /// `len` — the element count of a sequence.
+///
+/// `$len(seq)` is the number of elements of `seq` as an `i64`: the static
+/// length of a fixed array, or the data-dependent length of a list such as
+/// a `$take_while` result.
+#[derive(LangRef)]
+#[langref(
+    category = "Intrinsics",
+    syntax = "i64 %r = $len(seq)",
+    example = "%arr = $iota(i64 @n);\n%n2 = $len(%arr);"
+)]
 struct Len;
 
 impl Intrinsic for Len {
     fn name(&self) -> &'static str {
         "len"
+    }
+    fn doc(&self) -> &'static InsnDoc {
+        &Self::ENTRY
     }
 
     fn arity(&self) -> usize {

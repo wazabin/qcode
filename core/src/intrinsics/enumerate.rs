@@ -9,16 +9,27 @@
 //!
 //! [`Builder::push_intrinsic`]: crate::builder::Builder::push_intrinsic
 
+use crate::LangRef;
+use crate::langref::{InsnDoc, LangRefEntry};
 use crate::register_intrinsic;
 use crate::types::{AggregateField, TypeId, TypeManager};
 use crate::value::insn::Intrinsic;
 
 /// `enumerate` — pair each array element with its `i64` index.
+///
+/// `$enumerate(arr)` is the array of tuples `(index: i64, elem: T)`, one per
+/// element of `arr`, in order. It supplies the index to a `map` or `scanl`
+/// body that needs it.
+#[derive(LangRef)]
+#[langref(category = "Intrinsics", syntax = "T %r = $enumerate(arr)")]
 struct Enumerate;
 
 impl Intrinsic for Enumerate {
     fn name(&self) -> &'static str {
         "enumerate"
+    }
+    fn doc(&self) -> &'static InsnDoc {
+        &Self::ENTRY
     }
 
     fn arity(&self) -> usize {
