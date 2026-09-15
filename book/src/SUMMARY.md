@@ -9,9 +9,9 @@
 
 # Concepts
 
-- [Blocks and block arguments](concepts/block-arguments.md)
 - [Values and types](concepts/types.md)
 - [Memory spaces and varnodes](concepts/spaces.md)
+- [Blocks and block arguments](concepts/block-arguments.md)
 - [Functions, calls and lambdas](concepts/functions.md)
 - [Sequences: map, scan and the array intrinsics](concepts/sequences.md)
 

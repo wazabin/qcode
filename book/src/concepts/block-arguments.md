@@ -47,7 +47,10 @@ the edge that makes it. The body reads `@i` and `@acc` like any other value.
 
 ## Why not φ
 
-Two reasons, both practical for a lifter.
+Two reasons, both practical for a lifter. (For the general case against
+φ-nodes, see Filip Pizlo's
+[SSA without phi](https://gist.github.com/pizlonator/cf1e72b8600b1437dda8153ea3fdb963);
+the trade-offs there are the ones this design makes.)
 
 The first is **locality**. A φ refers to predecessor blocks by name, so adding,
 removing or splitting an edge means editing every φ in the successor. With
