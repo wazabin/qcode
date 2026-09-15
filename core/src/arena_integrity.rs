@@ -116,21 +116,57 @@ pub fn verify_body_arena_integrity_scoped(
             // Block ownership is derived from the storing arena (`fid`); there is
             // no per-block parent field left to disagree with it.
 
-            for &insn_local in &block.instructions {
+            // The list is walked along its links, checking each against the
+            // one before it, its length against the block's count, and its
+            // end against the block's `last`.
+            let list = block.instructions;
+            let mut walked = 0;
+            let mut prev = None;
+            let mut at = list.first;
+            while let Some(insn_local) = at {
+                walked += 1;
+                if walked > list.len {
+                    out.push(format!(
+                        "block {block_id:?} links more instructions than its count of {}",
+                        list.len
+                    ));
+                    break;
+                }
                 insn_membership.entry(insn_local).or_default().push(local);
                 let insn_id = InstructionId::new(fid, insn_local);
                 if !live_insns.contains(&insn_local) {
                     out.push(format!(
                         "block {block_id:?} references removed instruction {insn_id:?}"
                     ));
-                    continue;
+                    break;
                 }
-                if body.insns[insn_local].parent != Some(local) {
+                let insn = &body.insns[insn_local];
+                if insn.parent != Some(local) {
                     out.push(format!(
                         "block {block_id:?} contains {insn_id:?}, whose parent is {:?}",
-                        body.insns[insn_local].parent
+                        insn.parent
                     ));
                 }
+                if insn.prev != prev {
+                    out.push(format!(
+                        "block {block_id:?}: {insn_id:?} links back to {:?}, not to {prev:?}",
+                        insn.prev
+                    ));
+                }
+                prev = Some(insn_local);
+                at = insn.next;
+            }
+            if walked != list.len {
+                out.push(format!(
+                    "block {block_id:?} links {walked} instructions but counts {}",
+                    list.len
+                ));
+            }
+            if list.last != prev {
+                out.push(format!(
+                    "block {block_id:?} ends at {prev:?} but its last is {:?}",
+                    list.last
+                ));
             }
 
             for (index, &param_local) in block.params.iter().enumerate() {
@@ -489,14 +525,16 @@ mod tests {
         let mut ctx = fixture();
         let f = ctx.function_ids()[0];
         let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
-        let y = ctx
-            .block(entry)
-            .instructions
-            .iter()
-            .copied()
+        let y = ctx.bodies[f]
+            .insn_ids(entry.local)
             .find(|&id| !ctx.bodies[f].insns[id].mnemonic().is_terminator())
             .expect("value instruction");
-        ctx.block_mut(entry).instructions.push(y);
+        // A second block whose list also reaches `y`.
+        let other = ctx.bodies[f].make_block();
+        let list = &mut ctx.bodies[f].blocks[other.local].instructions;
+        list.first = Some(y);
+        list.last = Some(y);
+        list.len = 1;
 
         assert_has(&ctx, "block memberships");
     }
@@ -506,17 +544,11 @@ mod tests {
         let mut ctx = fixture();
         let f = ctx.function_ids()[0];
         let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
-        let detached = ctx
-            .block(entry)
-            .instructions
-            .iter()
-            .copied()
+        let detached = ctx.bodies[f]
+            .insn_ids(entry.local)
             .find(|&id| !ctx.bodies[f].insns[id].mnemonic().is_terminator())
             .expect("value instruction");
-        ctx.block_mut(entry)
-            .instructions
-            .retain(|&id| id != detached);
-        ctx.bodies[f].insns[detached].parent = None;
+        ctx.bodies[f].unlink(detached);
 
         assert_eq!(verify_body_arena_integrity(&ctx), Vec::<String>::new());
     }
@@ -526,11 +558,8 @@ mod tests {
         let mut ctx = fixture();
         let f = ctx.function_ids()[0];
         let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
-        let insn = ctx
-            .block(entry)
-            .instructions
-            .iter()
-            .copied()
+        let insn = ctx.bodies[f]
+            .insn_ids(entry.local)
             .find(|&id| !ctx.bodies[f].insns[id].mnemonic().is_terminator())
             .expect("value instruction");
         let param = ctx.block(entry).params[0];
@@ -646,11 +675,8 @@ mod tests {
         let mut ctx = fixture();
         let f = ctx.function_ids()[0];
         let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
-        let insn = ctx
-            .block(entry)
-            .instructions
-            .iter()
-            .copied()
+        let insn = ctx.bodies[f]
+            .insn_ids(entry.local)
             .find(|&id| !ctx.bodies[f].insns[id].mnemonic().is_terminator())
             .expect("value instruction");
         let missing_temp = crate::value::LocalTempId::from(0);

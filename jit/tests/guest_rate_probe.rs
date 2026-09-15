@@ -56,7 +56,7 @@ impl BlockExecutor for Counter {
         if start != 0 {
             return Ok(None);
         }
-        let ids = ctx.block(block).instruction_ids();
+        let ids: Vec<_> = ctx.body(block.func).insn_ids(block.local).collect();
         let key = (block, ids.len());
         let count = *self.cache.entry(key).or_insert_with(|| {
             // *Distinct* addresses, not address-carrying instructions: the

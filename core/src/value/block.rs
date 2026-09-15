@@ -14,7 +14,6 @@ use crate::{
         },
     },
 };
-use core::slice;
 use jstd::graph::FxBuildHasher;
 use std::{
     borrow::Cow,
@@ -72,8 +71,12 @@ pub struct BasicBlock<'str> {
     /// These are NOT part of `instructions`; use `params()` to iterate them.
     pub params: Vec<LocalParamId>,
 
-    /// The ids of the instructions in this block
-    pub instructions: Vec<LocalInsnId>,
+    /// The instructions of this block, in order. The order is a doubly
+    /// linked list threaded through the instruction records (their `prev`
+    /// and `next`), of which this holds the ends and the length; walk it
+    /// through the body ([`FunctionBody::insn_ids`](crate::value::FunctionBody::insn_ids))
+    /// or a view ([`BlockRef::instructions`]).
+    pub(crate) instructions: InsnList,
 
     /// The set of edges that this block is incident to, as bare body-local
     /// [`EdgeId`]s (see [`add_cfg_edge`](crate::context::Context::add_cfg_edge)).
@@ -95,13 +98,38 @@ pub struct BasicBlock<'str> {
     pub extra_addresses: Vec<u64>,
 }
 
+/// The ends and length of a block's instruction list. The list itself is
+/// a doubly linked list threaded through the instructions (their
+/// [`prev_in_block`](Instruction::prev_in_block) and
+/// [`next_in_block`](Instruction::next_in_block)); walk it through the body
+/// ([`FunctionBody::insn_ids`](crate::value::FunctionBody::insn_ids)) or a
+/// view ([`BlockRef::instructions`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InsnList {
+    pub(crate) first: Option<LocalInsnId>,
+    pub(crate) last: Option<LocalInsnId>,
+    pub(crate) len: usize,
+}
+
 impl<'str> BasicBlock<'str> {
-    /// The ids of the instructions in this block, in order (raw `&BasicBlock`
-    /// accessor). Routing target for the raw `.instructions` field reads (stage
-    /// 6a §11); the field itself becomes private and localizes behind this
-    /// accessor at the storage flip.
-    pub fn instruction_ids(&self) -> &[LocalInsnId] {
-        &self.instructions
+    /// The first instruction of this block, if it has one.
+    pub fn first_insn(&self) -> Option<LocalInsnId> {
+        self.instructions.first
+    }
+
+    /// The last instruction of this block — its terminator, once it has one.
+    pub fn last_insn(&self) -> Option<LocalInsnId> {
+        self.instructions.last
+    }
+
+    /// How many instructions this block holds.
+    pub fn insn_count(&self) -> usize {
+        self.instructions.len
+    }
+
+    /// Whether this block holds any instruction.
+    pub fn has_insns(&self) -> bool {
+        self.instructions.len > 0
     }
 
     /// The ids of this block's parameters, in declaration order (raw
@@ -211,7 +239,7 @@ impl<'str> BasicBlock<'str> {
 
         // Clone instructions verbatim, preserving the exact result type and the
         // machine address. Operands are copied as-is; the caller remaps them.
-        let orig_insns = ctx.block(orig).instructions.clone();
+        let orig_insns: Vec<LocalInsnId> = ctx.body(orig.func).insn_ids(orig.local).collect();
         for old_insn_local in orig_insns {
             let old_insn_id = InstructionId::new(orig.func, old_insn_local);
             let (mnemonic, type_id, address) = {
@@ -269,7 +297,7 @@ impl<'str> BasicBlock<'str> {
         }
 
         // Clone instructions
-        let orig_insns = ctx.block(orig).instructions.clone();
+        let orig_insns: Vec<LocalInsnId> = ctx.body(orig.func).insn_ids(orig.local).collect();
         for old_insn_local in orig_insns {
             let old_insn_id = InstructionId::new(orig.func, old_insn_local);
             // Extract information from the old instruciton
@@ -389,7 +417,9 @@ where
         InstructionIter {
             view: self.view,
             func: self.id.func,
-            inner: inner.instructions.iter(),
+            front: inner.instructions.first,
+            back: inner.instructions.last,
+            remaining: inner.instructions.len,
             marker: PhantomData,
         }
     }
@@ -401,12 +431,7 @@ where
     }
 
     pub fn instruction_ids(&'s self) -> Vec<InstructionId> {
-        let func = self.id.func;
-        self.inner()
-            .instructions
-            .iter()
-            .map(|&local| InstructionId::new(func, local))
-            .collect()
+        self.instructions().map(|insn| insn.id).collect()
     }
 
     /// How many instructions this block holds.
@@ -416,17 +441,19 @@ where
     /// count should not allocate for it — the JIT reads this per block
     /// execution.
     pub fn instruction_count(&'s self) -> usize {
-        self.inner().instructions.len()
+        self.inner().instructions.len
     }
 
     /// Does this block have any instructions?
     pub fn is_empty(&'s self) -> bool {
-        self.inner().instructions.is_empty()
+        self.inner().instructions.len == 0
     }
 
     /// Does this block finish with a terminator instruction?
     pub fn is_terminated(&'s self) -> bool {
-        self.iter().last().is_some_and(|insn| insn.is_terminator())
+        self.iter()
+            .next_back()
+            .is_some_and(|insn| insn.is_terminator())
     }
 
     pub fn parent(&'s self) -> Option<FunctionRef<'str, 'ctx, R>> {
@@ -466,7 +493,7 @@ where
         // an indirect jump's resolved targets). Without this such edges would be
         // lost on round-trip.
         use crate::value::insn::Mnemonic;
-        if let Some(term) = self.iter().last()
+        if let Some(term) = self.iter().next_back()
             && matches!(
                 term.mnemonic(),
                 Mnemonic::Call(_) | Mnemonic::CallInd(_) | Mnemonic::BranchInd(_)
@@ -557,11 +584,15 @@ where
     }
 }
 
+/// The instructions of a block in order, walked along their links from
+/// both ends.
 pub struct InstructionIter<'str, 'ctx, R = ModuleView<'ctx, 'str>> {
     view: R,
     func: FunctionId,
-    inner: slice::Iter<'ctx, LocalInsnId>,
-    marker: PhantomData<&'str ()>,
+    front: Option<LocalInsnId>,
+    back: Option<LocalInsnId>,
+    remaining: usize,
+    marker: PhantomData<&'ctx &'str ()>,
 }
 
 impl<'str: 'ctx, 'ctx, R> Iterator for InstructionIter<'str, 'ctx, R>
@@ -571,10 +602,40 @@ where
     type Item = InstructionRef<'str, 'ctx, R>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner
-            .next()
-            .map(|&local| InstructionRef::new(self.view, InstructionId::new(self.func, local)))
+        if self.remaining == 0 {
+            return None;
+        }
+        let local = self.front?;
+        let id = InstructionId::new(self.func, local);
+        self.remaining -= 1;
+        self.front = self.view.instruction(id).next;
+        Some(InstructionRef::new(self.view, id))
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<'str: 'ctx, 'ctx, R> DoubleEndedIterator for InstructionIter<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let local = self.back?;
+        let id = InstructionId::new(self.func, local);
+        self.remaining -= 1;
+        self.back = self.view.instruction(id).prev;
+        Some(InstructionRef::new(self.view, id))
+    }
+}
+
+impl<'str: 'ctx, 'ctx, R> ExactSizeIterator for InstructionIter<'str, 'ctx, R> where
+    R: QCodeView<'ctx, 'str>
+{
 }
 
 impl<'str: 'ctx, 'ctx, R> IntoIterator for &BlockRef<'str, 'ctx, R>
@@ -640,14 +701,11 @@ impl<'str, H: QCodeMut<'str>> BaseRef<H, BlockId> {
     /// Whether this block currently ends in a terminator instruction.
     pub fn is_terminated(&self) -> bool {
         let body = self.ctx.body(self.id.func);
-        body.block(self.id)
-            .instructions
-            .last()
-            .is_some_and(|&local| {
-                body.insn(InstructionId::new(self.id.func, local))
-                    .mnemonic()
-                    .is_terminator()
-            })
+        body.block(self.id).last_insn().is_some_and(|local| {
+            body.insn(InstructionId::new(self.id.func, local))
+                .mnemonic()
+                .is_terminator()
+        })
     }
 
     /// Sets (or clears) this block's comment. Own-block edit, host-routed.
@@ -673,29 +731,25 @@ impl<'str, H: QCodeMut<'str>> BaseRef<H, BlockId> {
         Ok(())
     }
 
-    fn insert_insn(&mut self, index: usize, insn_id: InstructionId) {
-        self.ctx.instruction_mut(insn_id).parent = Some(self.id.local);
-        self.ctx
-            .block_mut(self.id)
-            .instructions
-            .insert(index, insn_id.localize(self.id.func));
-    }
-
     /// Inserts an instruction at the given index, shifting later instructions
-    /// right. Panics if `index > len`.
+    /// right. Panics if `index > len`. Walks to the index: prefer
+    /// [`insert_insn_before`](Self::insert_insn_before) or
+    /// [`push_insn`](Self::push_insn), which do not.
     pub fn insert_insn_at_index(&mut self, index: usize, insn_id: InstructionId) {
-        self.insert_insn(index, insn_id);
+        let block = self.id;
+        self.ctx.function_mut(block.func).insert_insn_at(
+            block.local,
+            index,
+            insn_id.localize(block.func),
+        );
     }
 
     /// Pushes an instruction to the end of this block.
     pub fn push_insn(&mut self, id: InstructionId) {
-        let len = self
-            .ctx
-            .body(self.id.func)
-            .block(self.id)
-            .instructions
-            .len();
-        self.insert_insn(len, id);
+        let block = self.id;
+        self.ctx
+            .function_mut(block.func)
+            .append_insn_local(block.local, id.localize(block.func));
     }
 
     /// Inserts `insn_id` immediately before `before_id`. Panics if `before_id` is
@@ -841,29 +895,30 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     /// Inserts an instruction after the instruction identified by `after_id` in this block.
     /// Panics if `after_id` is not an instruction in this block.
     pub fn insert_insn_after(&mut self, after_id: InstructionId, insn_id: InstructionId) {
-        let index = self
-            .inner()
-            .instructions
-            .iter()
-            .position(|&local| InstructionId::new(self.id.func, local) == after_id)
-            .expect("after_id not found in block");
-        self.insert_insn(index + 1, insn_id);
+        let block = self.id;
+        assert_eq!(
+            self.ctx.body(block.func).insn(after_id).parent,
+            Some(block.local),
+            "after_id not found in block"
+        );
+        self.ctx.function_mut(block.func).link_after(
+            block.local,
+            after_id.localize(block.func),
+            insn_id.localize(block.func),
+        );
     }
 
     /// Retains only the instructions for which `f` returns true, deleting the
     /// removed instructions.
     pub fn retain_insns(&mut self, mut f: impl FnMut(&InstructionId) -> bool) {
-        let func = self.id.func;
-        let mut removed = Vec::new();
-        self.inner_mut().instructions.retain(|&local| {
-            let id = InstructionId::new(func, local);
-            if f(&id) {
-                true
-            } else {
-                removed.push(id);
-                false
-            }
-        });
+        let block = self.id;
+        let removed: Vec<InstructionId> = self
+            .ctx
+            .body(block.func)
+            .insn_ids(block.local)
+            .map(|local| InstructionId::new(block.func, local))
+            .filter(|id| !f(id))
+            .collect();
         for id in removed {
             self.ctx.remove_instruction(id);
         }
@@ -871,18 +926,20 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
 
     /// Removes the last instruction from this block.
     pub fn pop_insn(&mut self) {
-        if let Some(&local) = self.inner().instructions.last() {
+        if let Some(local) = self.inner().last_insn() {
             self.ctx
                 .remove_instruction(InstructionId::new(self.id.func, local));
         }
     }
 
-    /// Appends a slice of instruction ids to this block.
+    /// Appends instructions to this block.
     pub fn extend_insns(&mut self, insns: &[InstructionId]) {
-        let func = self.id.func;
-        self.inner_mut()
-            .instructions
-            .extend(insns.iter().map(|&id| id.localize(func)));
+        let block = self.id;
+        for &id in insns {
+            self.ctx
+                .function_mut(block.func)
+                .append_insn_local(block.local, id.localize(block.func));
+        }
     }
 
     /// Associates this block with `addr` in the context address map.

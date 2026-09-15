@@ -94,12 +94,11 @@ pub struct Builder<'str, 'ctx> {
     /// If it is not the case, the block might be invalid
     pub(crate) is_terminated: bool,
 
-    /// Explicit insert position for new instructions.
-    ///
-    /// `None` (default) appends to the end of the block.
-    /// `Some(n)` inserts at index `n` and auto-advances after each push,
-    /// so consecutive pushes form a contiguous sequence starting at `n`.
-    insert_point: Option<usize>,
+    /// Where a pushed instruction goes: before this instruction of the
+    /// current block, or at its end (`None`, the default). Consecutive
+    /// pushes land in push order before it, so they form a contiguous
+    /// sequence there.
+    insert_point: Option<LocalInsnId>,
 }
 
 /// Generates a canonical comparison method and its "greater-than" mirror
@@ -262,9 +261,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         block: LocalBlockId,
     ) -> Self {
         let is_terminated = body.blocks[block]
-            .instructions
-            .last()
-            .is_some_and(|&i| body.insns[i].mnemonic().is_terminator());
+            .last_insn()
+            .is_some_and(|i| body.insns[i].mnemonic().is_terminator());
         Self {
             body,
             shared,
@@ -307,9 +305,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     /// arenas (id-less).
     fn block_is_terminated(&self, block: LocalBlockId) -> bool {
         self.body.blocks[block]
-            .instructions
-            .last()
-            .is_some_and(|&i| self.body.insns[i].mnemonic().is_terminator())
+            .last_insn()
+            .is_some_and(|i| self.body.insns[i].mnemonic().is_terminator())
     }
 
     /// Sets the current address for instructions added by this builder.
@@ -333,7 +330,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     /// contains lifted code, without disturbing the relative order of
     /// either the new or the existing instructions.
     pub fn set_insert_point_to_start(&mut self) {
-        self.insert_point = Some(0);
+        self.insert_point = self.body.blocks[self.block].first_insn();
     }
 
     /// Positions the builder immediately before an existing instruction in the
@@ -345,12 +342,12 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     ///
     /// Panics if `before_id` is not an instruction in the current block.
     pub fn set_insert_point_before(&mut self, before_id: InstructionId) {
-        let index = self.body.blocks[self.block]
-            .instructions
-            .iter()
-            .position(|&id| id == before_id.local)
-            .expect("before_id not found in block");
-        self.insert_point = Some(index);
+        assert_eq!(
+            self.body.insns[before_id.local].parent,
+            Some(self.block),
+            "before_id not found in block"
+        );
+        self.insert_point = Some(before_id.local);
     }
 
     /// Resets the insert point to append mode (the default).
@@ -616,16 +613,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         }
 
         match self.insert_point {
-            None => {
-                self.body.insns[local].parent = Some(block);
-                self.body.blocks[block].instructions.push(local);
-            }
-            Some(ref mut pos) => {
-                let index = *pos;
-                self.body.insns[local].parent = Some(block);
-                self.body.blocks[block].instructions.insert(index, local);
-                *pos += 1;
-            }
+            None => self.body.link_last(block, local),
+            Some(before) => self.body.link_before(block, before, local),
         }
 
         local
@@ -1660,12 +1649,12 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             return None;
         }
         let root = self.body.root_id()?;
-        self.body.blocks[root].instructions.iter().find_map(|&i| {
-            match self.body.insns[i].mnemonic() {
+        self.body
+            .insn_ids(root)
+            .find_map(|i| match self.body.insns[i].mnemonic() {
                 Mnemonic::Return(r) => r.value.and_then(|v| self.lstored_type_of(v)),
                 _ => None,
-            }
-        })
+            })
     }
 
     /// The type of the first value returned by a lambda body (this body). Id-less.
@@ -1676,7 +1665,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         self.body
             .roster
             .iter()
-            .flat_map(|&b| self.body.blocks[b].instructions.iter().copied())
+            .flat_map(|&b| self.body.insn_ids(b))
             .find_map(|i| match self.body.insns[i].mnemonic() {
                 Mnemonic::ReturnValue(r) => self.lstored_type_of(r.value),
                 _ => None,
@@ -2698,9 +2687,9 @@ mod tests {
         }
 
         // Instructions landed in the arenas, wired to their blocks.
-        assert_eq!(body.blocks[entry].instructions.len(), 4);
-        assert_eq!(body.blocks[target].instructions.len(), 1);
-        let last = *body.blocks[entry].instructions.last().unwrap();
+        assert_eq!(body.blocks[entry].insn_count(), 4);
+        assert_eq!(body.blocks[target].insn_count(), 1);
+        let last = body.blocks[entry].last_insn().unwrap();
         assert!(body.insns[last].mnemonic().is_terminator());
 
         // The body never acquired an identity: it is still detached.

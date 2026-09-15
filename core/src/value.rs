@@ -88,7 +88,7 @@ macro_rules! composite_id {
 }
 
 pub use block::cfg::LocalBlockId;
-pub use block::{BasicBlock, BlockId, BlockMutRef, BlockRef};
+pub use block::{BasicBlock, BlockId, BlockMutRef, BlockRef, InsnList};
 pub use block_param::{BlockParam, BlockParamId, BlockParamMutRef, BlockParamRef, LocalParamId};
 pub use bytes::{
     Bytes, BytesDisplay, BytesId, BytesRef, StringEncoding, decode_string, escape_decoded,

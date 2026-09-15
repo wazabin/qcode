@@ -206,7 +206,7 @@ impl Jit {
         block: BlockId,
         start: usize,
     ) -> Result<usize, Unsupported> {
-        let count = ctx.block(block).instruction_ids().len();
+        let count = ctx.block(block).insn_count();
         if start != 0 {
             if let Some((cached_count, known)) = self.partial.get(&(block, start))
                 && *cached_count == count
@@ -253,7 +253,7 @@ impl Jit {
         block: BlockId,
         start: usize,
     ) -> Result<usize, Unsupported> {
-        let full_body = ctx.block(block).instruction_ids().len().saturating_sub(1);
+        let full_body = ctx.block(block).insn_count().saturating_sub(1);
         let mut signature = self.module.make_signature();
         // spaces, exports, tlb, memory.
         for _ in 0..4 {
@@ -435,7 +435,7 @@ impl Jit {
         emu: &StandaloneEmulator<VmMemory>,
         block: BlockId,
     ) -> Option<BlockId> {
-        let &terminator = ctx.block(block).instruction_ids().last()?;
+        let terminator = ctx.block(block).last_insn()?;
         let terminator = InstructionId::new(block.func, terminator);
         let insn = qcode::value::Instruction::from_id(ctx, terminator);
         let target = match insn.mnemonic() {

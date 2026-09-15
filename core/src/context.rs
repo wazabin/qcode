@@ -995,7 +995,7 @@ impl<'str> Context<'str> {
                     needed_temp_spaces.insert(space);
                 }
             }
-            for &insn_local in &self.block(old).instructions {
+            for insn_local in self.body(old.func).insn_ids(old.local) {
                 let insn = self.instruction(InstructionId::new(old.func, insn_local));
                 for arg in insn.mnemonic().args() {
                     if let crate::value::LocalValueId::Temp(temp) = arg {
@@ -1086,7 +1086,8 @@ impl<'str> Context<'str> {
                 self.block_param_mut(new_param).origin = Some(remapped.localize(new.func));
             }
 
-            let insns = self.block(new).instructions.clone();
+            let insns: Vec<crate::value::LocalInsnId> =
+                self.body(new.func).insn_ids(new.local).collect();
             for insn_local in insns {
                 let insn_id = InstructionId::new(new.func, insn_local);
                 let type_id = remap_rehomed_type(

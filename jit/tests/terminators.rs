@@ -32,8 +32,8 @@ fn a_value_read_from_another_block_is_exported_and_imported() {
     );
     let blocks = FunctionBody::from_id(&ctx, escapes).block_ids();
     let (entry, next) = (blocks[0], blocks[1]);
-    let a = InstructionId::new(escapes, ctx.block(entry).instruction_ids()[0]);
-    let b = InstructionId::new(escapes, ctx.block(next).instruction_ids()[0]);
+    let a = InstructionId::new(escapes, ctx.block(entry).first_insn().unwrap());
+    let b = InstructionId::new(escapes, ctx.block(next).first_insn().unwrap());
 
     let mut jit = Jit::new();
     assert_eq!(
