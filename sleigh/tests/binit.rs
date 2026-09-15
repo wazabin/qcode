@@ -1427,16 +1427,31 @@ mod engine {
         Err(RunError::StepLimit)
     }
 
-    fn snapshot_state(
-        emu: &mut Emulator<'_>,
-        ctx: &qcode::context::Context<'_>,
+    /// Which optional parts of the machine state a case's snapshot covers,
+    /// derived from the fields its recorded states mention.
+    #[derive(Clone, Copy)]
+    struct SnapshotScope {
         include_mem0: bool,
         include_mem1: bool,
         include_scratch_memory: bool,
         include_x87: bool,
         include_xmm: bool,
         include_ymm: bool,
+    }
+
+    fn snapshot_state(
+        emu: &mut Emulator<'_>,
+        ctx: &qcode::context::Context<'_>,
+        scope: SnapshotScope,
     ) -> Result<DbState, String> {
+        let SnapshotScope {
+            include_mem0,
+            include_mem1,
+            include_scratch_memory,
+            include_x87,
+            include_xmm,
+            include_ymm,
+        } = scope;
         let mut regs = HashMap::new();
         let mut f80 = HashMap::new();
         let mut xmm = HashMap::new();
@@ -1746,6 +1761,14 @@ mod engine {
                 || final_state.regs.contains_key("mxcsr");
             // A `ymmN` key means a VEX form: the whole 256-bit file is compared.
             let include_ymm = !pair.initial.ymm.is_empty() || !final_state.ymm.is_empty();
+            let scope = SnapshotScope {
+                include_mem0,
+                include_mem1,
+                include_scratch_memory,
+                include_x87,
+                include_xmm,
+                include_ymm,
+            };
             // Mismatches that stem from the harness's modeling limits (rather than a
             // wazabin bug) are reclassified so they are recorded distinctly from real
             // state mismatches.
@@ -2023,19 +2046,10 @@ mod engine {
                         )
                     })?;
                     if actual != expected {
-                        let actual_state = snapshot_state(
-                            &mut emu,
-                            &ctx,
-                            include_mem0,
-                            include_mem1,
-                            include_scratch_memory,
-                            include_x87,
-                            include_xmm,
-                            include_ymm,
-                        )
-                        .map_err(|error| {
-                            DbMismatch::backend_error(tc, state_index, pair, final_state, error)
-                        })?;
+                        let actual_state =
+                            snapshot_state(&mut emu, &ctx, scope).map_err(|error| {
+                                DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                            })?;
                         return Err(classify(
                             actual_state,
                             serde_json::json!({
@@ -2068,19 +2082,10 @@ mod engine {
                         )
                     })?);
                     if actual != raw as usize {
-                        let actual_state = snapshot_state(
-                            &mut emu,
-                            &ctx,
-                            include_mem0,
-                            include_mem1,
-                            include_scratch_memory,
-                            include_x87,
-                            include_xmm,
-                            include_ymm,
-                        )
-                        .map_err(|error| {
-                            DbMismatch::backend_error(tc, state_index, pair, final_state, error)
-                        })?;
+                        let actual_state =
+                            snapshot_state(&mut emu, &ctx, scope).map_err(|error| {
+                                DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                            })?;
                         return Err(classify(
                             actual_state,
                             serde_json::json!({
@@ -2113,19 +2118,10 @@ mod engine {
                         actual = u64::from(full_to_abridged_physical_tag(actual as u16));
                     }
                     if actual != raw as u64 {
-                        let actual_state = snapshot_state(
-                            &mut emu,
-                            &ctx,
-                            include_mem0,
-                            include_mem1,
-                            include_scratch_memory,
-                            include_x87,
-                            include_xmm,
-                            include_ymm,
-                        )
-                        .map_err(|error| {
-                            DbMismatch::backend_error(tc, state_index, pair, final_state, error)
-                        })?;
+                        let actual_state =
+                            snapshot_state(&mut emu, &ctx, scope).map_err(|error| {
+                                DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                            })?;
                         return Err(classify(
                             actual_state,
                             serde_json::json!({
@@ -2140,19 +2136,10 @@ mod engine {
                         DbMismatch::backend_error(tc, state_index, pair, final_state, error)
                     })? as u64;
                     if actual != raw as u64 {
-                        let actual_state = snapshot_state(
-                            &mut emu,
-                            &ctx,
-                            include_mem0,
-                            include_mem1,
-                            include_scratch_memory,
-                            include_x87,
-                            include_xmm,
-                            include_ymm,
-                        )
-                        .map_err(|error| {
-                            DbMismatch::backend_error(tc, state_index, pair, final_state, error)
-                        })?;
+                        let actual_state =
+                            snapshot_state(&mut emu, &ctx, scope).map_err(|error| {
+                                DbMismatch::backend_error(tc, state_index, pair, final_state, error)
+                            })?;
                         return Err(classify(
                             actual_state,
                             serde_json::json!({
@@ -2206,17 +2193,7 @@ mod engine {
                     )
                 })?;
                 if actual != expected {
-                    let actual_state = snapshot_state(
-                        &mut emu,
-                        &ctx,
-                        include_mem0,
-                        include_mem1,
-                        include_scratch_memory,
-                        include_x87,
-                        include_xmm,
-                        include_ymm,
-                    )
-                    .map_err(|error| {
+                    let actual_state = snapshot_state(&mut emu, &ctx, scope).map_err(|error| {
                         DbMismatch::backend_error(tc, state_index, pair, final_state, error)
                     })?;
                     return Err(classify(
@@ -2245,17 +2222,7 @@ mod engine {
                     DbMismatch::backend_error(tc, state_index, pair, final_state, error)
                 })?;
                 if actual != expected {
-                    let actual_state = snapshot_state(
-                        &mut emu,
-                        &ctx,
-                        include_mem0,
-                        include_mem1,
-                        include_scratch_memory,
-                        include_x87,
-                        include_xmm,
-                        include_ymm,
-                    )
-                    .map_err(|error| {
+                    let actual_state = snapshot_state(&mut emu, &ctx, scope).map_err(|error| {
                         DbMismatch::backend_error(tc, state_index, pair, final_state, error)
                     })?;
                     return Err(classify(
@@ -2296,17 +2263,7 @@ mod engine {
                     )
                 })?;
                 if actual != expected {
-                    let actual_state = snapshot_state(
-                        &mut emu,
-                        &ctx,
-                        include_mem0,
-                        include_mem1,
-                        include_scratch_memory,
-                        include_x87,
-                        include_xmm,
-                        include_ymm,
-                    )
-                    .map_err(|error| {
+                    let actual_state = snapshot_state(&mut emu, &ctx, scope).map_err(|error| {
                         DbMismatch::backend_error(tc, state_index, pair, final_state, error)
                     })?;
                     return Err(classify(
@@ -2332,17 +2289,7 @@ mod engine {
                     DbMismatch::backend_error(tc, state_index, pair, final_state, error)
                 })?;
                 if actual != *expected {
-                    let actual_state = snapshot_state(
-                        &mut emu,
-                        &ctx,
-                        include_mem0,
-                        include_mem1,
-                        include_scratch_memory,
-                        include_x87,
-                        include_xmm,
-                        include_ymm,
-                    )
-                    .map_err(|error| {
+                    let actual_state = snapshot_state(&mut emu, &ctx, scope).map_err(|error| {
                         DbMismatch::backend_error(tc, state_index, pair, final_state, error)
                     })?;
                     return Err(classify(
@@ -2367,17 +2314,7 @@ mod engine {
                         )
                     })?;
                 if actual != expected {
-                    let actual_state = snapshot_state(
-                        &mut emu,
-                        &ctx,
-                        include_mem0,
-                        include_mem1,
-                        include_scratch_memory,
-                        include_x87,
-                        include_xmm,
-                        include_ymm,
-                    )
-                    .map_err(|error| {
+                    let actual_state = snapshot_state(&mut emu, &ctx, scope).map_err(|error| {
                         DbMismatch::backend_error(tc, state_index, pair, final_state, error)
                     })?;
                     let changed_offsets: Vec<_> = actual
@@ -2426,17 +2363,7 @@ mod engine {
                     })?;
                 let expected = raw as u64;
                 if actual != expected {
-                    let actual_state = snapshot_state(
-                        &mut emu,
-                        &ctx,
-                        include_mem0,
-                        include_mem1,
-                        include_scratch_memory,
-                        include_x87,
-                        include_xmm,
-                        include_ymm,
-                    )
-                    .map_err(|error| {
+                    let actual_state = snapshot_state(&mut emu, &ctx, scope).map_err(|error| {
                         DbMismatch::backend_error(tc, state_index, pair, final_state, error)
                     })?;
                     return Err(classify(
@@ -2475,17 +2402,7 @@ mod engine {
                     )
                 })?;
                 if actual != expected_bit {
-                    let actual_state = snapshot_state(
-                        &mut emu,
-                        &ctx,
-                        include_mem0,
-                        include_mem1,
-                        include_scratch_memory,
-                        include_x87,
-                        include_xmm,
-                        include_ymm,
-                    )
-                    .map_err(|error| {
+                    let actual_state = snapshot_state(&mut emu, &ctx, scope).map_err(|error| {
                         DbMismatch::backend_error(tc, state_index, pair, final_state, error)
                     })?;
                     return Err(classify(
