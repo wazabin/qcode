@@ -644,7 +644,7 @@ impl<'v> ScratchBlock<'v> {
     /// its entry, another instruction's for a block an exit leads to, none
     /// for a block internal to the instruction.
     pub fn address(&self) -> Option<u64> {
-        self.ctx.block(self.id).address
+        self.ctx.block(self.id).address()
     }
 
     /// Whether the block holds any instruction. A block an exit leads to is

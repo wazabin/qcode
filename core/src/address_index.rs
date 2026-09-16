@@ -18,9 +18,17 @@
 //! ([`LiftTarget`](crate::lift::LiftTarget)) uses this to tell a complete index
 //! from one that omits something, without rescanning the module.
 //!
-//! [`mark_current`](AddressIndex::mark_current) is the one way to claim
-//! currency without a rebuild; it is for a caller that applied a mutation's
-//! effects to the index by hand, and a wrong claim is that caller's bug.
+//! Editing the index's contents by hand — [`forget`](AddressIndex::forget),
+//! [`set_block`](AddressIndex::set_block),
+//! [`rehome_block`](AddressIndex::rehome_block),
+//! [`register`](AddressIndex::register) — drops its provenance outright: an
+//! index that has been edited follows from no revision of the context until
+//! it is refreshed, or the caller [vouches](AddressIndex::mark_current) for
+//! it. `mark_current` is the one way to claim currency without a rebuild; it
+//! is for a caller that applied a mutation's effects to the index by hand,
+//! and a wrong claim is that caller's bug. The address-bearing fields of
+//! blocks and function interfaces are crate-private, so no change to them
+//! happens outside the mutators that move the revision.
 
 use rustc_hash::FxHashMap;
 
@@ -175,15 +183,22 @@ impl AddressIndex {
     /// function-over-block precedence (a function entry that deliberately shadows
     /// its root block, or another block that already owns the address, is left
     /// untouched).
+    ///
+    /// Like every edit of the index's contents this drops its provenance: what
+    /// the index says no longer follows from any revision of the context, until
+    /// the caller [vouches](Self::mark_current) for it or refreshes.
     pub fn rehome_block(&mut self, addr: u64, old: BlockId, new: BlockId) {
+        self.provenance = None;
         if self.targets.get(&addr) == Some(&AddressTarget::Block(old)) {
             self.targets.insert(addr, AddressTarget::Block(new));
         }
     }
 
     /// Drops `address` from the index, so it resolves to nothing until it is
-    /// registered again. Used when a block stops covering an address.
+    /// registered again. Used when a block stops covering an address. Drops
+    /// the index's provenance, as [`rehome_block`](Self::rehome_block) does.
     pub fn forget(&mut self, address: u64) {
+        self.provenance = None;
         self.targets.remove(&address);
     }
 
@@ -191,8 +206,10 @@ impl AddressIndex {
     ///
     /// For a caller that has just made `block` cover an address another block
     /// used to — absorbing that block, typically, which leaves the index
-    /// naming something deleted.
+    /// naming something deleted. Drops the index's provenance, as
+    /// [`rehome_block`](Self::rehome_block) does.
     pub fn set_block(&mut self, address: u64, block: BlockId) {
+        self.provenance = None;
         self.targets.insert(address, AddressTarget::Block(block));
     }
 
@@ -210,13 +227,16 @@ impl AddressIndex {
     ///
     /// A function and one of its own blocks may intentionally share an entry
     /// address; the function remains the indexed target and the block becomes
-    /// its root. Every other collision is rejected.
+    /// its root. Every other collision is rejected. Drops the index's
+    /// provenance, as [`rehome_block`](Self::rehome_block) does; the tracked
+    /// mutators that call this restore it once context and index agree again.
     pub fn register(
         &mut self,
         ctx: &mut Context<'_>,
         address: u64,
         target: AddressTarget,
     ) -> Result<()> {
+        self.provenance = None;
         let Some(existing) = self.targets.get(&address).copied() else {
             self.targets.insert(address, target);
             return Ok(());

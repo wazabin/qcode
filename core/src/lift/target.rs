@@ -985,7 +985,7 @@ mod tests {
         let root = BasicBlock::make(ctx, function)
             .with_address_indexed(addresses, 0x1000)
             .id;
-        ctx.block_mut(root).extra_addresses.push(0x1004);
+        BasicBlock::from_id_mut(ctx, root).cover_address(0x1004);
         let zero = ctx.shared.get_const(0, 8);
         ctx.builder(root).push_branchind(zero);
         addresses.refresh(ctx);
@@ -1259,6 +1259,71 @@ mod tests {
     }
 
     #[test]
+    fn editing_the_index_by_hand_drops_its_currency_so_bind_rebuilds_it() {
+        let mut ctx = Context::new();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let function = host(&mut ctx, &mut addresses, 0x1000);
+        let existing = BasicBlock::make(&mut ctx, function)
+            .with_address_indexed(&mut addresses, 0x1010)
+            .id;
+        let stray = BasicBlock::make(&mut ctx, function).id;
+        assert!(addresses.is_current(&ctx));
+
+        // An entry omitted by hand: the index no longer follows from the
+        // context, so the safe binding rebuilds it and finds the block.
+        addresses.forget(0x1010);
+        assert!(!addresses.is_current(&ctx));
+        assert!(!addresses.describes(&ctx));
+        assert_eq!(
+            LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).err(),
+            Some(TargetError::ForeignIndex)
+        );
+        {
+            let mut target = LiftTarget::bind(&mut ctx, &mut addresses, function).unwrap();
+            let mut construction = target.begin(0x1000, 1).unwrap();
+            assert_eq!(construction.block_at(0x1010).unwrap(), existing);
+            construction.abort();
+        }
+
+        // An entry replaced by hand with the wrong block: rebuilt just the
+        // same, and the right block comes back.
+        addresses.set_block(0x1010, stray);
+        assert!(!addresses.is_current(&ctx));
+        {
+            let mut target = LiftTarget::bind(&mut ctx, &mut addresses, function).unwrap();
+            let mut construction = target.begin(0x1000, 1).unwrap();
+            assert_eq!(construction.block_at(0x1010).unwrap(), existing);
+            construction.abort();
+        }
+        assert!(addresses.is_current(&ctx));
+
+        // The other hand edits drop currency too.
+        addresses.rehome_block(0x1010, existing, stray);
+        assert!(!addresses.is_current(&ctx));
+        addresses.refresh(&ctx);
+        addresses
+            .register(&mut ctx, 0x1020, AddressTarget::Block(stray))
+            .unwrap();
+        assert!(!addresses.is_current(&ctx));
+
+        // A hand edit that is right can be vouched for, which is the
+        // caller-maintained path — and it is the caller's claim.
+        addresses.refresh(&ctx);
+        addresses.forget(0x1010);
+        addresses.set_block(0x1010, existing);
+        addresses.mark_current(&ctx);
+        LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+        assert_eq!(
+            ctx.block_ids()
+                .iter()
+                .filter(|&&b| ctx.block(b).address == Some(0x1010))
+                .count(),
+            1,
+            "no duplicate was ever made"
+        );
+    }
+
+    #[test]
     fn a_wrong_currency_claim_is_the_callers_bug_and_duplicates() {
         // The documented hazard of `mark_current`: the claim is trusted, so an
         // omission the caller did not know of becomes a second block at the
@@ -1517,7 +1582,8 @@ mod tests {
             assert_eq!(construction.context().functions().count(), 2);
         }
         // An address interior to a foreign block is not promoted.
-        ctx.block_mut(foreign).extra_addresses.push(0x2014);
+        BasicBlock::from_id_mut(&mut ctx, foreign).cover_address(0x2014);
+        assert!(!addresses.is_current(&ctx));
         addresses.refresh(&ctx);
         let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
         let mut construction = target.begin(0x1000, 2).unwrap();

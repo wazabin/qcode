@@ -949,7 +949,7 @@ impl<S: CodeSource> Vm<S> {
     /// that was being discovered, so every address the absorber now covers has
     /// to be repointed, not only the one that prompted this.
     fn reindex_absorbed(&mut self, block: BlockId) {
-        let covered = self.ctx.block(block).extra_addresses.clone();
+        let covered = self.ctx.block(block).extra_addresses().to_vec();
         if covered.is_empty() {
             return;
         }
@@ -1090,7 +1090,7 @@ impl<S: CodeSource> Vm<S> {
         // fallthrough arm of a branch *inside* one instruction's p-code) has
         // nowhere to be lifted from, so emptying it leaves a hole nothing can
         // fill.
-        if self.ctx.block(head).address.is_none() {
+        if self.ctx.block(head).address().is_none() {
             return (forward > 0).then_some(filled);
         }
         // What the head has already run: everything it held before the

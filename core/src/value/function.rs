@@ -62,7 +62,13 @@ pub struct FunctionInterface<'str> {
     pub name: Cow<'str, str>,
 
     /// Optional entry address (from binary).
-    pub address: Option<u64>,
+    ///
+    /// Crate-private: an entry address is what an
+    /// [`AddressIndex`](crate::address_index::AddressIndex) lists and the
+    /// module's [shape revision](crate::context::Context::revision) counts, so
+    /// only the mutators that tick that clock write it. Read it through
+    /// [`address`](Self::address).
+    pub(crate) address: Option<u64>,
 
     /// Whether this is an external (imported) function.
     ///
@@ -596,6 +602,11 @@ pub enum FunctionKind {
 }
 
 impl<'str> FunctionInterface<'str> {
+    /// The function's entry address, if it has one.
+    pub fn address(&self) -> Option<u64> {
+        self.address
+    }
+
     /// A fresh interface named `name`, with default (empty) signature/kind.
     pub fn new(name: Cow<'str, str>) -> Self {
         Self {

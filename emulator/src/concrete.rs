@@ -3778,7 +3778,7 @@ mod tests {
         let mut ctx = Context::new();
         let function = ctx.anon_function();
         let block = BasicBlock::make(&mut ctx, function).with_address(0x2000).id;
-        ctx.block_mut(block).extra_addresses.push(0x2001);
+        BasicBlock::from_id_mut(&mut ctx, block).cover_address(0x2001);
         let mut emulator = StandaloneEmulator::new(block);
 
         assert!(emulator.address_index.is_none());
