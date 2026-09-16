@@ -1526,33 +1526,11 @@ dependencies = [
 
 [[package]]
 name = "wazabin-jstd"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d153e5272c46dc622cb0c47c53d466c0d52ddad2accb90fa841a394d38155f58"
-dependencies = [
- "rustc-hash",
- "serde",
- "wazabin-jstd-derive 0.2.1",
-]
-
-[[package]]
-name = "wazabin-jstd"
 version = "0.2.2"
 dependencies = [
  "rustc-hash",
  "serde",
- "wazabin-jstd-derive 0.2.2",
-]
-
-[[package]]
-name = "wazabin-jstd-derive"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d1a53fcd34dc17d4c81d2849be84ffabeaed36b4cb9c4052136d31b6604bbf"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
+ "wazabin-jstd-derive",
 ]
 
 [[package]]
@@ -1569,17 +1547,7 @@ name = "wazabin-pcode"
 version = "0.1.3"
 dependencies = [
  "serde",
- "wazabin-jstd 0.2.2",
-]
-
-[[package]]
-name = "wazabin-pcode"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3342b0a36681fc09e5561aeb42c2029308fe33dabe479e43673eb75747c30b94"
-dependencies = [
- "serde",
- "wazabin-jstd 0.2.1",
+ "wazabin-jstd",
 ]
 
 [[package]]
@@ -1594,8 +1562,8 @@ dependencies = [
  "serde",
  "smallvec",
  "wazabin-binary",
- "wazabin-jstd 0.2.1",
- "wazabin-pcode 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "wazabin-jstd",
+ "wazabin-pcode",
  "wazabin-qcode-macro",
  "wazabin-qcode-parser",
 ]
@@ -1655,7 +1623,7 @@ name = "wazabin-qcode-passes"
 version = "0.4.2"
 dependencies = [
  "rustc-hash",
- "wazabin-jstd 0.2.1",
+ "wazabin-jstd",
  "wazabin-qcode",
  "wazabin-qcode-macro",
 ]
@@ -1672,7 +1640,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
- "wazabin-jstd 0.2.1",
+ "wazabin-jstd",
  "wazabin-qcode",
  "wazabin-qcode-emulator",
  "wazabin-qcode-passes",
@@ -1699,8 +1667,8 @@ dependencies = [
  "pest_derive",
  "serde",
  "toml",
- "wazabin-jstd 0.2.2",
- "wazabin-pcode 0.1.3",
+ "wazabin-jstd",
+ "wazabin-pcode",
 ]
 
 [[package]]
