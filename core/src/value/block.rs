@@ -1026,15 +1026,21 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         addresses: &mut crate::address_index::AddressIndex,
         addr: u64,
     ) -> Result<()> {
+        let current = addresses.is_current(self.ctx);
         let old_address = self.inner().address;
         self.inner_mut().address = Some(addr);
-        if let Err(error) = self
+        self.ctx.bodies[self.id.func].touch_shape();
+        let registered = self
             .ctx
-            .set_address_indexed(addresses, addr, self.id.into())
-        {
+            .set_address_indexed(addresses, addr, self.id.into());
+        if registered.is_err() {
             self.inner_mut().address = old_address;
-            return Err(error);
         }
+        // Registered or restored, the index reflects the block either way.
+        if current {
+            addresses.mark_current(self.ctx);
+        }
+        registered?;
 
         if self.name().is_none() {
             let label = self

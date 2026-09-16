@@ -51,7 +51,7 @@ use jstd::registry::{self, Identified, Registry};
 /// and space identifiers. When names are owned (e.g. generated names), they
 /// are stored as `Cow::Owned`; when they are borrowed from source data they are
 /// `Cow::Borrowed` and must outlive the context.
-#[derive(Default, Clone, serde::Serialize)]
+#[derive(serde::Serialize)]
 pub struct Context<'str> {
     /// Module-shared IR state: everything that is **not** per-function interface
     /// or body storage (regimes 1–3 of the context-split design — architecture,
@@ -79,6 +79,74 @@ pub struct Context<'str> {
     /// See [`is_poisoned`](Self::is_poisoned).
     #[serde(default)]
     poisoned: bool,
+
+    /// Which module instance this is; see [`identity`](Self::identity). Never
+    /// shared: a clone or a deserialized module gets its own.
+    #[serde(skip)]
+    identity: ContextIdentity,
+
+    /// The module-level part of the shape revision — see
+    /// [`revision`](Self::revision): bumped when a function is added or takes
+    /// an address. The per-function part lives in each body.
+    #[serde(skip)]
+    shape: u64,
+}
+
+/// The identity of one [`Context`] instance.
+///
+/// Every context ever constructed in a process — by [`Context::new`], by
+/// cloning, by deserializing — has a distinct identity, and keeps it for its
+/// whole life. Derived state built *from* a context, such as an
+/// [`AddressIndex`](crate::address_index::AddressIndex), records the identity
+/// so that it can later tell the context it describes from any other,
+/// including a clone whose ids happen to coincide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContextIdentity(u64);
+
+impl ContextIdentity {
+    fn fresh() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// The address-bearing shape of a [`Context`] at one moment: which module
+/// instance it is, and how many times the set of addressed entities has been
+/// changed since it was made. See [`Context::revision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Revision {
+    pub identity: ContextIdentity,
+    pub shape: u64,
+}
+
+impl<'str> Default for Context<'str> {
+    fn default() -> Self {
+        Self {
+            shared: Shared::default(),
+            interfaces: Registry::default(),
+            bodies: Registry::default(),
+            poisoned: false,
+            identity: ContextIdentity::fresh(),
+            shape: 0,
+        }
+    }
+}
+
+impl<'str> Clone for Context<'str> {
+    /// A clone is a new module instance: it has the same contents and the
+    /// same ids, but its own [`identity`](Self::identity), so derived state
+    /// built for the original does not pass for state built for the clone.
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            interfaces: self.interfaces.clone(),
+            bodies: self.bodies.clone(),
+            poisoned: self.poisoned,
+            identity: ContextIdentity::fresh(),
+            shape: self.shape,
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -118,6 +186,8 @@ impl<'de, 'str> serde::Deserialize<'de> for Context<'str> {
             interfaces,
             bodies,
             poisoned,
+            identity: ContextIdentity::fresh(),
+            shape: 0,
         })
     }
 }
@@ -432,6 +502,42 @@ impl<'str> Context<'str> {
         self.poisoned = false;
     }
 
+    /// Which module instance this is. See [`ContextIdentity`].
+    pub fn identity(&self) -> ContextIdentity {
+        self.identity
+    }
+
+    /// The module's shape revision: its identity, and a count of every change
+    /// so far to the set of entities that carry a machine address — an
+    /// address assigned to a function or block, an addressed block deleted,
+    /// absorbed into another or split, a body's epoch restarted. Creating a
+    /// function or block that has no address yet does not move it, since an
+    /// index need not list what has no address; nor do instruction-level
+    /// edits.
+    ///
+    /// Derived address state records the revision it was computed at; the
+    /// state is current exactly while the revision has not moved
+    /// ([`AddressIndex::is_current`](crate::address_index::AddressIndex::is_current)).
+    /// Every such change made through this crate's API is counted. Writing a
+    /// block's or interface's public `address` field directly, or rebuilding a
+    /// body's arenas by hand, is not: those fields are public for reading, and
+    /// an index cannot be kept current across a write that bypasses the
+    /// tracked mutators.
+    ///
+    /// The count is the sum of a module-level counter and one per function
+    /// body, so reading it is O(functions).
+    pub fn revision(&self) -> Revision {
+        Revision {
+            identity: self.identity,
+            shape: self.shape + self.bodies.iter().map(|body| body.shape()).sum::<u64>(),
+        }
+    }
+
+    /// Counts a change to the module-level address-bearing shape.
+    pub(crate) fn touch_shape(&mut self) {
+        self.shape += 1;
+    }
+
     /// Returns the [`SpaceId`] for the named space, or `None` if it has not
     /// been registered.
     pub fn try_get_space(&self, name: &str) -> Option<SpaceId> {
@@ -700,6 +806,18 @@ impl<'str> Context<'str> {
         addr: u64,
         func: FunctionId,
     ) -> BlockId {
+        addresses.tracked(self, |ctx, addresses| {
+            ctx.get_or_make_block_untracked(addresses, addr, func)
+        })
+    }
+
+    #[track_caller]
+    fn get_or_make_block_untracked(
+        &mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        addr: u64,
+        func: FunctionId,
+    ) -> BlockId {
         use crate::address_index::AddressTarget;
 
         if let Some(AddressTarget::Function(owner)) = addresses.get(addr) {
@@ -791,9 +909,11 @@ impl<'str> Context<'str> {
         block: BlockId,
         addr: u64,
     ) -> BlockId {
-        let tail = BasicBlock::make(self, block.func).id;
-        self.split_block_into(addresses, block, addr, tail);
-        tail
+        addresses.tracked(self, |ctx, addresses| {
+            let tail = BasicBlock::make(ctx, block.func).id;
+            ctx.split_block_into(addresses, block, addr, tail);
+            tail
+        })
     }
 
     /// [`split_block_at_address`](Self::split_block_at_address) with the new
@@ -814,24 +934,29 @@ impl<'str> Context<'str> {
             self.block(tail).address.is_none(),
             "the tail of a split has no address of its own yet"
         );
-        // `addr` is a branch target, and stays one: a later run through here
-        // must not fold across it and undo this split.
-        addresses.mark_boundary(addr);
+        addresses.tracked(self, |ctx, addresses| {
+            // `addr` is a branch target, and stays one: a later run through
+            // here must not fold across it and undo this split.
+            addresses.mark_boundary(addr);
 
-        // Emptying `block` drops its terminator, and with it every outgoing
-        // edge; the successors are rebuilt when it is lifted again.
-        self.bodies[block.func].clear_block_instructions(block);
+            // Emptying `block` drops its terminator, and with it every
+            // outgoing edge; the successors are rebuilt when it is lifted
+            // again.
+            ctx.bodies[block.func].clear_block_instructions(block);
 
-        // `addr` and everything else absorbed into `block` stop being its, and
-        // the index stops pointing at it for them: whichever half covers each
-        // address is settled by lifting, not guessed at here.
-        let absorbed = std::mem::take(&mut self.block_mut(block).extra_addresses);
-        for absorbed_addr in absorbed {
-            addresses.forget(absorbed_addr);
-        }
-        BasicBlock::from_id_mut(self, tail)
-            .in_function(block.func)
-            .with_address_indexed(addresses, addr);
+            // `addr` and everything else absorbed into `block` stop being
+            // its, and the index stops pointing at it for them: whichever
+            // half covers each address is settled by lifting, not guessed at
+            // here.
+            let absorbed = std::mem::take(&mut ctx.block_mut(block).extra_addresses);
+            ctx.bodies[block.func].touch_shape();
+            for absorbed_addr in absorbed {
+                addresses.forget(absorbed_addr);
+            }
+            BasicBlock::from_id_mut(ctx, tail)
+                .in_function(block.func)
+                .with_address_indexed(addresses, addr);
+        });
     }
 
     /// Moves `insn` and everything after it into a fresh block of the same
@@ -1039,6 +1164,17 @@ impl<'str> Context<'str> {
         target: FunctionId,
         olds: &[BlockId],
     ) -> HashMap<BlockId, BlockId> {
+        addresses.tracked(self, |ctx, addresses| {
+            ctx.rehome_owned_blocks_untracked(addresses, target, olds)
+        })
+    }
+
+    fn rehome_owned_blocks_untracked(
+        &mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        target: FunctionId,
+        olds: &[BlockId],
+    ) -> HashMap<BlockId, BlockId> {
         // Body-local temporary values and spaces move with blocks that reference
         // them. Collect the exact dependency closure first: operand/origin temps,
         // explicit load/store spaces, and pointer provenance carried by types.
@@ -1227,6 +1363,7 @@ impl<'str> Context<'str> {
             }
             self.block_mut(new).extra_addresses = extra;
             self.block_mut(new).address = Some(addr);
+            self.bodies[new.func].touch_shape();
         }
 
         // Phase 5: delete the originals (unlinks their old edges, physically
@@ -1331,6 +1468,16 @@ impl<'str> Context<'str> {
     /// Indexed construction variant of
     /// [`split_function_at`](Self::split_function_at).
     pub fn split_function_at_indexed(
+        &mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        block: BlockId,
+    ) -> FunctionId {
+        addresses.tracked(self, |ctx, addresses| {
+            ctx.split_function_at_untracked(addresses, block)
+        })
+    }
+
+    fn split_function_at_untracked(
         &mut self,
         addresses: &mut crate::address_index::AddressIndex,
         block: BlockId,

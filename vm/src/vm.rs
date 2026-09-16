@@ -960,6 +960,10 @@ impl<S: CodeSource> Vm<S> {
         for addr in covered {
             index.set_block(addr, block);
         }
+        // Absorption moved those addresses behind the index; every one of them
+        // now points at the absorber again, so the index is complete and the
+        // next on-demand lift binds it without a rebuild.
+        index.mark_current(&self.ctx);
         self.emu.set_address_index(index);
     }
 

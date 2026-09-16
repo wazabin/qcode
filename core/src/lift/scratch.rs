@@ -158,7 +158,11 @@ impl ScratchStore {
             self.ctx.bodies[self.function].start_epoch();
             self.ctx.clear_poison();
         }
+        // Emptied by hand rather than rebuilt, to keep its capacity: the host
+        // has no blocks now and the module has no addressed function, so an
+        // empty index is the complete one.
         self.addresses.clear();
+        self.addresses.mark_current(&self.ctx);
     }
 
     /// Binds the store for one instruction.
@@ -203,8 +207,8 @@ mod tests {
         let first = store.arena_stats();
         assert_eq!(first.blocks.issued, 3, "entry, local label, fall-through");
         assert_eq!(first.instructions.issued, 3);
-        let first_users = store.context().bodies[store.function()].users.len();
-        assert_eq!(first_users, 2, "the literal and the temporary");
+        let first_uses = store.context().bodies[store.function()].uses.len();
+        assert_eq!(first_uses, 2, "the literal and the temporary");
 
         for i in 0..10_000u64 {
             store.reset();
@@ -217,7 +221,7 @@ mod tests {
         assert_eq!(last.instructions.capacity, first.instructions.capacity);
         let body = &store.context().bodies[store.function()];
         assert_eq!(body.temps.len(), 1);
-        assert_eq!(body.users.len(), first_users);
+        assert_eq!(body.uses.len(), first_uses);
         let last_address = 0x1000 + 4 * 9_999;
         assert!(body.names.contains(&format!("local_{last_address:x}")));
         assert!(!body.names.contains("local_1000"));

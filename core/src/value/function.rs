@@ -508,6 +508,12 @@ pub struct FunctionBody<'str> {
     /// a value with no use in this body has no entry.
     #[serde(skip)]
     pub(crate) shared_first_use: FxHashMap<LocalValueId, UseId>,
+
+    /// This body's part of the module's shape revision (see
+    /// [`Context::revision`](crate::context::Context::revision)): bumped by
+    /// every change to which blocks exist here and which addresses they carry.
+    #[serde(skip)]
+    shape: u64,
 }
 
 /// Aggregate storage statistics for one kind of function-body entity.
@@ -762,6 +768,7 @@ impl<'str> FunctionBody<'str> {
             names: crate::context::NameTable::default(),
             uses: UseArena::default(),
             shared_first_use: FxHashMap::default(),
+            shape: 0,
         }
     }
 
@@ -787,6 +794,7 @@ impl<'str> FunctionBody<'str> {
             names: crate::context::NameTable::default(),
             uses: UseArena::default(),
             shared_first_use: FxHashMap::default(),
+            shape: 0,
         }
     }
 
@@ -1027,6 +1035,7 @@ impl<'str> FunctionBody<'str> {
     /// Only a [`ScratchStore`](crate::lift::ScratchStore) may call this — the
     /// one owner that can vouch no id of the previous epoch survives.
     pub(crate) fn start_epoch(&mut self) {
+        self.shape += 1;
         self.insns.clear();
         self.blocks.clear();
         self.params.clear();
@@ -1037,7 +1046,8 @@ impl<'str> FunctionBody<'str> {
         self.temp_spaces.truncate(0);
         self.instruction_addrs.clear();
         self.names.clear();
-        self.users.clear();
+        self.uses.clear();
+        self.shared_first_use.clear();
     }
 
     /// Drops the temporaries and temporary spaces appended since the body had
@@ -1172,6 +1182,17 @@ impl<'str> FunctionBody<'str> {
         let local = self.blocks.push(block);
         self.roster.push(local);
         local
+    }
+
+    /// This body's part of the shape revision; see
+    /// [`Context::revision`](crate::context::Context::revision).
+    pub fn shape(&self) -> u64 {
+        self.shape
+    }
+
+    /// Counts a change to this body's address-bearing shape.
+    pub(crate) fn touch_shape(&mut self) {
+        self.shape += 1;
     }
 
     /// Mint a fresh empty block, owned by this function (arena membership) and
@@ -2199,7 +2220,14 @@ impl<'str> FunctionBody<'str> {
         if let Some(name) = name {
             self.names.forget(&name);
         }
+        let addressed = {
+            let block = &self.blocks[block.local];
+            block.address.is_some() || !block.extra_addresses.is_empty()
+        };
         self.blocks.remove(block.local);
+        if addressed {
+            self.shape += 1;
+        }
     }
 
     /// Absorb `other` into `keep`: drop `keep`'s terminal branch, append `other`'s
@@ -2265,6 +2293,12 @@ impl<'str> FunctionBody<'str> {
             self.names.forget(&name);
         }
         self.blocks.remove(other.local);
+        // The addresses `other` carried move to `keep`: an index naming
+        // `other` for them is behind now, and one that never listed `other`
+        // has nothing to catch up on.
+        if b_addr.is_some() || !b_extra.is_empty() {
+            self.shape += 1;
+        }
         if let Some(addr) = b_addr {
             self.block_mut(keep).extra_addresses.push(addr);
         }
@@ -2393,17 +2427,24 @@ impl<'str> FunctionBody<'str> {
         let name = name.unwrap_or_else(|| Cow::Owned(format!("fn_{address:x}")));
         let name = ctx.shared.name_map.unique(name);
         let id = FunctionId::from(ctx.bodies.len());
+        // A current index stays current: the function and its address both
+        // go into it here.
+        let current = addresses.is_current(ctx);
         let pushed = ctx.push_function(
             FunctionInterface::new(name.clone()),
             FunctionBody::empty_with_id(id),
         );
         debug_assert_eq!(pushed, id);
 
-        Self::from_id_mut(ctx, id)
+        let function = Self::from_id_mut(ctx, id)
             .with_name(name)
             .expect("Function name is not unique")
             .with_address_indexed(addresses, address)
-            .expect("Function address is not unique")
+            .expect("Function address is not unique");
+        if current {
+            addresses.mark_current(function.ctx);
+        }
+        function
     }
 
     /// Like [`FunctionBody::make_at_addr`] but marks the result as external.
@@ -2973,16 +3014,21 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         addresses: &mut crate::address_index::AddressIndex,
         address: u64,
     ) -> Result<()> {
+        let current = addresses.is_current(self.ctx);
         let old_address = self.interface().address;
         self.interface_mut().address = Some(address);
-        if let Err(error) = self
+        self.ctx.touch_shape();
+        let result = self
             .ctx
-            .set_address_indexed(addresses, address, self.id.into())
-        {
+            .set_address_indexed(addresses, address, self.id.into());
+        if result.is_err() {
             self.interface_mut().address = old_address;
-            return Err(error);
         }
-        Ok(())
+        // Registered or restored, the index reflects the interface either way.
+        if current {
+            addresses.mark_current(self.ctx);
+        }
+        result
     }
 
     fn with_address_indexed(

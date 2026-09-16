@@ -79,6 +79,15 @@ pub enum TargetError {
     /// A previous rollback could not restore the context, which is poisoned
     /// (see [`Context::is_poisoned`]); nothing further is lifted into it.
     Poisoned,
+    /// The index was not computed for this context: it describes another
+    /// module instance (a clone of this one, or an unrelated module whose ids
+    /// happen to match), or it was cleared and never rebuilt.
+    ForeignIndex,
+    /// The index was computed for this context, but the context's
+    /// address-bearing shape has changed since without it, so it may omit an
+    /// entity the context has. Refresh it, or bind through
+    /// [`LiftTarget::bind`], which does.
+    OutdatedIndex,
 }
 
 impl fmt::Display for TargetError {
@@ -109,6 +118,10 @@ impl fmt::Display for TargetError {
             Self::Poisoned => {
                 f.write_str("the context was poisoned by a failed rollback and refuses lifting")
             }
+            Self::ForeignIndex => f.write_str("the address index describes another context"),
+            Self::OutdatedIndex => {
+                f.write_str("the context changed since its address index was computed")
+            }
         }
     }
 }
@@ -126,41 +139,50 @@ pub struct LiftTarget<'a, 'str> {
 }
 
 impl<'a, 'str> LiftTarget<'a, 'str> {
-    /// Binds `addresses` after rebuilding it from `ctx`, so it is complete and
-    /// current, and selects `function` as the host.
+    /// Binds `addresses`, rebuilding it from `ctx` first unless it is
+    /// [current](AddressIndex::is_current), and selects `function` as the host.
     ///
-    /// This is the safe binding: because the index is rebuilt here, an address
-    /// the context already covers is always found, so no construction creates a
-    /// second block or function at an address that already has one. Use it
-    /// wherever the caller cannot cheaply prove its index is current — a fresh
-    /// analysis, a Python wrapper, a one-off lift.
+    /// This is the safe binding, and the recommended one: an index that is
+    /// current is complete, so no construction creates a second block or
+    /// function at an address the context already covers; one that is not —
+    /// computed for another context, or left behind by a mutation made
+    /// without it — is rebuilt here, which costs O(module) once per such
+    /// event and nothing otherwise. A caller that threads its index through
+    /// every mutation pays the rebuild never; one that cannot pays it only
+    /// when it has to.
     ///
-    /// The rebuild is O(module). A caller that lifts in a hot loop and keeps
-    /// its index current itself uses [`bind_indexed`](Self::bind_indexed).
+    /// [`bind_indexed`](Self::bind_indexed) refuses instead of rebuilding, for
+    /// a caller that would rather learn its index fell behind.
     pub fn bind(
         ctx: &'a mut Context<'str>,
         addresses: &'a mut AddressIndex,
         function: FunctionId,
     ) -> Result<Self, TargetError> {
-        addresses.refresh(ctx);
+        if !addresses.is_current(ctx) {
+            addresses.refresh(ctx);
+        }
         Self::bind_indexed(ctx, addresses, function)
     }
 
     /// Binds a caller-maintained `addresses` without rebuilding it, and selects
     /// `function` as the host.
     ///
-    /// This is the advanced, hot-path binding for a caller that owns its index
-    /// across every mutation and keeps it current — an emulator that lifts on
-    /// demand, or a session that threads one index through a run. **The index
-    /// must reflect every address-bearing entity in `ctx`.** The target checks
-    /// each entry it acts on against the context and refuses a stale one
-    /// ([`TargetError::StaleIndex`]), but it cannot detect an entity the index
-    /// *omits*: an address the index does not list is taken to be free, and a
-    /// construction there would make a second block or function beside the one
-    /// already in the context. Where that guarantee is not cheap to uphold, use
-    /// [`bind`](Self::bind), which rebuilds the index first. Establishing
-    /// provenance without a rebuild needs context/index revision tracking,
-    /// which does not exist yet.
+    /// The index must be [current](AddressIndex::is_current) for `ctx`: computed
+    /// for this context instance and carried through every address-bearing
+    /// change since, by the tracked `*_indexed` mutators or by a caller that
+    /// applied a change by hand and [vouched for it](AddressIndex::mark_current).
+    /// An index computed for another context is refused as
+    /// [`ForeignIndex`](TargetError::ForeignIndex); one the context has moved
+    /// past as [`OutdatedIndex`](TargetError::OutdatedIndex). Only a current
+    /// index is complete, and only a complete index lets a construction know
+    /// that an address it does not list is free. The entries it does list are
+    /// still checked against the context as they are used
+    /// ([`StaleIndex`](TargetError::StaleIndex)).
+    ///
+    /// This is the hot-path binding for a caller that keeps its index current
+    /// on purpose — an emulator that lifts on demand, a session that threads
+    /// one index through a run — and wants to know when it has not. Everyone
+    /// else uses [`bind`](Self::bind).
     ///
     /// A [poisoned](Context::is_poisoned) context is refused outright.
     pub fn bind_indexed(
@@ -170,6 +192,12 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
     ) -> Result<Self, TargetError> {
         if ctx.is_poisoned() {
             return Err(TargetError::Poisoned);
+        }
+        if !addresses.describes(ctx) {
+            return Err(TargetError::ForeignIndex);
+        }
+        if !addresses.is_current(ctx) {
+            return Err(TargetError::OutdatedIndex);
         }
         if usize::from(function) >= ctx.bodies.len() {
             return Err(TargetError::UnknownFunction(function));
@@ -319,6 +347,17 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
         BasicBlock::make(self.ctx, self.function)
             .with_address_indexed(self.addresses, address)
             .id
+    }
+
+    /// Declares the index current again at the end of a construction.
+    ///
+    /// The index was current when the target bound, and the target holds
+    /// both it and the context exclusively, so every change since is the
+    /// construction's own: blocks it made at addresses through the index, or,
+    /// on rollback, deleted and forgot again. Nothing was made at an address
+    /// without going through the index, so the index is complete.
+    fn settle_index(&mut self) {
+        self.addresses.mark_current(self.ctx);
     }
 }
 
@@ -555,6 +594,7 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
             }
         }
         self.settled = true;
+        self.target.settle_index();
         Ok(lifted)
     }
 
@@ -624,6 +664,7 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
         } else {
             ctx.poison();
         }
+        self.target.settle_index();
     }
 }
 
@@ -736,7 +777,8 @@ mod tests {
         assert_eq!(body.insns.issued_len(), 0);
         assert_eq!(body.blocks.issued_len(), 1);
         assert_eq!(body.temps.len(), 0);
-        assert!(body.users.is_empty());
+        assert!(body.uses.is_empty());
+        assert!(body.shared_first_use.is_empty());
         assert_eq!(ctx.bodies.len(), 1, "no callee was created");
 
         // And the address lifts afterwards.
@@ -984,11 +1026,19 @@ mod tests {
         let foreign = BasicBlock::make(&mut ctx, other)
             .with_address_indexed(&mut addresses, 0x2010)
             .id;
-        // A block the index remembers but the context no longer has.
+        // A block the index remembers but the context no longer has. Deleting
+        // it behind the index leaves the index behind, which binding notices;
+        // a caller that then vouches for the index anyway gets the per-entry
+        // check instead.
         let gone = BasicBlock::make(&mut ctx, function)
             .with_address_indexed(&mut addresses, 0x1050)
             .id;
         ctx.delete_block(gone);
+        assert_eq!(
+            LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).err(),
+            Some(TargetError::OutdatedIndex)
+        );
+        addresses.mark_current(&ctx);
 
         let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
         let mut construction = target.begin(0x1000, 1).unwrap();
@@ -1011,6 +1061,166 @@ mod tests {
             Some(TargetError::StaleIndex { address: 0x1050 })
         );
         assert_eq!(construction.callee_at(0x2000).unwrap(), Callee::Real(other));
+    }
+
+    #[test]
+    fn an_index_of_another_context_is_foreign_even_when_its_ids_match() {
+        let mut ctx = Context::new();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let function = host(&mut ctx, &mut addresses, 0x1000);
+        // A clone has the same ids and, at this moment, the same shape — and
+        // is still another module: an index built for it does not describe
+        // this one.
+        let twin = ctx.clone();
+        assert_ne!(twin.identity(), ctx.identity());
+        let mut foreign = AddressIndex::analyze(&twin);
+        assert_eq!(foreign, addresses, "same contents");
+        assert_eq!(
+            LiftTarget::bind_indexed(&mut ctx, &mut foreign, function).err(),
+            Some(TargetError::ForeignIndex)
+        );
+        // The safe binding rebuilds it for this context instead.
+        LiftTarget::bind(&mut ctx, &mut foreign, function).unwrap();
+        assert!(foreign.is_current(&ctx));
+        // A revision travels with its context through moves, not clones.
+        let moved = ctx;
+        assert!(foreign.is_current(&moved));
+    }
+
+    #[test]
+    fn an_index_that_omits_an_addressed_block_is_outdated_and_never_duplicates_it() {
+        let mut ctx = Context::new();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let function = host(&mut ctx, &mut addresses, 0x1000);
+        assert!(addresses.is_current(&ctx));
+
+        // Instruction-level work moves nothing: the index stays current.
+        let zero = ctx.shared.get_const(0, 8);
+        let scratch = BasicBlock::make(&mut ctx, function).id;
+        ctx.builder(scratch).push_branchind(zero);
+        assert!(addresses.is_current(&ctx), "an address-less block is not indexed");
+
+        // A block given an address behind the index: the index now omits it.
+        let unlisted = BasicBlock::make(&mut ctx, function)
+            .with_address(0x1010)
+            .id;
+        assert_eq!(addresses.block_at(0x1010), None);
+        assert!(!addresses.is_current(&ctx));
+        assert!(addresses.describes(&ctx));
+        assert_eq!(
+            LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).err(),
+            Some(TargetError::OutdatedIndex)
+        );
+
+        // The safe binding refreshes, and a construction branching to that
+        // address finds the block rather than making a second one.
+        let mut target = LiftTarget::bind(&mut ctx, &mut addresses, function).unwrap();
+        let mut construction = target.begin(0x1000, 1).unwrap();
+        assert_eq!(construction.block_at(0x1010).unwrap(), unlisted);
+        let entry = construction.entry();
+        let mut recorder = Recorder::new(0x1000, 1, entry);
+        let site = construction.builder(entry).push_branch(unlisted).id;
+        recorder.exit(
+            site,
+            ExitArm::Unconditional,
+            ExitKind::Branch { target: 0x1010 },
+        );
+        construction.commit(recorder.finish()).unwrap();
+        let _ = target;
+        assert!(addresses.is_current(&ctx), "a construction leaves it current");
+        assert_eq!(
+            ctx.block_ids()
+                .iter()
+                .filter(|&&b| ctx.block(b).address == Some(0x1010))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_wrong_currency_claim_is_the_callers_bug_and_duplicates() {
+        // The documented hazard of `mark_current`: the claim is trusted, so an
+        // omission the caller did not know of becomes a second block at the
+        // same address. This is why the claim is the caller's alone to make,
+        // and why the tracked mutators are preferred.
+        let mut ctx = Context::new();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let function = host(&mut ctx, &mut addresses, 0x1000);
+        let unlisted = BasicBlock::make(&mut ctx, function)
+            .with_address(0x1010)
+            .id;
+        addresses.mark_current(&ctx);
+        let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+        let mut construction = target.begin(0x1000, 1).unwrap();
+        let duplicate = construction.block_at(0x1010).unwrap();
+        assert_ne!(duplicate, unlisted);
+        let entry = construction.entry();
+        let mut recorder = Recorder::new(0x1000, 1, entry);
+        let site = construction.builder(entry).push_branch(duplicate).id;
+        recorder.exit(
+            site,
+            ExitArm::Unconditional,
+            ExitKind::Branch { target: 0x1010 },
+        );
+        construction.commit(recorder.finish()).unwrap();
+        let _ = target;
+        assert_eq!(
+            ctx.block_ids()
+                .iter()
+                .filter(|&&b| ctx.block(b).address == Some(0x1010))
+                .count(),
+            2,
+            "what a wrong claim costs"
+        );
+    }
+
+    #[test]
+    fn rebinding_after_arbitrary_mutation_refreshes_or_refuses() {
+        let mut ctx = Context::new();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let function = host(&mut ctx, &mut addresses, 0x1000);
+        {
+            let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+            let mut construction = target.begin(0x1000, 1).unwrap();
+            let lifted = emit_fallthrough(&mut construction);
+            construction.commit(lifted).unwrap();
+        }
+        assert!(addresses.is_current(&ctx));
+        let placeholder = addresses.block_at(0x1001).unwrap();
+
+        // Arbitrary mutation between lifts: a pass deletes the fall-through
+        // placeholder without the index.
+        ctx.delete_block(placeholder);
+        assert_eq!(
+            LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).err(),
+            Some(TargetError::OutdatedIndex)
+        );
+        let mut target = LiftTarget::bind(&mut ctx, &mut addresses, function).unwrap();
+        assert_eq!(target.addresses().block_at(0x1001), None, "refreshed");
+        let mut construction = target.begin(0x1001, 1).unwrap();
+        assert_ne!(construction.entry(), placeholder, "a fresh block, not the deleted id");
+        let lifted = emit_fallthrough(&mut construction);
+        construction.commit(lifted).unwrap();
+        let _ = target;
+        assert!(addresses.is_current(&ctx));
+    }
+
+    #[test]
+    fn a_rolled_back_construction_leaves_the_index_current() {
+        let mut ctx = Context::new();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let function = host(&mut ctx, &mut addresses, 0x1000);
+        let revision = ctx.revision();
+        {
+            let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+            let mut construction = target.begin(0x1000, 1).unwrap();
+            let _ = emit_fallthrough(&mut construction);
+            construction.abort();
+            // Rebinding right away works: the rollback settled the index.
+            target.begin(0x1000, 1).unwrap().abort();
+        }
+        assert!(addresses.is_current(&ctx));
+        assert_ne!(ctx.revision(), revision, "the placeholders came and went");
     }
 
     #[test]
