@@ -276,3 +276,71 @@ fn a_chain_follows_returns_and_indirect_calls() {
         vm.stats.native_bodies
     );
 }
+
+/// `step` means one block at most, so stepping a loop that stays in compiled
+/// code comes back after every pass round it.
+#[test]
+fn a_step_never_chains_past_the_block_it_starts() {
+    // `l: dec ecx; jmp l`
+    let mut vm = machine(&[0xff, 0xc9, 0xeb, 0xfc]);
+    vm.set_block_executor(Box::new(Jit::new()));
+    for _ in 0..100 {
+        assert!(vm.step().is_none());
+    }
+    let ctx = vm.context().clone();
+    // One decrement per block, and at most one block per step; the first
+    // steps went on discovery rather than running anything.
+    let ecx = vm.emulator().read_varnode_by_name(&ctx, "ECX").unwrap();
+    let passes = ecx.wrapping_neg() & 0xffff_ffff;
+    assert!((1..=100).contains(&passes), "{passes} passes in 100 steps");
+}
+
+/// A block that is a terminator and nothing else retires no operation when
+/// it runs, so any positive allowance would still let a chain through it
+/// into the next block. A step must therefore hand the executor the
+/// allowance that forbids chaining outright, which is `0`; `run` hands it
+/// what is left of its budget.
+#[test]
+fn a_step_forbids_chaining_where_a_run_rations_it() {
+    use qcode_vm::BlockExecutor;
+    use std::{cell::RefCell, rc::Rc};
+
+    /// Records the allowance of every call and runs nothing itself.
+    struct Recorder(Rc<RefCell<Vec<u64>>>);
+    impl BlockExecutor for Recorder {
+        fn run_block(
+            &mut self,
+            _: &qcode::context::Context<'_>,
+            _: &mut qcode_emulator::StandaloneEmulator<VmMemory>,
+            _: qcode::value::BlockId,
+            _: usize,
+            chain: u64,
+        ) -> Result<Option<qcode_vm::Executed>, qcode_emulator::EmulatorErrorKind> {
+            self.0.borrow_mut().push(chain);
+            Ok(None)
+        }
+    }
+
+    // `l: dec ecx; jmp l`
+    let mut vm = machine(&[0xff, 0xc9, 0xeb, 0xfc]);
+    let allowances = Rc::new(RefCell::new(Vec::new()));
+    vm.set_block_executor(Box::new(Recorder(allowances.clone())));
+
+    for _ in 0..50 {
+        assert!(vm.step().is_none());
+    }
+    let stepped = allowances.borrow_mut().drain(..).collect::<Vec<_>>();
+    assert!(
+        !stepped.is_empty(),
+        "the executor was never offered a block"
+    );
+    assert!(stepped.iter().all(|&chain| chain == 0), "{stepped:?}");
+
+    assert!(matches!(vm.run(1000), qcode_vm::VmExit::InstructionLimit));
+    let ran = allowances.borrow();
+    assert!(!ran.is_empty(), "the executor was never offered a block");
+    assert!(
+        ran.iter().all(|&chain| (1..=1000).contains(&chain)),
+        "{ran:?}"
+    );
+}

@@ -619,10 +619,18 @@ impl<S: CodeSource> Vm<S> {
     /// Executes one instruction, lifting code on demand if control leaves the
     /// part of the module already known.
     ///
+    /// With an executor installed, one instruction is the whole of the block
+    /// it starts, and no more: a step never chains on into further blocks,
+    /// so stepping a loop compiled whole comes back after each pass round
+    /// it rather than never.
+    ///
     /// Returns `None` when the step was ordinary, and `Some(exit)` when the
     /// machine stopped for a reason worth reporting.
     pub fn step(&mut self) -> Option<VmExit> {
-        self.step_within(u64::MAX)
+        // The allowance that forbids chaining outright, not one operation: a
+        // block with nothing but a terminator retires nothing, and would be
+        // within any positive allowance.
+        self.step_within(0)
     }
 
     /// [`step`](Self::step), with an executor allowed to chain through at
