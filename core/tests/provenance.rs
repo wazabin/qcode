@@ -197,7 +197,7 @@ fn a_reloaded_module_mutates_on_its_own_clock() {
 
 #[test]
 fn a_clone_of_a_body_is_detached_until_push_function_installs_and_counts_it() {
-    let (mut ctx, mut addresses, function, block) = module(0x1000);
+    let (mut ctx, addresses, function, block) = module(0x1000);
     // The one way a body value leaves a module: a read-only clone, on a
     // detached clock. Mutating the clone moves nothing in the module.
     let mut snapshot = ctx.body(function).clone();
