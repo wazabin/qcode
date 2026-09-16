@@ -632,7 +632,7 @@ mod tests {
         let f = ctx.function_ids()[0];
         let dead = BasicBlock::make(&mut ctx, f).id;
         ctx.delete_block(dead);
-        ctx.function_mut(f).set_root_id(Some(dead.local));
+        ctx.bodies[f].set_root_id(Some(dead.local));
 
         assert_has(&ctx, "root");
     }

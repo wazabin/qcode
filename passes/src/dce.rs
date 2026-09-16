@@ -4,7 +4,7 @@ use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     context::Context,
-    value::{BlockId, FunctionBody, InstructionId, QCodeView, ValueId},
+    value::{BlockId, BodyMut, InstructionId, QCodeMut, QCodeView, ValueId},
 };
 
 use crate::{PassCtx, with_body_mut};
@@ -87,7 +87,7 @@ pub fn remove_dead_insns(ctx: &mut Context, block_id: BlockId) -> bool {
 
 /// Body-local core of [`remove_dead_insns`].
 pub fn remove_dead_insns_body<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut BodyMut<'_, 'str>,
     cx: PassCtx<'a, 'str>,
     block_id: BlockId,
 ) -> bool {
@@ -118,7 +118,7 @@ pub fn remove_dead_insns_body<'a, 'str>(
 /// load-before-store registers that later become dead, without touching join
 /// blocks whose predecessor terminators carry positional arguments.
 pub fn remove_unused_no_pred_block_params<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut BodyMut<'_, 'str>,
     cx: PassCtx<'a, 'str>,
     block_id: BlockId,
 ) -> bool {

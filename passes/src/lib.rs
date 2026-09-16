@@ -9,8 +9,8 @@
 //!
 //! ## The context view
 //!
-//! A pass reads the module through a [`PassCtx`] and mutates a single
-//! [`FunctionBody`] lent out of the bodies registry. Splitting a [`Context`]
+//! A pass reads the module through a [`PassCtx`] and mutates a single body
+//! through its [`BodyMut`], borrowed out of the bodies registry. Splitting a [`Context`]
 //! into those two halves is what [`with_body_mut`] does. Because `PassCtx`
 //! holds only shared references it is `Copy`, so a caller hands the same view
 //! to every helper.
@@ -53,10 +53,7 @@
 use jstd::registry::Registry;
 use qcode::{
     context::{Context, Shared},
-    value::{
-        BodiesMut, BodyView, FunctionBody, FunctionId, function::FunctionInterface,
-        util::body_mut::BodyMut,
-    },
+    value::{BodiesMut, BodyMut, BodyView, FunctionBody, FunctionId, function::FunctionInterface},
 };
 
 pub mod cfg;
@@ -126,14 +123,6 @@ impl<'ctx, 'str> PassCtx<'ctx, 'str> {
     {
         BodyView::new(body, self.shared, self.interfaces)
     }
-
-    /// Build the mutation host for a pass's exclusively borrowed body.
-    pub fn host<'body>(self, body: &'body mut FunctionBody<'str>) -> BodyMut<'body, 'str>
-    where
-        'ctx: 'body,
-    {
-        BodyMut::new(body, self.shared, self.interfaces)
-    }
 }
 
 /// Split a context into its lendable bodies and the read-only module view,
@@ -143,15 +132,15 @@ pub fn split<'a, 'str>(ctx: &'a mut Context<'str>) -> (BodiesMut<'a, 'str>, Pass
     (bodies, PassCtx { shared, interfaces })
 }
 
-/// Run `f` against function `fid`'s body lent out of `ctx`, with the matching
-/// read-only view.
+/// Run `f` against function `fid`'s body borrowed out of `ctx`, with the
+/// matching read-only view.
 ///
 /// This is the `&mut Context` entry point the block-local passes expose to
-/// callers that hold a whole context and neither a [`FunctionBody`] nor a view.
+/// callers that hold a whole context and neither a [`BodyMut`] nor a view.
 pub fn with_body_mut<'str, R>(
     ctx: &mut Context<'str>,
     fid: FunctionId,
-    f: impl FnOnce(&mut FunctionBody<'str>, PassCtx<'_, 'str>) -> R,
+    f: impl FnOnce(&mut BodyMut<'_, 'str>, PassCtx<'_, 'str>) -> R,
 ) -> R {
     let (mut bodies, view) = split(ctx);
     f(&mut bodies.get_mut(fid), view)

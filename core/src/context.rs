@@ -1,11 +1,7 @@
 //! The central arena for all IR state: [`Context`].
 
 use crate::value::QCodeMut;
-use std::{
-    borrow::Cow,
-    fmt::Display,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::{borrow::Cow, fmt::Display, sync::atomic::Ordering};
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -16,7 +12,7 @@ use crate::{
     space::{LocalMemorySpaceId, MemorySpaceId, Space, SpaceId, SpaceStore},
     types::TypeManager,
     value::{
-        BasicBlock, BlockParamRef, BodiesMut, BodyLoan, FunctionBody, FunctionId, FunctionRef,
+        BasicBlock, BlockParamRef, BodiesMut, BodyMut, FunctionBody, FunctionId, FunctionRef,
         Instruction, ModuleView, QCodeView, TempId, TempSpaceId, ValueId,
         block::{BlockId, BlockRef, EdgeData, EdgeId},
         block_param::{BlockParam, BlockParamId},
@@ -61,7 +57,7 @@ pub struct Context<'str> {
     /// or body storage (regimes 1–3 of the context-split design — architecture,
     /// interners, module maps, truths). Reached behind `&mut Context`, or as
     /// the frozen `&Shared` view [`split_bodies`](Self::split_bodies) hands
-    /// out while bodies are lent.
+    /// out while bodies are borrowed.
     pub shared: Shared<'str>,
 
     /// Per-function *interface* storage — the caller-reasoning surface (name,
@@ -77,29 +73,17 @@ pub struct Context<'str> {
     /// edge arenas; the composite-ID accessors ([`Context::instruction`] etc.)
     /// route through here. Read through [`bodies`](Self::bodies) and
     /// [`body`](Self::body); a body is handed out mutably only as a
-    /// [`BodyLoan`], which settles what the holder did with it against the
-    /// module's revision — see [`revision`](Self::revision). The registry
-    /// itself is never handed out mutably, so bodies cannot be installed,
-    /// removed or swapped except by this crate.
+    /// [`BodyMut`], whose verbs count what they change — see
+    /// [`revision`](Self::revision). Neither the registry nor a bare
+    /// `&mut FunctionBody` is ever handed out, so bodies cannot be installed,
+    /// removed, replaced or swapped except by this crate.
     pub(crate) bodies: Registry<FunctionId, FunctionBody<'str>>,
 
     /// Set when a lift into this module failed in a way its rollback could not
-    /// fully undo, so the module may hold IR that no instruction accounts for,
-    /// or when a [`BodyLoan`] settled a body that is not the one its slot
-    /// installs. See [`is_poisoned`](Self::is_poisoned). Atomic so a loan,
-    /// which borrows the module's bodies mutably, can set it through a shared
-    /// reference.
+    /// fully undo, so the module may hold IR that no instruction accounts for.
+    /// See [`is_poisoned`](Self::is_poisoned).
     #[serde(default)]
-    poisoned: AtomicBool,
-
-    /// How many [`BodyLoan`]s of this module have been handed out and not
-    /// settled. A live loan borrows the module, so whenever this is observed
-    /// non-zero through a reference to the module, the loans it counts were
-    /// leaked (`mem::forget`) and never settled: the bodies they lent may be
-    /// on another module's clock, or replaced. No index is current until
-    /// [`settle_loans`](Self::settle_loans) has repaired that.
-    #[serde(skip)]
-    loans: std::sync::atomic::AtomicU64,
+    poisoned: bool,
 
     /// Which module instance this is; see [`identity`](Self::identity). Never
     /// shared: a clone or a deserialized module gets its own.
@@ -202,8 +186,7 @@ impl<'str> Default for Context<'str> {
             shared: Shared::default(),
             interfaces: Registry::default(),
             bodies: Registry::default(),
-            poisoned: AtomicBool::new(false),
-            loans: std::sync::atomic::AtomicU64::new(0),
+            poisoned: false,
             identity: ContextIdentity::fresh(),
             clock: ShapeClock::default(),
         }
@@ -226,10 +209,7 @@ impl<'str> Clone for Context<'str> {
             shared: self.shared.clone(),
             interfaces: self.interfaces.clone(),
             bodies,
-            poisoned: AtomicBool::new(self.is_poisoned()),
-            // Every body was just linked to the new clock, whatever loans of
-            // the original were leaked.
-            loans: std::sync::atomic::AtomicU64::new(0),
+            poisoned: self.poisoned,
             identity: ContextIdentity::fresh(),
             clock,
         }
@@ -274,8 +254,7 @@ impl<'de, 'str> serde::Deserialize<'de> for Context<'str> {
             shared,
             interfaces,
             bodies,
-            poisoned: AtomicBool::new(poisoned),
-            loans: std::sync::atomic::AtomicU64::new(0),
+            poisoned,
             identity: ContextIdentity::fresh(),
             clock,
         })
@@ -580,7 +559,7 @@ impl<'str> Context<'str> {
     /// disposal, or a store that discards the whole damaged epoch (the scratch
     /// store does, since its host holds nothing but the failed instruction).
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned.load(Ordering::Relaxed)
+        self.poisoned
     }
 
     /// Marks the module as holding IR its construction cannot vouch for. Set
@@ -588,48 +567,13 @@ impl<'str> Context<'str> {
     /// that detects damage of its own may set it too. There is no public way
     /// to clear it.
     pub fn poison(&mut self) {
-        self.poisoned.store(true, Ordering::Relaxed);
+        self.poisoned = true;
     }
 
     /// Clears the poison. Only for an owner that has discarded every body the
     /// damage could be in — the scratch store, after emptying its one host.
     pub(crate) fn clear_poison(&mut self) {
-        self.poisoned.store(false, Ordering::Relaxed);
-    }
-
-    /// Whether a [`BodyLoan`] of this module was leaked instead of settled.
-    ///
-    /// A live loan borrows the module exclusively, so this is observable
-    /// only once every loan has ended — normally by settling, which leaves
-    /// nothing outstanding. A loan that was `mem::forget`ten never settled:
-    /// the body it lent may have been replaced, or swapped with another
-    /// module's and so left on that module's clock. Until
-    /// [`settle_loans`](Self::settle_loans) repairs that, no index is
-    /// [current](crate::address_index::AddressIndex::is_current) for this
-    /// module, whatever its revision says.
-    pub fn has_unsettled_loans(&self) -> bool {
-        self.loans.load(Ordering::Relaxed) != 0
-    }
-
-    /// Settles every leaked loan: checks that each slot holds a body of its
-    /// own function (poisoning the module otherwise), links every body to
-    /// this module's clock, and moves the revision, since what the leaked
-    /// loans did is unknown. O(functions), and only when something was
-    /// leaked; every path that lends a body or binds an index calls this
-    /// first, so a leak costs one walk and never a missed change.
-    pub fn settle_loans(&mut self) {
-        if !self.has_unsettled_loans() {
-            return;
-        }
-        for mut body in self.bodies.iter_mut() {
-            let slot = body.id;
-            if body.try_id() != Some(slot) {
-                self.poisoned.store(true, Ordering::Relaxed);
-            }
-            body.link_clock(self.clock.clone());
-        }
-        self.clock.tick();
-        self.loans.store(0, Ordering::Relaxed);
+        self.poisoned = false;
     }
 
     /// The architecture description this module was built for, if a front end
@@ -671,20 +615,17 @@ impl<'str> Context<'str> {
     /// interfaces are never reachable mutably, so nothing is installed,
     /// removed or replaced in them except by this crate, which counts what it
     /// installs ([`push_function`](Self::push_function),
-    /// [`push_block`](Self::push_block)). And a body is only ever lent out
-    /// mutably, as a [`BodyLoan`] that settles the slot when it is returned:
-    /// a body swapped with another module's, replaced, or restored from a
-    /// clone is counted then, and linked to this module's clock. A loan that
-    /// is leaked instead of returned stays counted as
-    /// [unsettled](Self::has_unsettled_loans): no index is current while one
-    /// is, and the next loan or binding [settles](Self::settle_loans) it by
-    /// relinking every body and moving the revision. A bare
-    /// `&mut BasicBlock` cannot be settled that way, so handing one out
-    /// ([`block_mut`](Self::block_mut)) counts as a change outright.
+    /// [`push_block`](Self::push_block)). And a body is reachable mutably
+    /// only through its verbs — [`body_mut`](Self::body_mut) hands out a
+    /// [`BodyMut`], never a `&mut FunctionBody` — so a body cannot be
+    /// swapped with another module's, replaced, or restored from a clone;
+    /// every installed body is on this module's clock for as long as it is
+    /// installed. A bare `&mut BasicBlock` is the one exception, so handing
+    /// one out ([`block_mut`](Self::block_mut)) counts as a change outright.
     ///
-    /// The count is one shared [`ShapeClock`], so reading it is O(1); a loan
-    /// settles in O(1) too, so a caller that keeps its index current across
-    /// instruction-level edits binds it without a rebuild.
+    /// The count is one shared [`ShapeClock`], so reading it is O(1), and
+    /// so is handing out a body, so a caller that keeps its index current
+    /// across instruction-level edits binds it without a rebuild.
     pub fn revision(&self) -> Revision {
         Revision {
             identity: self.identity,
@@ -2111,24 +2052,16 @@ impl<'str> Context<'str> {
         &self.bodies[fid]
     }
 
-    /// The function *body* `fid`, lent out mutably (see [`Context::body`]).
-    ///
-    /// The loan settles the slot against the module's revision when it is
-    /// dropped, so a body swapped or replaced through it is accounted for;
-    /// see [`BodyLoan`]. The module is borrowed for as long as the loan lives.
-    pub fn body_mut(&mut self, fid: FunctionId) -> BodyLoan<'_, 'str> {
-        self.settle_loans();
-        BodyLoan::new(
-            &mut self.bodies[fid],
-            fid,
-            &self.clock,
-            &self.poisoned,
-            &self.loans,
-        )
+    /// The function *body* `fid`, mutably (see [`Context::body`]): its
+    /// verbs, over the module's shared state and interfaces, read-only. See
+    /// [`BodyMut`]. The module is borrowed for as long as the host lives.
+    pub fn body_mut(&mut self, fid: FunctionId) -> BodyMut<'_, 'str> {
+        BodyMut::new(&mut self.bodies[fid], &self.shared, &self.interfaces)
     }
 
-    /// Every function body, with its id, for reading. Mutable access is by
-    /// [loan](Self::body_mut) or through [`split_bodies`](Self::split_bodies).
+    /// Every function body, with its id, for reading. Mutable access is
+    /// through [`body_mut`](Self::body_mut) or
+    /// [`split_bodies`](Self::split_bodies).
     ///
     /// The registry itself is never reachable mutably, so a body cannot be
     /// installed, removed or replaced behind the module's revision:
@@ -2180,13 +2113,14 @@ impl<'str> Context<'str> {
         self.bodies.len()
     }
 
-    /// Borrows the bodies for lending alongside the frozen module state a
-    /// pass reads: the shared IR state and the interface registry.
+    /// Borrows the bodies for mutation, one or several disjoint ones at a
+    /// time, alongside the frozen module state a pass reads: the shared IR
+    /// state and the interface registry.
     ///
     /// This is how a pass driver holds one body — or several disjoint ones —
     /// mutably while reading the rest of the module; see [`BodiesMut`]. The
-    /// bodies-free halves cannot alias a lent body, and the bodies cannot be
-    /// added to, removed from or replaced through the borrow.
+    /// bodies-free halves cannot alias a borrowed body, and the bodies cannot
+    /// be added to, removed from or replaced through the borrow.
     pub fn split_bodies(
         &mut self,
     ) -> (
@@ -2194,9 +2128,8 @@ impl<'str> Context<'str> {
         &Shared<'str>,
         &Registry<FunctionId, crate::value::function::FunctionInterface<'str>>,
     ) {
-        self.settle_loans();
         (
-            BodiesMut::new(&mut self.bodies, &self.clock, &self.poisoned, &self.loans),
+            BodiesMut::new(&mut self.bodies, &self.shared, &self.interfaces),
             &self.shared,
             &self.interfaces,
         )
@@ -2540,10 +2473,6 @@ impl<'str> Context<'str> {
     /// The owning function's storage (read). Alias of [`body`](Self::body).
     pub fn function(&self, f: FunctionId) -> &FunctionBody<'str> {
         &self.bodies[f]
-    }
-    /// The owning function's storage (write). Alias of [`body_mut`](Self::body_mut).
-    pub fn function_mut(&mut self, f: FunctionId) -> BodyLoan<'_, 'str> {
-        self.body_mut(f)
     }
 
     /// A read [`BlockRef`] over `id`, module-routed.

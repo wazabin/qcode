@@ -3,9 +3,8 @@
 //! Every on-demand lift binds the VM's context and address index as a
 //! `LiftTarget`, which checks the index's provenance — a comparison of the
 //! context's revision — before lowering; and the optimizations the VM runs
-//! between lifts take the host body out as a `BodyLoan`, which settles the
-//! slot against the revision when it is returned. This prints both costs in
-//! isolation, for modules of growing function count, next to the whole
+//! between lifts borrow the host body as a `BodyMut`. This prints both costs
+//! in isolation, for modules of growing function count, next to the whole
 //! per-instruction translation cost the VM reports, so the share is visible.
 //!
 //! ```sh
@@ -33,7 +32,7 @@ fn main() {
     println!("checked binding alone, by module size (index current):");
     println!(
         "{:>10} {:>8} {:>12} {:>14} {:>16} {:>12}",
-        "functions", "blocks", "bind_indexed", "bind(current)", "bind(refresh)", "body loan"
+        "functions", "blocks", "bind_indexed", "bind(current)", "bind(refresh)", "body_mut"
     );
     for &functions in &[1usize, 10, 100, 1_000, 10_000] {
         let mut ctx = lifter.new_context();
@@ -79,14 +78,14 @@ fn main() {
         }
         let refresh = started.elapsed();
 
-        // A body lent out and returned unchanged, as an optimization between
-        // lifts does: the index must still be current afterwards.
+        // A body borrowed and read, as an optimization between lifts does:
+        // the index must still be current afterwards.
         let started = Instant::now();
         for _ in 0..CALLS {
-            let loan = ctx.body_mut(host);
-            std::hint::black_box(loan.root_id());
+            let body = ctx.body_mut(host);
+            std::hint::black_box(body.root_id());
         }
-        let loan = started.elapsed();
+        let body = started.elapsed();
         assert!(addresses.is_current(&ctx));
 
         println!(
@@ -94,7 +93,7 @@ fn main() {
             per_call(indexed, CALLS),
             per_call(current, CALLS),
             per_call(refresh, refresh_calls),
-            per_call(loan, CALLS)
+            per_call(body, CALLS)
         );
     }
 

@@ -95,9 +95,9 @@ pub use bytes::{
     render_bytes_literal,
 };
 pub use function::{
-    ArgMemKind, BodyArenaKindStats, BodyArenaStats, BodyIdentity, DerivedOutput, ExternArg,
-    ExternArgmem, ExternInterface, ExternSlot, Footprint, FunctionBody, FunctionEffects,
-    FunctionId, FunctionKind, FunctionMutRef, FunctionRef, InterfaceSlot, MemoryChannelState,
+    ArgMemKind, BodyArenaKindStats, BodyArenaStats, DerivedOutput, ExternArg, ExternArgmem,
+    ExternInterface, ExternSlot, Footprint, FunctionBody, FunctionEffects, FunctionId,
+    FunctionKind, FunctionMutRef, FunctionRef, InterfaceSlot, MemoryChannelState,
     MemoryInterfaceMap, ParamAttrs, RamBase, RamField, RamLocations, RamObject, RamRegion,
     RegisterChannelState, RegisterEffectSets, RegisterInterfaceMap, SlotBase, WrittenSpaces,
     WrittenSpacesState,
@@ -109,7 +109,7 @@ pub use poison::{Poison, PoisonId, PoisonRef};
 pub use temp::{
     LocalTempId, LocalTempSpaceId, Temp, TempId, TempRef, TempSpace, TempSpaceId, TempSpaceRef,
 };
-pub use util::loan::{BodiesMut, BodyLoan};
+pub use util::body_mut::{BodiesMut, BodyMut};
 pub use util::named::{Named, Renameable};
 pub use varnode::{Varnode, VarnodeId, VarnodeRef, register::Register, register::RegisterId};
 

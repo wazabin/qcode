@@ -27,10 +27,10 @@
 //! it. `mark_current` is the one way to claim currency without a rebuild; it
 //! is for a caller that applied a mutation's effects to the index by hand,
 //! and a wrong claim is that caller's bug. The address-bearing fields of
-//! blocks and function interfaces are crate-private, and bodies are only
-//! lent out ([`BodyLoan`](crate::value::BodyLoan)), so no change to what a
-//! module covers happens outside the mutators that move the revision — see
-//! [`Context::revision`].
+//! blocks and function interfaces are crate-private, and a body is reachable
+//! mutably only through its verbs ([`BodyMut`](crate::value::BodyMut)), so
+//! no change to what a module covers happens outside the mutators that move
+//! the revision — see [`Context::revision`].
 
 use rustc_hash::FxHashMap;
 
@@ -135,12 +135,8 @@ impl AddressIndex {
     /// this very context instance (not a clone, not another module with the
     /// same ids), and every address-bearing change since was made with it.
     /// Then no address the context covers is missing from it.
-    ///
-    /// Never true while the context has an [unsettled
-    /// loan](Context::has_unsettled_loans): a body lent and never returned
-    /// may have changed in ways the revision does not count.
     pub fn is_current(&self, ctx: &Context<'_>) -> bool {
-        self.provenance == Some(ctx.revision()) && !ctx.has_unsettled_loans()
+        self.provenance == Some(ctx.revision())
     }
 
     /// Whether this index was computed for `ctx` at all, whatever has changed

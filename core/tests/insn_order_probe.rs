@@ -13,7 +13,10 @@
 //! It uses only verbs that predate the list, so the same file measures the
 //! vector representation it replaced.
 
-use qcode::{context::Context, value::BasicBlock};
+use qcode::{
+    context::Context,
+    value::{BasicBlock, QCodeMut},
+};
 use std::time::Instant;
 
 #[test]

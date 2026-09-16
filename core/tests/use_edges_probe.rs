@@ -16,7 +16,7 @@
 
 use qcode::{
     context::Context,
-    value::{BasicBlock, ValueId},
+    value::{BasicBlock, QCodeMut, ValueId},
 };
 use rustc_hash::FxHashSet;
 use std::time::Instant;

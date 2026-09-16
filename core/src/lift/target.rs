@@ -165,7 +165,6 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
         addresses: &'a mut AddressIndex,
         function: FunctionId,
     ) -> Result<Self, TargetError> {
-        ctx.settle_loans();
         if !addresses.is_current(ctx) {
             addresses.refresh(ctx);
         }
@@ -198,10 +197,6 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
         addresses: &'a mut AddressIndex,
         function: FunctionId,
     ) -> Result<Self, TargetError> {
-        // A leaked loan is settled here, before the index is judged: the
-        // settlement moves the revision, so the index is outdated, as it
-        // should be for a change nobody accounted for.
-        ctx.settle_loans();
         if ctx.is_poisoned() {
             return Err(TargetError::Poisoned);
         }

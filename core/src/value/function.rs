@@ -420,33 +420,6 @@ pub struct MemoryInterfaceMap {
 /// caller-reasoning surface lives separately in [`FunctionInterface`], stored in
 /// [`Context::interfaces`](crate::context::Context::interfaces)
 /// under the same [`FunctionId`].
-/// The identity of one [`FunctionBody`] *value*.
-///
-/// Every body ever made in a process — constructed, cloned or deserialized —
-/// has a distinct identity, and keeps it for its whole life, through moves.
-/// A module lends its bodies out by [`BodyLoan`](crate::value::BodyLoan),
-/// which remembers the identity it lent and so can tell, when the loan is
-/// returned, whether the slot still holds that value or was given another
-/// (a swap with another module's body, a replacement, a clone put back).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BodyIdentity(u64);
-
-impl BodyIdentity {
-    fn fresh() -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        Self(NEXT.fetch_add(1, Ordering::Relaxed))
-    }
-}
-
-impl Default for BodyIdentity {
-    /// A fresh identity: what a deserialized body gets, since the wire does
-    /// not carry one.
-    fn default() -> Self {
-        Self::fresh()
-    }
-}
-
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct FunctionBody<'str> {
     /// Immutable identity of this body in the lockstep function registries, or
@@ -548,18 +521,14 @@ pub struct FunctionBody<'str> {
     /// the body is installed; a detached body ticks a clock of its own.
     #[serde(skip)]
     clock: crate::context::ShapeClock,
-
-    /// Which body value this is; see [`BodyIdentity`]. Never shared: a clone
-    /// gets its own, as does a deserialized body.
-    #[serde(skip)]
-    identity: BodyIdentity,
 }
 
 impl<'str> Clone for FunctionBody<'str> {
-    /// A clone is a new, detached body value: the same contents and ids, its
-    /// own [`identity`](Self::identity), and a clock of its own — it is not
-    /// installed in the module the original is, so its changes must not move
-    /// that module's revision. Installing it links it.
+    /// A clone is a new, detached body value: the same contents and ids, and
+    /// a clock of its own — it is not installed in the module the original
+    /// is, so its changes must not move that module's revision. Installing
+    /// it ([`Context::push_function`](crate::context::Context::push_function))
+    /// links it.
     fn clone(&self) -> Self {
         Self {
             id: self.id,
@@ -576,7 +545,6 @@ impl<'str> Clone for FunctionBody<'str> {
             uses: self.uses.clone(),
             shared_first_use: self.shared_first_use.clone(),
             clock: crate::context::ShapeClock::default(),
-            identity: BodyIdentity::fresh(),
         }
     }
 }
@@ -839,7 +807,6 @@ impl<'str> FunctionBody<'str> {
             uses: UseArena::default(),
             shared_first_use: FxHashMap::default(),
             clock: crate::context::ShapeClock::default(),
-            identity: BodyIdentity::fresh(),
         }
     }
 
@@ -866,13 +833,7 @@ impl<'str> FunctionBody<'str> {
             uses: UseArena::default(),
             shared_first_use: FxHashMap::default(),
             clock: crate::context::ShapeClock::default(),
-            identity: BodyIdentity::fresh(),
         }
-    }
-
-    /// Which body value this is; see [`BodyIdentity`].
-    pub fn identity(&self) -> BodyIdentity {
-        self.identity
     }
 
     /// This body's immutable function identity. Panics on a detached body (one

@@ -25,8 +25,8 @@ use crate::{
     context::{Context, Shared},
     error::Result,
     value::{
-        BasicBlock, BodyView, FunctionBody, FunctionId, Instruction, ModuleView, QCodeView,
-        ValueId,
+        BasicBlock, BodyView, FunctionBody, FunctionId, Instruction, LocalParamId, ModuleView,
+        QCodeView, ValueId,
         block::{BlockId, EdgeId},
         block_param::BlockParam,
         block_param::BlockParamId,
@@ -62,9 +62,9 @@ pub trait QCodeMut<'str> {
     ///
     /// Sealed: only this crate's verbs route through the bare body, and they
     /// tick the module's clock exactly when they change an address. A caller
-    /// outside the crate takes a body out as a [`BodyLoan`](crate::value::BodyLoan)
-    /// (through [`Context::body_mut`] or [`Context::split_bodies`]), which
-    /// settles what was done with it.
+    /// outside the crate reaches a body through a [`BodyMut`] (from
+    /// [`Context::body_mut`] or [`Context::split_bodies`]), whose verbs are
+    /// exactly these.
     fn function_mut(&mut self, id: FunctionId, _: Sealed) -> &mut FunctionBody<'str>;
 
     /// The storage of the function `id` (read), tied to `&self`. The
@@ -107,6 +107,15 @@ pub trait QCodeMut<'str> {
     /// Mutably borrows the block parameter `id` from its owning function's arena.
     fn block_param_mut(&mut self, id: BlockParamId) -> &mut BlockParam<'str> {
         &mut self.function_mut(id.func, SEAL).params[id.local]
+    }
+
+    /// Mutably borrows the parameter list of the block `id`; see
+    /// [`FunctionBody::block_params_mut`]. Not an address-bearing change.
+    fn block_params_mut<'a>(&'a mut self, id: BlockId) -> &'a mut Vec<LocalParamId>
+    where
+        'str: 'a,
+    {
+        self.function_mut(id.func, SEAL).block_params_mut(id)
     }
 
     // ---- body-local verbs (canon: inherent methods on `FunctionBody`) -------
@@ -213,6 +222,13 @@ pub trait QCodeMut<'str> {
         for (func, dead) in by_func {
             self.function_mut(func, SEAL).remove_instructions(&dead);
         }
+    }
+
+    /// Removes the instructions `dead` of `block`, all at once; see
+    /// [`FunctionBody::remove_block_instructions`].
+    fn remove_block_instructions(&mut self, block: BlockId, dead: &FxHashSet<LocalInsnId>) {
+        self.function_mut(block.func, SEAL)
+            .remove_block_instructions(block, dead);
     }
 
     /// Rehome `remove`'s outgoing CFG edges onto `keep`. The direct edge and
