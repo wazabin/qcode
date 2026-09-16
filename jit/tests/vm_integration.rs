@@ -276,3 +276,21 @@ fn a_chain_follows_returns_and_indirect_calls() {
         vm.stats.native_bodies
     );
 }
+
+/// `step` means one block at most, so stepping a loop that stays in compiled
+/// code comes back after every pass round it.
+#[test]
+fn a_step_never_chains_past_the_block_it_starts() {
+    // `l: dec ecx; jmp l`
+    let mut vm = machine(&[0xff, 0xc9, 0xeb, 0xfc]);
+    vm.set_block_executor(Box::new(Jit::new()));
+    for _ in 0..100 {
+        assert!(vm.step().is_none());
+    }
+    let ctx = vm.context().clone();
+    // One decrement per block, and at most one block per step; the first
+    // steps went on discovery rather than running anything.
+    let ecx = vm.emulator().read_varnode_by_name(&ctx, "ECX").unwrap();
+    let passes = ecx.wrapping_neg() & 0xffff_ffff;
+    assert!((1..=100).contains(&passes), "{passes} passes in 100 steps");
+}
