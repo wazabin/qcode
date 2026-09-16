@@ -13,17 +13,14 @@
 //! benchmark leaves noise there, and treating that as a pass is how a benchmark
 //! comes to agree with itself while measuring nothing.
 //!
-//! # This currently fails, on every benchmark
-//!
-//! `main` calls `initialise_board` and the machine stops with "function
-//! FunctionId(1) has no root block": the VM cannot yet follow a `call` into a
-//! function it has only just discovered. Nothing here reaches a benchmark body.
-//!
-//! That is the point of adding this. Every benchmark this repository had until
-//! now was a single function — the countdown loop, and hand-written kernels
-//! that `-O2` inlined flat — so a gap this large in ordinary compiled code was
-//! invisible. The failure is not a regression; it reproduces unchanged on the
-//! commit before any of the JIT work.
+//! Every benchmark this repository had before this was a single function —
+//! the countdown loop, and hand-written kernels that `-O2` inlined flat — so
+//! what ordinary compiled code does between functions was invisible: calls
+//! into code discovered a moment ago, and returns, which under the VM's flat
+//! lifting are indirect branches on the popped address. Both are what the
+//! `native` column measures. It counts the VM's entries into compiled code,
+//! and a chain that follows returns keeps it in the tens; one that hands
+//! every return back to the interpreter put it in the hundreds of thousands.
 
 use qcode_jit::Jit;
 use qcode_vm::{Vm, VmMemory, perm};

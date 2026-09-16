@@ -238,3 +238,41 @@ fn the_budget_stops_a_loop_that_stays_in_compiled_code() {
         vm.stats.steps
     );
 }
+
+/// A return is an indirect branch on the popped address, and a chain follows
+/// it into the caller's compiled code instead of handing back after every
+/// call. The interpreter is never involved once everything is compiled, so
+/// only the first entry into each block is a native entry the VM counts.
+#[test]
+fn a_chain_follows_returns_and_indirect_calls() {
+    let code: &[u8] = &[
+        0xb9, 0xe8, 0x03, 0x00, 0x00, // 1000: mov ecx, 1000
+        0x48, 0x8d, 0x05, 0x0b, 0x00, 0x00, 0x00, // 1005: lea rax, [rip+0xb] ; f
+        0xff, 0xd0, // 100c: call rax
+        0xff, 0xc9, // 100e: dec ecx
+        0x75, 0xfa, // 1010: jnz 100c
+        0xe9, 0xe9, 0x0f, 0x00, 0x00, // 1012: jmp 2000 ; unmapped: ends the run
+        0xff, 0xc3, // 1017: f: inc ebx
+        0xc3, // 1019: ret
+    ];
+    let mut vm = machine(code);
+    let ctx = vm.context().clone();
+    vm.emulator()
+        .set_varnode_by_name(&ctx, "RSP", 0x21000)
+        .unwrap();
+    vm.set_block_executor(Box::new(Jit::new()));
+    let exit = vm.run(u64::MAX);
+    assert!(
+        matches!(exit, qcode_vm::VmExit::Unlifted { addr: 0x2000, .. }),
+        "{exit:?}"
+    );
+    assert_eq!(vm.emulator().read_varnode_by_name(&ctx, "EBX"), Some(1000));
+    assert_eq!(vm.emulator().read_varnode_by_name(&ctx, "ECX"), Some(0));
+    // A handful of blocks, each discovered once; the thousand calls and
+    // returns in between never left native code.
+    assert!(
+        vm.stats.native_bodies < 20,
+        "{} native entries",
+        vm.stats.native_bodies
+    );
+}

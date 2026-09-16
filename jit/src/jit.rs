@@ -424,16 +424,25 @@ impl Jit {
     }
 
     /// The successor this block's terminator selects, when that is a decision
-    /// the backend can make: an argument-less branch, or a conditional one
-    /// whose condition the compiled body has just exported.
+    /// the backend can make: an argument-less branch, a conditional one whose
+    /// condition the compiled body has just exported, or an indirect one whose
+    /// pointer it exported and that resolves to a block already lifted.
     ///
-    /// `None` means "leave it to the interpreter" — an indirect branch, a call,
-    /// a return, or any edge that binds block arguments, all of which stay in
-    /// one implementation.
+    /// The indirect case is what guest calls and returns become under the
+    /// VM's flat lifting — `ret` is a `branchind` on the popped address — so
+    /// without it every return handed control back to the interpreter, and on
+    /// call-heavy code that round trip was most of the run. The pointer is
+    /// resolved through the emulator's own address index, the same lookup the
+    /// interpreter's `branchind` makes; an address it does not know is left to
+    /// the interpreter, whose failure to resolve it is what triggers discovery.
+    ///
+    /// `None` means "leave it to the interpreter" — a call, a return, or any
+    /// edge that binds block arguments, all of which stay in one
+    /// implementation.
     fn next_block(
         &self,
         ctx: &Context<'_>,
-        emu: &StandaloneEmulator<VmMemory>,
+        emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
     ) -> Option<BlockId> {
         let terminator = ctx.block(block).last_insn()?;
@@ -453,6 +462,13 @@ impl Jit {
                 } else {
                     cbranch.failure_block
                 }
+            }
+            Mnemonic::BranchInd(branchind) => {
+                let ValueId::Instruction(ptr) = branchind.ptr.qualify(block.func) else {
+                    return None;
+                };
+                let addr = emu.insn_values.get(&ptr)?.as_bits() as u64;
+                return emu.block_at_address(ctx, addr);
             }
             _ => return None,
         };
