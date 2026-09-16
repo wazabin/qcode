@@ -2,9 +2,6 @@ use std::fmt::{Display, Formatter};
 
 use crate::LangRef;
 use crate::value::{LocalValueId, insn::mnemonic::MnemonicKind};
-use smallvec::smallvec;
-
-use super::mnemonic::Args;
 
 /// The unary operators of a [`Unary`] instruction.
 ///
@@ -84,10 +81,6 @@ pub struct Unary {
 impl MnemonicKind for Unary {
     fn opcode(&self) -> &'static str {
         "unop"
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
     }
 }
 

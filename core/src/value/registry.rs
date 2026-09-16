@@ -28,21 +28,19 @@ use std::collections::BTreeSet;
 ///
 /// # Invariants
 ///
-/// - **`push_insn` is final.** Instructions are immutable after insertion.
-///   The owning function's `users` map is populated at push time from the
-///   instruction's operands and is not updated if operands are later altered via
-///   interior mutation. Use
-///   `Context::replace_all_uses_with`
-///   to rewrite operands while keeping `users` consistent.
+/// - **`push_insn` is final.** An installed instruction's operands are
+///   mirrored by its function's use edges, recorded at push time, and change
+///   only through the verbs that move the edges along —
+///   `Context::replace_all_uses_with`,
+///   [`FunctionBody::replace_operand`](crate::value::FunctionBody::replace_operand),
+///   `Context::replace_instruction_mnemonic` — never in place.
 ///
-/// - **`users` is managed internally.** The reverse use-def map now lives in
-///   each [`FunctionBody`](crate::value::FunctionBody) (function-scoped; see
-///   [`FunctionBody::users_of`](crate::value::FunctionBody::users_of)). Do not mutate
-///   it directly. Read it through
-///   [`FunctionRef::users_of`](crate::value::FunctionRef::users_of) /
+/// - **Use edges are managed internally.** They live in each
+///   [`FunctionBody`](crate::value::FunctionBody) (function-scoped; see
+///   [`FunctionBody::users_of`](crate::value::FunctionBody::users_of)). Read
+///   them through [`FunctionRef::users_of`](crate::value::FunctionRef::users_of) /
 ///   [`Context::users`](crate::context::Context::users), and remove dead
-///   instructions via
-///   `Context::remove_instructions`.
+///   instructions via `Context::remove_instructions`.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ValueRegistry<'str> {
     /// Literal (constant) interner. Behind an `RwLock` (see

@@ -36,9 +36,7 @@ pub fn replace_terminator_with_branch<'a, 'str>(
     let term_id = cx
         .body_view(body)
         .block_ref(block)
-        .instruction_ids()
-        .last()
-        .copied()
+        .last_instruction()
         .filter(|&id| cx.body_view(body).insn_ref(id).mnemonic().is_terminator());
     let local_target = target.localize(block.func);
     let args: Vec<_> = args
@@ -62,7 +60,7 @@ pub fn replace_terminator_with_branch<'a, 'str>(
             }),
             0,
         );
-        let end = cx.body_view(body).block_ref(block).instruction_ids().len();
+        let end = cx.body_view(body).block_ref(block).len();
         {
             // TODO(5b-ii): `BaseRef::insert_insn_at_index` is not mirrored on
             // `FunctionBody`; go through a temporary host.

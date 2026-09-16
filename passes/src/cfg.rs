@@ -146,12 +146,7 @@ fn merge_candidate<'a, 'str>(
     }
 
     // A's terminal must be an unconditional Branch to B.
-    let a_terminal = cx
-        .body_view(body)
-        .block_ref(a_id)
-        .instruction_ids()
-        .last()
-        .copied();
+    let a_terminal = cx.body_view(body).block_ref(a_id).last_instruction();
     let is_branch_to_b = a_terminal
         .map(|id| {
             matches!(
@@ -224,13 +219,7 @@ fn try_fold_cbranch<'a, 'str>(
     cx: PassCtx<'a, 'str>,
     block_id: BlockId,
 ) -> bool {
-    let Some(term_id) = cx
-        .body_view(body)
-        .block_ref(block_id)
-        .instruction_ids()
-        .last()
-        .copied()
-    else {
+    let Some(term_id) = cx.body_view(body).block_ref(block_id).last_instruction() else {
         return false;
     };
     let (target, args) = {
@@ -954,7 +943,7 @@ mod tests {
         assert!(
             FunctionBody::from_id(&ctx, f)
                 .iter()
-                .all(|blk| !blk.instruction_ids().contains(&y)),
+                .all(|blk| !blk.iter_instruction_ids().any(|i| i == y)),
             "dead merged instruction must be removed, not looped on"
         );
     }
@@ -985,7 +974,9 @@ mod tests {
 
         // Bypass in isolation: `<d>` is unreachable, so a full `simplify_cfg`
         // run would prune it (and then splice the forwarding `<a>`/`<d>`).
-        let removed_insns = BasicBlock::from_id(&ctx, b).instruction_ids();
+        let removed_insns = BasicBlock::from_id(&ctx, b)
+            .iter_instruction_ids()
+            .collect::<Vec<_>>();
         try_bypass_empty_block_in(&mut ctx, f, b);
 
         // b is gone; a and d both branch straight to t.
@@ -1072,7 +1063,9 @@ mod tests {
 
         // Bypass in isolation (see `bypasses_empty_block_with_two_predecessors`):
         // a full run would prune the unreachable `<d>` predecessor.
-        let removed_insns = BasicBlock::from_id(&ctx, b).instruction_ids();
+        let removed_insns = BasicBlock::from_id(&ctx, b)
+            .iter_instruction_ids()
+            .collect::<Vec<_>>();
         try_bypass_empty_block_in(&mut ctx, f, b);
 
         assert!(
@@ -1128,7 +1121,9 @@ mod tests {
             "
         );
 
-        let removed_insns = BasicBlock::from_id(&ctx, b).instruction_ids();
+        let removed_insns = BasicBlock::from_id(&ctx, b)
+            .iter_instruction_ids()
+            .collect::<Vec<_>>();
         simplify_cfg(&mut ctx, f);
 
         assert!(
@@ -1226,7 +1221,11 @@ mod tests {
 
         let removed_insns = [orphan, t]
             .into_iter()
-            .flat_map(|block| BasicBlock::from_id(&ctx, block).instruction_ids())
+            .flat_map(|block| {
+                BasicBlock::from_id(&ctx, block)
+                    .iter_instruction_ids()
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         simplify_cfg(&mut ctx, f);
 

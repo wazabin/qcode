@@ -12,15 +12,16 @@ use crate::{PassCtx, with_body_mut};
 /// This host's users of `v` as body-local ids, without allocating.
 ///
 /// Body-local because that is how they are stored: the qualified form exists
-/// only to be built, and this is read once per instruction.
-fn users_of_slice<'a, 'str: 'a>(
+/// only to be built, and this is read once per instruction. Empty for a
+/// shared value, which has no owning function to ask.
+fn local_users<'a, 'str: 'a>(
     host: impl QCodeView<'a, 'str>,
     v: ValueId,
-) -> &'a [qcode::value::insn::LocalInsnId] {
-    match v.owning_function() {
-        Some(f) => host.function_ref(f).local_users_of(v),
-        None => &[],
-    }
+) -> impl Iterator<Item = qcode::value::insn::LocalInsnId> + 'a {
+    v.owning_function()
+        .map(|f| host.function_ref(f).local_users_of(v))
+        .into_iter()
+        .flatten()
 }
 
 /// Whether this host records any user of `v`. A shared value with no owning
@@ -37,7 +38,7 @@ pub fn has_users<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, v: ValueId) -> bo
 }
 
 /// This host's users of `v`. Allocates; prefer [`has_users`] to ask whether
-/// there are any, and `users_of_slice` to look at them in a hot loop.
+/// there are any, and `local_users` to look at them in a hot loop.
 pub fn host_users<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, v: ValueId) -> Vec<InstructionId> {
     match v.owning_function() {
         Some(f) => host.function_ref(f).users_of(v),
@@ -60,17 +61,15 @@ pub fn dead_insns<'a, 'str: 'a>(
     block_id: BlockId,
 ) -> HashSet<InstructionId> {
     let mut dead: HashSet<InstructionId> = HashSet::default();
-    let insn_ids: Vec<InstructionId> = host.block_ref(block_id).instruction_ids().to_vec();
     let func = block_id.func;
-    for id in insn_ids.into_iter().rev() {
+    for id in host.block_ref(block_id).iter_instruction_ids().rev() {
         if host.instruction(id).mnemonic().has_side_effects() {
             continue;
         }
         // A user in another block is never in `dead`, so it keeps this
         // instruction alive — as it must.
-        let live_user = users_of_slice(host, ValueId::Instruction(id))
-            .iter()
-            .any(|&user| !dead.contains(&InstructionId::new(func, user)));
+        let live_user = local_users(host, ValueId::Instruction(id))
+            .any(|user| !dead.contains(&InstructionId::new(func, user)));
         if !live_user {
             dead.insert(id);
         }

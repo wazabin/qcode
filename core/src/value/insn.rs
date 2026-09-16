@@ -11,6 +11,7 @@ use crate::{
     value::{
         BlockId, BlockRef, FunctionId, FunctionRef, LocalBlockId, ModuleView, QCodeView, Value,
         ValueId,
+        uses::{UseId, WithUsers},
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable},
@@ -96,10 +97,25 @@ pub struct Instruction<'str> {
     pub(crate) prev: Option<LocalInsnId>,
     pub(crate) next: Option<LocalInsnId>,
 
+    /// Head of the list of this instruction's uses (see [`crate::value::uses`]).
+    /// Derived bookkeeping, rebuilt after deserialization.
+    #[serde(skip)]
+    pub(crate) first_use: Option<UseId>,
+
     // Address of the binary instruction
     address: Option<u64>,
 
     _marker: std::marker::PhantomData<&'str ()>,
+}
+
+impl WithUsers for Instruction<'_> {
+    fn first_use(&self) -> Option<UseId> {
+        self.first_use
+    }
+
+    fn first_use_mut(&mut self) -> &mut Option<UseId> {
+        &mut self.first_use
+    }
 }
 
 impl<'str> Instruction<'str> {
@@ -109,6 +125,7 @@ impl<'str> Instruction<'str> {
             parent: None,
             prev: None,
             next: None,
+            first_use: None,
             type_id,
             mnemonic,
             address: None,
@@ -130,8 +147,14 @@ impl<'str> Instruction<'str> {
         self.next
     }
 
-    /// Mutable access to this instruction's mnemonic (crate-internal; used by the
-    /// generic mutation host to rewrite operands).
+    /// Mutable access to this instruction's mnemonic (crate-internal).
+    ///
+    /// Once the instruction is in a body, its operands are mirrored by the
+    /// body's use edges, and only the body's use-maintaining verbs
+    /// ([`FunctionBody::replace_uses_where`](crate::value::FunctionBody::replace_uses_where),
+    /// [`FunctionBody::replace_instruction_mnemonic`](crate::value::FunctionBody::replace_instruction_mnemonic),
+    /// …) may change them. Everything else about the mnemonic — a callee slot,
+    /// a block target — is free to change through this.
     pub(crate) fn mnemonic_mut(&mut self) -> &mut Mnemonic {
         &mut self.mnemonic
     }
@@ -459,33 +482,12 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
         self.ctx.instruction_mut(self.id)
     }
 
-    pub fn mnemonic_mut(&mut self) -> &mut Mnemonic {
-        &mut self.inner_mut().mnemonic
-    }
-
-    /// Replace this instruction's mnemonic while keeping the reverse use-def
-    /// map in sync.
+    /// Replace this instruction's mnemonic, keeping its function's use edges
+    /// in step. The only way to change an installed instruction's operands
+    /// wholesale; see
+    /// [`FunctionBody::replace_instruction_mnemonic`](crate::value::FunctionBody::replace_instruction_mnemonic).
     pub fn set_mnemonic(&mut self, mnemonic: Mnemonic) {
-        let old_args = self.inner().mnemonic.args();
-        let new_args = mnemonic.args();
-
-        // Operand uses are recorded in this instruction's own function map.
-        let func = self.id.func;
-        for arg in old_args {
-            if let Some(users) = self.ctx.bodies[func].users.get_mut(&arg) {
-                users.retain(|&local| local != self.id.localize(func));
-            }
-        }
-
-        for arg in new_args {
-            self.ctx.bodies[func]
-                .users
-                .entry(arg)
-                .or_default()
-                .push(self.id.localize(func));
-        }
-
-        self.inner_mut().mnemonic = mnemonic;
+        self.ctx.bodies[self.id.func].replace_instruction_mnemonic(self.id, mnemonic);
     }
 
     pub fn address_mut(&mut self) -> &mut Option<u64> {

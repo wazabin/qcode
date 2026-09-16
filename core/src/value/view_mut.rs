@@ -143,8 +143,8 @@ pub trait QCodeMut<'str> {
         self.function_mut(from.func).add_cfg_edge(from, to)
     }
 
-    /// Replace every use of `old` with `new` across `old`'s owning function and
-    /// update the reverse use-map (SSA defs only; all uses are intra-function).
+    /// Replace every use of `old` with `new` across `old`'s owning function,
+    /// moving the use edges along (SSA defs only; all uses are intra-function).
     fn replace_all_uses_with(&mut self, old: impl Into<ValueId>, new: impl Into<ValueId>) {
         let old = old.into();
         let new = new.into();
@@ -175,8 +175,8 @@ pub trait QCodeMut<'str> {
             .replace_instruction(id, new.into());
     }
 
-    /// Physically removes a set of instructions after pruning their operands
-    /// from the reverse-use maps, grouped per owning function. Call after
+    /// Physically removes a set of instructions after taking down their use
+    /// edges, grouped per owning function. Call after
     /// removing them from their parent blocks and unlinking any CFG edges owned
     /// by terminators.
     fn remove_instructions(&mut self, dead: &FxHashSet<InstructionId>) {
@@ -196,8 +196,8 @@ pub trait QCodeMut<'str> {
             .rehome_outgoing_edges(keep, remove);
     }
 
-    /// Replace an instruction's mnemonic in place, keeping the reverse use-map
-    /// in sync. For transforms that change an instruction without changing its
+    /// Replace an instruction's mnemonic in place, keeping the use edges in
+    /// step. For transforms that change an instruction without changing its
     /// identity, parent block, address, or result type.
     fn replace_instruction_mnemonic(&mut self, id: InstructionId, mnemonic: Mnemonic) {
         self.function_mut(id.func)

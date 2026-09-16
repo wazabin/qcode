@@ -1,7 +1,6 @@
-use super::mnemonic::{Args, MnemonicKind};
+use super::mnemonic::MnemonicKind;
 use crate::value::LocalValueId;
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
 
 pub use pcode_types::PCodeOpId;
 
@@ -24,9 +23,5 @@ pub struct PCodeOp {
 impl MnemonicKind for PCodeOp {
     fn opcode(&self) -> &'static str {
         "pcode_op"
-    }
-
-    fn args(&self) -> Args {
-        SmallVec::from_vec(self.args.clone())
     }
 }

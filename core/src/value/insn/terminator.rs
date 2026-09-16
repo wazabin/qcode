@@ -1,7 +1,6 @@
 use crate::value::{LocalBlockId, LocalValueId, function::FunctionId};
 
-use super::mnemonic::{Args, MnemonicKind};
-use smallvec::{SmallVec, smallvec};
+use super::mnemonic::MnemonicKind;
 
 /// A statically named callee. `Real` refers to an installed function; `Minted`
 /// is a pass-local placeholder that must be resolved before execution.
@@ -62,10 +61,6 @@ impl MnemonicKind for Branch {
     fn is_terminator(&self) -> bool {
         true
     }
-
-    fn args(&self) -> Args {
-        SmallVec::from_vec(self.args.clone())
-    }
 }
 
 /// One arm of a [`Switch`]: the scrutinee value that selects it, the block it
@@ -116,15 +111,6 @@ impl MnemonicKind for Switch {
     fn is_terminator(&self) -> bool {
         true
     }
-
-    fn args(&self) -> Args {
-        let mut args = smallvec![self.scrutinee];
-        for case in &self.cases {
-            args.extend_from_slice(&case.args);
-        }
-        args.extend_from_slice(&self.default_args);
-        args
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -139,10 +125,6 @@ impl MnemonicKind for BranchInd {
 
     fn is_terminator(&self) -> bool {
         true
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.ptr]
     }
 }
 
@@ -171,10 +153,6 @@ impl MnemonicKind for TailCall {
     fn is_terminator(&self) -> bool {
         true
     }
-
-    fn args(&self) -> Args {
-        SmallVec::from_vec(self.args.clone())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -187,10 +165,6 @@ pub struct Apply {
 impl MnemonicKind for Apply {
     fn opcode(&self) -> &'static str {
         "apply"
-    }
-
-    fn args(&self) -> Args {
-        SmallVec::from_vec(self.args.clone())
     }
 }
 
@@ -260,10 +234,6 @@ impl MnemonicKind for Call {
     fn is_terminator(&self) -> bool {
         true
     }
-
-    fn args(&self) -> Args {
-        SmallVec::from_vec(self.args.clone())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -279,12 +249,6 @@ impl MnemonicKind for CallInd {
 
     fn is_terminator(&self) -> bool {
         true
-    }
-
-    fn args(&self) -> Args {
-        let mut args = smallvec![self.ptr];
-        args.extend(self.args.clone());
-        args
     }
 }
 
@@ -311,13 +275,6 @@ impl MnemonicKind for CBranch {
     fn is_terminator(&self) -> bool {
         true
     }
-
-    fn args(&self) -> Args {
-        let mut args = smallvec![self.condition];
-        args.extend_from_slice(&self.success_args);
-        args.extend_from_slice(&self.failure_args);
-        args
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -334,14 +291,6 @@ impl MnemonicKind for Return {
     fn is_terminator(&self) -> bool {
         true
     }
-
-    fn args(&self) -> Args {
-        let mut args = smallvec![self.ptr];
-        if let Some(value) = self.value {
-            args.push(value);
-        }
-        args
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -356,10 +305,6 @@ impl MnemonicKind for ReturnValue {
 
     fn is_terminator(&self) -> bool {
         true
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.value]
     }
 }
 
@@ -389,10 +334,6 @@ impl MnemonicKind for BadInsn {
 
     fn is_terminator(&self) -> bool {
         true
-    }
-
-    fn args(&self) -> Args {
-        smallvec![]
     }
 }
 
@@ -685,7 +626,7 @@ mod tests {
         let rec = FunctionBody::from_name(&ctx, "rec").expect("lambda exists");
         assert!(rec.is_lambda());
         let entry = rec.root().expect("lambda has root");
-        let insns = entry.instruction_ids();
+        let insns = entry.iter_instruction_ids().collect::<Vec<_>>();
         let apply = ctx.get_insn(insns[1]);
         assert!(!apply.is_terminator(), "apply is a value instruction");
         assert!(matches!(apply.mnemonic(), Mnemonic::Apply(_)));

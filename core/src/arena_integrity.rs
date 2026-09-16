@@ -382,30 +382,14 @@ pub fn verify_body_arena_integrity_scoped(
             }
         }
 
-        for (&value, users) in &body.users {
-            let key_live = match value {
-                LocalValueId::Instruction(id) => live_insns.contains(&id),
-                LocalValueId::BlockParam(id) => live_params.contains(&id),
-                LocalValueId::BasicBlock(id) => live_blocks.contains(&id),
-                LocalValueId::Temp(id) => usize::from(id) < body.temps.len(),
-                _ => true,
-            };
-            if !key_live {
-                out.push(format!(
-                    "function {fid:?}: users map contains removed key {:?}",
-                    value.qualify(fid)
-                ));
-            }
-            for &user in users {
-                if !live_insns.contains(&user) {
-                    out.push(format!(
-                        "function {fid:?}: users map for {:?} references removed instruction {:?}",
-                        value.qualify(fid),
-                        InstructionId::new(fid, user)
-                    ));
-                }
-            }
-        }
+        verify_use_edges(
+            &body,
+            fid,
+            &live_insns,
+            &live_params,
+            &live_blocks,
+            &mut out,
+        );
 
         let stats = body.arena_stats();
         // Widened so the bound exists on 32-bit targets (wasm) too.
@@ -425,6 +409,156 @@ pub fn verify_body_arena_integrity_scoped(
     }
 
     out
+}
+
+/// Checks a body's use edges against its operands: every operand occurrence
+/// whose value has storage here has exactly one edge, every edge names the
+/// operand at its `(user, operand_index)`, every edge is reachable exactly
+/// once from its value's list head, and no edge points at removed storage.
+/// Together these say the edges are what [`FunctionBody::rebuild_uses`]
+/// would derive.
+fn verify_use_edges(
+    body: &crate::value::FunctionBody<'_>,
+    fid: crate::value::FunctionId,
+    live_insns: &FxHashSet<crate::value::LocalInsnId>,
+    live_params: &FxHashSet<crate::value::LocalParamId>,
+    live_blocks: &FxHashSet<crate::value::LocalBlockId>,
+    out: &mut Vec<String>,
+) {
+    let has_storage = |value: LocalValueId| match value {
+        LocalValueId::Instruction(id) => live_insns.contains(&id),
+        LocalValueId::BlockParam(id) => live_params.contains(&id),
+        LocalValueId::BasicBlock(id) => live_blocks.contains(&id),
+        LocalValueId::Temp(id) => usize::from(id) < body.temps.len(),
+        _ => true,
+    };
+
+    // Every edge names a live user and its operand, and a value with storage.
+    let mut edges_per_operand: FxHashMap<(crate::value::LocalInsnId, usize), usize> =
+        FxHashMap::default();
+    for (edge_id, edge) in body.use_edges() {
+        let user = InstructionId::new(fid, edge.user);
+        let index = usize::from(edge.operand_index);
+        if !live_insns.contains(&edge.user) {
+            out.push(format!(
+                "function {fid:?}: use {edge_id:?} of {:?} has removed user {user:?}",
+                edge.value.qualify(fid)
+            ));
+            continue;
+        }
+        if !has_storage(edge.value) {
+            out.push(format!(
+                "function {fid:?}: use {edge_id:?} by {user:?} names removed value {:?}",
+                edge.value.qualify(fid)
+            ));
+        }
+        match body.insns[edge.user].mnemonic().operand(index) {
+            Some(operand) if operand == edge.value => {
+                *edges_per_operand.entry((edge.user, index)).or_default() += 1;
+            }
+            Some(operand) => out.push(format!(
+                "function {fid:?}: use {edge_id:?} says operand {index} of {user:?} is {:?} but it is {:?}",
+                edge.value.qualify(fid),
+                operand.qualify(fid)
+            )),
+            None => out.push(format!(
+                "function {fid:?}: use {edge_id:?} names operand {index} of {user:?}, which has no such operand"
+            )),
+        }
+    }
+
+    // Every operand occurrence with storage has exactly one edge naming it.
+    for insn in body.insns.iter() {
+        let user = InstructionId::new(fid, insn.id);
+        let mut index = 0;
+        insn.mnemonic().for_each_operand(|value| {
+            let edges = edges_per_operand
+                .get(&(insn.id, index))
+                .copied()
+                .unwrap_or(0);
+            if has_storage(value) && edges != 1 {
+                out.push(format!(
+                    "function {fid:?}: operand {index} of {user:?} ({:?}) has {edges} use edges",
+                    value.qualify(fid)
+                ));
+            }
+            index += 1;
+        });
+    }
+
+    // Every edge is reachable exactly once, from its own value's head.
+    let mut reached: FxHashSet<crate::value::uses::UseId> = FxHashSet::default();
+    let mut walk = |value: LocalValueId, out: &mut Vec<String>| {
+        let mut at = body.first_use_of(value);
+        let mut steps = 0;
+        while let Some(edge_id) = at {
+            if !body.uses.contains(edge_id) {
+                out.push(format!(
+                    "function {fid:?}: use list of {:?} reaches freed use {edge_id:?}",
+                    value.qualify(fid)
+                ));
+                break;
+            }
+            let edge = &body.uses[edge_id];
+            if edge.value != value {
+                out.push(format!(
+                    "function {fid:?}: use list of {:?} holds use {edge_id:?} of {:?}",
+                    value.qualify(fid),
+                    edge.value.qualify(fid)
+                ));
+            }
+            if !reached.insert(edge_id) {
+                out.push(format!(
+                    "function {fid:?}: use {edge_id:?} is reachable more than once (from {:?})",
+                    value.qualify(fid)
+                ));
+                break;
+            }
+            steps += 1;
+            if steps > body.uses.len() {
+                out.push(format!(
+                    "function {fid:?}: use list of {:?} cycles",
+                    value.qualify(fid)
+                ));
+                break;
+            }
+            at = edge.next;
+        }
+    };
+    for insn in body.insns.iter() {
+        walk(LocalValueId::Instruction(insn.id), out);
+    }
+    for param in body.params.iter() {
+        walk(LocalValueId::BlockParam(param.id), out);
+    }
+    for block in body.blocks.iter() {
+        walk(LocalValueId::BasicBlock(block.id), out);
+    }
+    for temp in body.temps.iter() {
+        walk(LocalValueId::Temp(temp.id), out);
+    }
+    for &value in body.shared_first_use.keys() {
+        if matches!(
+            value,
+            LocalValueId::Instruction(_)
+                | LocalValueId::BlockParam(_)
+                | LocalValueId::BasicBlock(_)
+                | LocalValueId::Temp(_)
+        ) {
+            out.push(format!(
+                "function {fid:?}: local value {:?} has its use-list head in the shared map",
+                value.qualify(fid)
+            ));
+        }
+        walk(value, out);
+    }
+    if reached.len() != body.uses.len() {
+        out.push(format!(
+            "function {fid:?}: {} of {} use edges are reachable from a use-list head",
+            reached.len(),
+            body.uses.len()
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -473,7 +607,9 @@ mod tests {
         let f = ctx.function_ids()[0];
         let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
         // `%y = @x + 1` — rewrite its `@x` operand to `%y` itself.
-        let y = BasicBlock::from_id(&ctx, entry).instruction_ids()[0];
+        let y = BasicBlock::from_id(&ctx, entry)
+            .first_instruction()
+            .unwrap();
         let x = ctx
             .instruction(y)
             .mnemonic()
@@ -569,7 +705,7 @@ mod tests {
         assert_has(&ctx, "references removed instruction");
         assert_has(&ctx, "references removed parameter");
         assert_has(&ctx, "references removed local value");
-        assert_has(&ctx, "users map for");
+        assert_has(&ctx, "has removed user");
     }
 
     #[test]
@@ -629,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_stale_local_name_and_users_entries() {
+    fn reports_stale_local_name() {
         let mut ctx = fixture();
         let f = ctx.function_ids()[0];
         let dead_block = BasicBlock::make(&mut ctx, f).id;
@@ -643,18 +779,113 @@ mod tests {
             )
             .expect("register corruption fixture");
 
-        let live_block = FunctionBody::from_id(&ctx, f).root().expect("root").id;
-        let dead_param = BasicBlock::from_id_mut(&mut ctx, live_block)
-            .push_param(8)
-            .id;
-        ctx.block_mut(live_block).params.pop();
-        ctx.remove_block_param(dead_param);
-        ctx.bodies[f]
-            .users
-            .insert(ValueId::BlockParam(dead_param).strip_func(), Vec::new());
-
         assert_has(&ctx, "local name \"stale\"");
-        assert_has(&ctx, "users map contains removed key");
+    }
+
+    /// The use edges of a value whose storage is pulled out from under them
+    /// point at nothing; the operands they mirror dangle too.
+    #[test]
+    fn reports_use_edges_of_removed_value() {
+        let mut ctx = fixture();
+        let f = ctx.function_ids()[0];
+        let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
+        let x = ctx.block(entry).params[0];
+        ctx.bodies[f].params.remove(x);
+
+        assert_has(&ctx, "references removed local value");
+        assert_has(&ctx, "names removed value");
+    }
+
+    /// An operand rewritten behind the body's back has an edge that names
+    /// the old value, and the new operand has no edge.
+    #[test]
+    fn reports_operand_rewritten_without_its_edge() {
+        let mut ctx = fixture();
+        let f = ctx.function_ids()[0];
+        let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
+        let y = BasicBlock::from_id(&ctx, entry)
+            .first_instruction()
+            .unwrap();
+        let one = ctx.get_const(1, 8).id().strip_func();
+        ctx.bodies[f].insns[y.local]
+            .mnemonic_mut()
+            .set_operand(0, one);
+
+        assert_has(&ctx, "but it is");
+        assert_has(&ctx, "has 0 use edges");
+    }
+
+    /// A use list must reach each edge once, and only edges of its own value.
+    #[test]
+    fn reports_use_list_that_leads_astray() {
+        let mut ctx = fixture();
+        let f = ctx.function_ids()[0];
+        let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
+        let y = BasicBlock::from_id(&ctx, entry)
+            .first_instruction()
+            .unwrap();
+        let x = ctx.block(entry).params[0];
+        // Point `@x`'s head at `%y`'s only use (by the return).
+        let y_use = ctx.bodies[f].insns[y.local].first_use;
+        assert!(y_use.is_some());
+        ctx.bodies[f].params[x].first_use = y_use;
+
+        assert_has(&ctx, "is reachable more than once");
+        assert_has(&ctx, "holds use");
+        assert_has(&ctx, "use edges are reachable from a use-list head");
+    }
+
+    /// The edges are a function of the operands: rebuilding them from
+    /// scratch reproduces the incrementally maintained graph.
+    #[test]
+    fn rebuilt_use_edges_match_maintained_ones() {
+        let mut ctx = fixture();
+        let f = ctx.function_ids()[0];
+        let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
+        let y = BasicBlock::from_id(&ctx, entry)
+            .first_instruction()
+            .unwrap();
+        let two = ctx.get_const(2, 8).id();
+        let z = crate::value::InstructionRef::from_mnemonic(
+            &mut ctx,
+            f,
+            Mnemonic::Binop(crate::value::insn::Binary {
+                op: crate::value::insn::Binop::Int(crate::value::insn::IntBinop::Add),
+                lhs: ValueId::Instruction(y).strip_func(),
+                rhs: ValueId::Instruction(y).strip_func(),
+            }),
+            8,
+        )
+        .id;
+        let terminator = BasicBlock::from_id(&ctx, entry).last_instruction().unwrap();
+        ctx.insert_insn_before(entry, terminator, z);
+        ctx.replace_all_uses_with(ValueId::Instruction(y), two);
+        ctx.bodies[f].replace_operand(z, 1, ValueId::Instruction(y));
+        assert_eq!(verify_body_arena_integrity(&ctx), Vec::<String>::new());
+
+        let edges = |ctx: &Context<'_>| {
+            let mut edges: Vec<_> = ctx.bodies[f]
+                .use_edges()
+                .map(|(_, e)| (format!("{:?}", e.value), e.user, e.operand_index))
+                .collect();
+            edges.sort();
+            edges
+        };
+        let maintained = edges(&ctx);
+        ctx.bodies[f].rebuild_uses();
+        assert_eq!(verify_body_arena_integrity(&ctx), Vec::<String>::new());
+        assert_eq!(edges(&ctx), maintained);
+        assert!(
+            maintained
+                .iter()
+                .any(|(v, u, i)| *v == format!("{:?}", two.strip_func())
+                    && *u == z.local
+                    && *i == 0)
+        );
+        assert!(maintained.iter().any(|(v, u, i)| *v
+            == format!("{:?}", ValueId::Instruction(y).strip_func())
+            && *u == z.local
+            && *i == 1));
     }
 
     #[test]

@@ -27,7 +27,7 @@ fn report_decline_reasons() {
     let mut jit = Jit::new();
     for block in ctx.block_ids() {
         let b = BasicBlock::from_id(&ctx, block);
-        let n = b.instruction_ids().len();
+        let n = b.len();
         let outcome = jit.try_compile(&ctx, block);
         eprintln!(
             "block {:?} addr={:x?} insns={n} -> {}",

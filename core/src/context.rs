@@ -101,6 +101,8 @@ impl<'de, 'str> serde::Deserialize<'de> for Context<'str> {
         for mut body in bodies.iter_mut() {
             let id = body.id;
             body.rehydrate_id(id);
+            // The wire carries operands, not the edges derived from them.
+            body.rebuild_uses();
         }
         Ok(Self {
             shared,
@@ -965,8 +967,8 @@ impl<'str> Context<'str> {
     /// machine addresses, and labels), all intra-set value/block references are
     /// remapped to the clones, the incident CFG edges are rebuilt between the new
     /// blocks (and their unmoved neighbours), the block addresses and the function
-    /// root are re-pointed, and the originals are deleted. `target`'s reverse-use
-    /// map is rebuilt from its live instructions afterwards.
+    /// root are re-pointed, and the originals are deleted. `target`'s use edges
+    /// are rebuilt from its live instructions afterwards.
     ///
     /// Assumes the relocated set is closed (the caller strips every cross-function
     /// CFG edge and rewrites foreign terminator targets to `TailCall`s first): every
@@ -1125,7 +1127,7 @@ impl<'str> Context<'str> {
                 crate::value::block::substitute_operands(&mut mnemonic, &pairs);
                 remap_rehomed_memory_space(&mut mnemonic, old.func, target, &temp_space_map);
                 remap_block_targets(&mut mnemonic, old.func, new.func, &block_map);
-                *self.instruction_mut(insn_id).mnemonic_mut() = mnemonic;
+                self.bodies[insn_id.func].replace_instruction_mnemonic(insn_id, mnemonic);
             }
         }
 
@@ -1175,9 +1177,12 @@ impl<'str> Context<'str> {
             BasicBlock::from_id_mut(self, old).delete();
         }
 
-        // Phase 6: rebuild `target`'s reverse-use map from its live instructions,
-        // since phase 2 rewrote operands in place.
-        self.rebuild_users(target);
+        // Phase 6: rebuild `target`'s use edges from its live instructions.
+        // The clones were pushed with the source arena's operands, so their
+        // edges hung off whatever those indices named in `target`; phase 2
+        // moved them as it rewrote each mnemonic, and rebuilding is the
+        // cheap proof that nothing was missed.
+        self.bodies[target].rebuild_uses();
         block_map
     }
 
@@ -1558,22 +1563,6 @@ impl<'str> Context<'str> {
         self.bodies[func].instruction_addrs = addrs;
     }
 
-    /// Rebuild `func`'s reverse-use map (`users`) from scratch by scanning its live
-    /// instructions' operands. Mirrors the per-operand recording in
-    /// [`Context::push_insn`](crate::context::Context::push_insn).
-    fn rebuild_users(&mut self, func: FunctionId) {
-        let live: Vec<InstructionId> = FunctionBody::from_id(self, func).instruction_ids();
-        let users = &mut self.bodies[func].users;
-        users.clear();
-        for id in live {
-            let args = self.bodies[func].insns[id.local].mnemonic().args();
-            let users = &mut self.bodies[func].users;
-            for arg in args {
-                users.entry(arg).or_default().push(id.localize(func));
-            }
-        }
-    }
-
     /// Assumes `prop` is true. Returns `false` (and records nothing) if the
     /// proposition is already assumed or known false; returns `true` if it was
     /// recorded or already held with the same polarity (idempotent). The
@@ -1768,27 +1757,17 @@ impl<'str> Context<'str> {
     // accessors that route a `(FunctionId, Local)` id to its arena are inherent on
     // `Context`). Each reads/writes `self.bodies[id.func]`. -----
 
-    /// Appends an instruction to `func`'s body and records all its operands in the
-    /// `users` map.
+    /// Appends an instruction to `func`'s body, recording a use edge for each
+    /// of its operands (see [`FunctionBody::push_insn`]).
     ///
     /// # Immutability invariant
     ///
-    /// Instructions are considered immutable after this call. If you alter the
-    /// operands of an instruction after insertion the `users` map will be stale.
-    /// Rewrite operands through [`replace_all_uses_with`](Self::replace_all_uses_with)
-    /// instead.
+    /// An installed instruction's operands change only through the verbs that
+    /// keep the use edges in step — [`replace_all_uses_with`](Self::replace_all_uses_with),
+    /// [`replace_instruction_mnemonic`](Self::replace_instruction_mnemonic) and
+    /// their kin — never in place.
     pub fn push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId {
-        let args = insn.mnemonic().args();
-        let local = self.bodies[func].insns.push(insn);
-        let id = InstructionId::new(func, local);
-        for arg in args {
-            self.bodies[func]
-                .users
-                .entry(arg)
-                .or_default()
-                .push(id.localize(func));
-        }
-        id
+        self.bodies[func].push_insn(insn)
     }
 
     /// Borrows the instruction `id`, routing through its owning function's arena.
@@ -2648,7 +2627,9 @@ mod tests {
                 .map(|b| b.id)
                 .find(|&b| b != entry)
                 .unwrap();
-            let insns = BasicBlock::from_id(ctx, entry).instruction_ids();
+            let insns = BasicBlock::from_id(ctx, entry)
+                .iter_instruction_ids()
+                .collect::<Vec<_>>();
             (fid, entry, bb1, insns[0])
         }
 
@@ -2688,7 +2669,10 @@ mod tests {
         let mut ctx_a = Context::new();
         let (fid, entry, bb1, a) = build(&mut ctx_a);
         let param = add_param(&mut ctx_a, bb1);
-        let b = BasicBlock::from_id(&ctx_a, entry).instruction_ids()[1];
+        let b = BasicBlock::from_id(&ctx_a, entry)
+            .iter_instruction_ids()
+            .nth(1)
+            .unwrap();
         BasicBlock::from_id_mut(&mut ctx_a, entry).set_comment(Some("c".into()));
         BasicBlock::from_id_mut(&mut ctx_a, entry)
             .rename("start".into())
@@ -2703,7 +2687,10 @@ mod tests {
         let mut ctx_b = Context::new();
         let (fid_b, entry_b, bb1_b, a_b) = build(&mut ctx_b);
         let param_b = add_param(&mut ctx_b, bb1_b);
-        let b_b = BasicBlock::from_id(&ctx_b, entry_b).instruction_ids()[1];
+        let b_b = BasicBlock::from_id(&ctx_b, entry_b)
+            .iter_instruction_ids()
+            .nth(1)
+            .unwrap();
 
         {
             let mut host = BodyMut::new(&mut ctx_b.bodies[fid_b], &ctx_b.shared, &ctx_b.interfaces);
@@ -2789,11 +2776,14 @@ mod tests {
         assert_eq!(ctx.get_insn(a).parent().map(|block| block.id), Some(target));
         assert!(
             !BasicBlock::from_id(&ctx, source)
-                .instruction_ids()
-                .contains(&a)
+                .iter_instruction_ids()
+                .any(|i| i == a)
         );
         assert_eq!(
-            BasicBlock::from_id(&ctx, target).instruction_ids()[..3],
+            BasicBlock::from_id(&ctx, target)
+                .iter_instruction_ids()
+                .take(3)
+                .collect::<Vec<_>>()[..],
             [a, b, consumer]
         );
         assert!(
@@ -2804,18 +2794,23 @@ mod tests {
         // The anchor may be any instruction, including one in the same block.
         ctx.move_insn_before(b, a);
         assert_eq!(
-            BasicBlock::from_id(&ctx, target).instruction_ids()[..3],
+            BasicBlock::from_id(&ctx, target)
+                .iter_instruction_ids()
+                .take(3)
+                .collect::<Vec<_>>()[..],
             [b, a, consumer]
         );
 
         // A terminator is also a valid destination anchor.
-        let return_id = *BasicBlock::from_id(&ctx, target)
-            .instruction_ids()
-            .last()
+        let return_id = BasicBlock::from_id(&ctx, target)
+            .last_instruction()
             .unwrap();
         ctx.move_insn_before(free, return_id);
         assert_eq!(
-            BasicBlock::from_id(&ctx, target).instruction_ids()[..4],
+            BasicBlock::from_id(&ctx, target)
+                .iter_instruction_ids()
+                .take(4)
+                .collect::<Vec<_>>()[..],
             [b, a, consumer, free]
         );
     }
@@ -2834,13 +2829,15 @@ mod tests {
             "
         );
         let block_ref = BasicBlock::from_id(&ctx, block);
-        let ids = block_ref.instruction_ids();
+        let ids = block_ref.iter_instruction_ids().collect::<Vec<_>>();
         let load_a = ids[0];
         let original_len = ids.len();
 
         ctx.remove_instruction(load_a);
 
-        let remaining = BasicBlock::from_id(&ctx, block).instruction_ids();
+        let remaining = BasicBlock::from_id(&ctx, block)
+            .iter_instruction_ids()
+            .collect::<Vec<_>>();
         assert_eq!(remaining.len(), original_len - 1);
         assert!(!remaining.contains(&load_a));
     }
@@ -2857,7 +2854,9 @@ mod tests {
                 return at %a;
             "
         );
-        let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+        let load_id = BasicBlock::from_id(&ctx, block)
+            .first_instruction()
+            .unwrap();
 
         ctx.remove_instruction(load_id);
 
@@ -2876,7 +2875,9 @@ mod tests {
                 return at %a;
             "
         );
-        let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+        let load_id = BasicBlock::from_id(&ctx, block)
+            .first_instruction()
+            .unwrap();
         // Instruction names are function-scoped, so resolve in the owner's table.
         assert!(
             ctx.get_named_in_scope(load_id.into(), "a").is_some(),
@@ -2904,7 +2905,9 @@ mod tests {
                 return at %a;
             "
         );
-        let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+        let load_id = BasicBlock::from_id(&ctx, block)
+            .first_instruction()
+            .unwrap();
 
         ctx.remove_instruction(load_id);
 
@@ -2918,7 +2921,9 @@ mod tests {
                 return at %a;
             "
         );
-        let a2 = BasicBlock::from_id(&ctx, block2).instruction_ids()[0];
+        let a2 = BasicBlock::from_id(&ctx, block2)
+            .first_instruction()
+            .unwrap();
         assert!(
             ctx.get_named_in_scope(a2.into(), "a").is_some(),
             "name should be reusable after removal"
@@ -2938,7 +2943,9 @@ mod tests {
                 return at %b;
             "
         );
-        let ids = BasicBlock::from_id(&ctx, block).instruction_ids();
+        let ids = BasicBlock::from_id(&ctx, block)
+            .iter_instruction_ids()
+            .collect::<Vec<_>>();
         let load_id = ids[0];
         let add_id = ids[1];
 
@@ -2972,7 +2979,9 @@ mod tests {
                 return at i64 0;
             "
         );
-        let ids = BasicBlock::from_id(&ctx, block).instruction_ids();
+        let ids = BasicBlock::from_id(&ctx, block)
+            .iter_instruction_ids()
+            .collect::<Vec<_>>();
         let dead_id = ids[1]; // %dead, unused
 
         assert!(
@@ -3000,7 +3009,9 @@ mod tests {
                 call [ptr];
             "
         );
-        let call_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+        let call_id = BasicBlock::from_id(&ctx, block)
+            .first_instruction()
+            .unwrap();
         let ptr = match ctx.get_insn(call_id).mnemonic() {
             Mnemonic::CallInd(call) => call.ptr.qualify(call_id.func),
             other => panic!("expected CallInd, got {other:?}"),
@@ -3051,8 +3062,12 @@ mod tests {
                     return at %guse;
             "
         );
-        let f_ids = BasicBlock::from_id(&ctx, f_entry).instruction_ids();
-        let g_ids = BasicBlock::from_id(&ctx, g_entry).instruction_ids();
+        let f_ids = BasicBlock::from_id(&ctx, f_entry)
+            .iter_instruction_ids()
+            .collect::<Vec<_>>();
+        let g_ids = BasicBlock::from_id(&ctx, g_entry)
+            .iter_instruction_ids()
+            .collect::<Vec<_>>();
         assert_eq!(
             f_ids[0].local, g_ids[0].local,
             "precondition: arena-local ids collide"
@@ -3077,7 +3092,9 @@ mod tests {
                 return at %a;
             "
         );
-        let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+        let load_id = BasicBlock::from_id(&ctx, block)
+            .first_instruction()
+            .unwrap();
         let old_ptr = ValueId::Varnode(x);
         let new_ptr = ValueId::Varnode(y);
         // Varnodes are shared values, so query their uses across functions.
@@ -3110,7 +3127,9 @@ mod tests {
                 return at %a;
             "
         );
-        let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+        let load_id = BasicBlock::from_id(&ctx, block)
+            .first_instruction()
+            .unwrap();
         let old_ptr = ValueId::Varnode(x);
         let new_arg = ValueId::Varnode(y);
 
@@ -3143,7 +3162,9 @@ mod tests {
                 return at %a;
             "
         );
-        let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+        let load_id = BasicBlock::from_id(&ctx, block)
+            .first_instruction()
+            .unwrap();
 
         // Manually detach from block without using remove_instruction,
         // simulating an instruction with no parent.
@@ -3459,7 +3480,9 @@ mod tests {
                 return at %first;
             "
         );
-        let ids = BasicBlock::from_id(&ctx, block).instruction_ids();
+        let ids = BasicBlock::from_id(&ctx, block)
+            .iter_instruction_ids()
+            .collect::<Vec<_>>();
         let first = ids[0];
         let removed = ids[1];
         let last = ids[2];

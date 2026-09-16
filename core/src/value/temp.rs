@@ -8,7 +8,11 @@ use std::{borrow::Cow, fmt::Display, marker::PhantomData};
 
 use jstd::Identifier;
 
-use crate::value::{ModuleView, QCodeView, Value, ValueId, util::named::Named};
+use crate::value::{
+    ModuleView, QCodeView, Value, ValueId,
+    uses::{UseId, WithUsers},
+    util::named::Named,
+};
 
 /// Function-local temporary-space index.
 #[derive(Identifier)]
@@ -60,6 +64,20 @@ pub struct Temp<'str> {
     pub(crate) address: i64,
     pub(crate) size: usize,
     pub(crate) space: LocalTempSpaceId,
+    /// Head of the list of this temporary's uses (see [`crate::value::uses`]).
+    /// Derived bookkeeping, rebuilt after deserialization.
+    #[serde(skip)]
+    pub(crate) first_use: Option<UseId>,
+}
+
+impl WithUsers for Temp<'_> {
+    fn first_use(&self) -> Option<UseId> {
+        self.first_use
+    }
+
+    fn first_use_mut(&mut self) -> &mut Option<UseId> {
+        &mut self.first_use
+    }
 }
 
 impl<'str> Temp<'str> {
@@ -70,6 +88,7 @@ impl<'str> Temp<'str> {
             address,
             size,
             space,
+            first_use: None,
         }
     }
 

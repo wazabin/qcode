@@ -90,7 +90,9 @@ fn constant_address(ctx: &Context<'_>, ptr: ValueId) -> Option<u64> {
 /// `block_id` only.
 pub fn forward_temp_stores(ctx: &mut Context<'_>, block_id: BlockId) -> Cleanup {
     let func = block_id.func;
-    let insn_ids: Vec<InstructionId> = BasicBlock::from_id(ctx, block_id).instruction_ids();
+    let insn_ids: Vec<InstructionId> = BasicBlock::from_id(ctx, block_id)
+        .iter_instruction_ids()
+        .collect::<Vec<_>>();
 
     /// The operands of the one or two mnemonics this pass reads, copied out of
     /// the instruction so that nothing has to be cloned to look at them.

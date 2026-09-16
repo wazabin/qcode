@@ -3,8 +3,7 @@ use crate::value::{
     insn::bits::{mask_for_size, signed_value},
 };
 
-use super::mnemonic::{Args, MnemonicKind};
-use smallvec::smallvec;
+use super::mnemonic::MnemonicKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Zext {
@@ -22,10 +21,6 @@ impl Zext {
 impl MnemonicKind for Zext {
     fn opcode(&self) -> &'static str {
         "zext"
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
     }
 }
 
@@ -48,10 +43,6 @@ impl Sext {
 impl MnemonicKind for Sext {
     fn opcode(&self) -> &'static str {
         "sext"
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
     }
 }
 
@@ -79,10 +70,6 @@ impl MnemonicKind for Range {
     fn opcode(&self) -> &'static str {
         "range"
     }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -94,10 +81,6 @@ pub struct IntToFloat {
 impl MnemonicKind for IntToFloat {
     fn opcode(&self) -> &'static str {
         "int_to_float"
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
     }
 }
 
@@ -111,10 +94,6 @@ impl MnemonicKind for FloatToFloat {
     fn opcode(&self) -> &'static str {
         "float_to_float"
     }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -126,10 +105,6 @@ pub struct FloatToInt {
 impl MnemonicKind for FloatToInt {
     fn opcode(&self) -> &'static str {
         "float_to_int"
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
     }
 }
 

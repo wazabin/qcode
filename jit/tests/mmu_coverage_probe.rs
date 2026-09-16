@@ -101,10 +101,7 @@ fn report_block_coverage_over_embench() {
         let mut jit = Jit::new();
         let (mut ok, mut no) = (0u64, 0u64);
         for block in ctx.block_ids() {
-            if BasicBlock::from_id(&ctx, block)
-                .instruction_ids()
-                .is_empty()
-            {
+            if BasicBlock::from_id(&ctx, block).is_empty() {
                 continue;
             }
             match jit.try_compile(&ctx, block) {

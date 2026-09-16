@@ -25,8 +25,8 @@ fn editing_the_front_of_a_long_block_does_not_scale_with_it() {
         let f = ctx.anon_function();
         let block = ctx.get_or_make_block(0x1000, f);
         let scratch = ctx.get_or_make_block(0x2000, f);
-        // Each instruction negates a constant of its own, so the reverse-use
-        // map's lists stay one long and only the block list is measured.
+        // Each instruction negates a constant of its own, so every use
+        // list stays one long and only the block list is measured.
         let consts: Vec<_> = (0..n as u64).map(|i| ctx.get_const(i, 8).id()).collect();
 
         // Every instruction is minted in the scratch block and moved to the
@@ -42,7 +42,7 @@ fn editing_the_front_of_a_long_block_does_not_scale_with_it() {
             ids.push(id);
         }
         let inserted = start.elapsed();
-        assert_eq!(BasicBlock::from_id(&ctx, block).instruction_count(), n);
+        assert_eq!(BasicBlock::from_id(&ctx, block).len(), n);
 
         // Then the first instruction goes, n times.
         let start = Instant::now();
@@ -50,7 +50,7 @@ fn editing_the_front_of_a_long_block_does_not_scale_with_it() {
             ctx.body_mut(f).remove_instruction(id);
         }
         let removed = start.elapsed();
-        assert_eq!(BasicBlock::from_id(&ctx, block).instruction_count(), 0);
+        assert_eq!(BasicBlock::from_id(&ctx, block).len(), 0);
 
         eprintln!(
             "n={n:>7}: {n} insertions at the front in {inserted:>12?}, {n} removals of the first in {removed:>12?}"

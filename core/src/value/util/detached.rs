@@ -98,7 +98,7 @@ impl<'a, 'str> DetachedMut<'a, 'str> {
         self.body.push_block_param_local(block, param)
     }
 
-    /// Replace instruction `insn`'s mnemonic in place, keeping reverse-uses synced.
+    /// Replace instruction `insn`'s mnemonic in place, keeping the use edges in step.
     pub fn replace_instruction_mnemonic(&mut self, insn: LocalInsnId, mnemonic: Mnemonic) {
         self.body.replace_instruction_mnemonic_local(insn, mnemonic);
     }

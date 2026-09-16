@@ -122,6 +122,7 @@ pub mod literal;
 pub mod poison;
 pub mod registry;
 pub mod temp;
+pub(crate) mod uses;
 pub mod util;
 pub mod varnode;
 pub mod view;
@@ -187,8 +188,8 @@ impl ValueId {
     /// The function that owns this value's definition, if it is an SSA def
     /// (an [`Instruction`] result or a [`BlockParam`]). Shared values (literals,
     /// bytes, varnodes) and functions/blocks return `None` — they have no single
-    /// owning function and their per-function use-lists live in each using
-    /// function's reverse-use map (exposed through [`FunctionBody::users_of`]).
+    /// owning function; each using function keeps its own use list for them
+    /// (exposed through [`FunctionBody::users_of`]).
     pub fn owning_function(self) -> Option<FunctionId> {
         match self {
             ValueId::Instruction(id) => Some(id.func),
