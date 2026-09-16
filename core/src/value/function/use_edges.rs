@@ -349,3 +349,143 @@ fn a_removed_use_slot_is_reused() {
     assert_eq!(ctx.bodies[f].uses.len(), before);
     assert_eq!(users(&ctx, f, c), vec![ids[0], ids[3], fresh, again]);
 }
+
+/// The highest use slot in use, plus one: how far the slab has grown.
+fn issued(ctx: &Context<'_>, f: FunctionId) -> usize {
+    ctx.bodies[f]
+        .use_edges()
+        .map(|edge| usize::from(edge.id) + 1)
+        .max()
+        .unwrap_or(0)
+}
+
+#[test]
+fn churning_a_block_does_not_grow_the_slab_past_its_peak() {
+    let mut ctx = Context::new();
+    let f = ctx.anon_function();
+    let block = ctx.get_or_make_block(0x1000, f);
+    let c = ctx.get_const(1, 8).id();
+    let mut live: Vec<InstructionId> = {
+        let mut b = ctx.builder(block);
+        (0..16).map(|_| b.push_bit_negate(c).id).collect()
+    };
+    let peak = issued(&ctx, f);
+    assert_eq!(peak, 16);
+
+    for round in 0..50 {
+        // Delete a mix of old and new instructions, then mint as many again.
+        for _ in 0..8 {
+            let victim = live.remove((round * 3) % live.len());
+            ctx.remove_instruction(victim);
+        }
+        for _ in 0..8 {
+            live.push(ctx.builder(block).push_bit_negate(c).id);
+        }
+        assert_clean(&ctx);
+        assert_eq!(ctx.bodies[f].uses.len(), 16);
+        assert_eq!(issued(&ctx, f), peak, "round {round} grew the slab");
+    }
+    let mut expected = live.clone();
+    expected.sort();
+    assert_eq!(users(&ctx, f, c), expected);
+}
+
+#[test]
+fn use_edges_iterate_over_the_holes_left_by_deletion() {
+    let mut ctx = Context::new();
+    let f = ctx.anon_function();
+    let block = ctx.get_or_make_block(0x1000, f);
+    let c = ctx.get_const(1, 8).id();
+    let ids: Vec<InstructionId> = {
+        let mut b = ctx.builder(block);
+        (0..5).map(|_| b.push_bit_negate(c).id).collect()
+    };
+    ctx.remove_instruction(ids[1]);
+    ctx.remove_instruction(ids[3]);
+    assert_clean(&ctx);
+
+    let edges: Vec<(usize, InstructionId)> = ctx.bodies[f]
+        .use_edges()
+        .map(|edge| (usize::from(edge.id), InstructionId::new(f, edge.user)))
+        .collect();
+    assert_eq!(edges, vec![(0, ids[0]), (2, ids[2]), (4, ids[4])]);
+    assert_eq!(ctx.bodies[f].uses.len(), 3);
+    assert!(!ctx.bodies[f].uses.contains(UseId::from(1)));
+    assert!(!ctx.bodies[f].uses.contains(UseId::from(3)));
+}
+
+#[test]
+fn rebuilding_forgets_the_holes_and_restarts_the_slab() {
+    let mut ctx = Context::new();
+    let f = ctx.anon_function();
+    let block = ctx.get_or_make_block(0x1000, f);
+    let c = ctx.get_const(1, 8).id();
+    let ids: Vec<InstructionId> = {
+        let mut b = ctx.builder(block);
+        (0..6).map(|_| b.push_bit_negate(c).id).collect()
+    };
+    for &id in &ids[..4] {
+        ctx.remove_instruction(id);
+    }
+    assert_eq!(issued(&ctx, f), 6, "the freed slots are still issued");
+    let before = users(&ctx, f, c);
+
+    ctx.bodies[f].rebuild_uses();
+    assert_clean(&ctx);
+    assert_eq!(users(&ctx, f, c), before);
+    assert_eq!(issued(&ctx, f), 2, "the rebuilt slab is dense");
+    let slots: Vec<usize> = ctx.bodies[f]
+        .use_edges()
+        .map(|edge| usize::from(edge.id))
+        .collect();
+    assert_eq!(slots, vec![0, 1]);
+
+    // The next edge takes the slot after the rebuilt ones, not one of the
+    // ids that were free before the rebuild.
+    let fresh = ctx.builder(block).push_bit_negate(c).id;
+    assert_clean(&ctx);
+    assert_eq!(issued(&ctx, f), 3);
+    assert_eq!(users(&ctx, f, c), vec![ids[4], ids[5], fresh]);
+}
+
+#[test]
+fn a_freed_slot_is_never_reachable_from_a_use_list() {
+    let mut ctx = Context::new();
+    qcode!(
+        ctx,
+        "
+        fn f:
+            <entry @x:i64>
+                %a = i64 @x + i64 2;
+                %b = %a + @x;
+                %c = %b + @x;
+                return at %c;
+        "
+    );
+    assert_eq!(users(&ctx, f, ValueId::BlockParam(x)), vec![a, b, c]);
+    let ret = BasicBlock::from_id(&ctx, entry).last_instruction().unwrap();
+    ctx.remove_instruction(ret);
+    ctx.remove_instruction(c);
+    // `c`'s two edges are free; the lists of `x` and `b` must have been
+    // unlinked from them, and the next edges take those slots over.
+    assert_eq!(users(&ctx, f, ValueId::BlockParam(x)), vec![a, b]);
+    assert!(!ctx.bodies[f].has_users(ValueId::Instruction(b)));
+    assert_clean(&ctx);
+
+    let d = ctx
+        .builder(entry)
+        .push_binop(
+            crate::value::insn::Binop::Int(crate::value::insn::IntBinop::Add),
+            ValueId::Instruction(b),
+            ValueId::BlockParam(x),
+        )
+        .id;
+    assert_clean(&ctx);
+    assert_eq!(users(&ctx, f, ValueId::BlockParam(x)), vec![a, b, d]);
+    assert_eq!(users(&ctx, f, ValueId::Instruction(b)), vec![d]);
+    assert_eq!(
+        ctx.bodies[f].use_edges().count(),
+        ctx.bodies[f].uses.len(),
+        "every slot is either live or on the free list"
+    );
+}

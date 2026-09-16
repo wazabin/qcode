@@ -178,3 +178,36 @@ impl Hook for ReadWatch {
         emit.interrupt_if(cond, self.code, &args);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The table is not a recycling arena on purpose: a hook's interrupt
+    /// code is compiled into the instrumented blocks, which outlive
+    /// `hook_del`. A reused id would hand those stale interrupts to whatever
+    /// hook registered next, so ids are issued once and never again.
+    #[test]
+    fn deleted_hook_ids_are_never_reissued() {
+        let mut table = HookTable::<()>::default();
+        let code = |table: &mut HookTable<()>| {
+            table.register(Callback::Code(Box::new(|_, _| HookAction::Continue)))
+        };
+        let first = code(&mut table);
+        let second = code(&mut table);
+        assert_eq!(first, HookId(0));
+        assert_eq!(second, HookId(1));
+
+        assert!(table.remove(first));
+        assert!(!table.remove(first), "already gone");
+        assert_eq!(table.callbacks.len(), 1);
+
+        let third = code(&mut table);
+        assert_eq!(third, HookId(2), "the freed id is not recycled");
+        assert!(
+            table.callbacks.iter().all(|(id, _)| *id != first),
+            "nothing answers the deleted hook's code any more"
+        );
+        assert_eq!(HookTable::<()>::code(first), TABLE_CODES);
+    }
+}

@@ -1524,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-jstd"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rustc-hash",
  "serde",
@@ -1533,7 +1533,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-jstd-derive"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "proc-macro2",
  "quote",
