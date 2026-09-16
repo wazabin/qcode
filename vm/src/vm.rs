@@ -627,7 +627,10 @@ impl<S: CodeSource> Vm<S> {
     /// Returns `None` when the step was ordinary, and `Some(exit)` when the
     /// machine stopped for a reason worth reporting.
     pub fn step(&mut self) -> Option<VmExit> {
-        self.step_within(1)
+        // The allowance that forbids chaining outright, not one operation: a
+        // block with nothing but a terminator retires nothing, and would be
+        // within any positive allowance.
+        self.step_within(0)
     }
 
     /// [`step`](Self::step), with an executor allowed to chain through at
