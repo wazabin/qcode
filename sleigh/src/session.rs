@@ -28,10 +28,11 @@ use qcode::{
     address_index::AddressIndex,
     context::Context,
     lift::{Exit, ExitArm, ExitKind, LiftTarget, Lifted, ScratchStore, TargetError},
+    space::{LocalMemorySpaceId, SpaceId},
     value::{
         BlockId, FunctionBody, FunctionId, InstructionId, LocalTempId, LocalValueId, Varnode,
-        VarnodeRef,
-        insn::{Callee, Mnemonic},
+        VarnodeId,
+        insn::{Binop, Callee, IntrinsicId, Mnemonic, Unop},
     },
 };
 use sleigh::{ContextBytes, ContextError, Instruction, InstructionPcode};
@@ -326,14 +327,16 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
 
 /// One instruction lifted by a [`ScratchSession`], readable until the next.
 ///
-/// Every block and instruction it exposes is a view carrying this borrow, so
-/// none can be kept past the instruction. Raw IR ids do appear inside the
-/// mnemonics a view shows — an operand is a [`LocalValueId`] — and those are
-/// fine to use as keys while the instruction is live. Nothing here resolves
-/// a bare id: an operand's value comes from [`ScratchInsn::operand`], which
-/// answers only for the operands of the live instruction it is asked
-/// through, so an id kept from an earlier instruction (whose constants the
-/// storage may since have recycled) cannot be read back as a stale value.
+/// Every block, instruction and operand it exposes is a view carrying this
+/// borrow, so none can be kept past the instruction. Operands are read by
+/// role or position from the live instruction ([`ScratchInsn::kind`],
+/// [`ScratchInsn::operands`]); nothing here takes a bare id and resolves it.
+/// The storage recycles constant ids between instructions, so an id kept
+/// from an earlier one may now number a different constant, and a facade
+/// that resolved ids would hand back that other value. Raw
+/// [`LocalValueId`]s still appear in [`ScratchInsn::mnemonic`] and as
+/// [`ScratchInsn::result`]; they are keys for the caller's own tables while
+/// the instruction is live, and nothing more.
 pub struct ScratchLifted<'s, 'l, 'spec, 'b> {
     session: &'s mut ScratchSession<'l, 'spec>,
     instruction: Instruction<'spec, 'b>,
@@ -407,13 +410,14 @@ impl<'s, 'l, 'spec, 'b> ScratchLifted<'s, 'l, 'spec, 'b> {
 }
 
 /// A resolved operand of a [`ScratchInsn`], valid as long as the instruction.
+#[derive(Clone, Copy)]
 #[non_exhaustive]
 pub enum ScratchOperand<'v> {
     /// An interned constant: its raw value, and its width in bytes. The
     /// interner masks a constant to its width when it mints it.
     Const { value: u64, size: usize },
     /// A register or other named location of the architecture.
-    Varnode(VarnodeRef<'static, 'v>),
+    Varnode(ScratchVarnode<'v>),
     /// The result of another instruction of the same scratch instruction.
     Result(ScratchInsn<'v>),
     /// A body-local temporary: the storage of an instruction-local unique.
@@ -428,10 +432,7 @@ impl std::fmt::Debug for ScratchOperand<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Const { value, size } => write!(f, "Const({value:#x}, {size})"),
-            Self::Varnode(varnode) => match varnode.name() {
-                Some(name) => write!(f, "Varnode({name})"),
-                None => write!(f, "Varnode({}:{})", varnode.address(), varnode.size()),
-            },
+            Self::Varnode(varnode) => write!(f, "{varnode:?}"),
             Self::Result(insn) => write!(f, "Result({:?})", insn.id),
             Self::Temp(temp) => write!(f, "Temp({temp:?})"),
             Self::Block(block) => write!(f, "Block({:?})", block.id),
@@ -448,6 +449,147 @@ impl ScratchOperand<'_> {
             _ => None,
         }
     }
+}
+
+/// A register or other architectural location named by a scratch operand.
+#[derive(Clone, Copy)]
+pub struct ScratchVarnode<'v> {
+    ctx: &'v Context<'static>,
+    id: VarnodeId,
+}
+
+impl std::fmt::Debug for ScratchVarnode<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.name() {
+            Some(name) => write!(f, "Varnode({name})"),
+            None => write!(
+                f,
+                "Varnode({:?}:{}:{})",
+                self.space(),
+                self.address(),
+                self.size()
+            ),
+        }
+    }
+}
+
+impl ScratchVarnode<'_> {
+    /// The id the varnode has in the module — architecture-defined, so it is
+    /// the same in every scratch epoch, and usable as a key.
+    pub fn id(&self) -> VarnodeId {
+        self.id
+    }
+
+    pub fn space(&self) -> SpaceId {
+        Varnode::from_id(self.ctx, self.id).space().id
+    }
+
+    pub fn address(&self) -> i64 {
+        Varnode::from_id(self.ctx, self.id).address()
+    }
+
+    pub fn size(&self) -> usize {
+        Varnode::from_id(self.ctx, self.id).size()
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        Varnode::from_id(self.ctx, self.id).name()
+    }
+}
+
+/// A scratch instruction's operation with its operands resolved: the
+/// [`Mnemonic`] as seen through the live instruction. Operands are named by
+/// their role so a caller need not know operand order.
+///
+/// Not every mnemonic has a view; [`Other`](Self::Other) covers the rest, whose
+/// operands are still reachable positionally through
+/// [`ScratchInsn::operands`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ScratchMnemonic<'v> {
+    Load {
+        space: LocalMemorySpaceId,
+        ptr: ScratchOperand<'v>,
+        size: usize,
+    },
+    Store {
+        space: LocalMemorySpaceId,
+        ptr: ScratchOperand<'v>,
+        src: ScratchOperand<'v>,
+        size: usize,
+    },
+    Binop {
+        op: Binop,
+        lhs: ScratchOperand<'v>,
+        rhs: ScratchOperand<'v>,
+    },
+    Unop {
+        op: Unop,
+        src: ScratchOperand<'v>,
+    },
+    Zext {
+        src: ScratchOperand<'v>,
+        size: usize,
+    },
+    Sext {
+        src: ScratchOperand<'v>,
+        size: usize,
+    },
+    Range {
+        src: ScratchOperand<'v>,
+        start: usize,
+        size: usize,
+    },
+    Carry {
+        lhs: ScratchOperand<'v>,
+        rhs: ScratchOperand<'v>,
+    },
+    SCarry {
+        lhs: ScratchOperand<'v>,
+        rhs: ScratchOperand<'v>,
+    },
+    SBorrow {
+        lhs: ScratchOperand<'v>,
+        rhs: ScratchOperand<'v>,
+    },
+    PopCount {
+        src: ScratchOperand<'v>,
+    },
+    LzCount {
+        src: ScratchOperand<'v>,
+    },
+    Intrinsic {
+        id: IntrinsicId,
+        args: Vec<ScratchOperand<'v>>,
+    },
+    Branch {
+        target: ScratchBlock<'v>,
+    },
+    CBranch {
+        condition: ScratchOperand<'v>,
+        taken: ScratchBlock<'v>,
+        not_taken: ScratchBlock<'v>,
+    },
+    BranchInd {
+        ptr: ScratchOperand<'v>,
+    },
+    Switch {
+        scrutinee: ScratchOperand<'v>,
+    },
+    /// A direct call; `callee` is the callee's entry address when it has one.
+    Call {
+        callee: Option<u64>,
+    },
+    CallInd {
+        ptr: ScratchOperand<'v>,
+    },
+    TailCall {
+        callee: Option<u64>,
+    },
+    Return,
+    BadInsn,
+    /// A mnemonic without a role view; see [`ScratchInsn::opcode`].
+    Other,
 }
 
 /// One exit of a scratch instruction.
@@ -552,6 +694,10 @@ impl std::fmt::Debug for ScratchInsn<'_> {
 }
 
 impl<'v> ScratchInsn<'v> {
+    /// The raw mnemonic. The operand ids inside are keys, not handles: the
+    /// facade resolves none of them, and they must not be carried to another
+    /// instruction. Prefer [`kind`](Self::kind), which resolves the operands
+    /// by role.
     pub fn mnemonic(&self) -> &'v Mnemonic {
         self.ctx.instruction(self.id).mnemonic()
     }
@@ -559,6 +705,86 @@ impl<'v> ScratchInsn<'v> {
     /// The operand other instructions name this one's result by.
     pub fn result(&self) -> LocalValueId {
         LocalValueId::Instruction(self.id.local)
+    }
+
+    /// The instruction's operation with its operands resolved by role.
+    pub fn kind(&self) -> ScratchMnemonic<'v> {
+        let op = |v: LocalValueId| self.resolve(v);
+        match self.mnemonic() {
+            Mnemonic::Load(l) => ScratchMnemonic::Load {
+                space: l.space,
+                ptr: op(l.ptr),
+                size: l.size,
+            },
+            Mnemonic::Store(st) => ScratchMnemonic::Store {
+                space: st.space,
+                ptr: op(st.ptr),
+                src: op(st.src),
+                size: st.size,
+            },
+            Mnemonic::Binop(b) => ScratchMnemonic::Binop {
+                op: b.op,
+                lhs: op(b.lhs),
+                rhs: op(b.rhs),
+            },
+            Mnemonic::Unop(u) => ScratchMnemonic::Unop {
+                op: u.op.clone(),
+                src: op(u.src),
+            },
+            Mnemonic::Zext(z) => ScratchMnemonic::Zext {
+                src: op(z.src),
+                size: z.size,
+            },
+            Mnemonic::Sext(z) => ScratchMnemonic::Sext {
+                src: op(z.src),
+                size: z.size,
+            },
+            Mnemonic::Range(r) => ScratchMnemonic::Range {
+                src: op(r.src),
+                start: r.start,
+                size: r.size,
+            },
+            Mnemonic::Carry(c) => ScratchMnemonic::Carry {
+                lhs: op(c.lhs),
+                rhs: op(c.rhs),
+            },
+            Mnemonic::SCarry(c) => ScratchMnemonic::SCarry {
+                lhs: op(c.lhs),
+                rhs: op(c.rhs),
+            },
+            Mnemonic::SBorrow(c) => ScratchMnemonic::SBorrow {
+                lhs: op(c.lhs),
+                rhs: op(c.rhs),
+            },
+            Mnemonic::PopCount(p) => ScratchMnemonic::PopCount { src: op(p.src) },
+            Mnemonic::LzCount(p) => ScratchMnemonic::LzCount { src: op(p.src) },
+            Mnemonic::Intrinsic(i) => ScratchMnemonic::Intrinsic {
+                id: i.id,
+                args: i.args.iter().map(|&a| op(a)).collect(),
+            },
+            Mnemonic::Branch(b) => ScratchMnemonic::Branch {
+                target: self.block_view(b.target),
+            },
+            Mnemonic::CBranch(c) => ScratchMnemonic::CBranch {
+                condition: op(c.condition),
+                taken: self.block_view(c.success_block),
+                not_taken: self.block_view(c.failure_block),
+            },
+            Mnemonic::BranchInd(b) => ScratchMnemonic::BranchInd { ptr: op(b.ptr) },
+            Mnemonic::Switch(sw) => ScratchMnemonic::Switch {
+                scrutinee: op(sw.scrutinee),
+            },
+            Mnemonic::Call(_) => ScratchMnemonic::Call {
+                callee: self.callee_address(),
+            },
+            Mnemonic::CallInd(c) => ScratchMnemonic::CallInd { ptr: op(c.ptr) },
+            Mnemonic::TailCall(_) => ScratchMnemonic::TailCall {
+                callee: self.callee_address(),
+            },
+            Mnemonic::Return(_) | Mnemonic::ReturnValue(_) => ScratchMnemonic::Return,
+            Mnemonic::BadInsn(_) => ScratchMnemonic::BadInsn,
+            _ => ScratchMnemonic::Other,
+        }
     }
 
     /// The operands of this instruction, in mnemonic order, resolved.
@@ -570,18 +796,15 @@ impl<'v> ScratchInsn<'v> {
             .map(move |v| this.resolve(v))
     }
 
-    /// Resolves `v`, which must be one of this instruction's operands — a
-    /// field of its [`mnemonic`](Self::mnemonic) — and is `None` otherwise.
-    ///
-    /// This is the only way to read a constant's value out of a scratch
-    /// instruction, and it is deliberately narrow: the storage recycles
-    /// constant ids across instructions, so a [`LocalValueId`] is a key within
-    /// the instruction it was read from and nowhere else. Asking through the
-    /// instruction that holds the operand is what makes the answer current.
-    pub fn operand(&self, v: LocalValueId) -> Option<ScratchOperand<'v>> {
-        self.mnemonic().args().contains(&v).then(|| self.resolve(v))
+    /// The mnemonic's opcode name.
+    pub fn opcode(&self) -> &'static str {
+        qcode::value::Instruction::from_id(self.ctx, self.id).opcode()
     }
 
+    /// Resolves an operand *of this instruction*. Private on purpose: every
+    /// caller is one of the accessors above, which take the id from the live
+    /// mnemonic, so no id from another instruction or epoch reaches the
+    /// interner through here.
     fn resolve(&self, v: LocalValueId) -> ScratchOperand<'v> {
         match v {
             LocalValueId::Literal(id) => {
@@ -591,7 +814,9 @@ impl<'v> ScratchInsn<'v> {
                     size: self.ctx.shared.types.size_of(literal.type_id),
                 }
             }
-            LocalValueId::Varnode(id) => ScratchOperand::Varnode(Varnode::from_id(self.ctx, id)),
+            LocalValueId::Varnode(id) => {
+                ScratchOperand::Varnode(ScratchVarnode { ctx: self.ctx, id })
+            }
             LocalValueId::Instruction(local) => ScratchOperand::Result(ScratchInsn {
                 ctx: self.ctx,
                 id: InstructionId::new(self.id.func, local),
@@ -855,48 +1080,57 @@ mod tests {
     }
 
     #[test]
-    fn an_operand_is_read_only_through_its_own_instruction() {
+    fn a_recycled_constant_id_is_never_a_way_to_a_value() {
         let lifter = lifter().with_flat_control_flow();
         // Budget 0: the storage is rebuilt after every instruction that
-        // interned a constant, so a constant id from one instruction is
-        // recycled by the next.
+        // interned a constant, so the next one reuses the first free id.
         let mut session = ScratchSession::new(&lifter).unwrap().with_literal_budget(0);
-        let stale = {
-            let lifted = session
-                .lift(0x1000, b"\x48\xc7\xc0\x44\x33\x22\x11")
-                .unwrap();
-            let store = lifted
+        fn store_of<'v>(lifted: &'v ScratchLifted<'_, '_, '_, '_>) -> ScratchInsn<'v> {
+            lifted
                 .entry()
                 .instructions()
                 .find(|insn| matches!(insn.mnemonic(), Mnemonic::Store(_)))
-                .unwrap();
-            let Mnemonic::Store(st) = store.mnemonic() else {
-                unreachable!()
-            };
-            assert_eq!(store.operand(st.src).unwrap().as_const(), Some(0x1122_3344));
-            let operands: Vec<_> = store.operands().collect();
-            assert_eq!(operands.len(), 2);
-            assert!(matches!(&operands[0], ScratchOperand::Varnode(v) if v.name() == Some("RAX")));
-            assert_eq!(operands[1].as_const(), Some(0x1122_3344));
-            // An id that is not this instruction's operand is refused.
-            assert!(
-                store
-                    .operand(LocalValueId::Instruction(0usize.into()))
-                    .is_none()
-            );
-            st.src
-        };
-
-        // `mov rax, rbx`: no constant, so after the rebuild the stale id names
-        // nothing in the storage at all. No instruction of this lift resolves
-        // it — the facade never reaches the interner with a foreign id.
-        let lifted = session.lift(0x1007, b"\x48\x89\xd8").unwrap();
-        assert_eq!(session_of(&lifted).rebuilds(), 1);
-        assert_eq!(session_of(&lifted).interned_literals(), 0);
-        for block in lifted.blocks() {
-            for insn in block.instructions() {
-                assert!(insn.operand(stale).is_none(), "{:?}", insn.mnemonic());
+                .unwrap()
+        }
+        fn raw_id(insn: &ScratchInsn<'_>) -> LocalValueId {
+            match insn.mnemonic() {
+                Mnemonic::Store(st) => st.src,
+                _ => unreachable!(),
             }
         }
+        fn value(insn: &ScratchInsn<'_>) -> u64 {
+            match insn.kind() {
+                ScratchMnemonic::Store { src, ptr, .. } => {
+                    assert!(matches!(ptr, ScratchOperand::Varnode(v) if v.name() == Some("RAX")));
+                    src.as_const().unwrap()
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+
+        let first_id = {
+            let lifted = session
+                .lift(0x1000, b"\x48\xc7\xc0\x44\x33\x22\x11")
+                .unwrap();
+            let store = store_of(&lifted);
+            assert_eq!(value(&store), 0x1122_3344);
+            let operands: Vec<_> = store.operands().collect();
+            assert_eq!(operands.len(), 2);
+            assert_eq!(operands[1].as_const(), Some(0x1122_3344));
+            raw_id(&store)
+        };
+        assert_eq!(session.rebuilds(), 0);
+
+        // The same numeric id now stands for a different constant: exactly
+        // the collision a resolve-by-id accessor would silently alias. The
+        // facade has no such accessor — a value is only reachable by role or
+        // position from the live instruction, which reports the new constant.
+        let lifted = session
+            .lift(0x1007, b"\x48\xc7\xc0\x88\x77\x66\x55")
+            .unwrap();
+        let store = store_of(&lifted);
+        assert_eq!(session_of(&lifted).rebuilds(), 1);
+        assert_eq!(raw_id(&store), first_id, "the id was recycled");
+        assert_eq!(value(&store), 0x5566_7788);
     }
 }
