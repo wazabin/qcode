@@ -49,7 +49,7 @@ impl BlockExecutor for Counter {
         _emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
         start: usize,
-        _chain: bool,
+        _chain: u64,
     ) -> Result<Option<Executed>, EmulatorErrorKind> {
         // Only whole blocks are counted; a continuation after an interrupt is
         // the same block's instructions, already counted at its entry.

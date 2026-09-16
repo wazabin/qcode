@@ -47,7 +47,7 @@ fn a_value_read_from_another_block_is_exported_and_imported() {
     // imports it — reads it.
     let mut emu = StandaloneEmulator::<VmMemory>::new_in(entry);
     emu.memory.configure_spaces(&ctx);
-    jit.run_block(&ctx, &mut emu, entry, 0, false)
+    jit.run_block(&ctx, &mut emu, entry, 0, 0)
         .expect("the block runs")
         .expect("the block was compiled");
     assert_eq!(emu.insn_values.get(&a).map(|v| v.as_bits()), Some(3));
@@ -55,7 +55,7 @@ fn a_value_read_from_another_block_is_exported_and_imported() {
     // The second block imports it and computes on it.
     emu.block = next;
     emu.idx = 0;
-    jit.run_block(&ctx, &mut emu, next, 0, false)
+    jit.run_block(&ctx, &mut emu, next, 0, 0)
         .expect("the block runs")
         .expect("the block was compiled");
     assert_eq!(emu.insn_values.get(&b).map(|v| v.as_bits()), Some(4));

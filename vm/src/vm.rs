@@ -105,11 +105,16 @@ pub trait BlockExecutor {
     /// had run that body.
     ///
     /// `chain` lets the executor run on past `block` into successors it also
-    /// handles, instead of handing control back after one. Deciding a branch
-    /// itself is how an executor keeps control inside its own code rather than
-    /// paying a round trip per block. The caller withholds it when something
-    /// needs to observe every block — a breakpoint is set, say — because blocks
-    /// crossed this way are never offered to the interpreter.
+    /// handles, instead of handing control back after one: it is how many
+    /// operations the executor may retire before it must stop chaining and
+    /// hand control back, and `0` forbids chaining altogether. Deciding a
+    /// branch itself is how an executor keeps control inside its own code
+    /// rather than paying a round trip per block, but a loop compiled whole
+    /// would never come back at all, and the caller's step budget has to be
+    /// able to stop it. The caller passes `0` when something needs to observe
+    /// every block — a breakpoint is set, say — because blocks crossed this
+    /// way are never offered to the interpreter. The first block always runs
+    /// to its end, whatever the allowance.
     ///
     /// `start` is the body index to begin at. It is 0 when a block is
     /// entered, and the instruction after an interrupting op when the
@@ -122,7 +127,7 @@ pub trait BlockExecutor {
         emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
         start: usize,
-        chain: bool,
+        chain: u64,
     ) -> Result<Option<Executed>, EmulatorErrorKind>;
 }
 
@@ -618,6 +623,12 @@ impl<S: CodeSource> Vm<S> {
     /// Returns `None` when the step was ordinary, and `Some(exit)` when the
     /// machine stopped for a reason worth reporting.
     pub fn step(&mut self) -> Option<VmExit> {
+        self.step_within(u64::MAX)
+    }
+
+    /// [`step`](Self::step), with an executor allowed to chain through at
+    /// most `budget` operations before handing control back.
+    fn step_within(&mut self, budget: u64) -> Option<VmExit> {
         // Stopped at an operation nobody has resumed: the machine has not
         // moved, and stepping it would run the op again without its effect.
         if let Some(interrupt) = &self.pending {
@@ -655,7 +666,11 @@ impl<S: CodeSource> Vm<S> {
                 let start = self.emu.idx;
                 // Blocks the executor runs are never offered to the interpreter, so
                 // it may only run past the first when nothing needs to see them.
-                let chain = self.breakpoints.is_empty();
+                let chain = if self.breakpoints.is_empty() {
+                    budget
+                } else {
+                    0
+                };
                 match executor.run_block(&self.ctx, &mut self.emu, block, start, chain) {
                     Ok(Some(run)) => {
                         // The operations were retired by the executor; they are
@@ -1134,7 +1149,7 @@ impl<S: CodeSource> Vm<S> {
             {
                 return VmExit::Breakpoint(pc);
             }
-            match self.step() {
+            match self.step_within(deadline - self.stats.steps) {
                 None => {}
                 Some(VmExit::Interrupt(interrupt)) => {
                     if let Some(exit) = self.dispatch(&interrupt) {

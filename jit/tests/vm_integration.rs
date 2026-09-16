@@ -218,3 +218,23 @@ fn an_intrinsic_interrupt_stops_the_jit_at_the_same_place_as_the_interpreter() {
     );
     assert_eq!(results[0], results[1]);
 }
+
+/// A loop compiled whole never leaves native code on its own; the run's
+/// budget has to be what brings it back.
+#[test]
+fn the_budget_stops_a_loop_that_stays_in_compiled_code() {
+    // `l: dec ecx; jmp l`
+    let mut vm = machine(&[0xff, 0xc9, 0xeb, 0xfc]);
+    vm.set_block_executor(Box::new(Jit::new()));
+    let exit = vm.run(10_000);
+    assert!(
+        matches!(exit, qcode_vm::VmExit::InstructionLimit),
+        "expected the budget to end the run, got {exit:?}"
+    );
+    // Overshoot is at most the block the budget ran out in.
+    assert!(
+        vm.stats.steps >= 10_000 && vm.stats.steps < 10_100,
+        "{}",
+        vm.stats.steps
+    );
+}

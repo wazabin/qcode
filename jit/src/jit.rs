@@ -363,7 +363,7 @@ impl Jit {
         emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
         start: usize,
-        chain: bool,
+        chain: u64,
     ) -> Result<Option<Executed>, EmulatorErrorKind> {
         let mut current = block;
         let mut from = start;
@@ -395,8 +395,9 @@ impl Jit {
             // run: deciding the branch here is what keeps control inside
             // compiled code, and the interpreter would otherwise redo it. A
             // body cut at an interrupting op has no successor to decide: the
-            // interpreter takes over at the op.
-            let next = if chain && !interrupts {
+            // interpreter takes over at the op. And only within the caller's
+            // allowance, or a loop compiled whole would never hand back.
+            let next = if retired < chain && !interrupts {
                 self.next_block(ctx, emu, current)
             } else {
                 None
@@ -560,7 +561,7 @@ impl BlockExecutor for Jit {
         emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
         start: usize,
-        chain: bool,
+        chain: u64,
     ) -> Result<Option<Executed>, EmulatorErrorKind> {
         Jit::run_block(self, ctx, emu, block, start, chain)
     }
