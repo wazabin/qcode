@@ -92,6 +92,15 @@ pub struct Context<'str> {
     #[serde(default)]
     poisoned: AtomicBool,
 
+    /// How many [`BodyLoan`]s of this module have been handed out and not
+    /// settled. A live loan borrows the module, so whenever this is observed
+    /// non-zero through a reference to the module, the loans it counts were
+    /// leaked (`mem::forget`) and never settled: the bodies they lent may be
+    /// on another module's clock, or replaced. No index is current until
+    /// [`settle_loans`](Self::settle_loans) has repaired that.
+    #[serde(skip)]
+    loans: std::sync::atomic::AtomicU64,
+
     /// Which module instance this is; see [`identity`](Self::identity). Never
     /// shared: a clone or a deserialized module gets its own.
     #[serde(skip)]
@@ -194,6 +203,7 @@ impl<'str> Default for Context<'str> {
             interfaces: Registry::default(),
             bodies: Registry::default(),
             poisoned: AtomicBool::new(false),
+            loans: std::sync::atomic::AtomicU64::new(0),
             identity: ContextIdentity::fresh(),
             clock: ShapeClock::default(),
         }
@@ -217,6 +227,9 @@ impl<'str> Clone for Context<'str> {
             interfaces: self.interfaces.clone(),
             bodies,
             poisoned: AtomicBool::new(self.is_poisoned()),
+            // Every body was just linked to the new clock, whatever loans of
+            // the original were leaked.
+            loans: std::sync::atomic::AtomicU64::new(0),
             identity: ContextIdentity::fresh(),
             clock,
         }
@@ -262,6 +275,7 @@ impl<'de, 'str> serde::Deserialize<'de> for Context<'str> {
             interfaces,
             bodies,
             poisoned: AtomicBool::new(poisoned),
+            loans: std::sync::atomic::AtomicU64::new(0),
             identity: ContextIdentity::fresh(),
             clock,
         })
@@ -583,6 +597,41 @@ impl<'str> Context<'str> {
         self.poisoned.store(false, Ordering::Relaxed);
     }
 
+    /// Whether a [`BodyLoan`] of this module was leaked instead of settled.
+    ///
+    /// A live loan borrows the module exclusively, so this is observable
+    /// only once every loan has ended — normally by settling, which leaves
+    /// nothing outstanding. A loan that was `mem::forget`ten never settled:
+    /// the body it lent may have been replaced, or swapped with another
+    /// module's and so left on that module's clock. Until
+    /// [`settle_loans`](Self::settle_loans) repairs that, no index is
+    /// [current](crate::address_index::AddressIndex::is_current) for this
+    /// module, whatever its revision says.
+    pub fn has_unsettled_loans(&self) -> bool {
+        self.loans.load(Ordering::Relaxed) != 0
+    }
+
+    /// Settles every leaked loan: checks that each slot holds a body of its
+    /// own function (poisoning the module otherwise), links every body to
+    /// this module's clock, and moves the revision, since what the leaked
+    /// loans did is unknown. O(functions), and only when something was
+    /// leaked; every path that lends a body or binds an index calls this
+    /// first, so a leak costs one walk and never a missed change.
+    pub fn settle_loans(&mut self) {
+        if !self.has_unsettled_loans() {
+            return;
+        }
+        for mut body in self.bodies.iter_mut() {
+            let slot = body.id;
+            if body.try_id() != Some(slot) {
+                self.poisoned.store(true, Ordering::Relaxed);
+            }
+            body.link_clock(self.clock.clone());
+        }
+        self.clock.tick();
+        self.loans.store(0, Ordering::Relaxed);
+    }
+
     /// The architecture description this module was built for, if a front end
     /// stamped one; see [`ArchitectureId`].
     pub fn architecture(&self) -> Option<ArchitectureId> {
@@ -625,7 +674,11 @@ impl<'str> Context<'str> {
     /// [`push_block`](Self::push_block)). And a body is only ever lent out
     /// mutably, as a [`BodyLoan`] that settles the slot when it is returned:
     /// a body swapped with another module's, replaced, or restored from a
-    /// clone is counted then, and linked to this module's clock. A bare
+    /// clone is counted then, and linked to this module's clock. A loan that
+    /// is leaked instead of returned stays counted as
+    /// [unsettled](Self::has_unsettled_loans): no index is current while one
+    /// is, and the next loan or binding [settles](Self::settle_loans) it by
+    /// relinking every body and moving the revision. A bare
     /// `&mut BasicBlock` cannot be settled that way, so handing one out
     /// ([`block_mut`](Self::block_mut)) counts as a change outright.
     ///
@@ -2064,7 +2117,14 @@ impl<'str> Context<'str> {
     /// dropped, so a body swapped or replaced through it is accounted for;
     /// see [`BodyLoan`]. The module is borrowed for as long as the loan lives.
     pub fn body_mut(&mut self, fid: FunctionId) -> BodyLoan<'_, 'str> {
-        BodyLoan::new(&mut self.bodies[fid], fid, &self.clock, &self.poisoned)
+        self.settle_loans();
+        BodyLoan::new(
+            &mut self.bodies[fid],
+            fid,
+            &self.clock,
+            &self.poisoned,
+            &self.loans,
+        )
     }
 
     /// Every function body, with its id, for reading. Mutable access is by
@@ -2134,8 +2194,9 @@ impl<'str> Context<'str> {
         &Shared<'str>,
         &Registry<FunctionId, crate::value::function::FunctionInterface<'str>>,
     ) {
+        self.settle_loans();
         (
-            BodiesMut::new(&mut self.bodies, &self.clock, &self.poisoned),
+            BodiesMut::new(&mut self.bodies, &self.clock, &self.poisoned, &self.loans),
             &self.shared,
             &self.interfaces,
         )

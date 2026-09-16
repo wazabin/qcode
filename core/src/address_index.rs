@@ -135,8 +135,12 @@ impl AddressIndex {
     /// this very context instance (not a clone, not another module with the
     /// same ids), and every address-bearing change since was made with it.
     /// Then no address the context covers is missing from it.
+    ///
+    /// Never true while the context has an [unsettled
+    /// loan](Context::has_unsettled_loans): a body lent and never returned
+    /// may have changed in ways the revision does not count.
     pub fn is_current(&self, ctx: &Context<'_>) -> bool {
-        self.provenance == Some(ctx.revision())
+        self.provenance == Some(ctx.revision()) && !ctx.has_unsettled_loans()
     }
 
     /// Whether this index was computed for `ctx` at all, whatever has changed

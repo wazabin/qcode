@@ -355,3 +355,124 @@ fn a_block_handed_out_mutably_counts_as_a_change_but_its_parameters_do_not() {
     ctx.body_mut(function).block_params_mut(block).clear();
     assert!(addresses.is_current(&ctx));
 }
+
+#[test]
+fn a_forgotten_loan_keeps_the_module_unsettled_until_the_next_binding_repairs_it() {
+    let (mut left, mut left_index, function, left_block) = module(0x1000);
+    let (mut right, mut right_index, _, right_block) = module(0x2000);
+
+    // Swapped through two loans that are never returned: no settlement runs.
+    let mut ours = left.body_mut(function);
+    let mut theirs = right.body_mut(function);
+    mem::swap(&mut *ours, &mut *theirs);
+    mem::forget(ours);
+    mem::forget(theirs);
+
+    // The revision alone would still match; the unsettled loan is what
+    // keeps the index from passing for current.
+    assert!(left.has_unsettled_loans());
+    assert!(right.has_unsettled_loans());
+    assert!(!left_index.is_current(&left));
+    assert!(!right_index.is_current(&right));
+    assert_eq!(
+        LiftTarget::bind_indexed(&mut left, &mut left_index, function).err(),
+        Some(TargetError::OutdatedIndex)
+    );
+    assert!(!left.has_unsettled_loans(), "binding settled the leak");
+
+    // The safe binding finds the swapped-in block, once.
+    assert_eq!(
+        block_found_by_a_safe_binding(&mut left, &mut left_index, function, 0x2010),
+        right_block
+    );
+    assert_eq!(blocks_at(&left, 0x2010), 1);
+    assert_eq!(
+        block_found_by_a_safe_binding(&mut right, &mut right_index, function, 0x1010),
+        left_block
+    );
+    assert!(left_index.is_current(&left));
+    assert!(right_index.is_current(&right));
+
+    // Settlement relinked the bodies: each now ticks the module it is in.
+    left.body_mut(function).delete_block(right_block);
+    assert!(!left_index.is_current(&left));
+    assert!(right_index.is_current(&right));
+    right.body_mut(function).delete_block(left_block);
+    assert!(!right_index.is_current(&right));
+}
+
+#[test]
+fn a_forgotten_loan_that_replaced_the_body_is_settled_by_the_next_loan() {
+    let (mut ctx, mut addresses, function, block) = module(0x1000);
+    let snapshot = ctx.body(function).clone();
+    BasicBlock::from_id_mut(&mut ctx, block).delete();
+    addresses.refresh(&ctx);
+    assert!(addresses.is_current(&ctx));
+
+    let mut loan = ctx.body_mut(function);
+    *loan = snapshot;
+    mem::forget(loan);
+    assert!(!addresses.is_current(&ctx));
+    // A refresh while unsettled sees the true contents but still cannot be
+    // current: the restored body is on a detached clock until settled.
+    addresses.refresh(&ctx);
+    assert!(!addresses.is_current(&ctx));
+
+    // The next loan settles first, then the refreshed index follows the
+    // module again.
+    let _ = ctx.body_mut(function).make_block();
+    assert!(!ctx.has_unsettled_loans());
+    assert!(!addresses.is_current(&ctx), "settlement moved the revision");
+    assert_eq!(
+        block_found_by_a_safe_binding(&mut ctx, &mut addresses, function, 0x1010),
+        block
+    );
+    assert_eq!(blocks_at(&ctx, 0x1010), 1);
+    // ...and the relinked body ticks this module.
+    ctx.body_mut(function).delete_block(block);
+    assert!(!addresses.is_current(&ctx));
+}
+
+#[test]
+fn a_forgotten_loan_that_left_another_function_in_the_slot_poisons_at_settlement() {
+    let (mut ctx, mut addresses, function, _) = module(0x1000);
+    let other = host(&mut ctx, &mut addresses, 0x2000);
+    {
+        let (mut bodies, _, _) = ctx.split_bodies();
+        let mut loans = bodies.select_mut(&[function, other]);
+        let (ours, theirs) = loans.split_at_mut(1);
+        mem::swap(&mut *ours[0], &mut *theirs[0]);
+        mem::forget(loans);
+    }
+    assert!(ctx.has_unsettled_loans());
+    assert!(!ctx.is_poisoned(), "nothing has settled yet");
+    assert_eq!(
+        LiftTarget::bind(&mut ctx, &mut addresses, function).err(),
+        Some(TargetError::Poisoned)
+    );
+    assert!(ctx.is_poisoned());
+
+    let (mut ctx, _, function, _) = module(0x1000);
+    let mut loan = ctx.body_mut(function);
+    *loan = FunctionBody::detached();
+    mem::forget(loan);
+    ctx.settle_loans();
+    assert!(ctx.is_poisoned());
+}
+
+#[test]
+fn a_forgotten_loan_that_changed_nothing_costs_one_settlement_and_no_rebuild_of_truth() {
+    let (mut ctx, mut addresses, function, block) = module(0x1000);
+    mem::forget(ctx.body_mut(function));
+    assert!(!addresses.is_current(&ctx));
+    // Settled by the safe binding: the index is rebuilt once and then stays
+    // current across ordinary loans again.
+    assert_eq!(
+        block_found_by_a_safe_binding(&mut ctx, &mut addresses, function, 0x1010),
+        block
+    );
+    assert!(addresses.is_current(&ctx));
+    let _ = ctx.body_mut(function).make_block();
+    assert!(addresses.is_current(&ctx));
+    LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+}

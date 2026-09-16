@@ -28,13 +28,25 @@
 //! keeps its index current across instruction-level edits — an emulator
 //! optimizing between lifts — still binds it without a rebuild.
 //!
+//! Settling happens when the loan is dropped, and dropping is not something
+//! safe code has to do: a loan can be `mem::forget`ten. So the guarantee does
+//! not rest on the destructor. The module counts every loan handed out and
+//! every loan settled, and a loan that was never settled keeps the module
+//! [unsettled](Context::has_unsettled_loans): no index is current for it,
+//! whatever the revision says, and the next binding or loan
+//! [settles](Context::settle_loans) it by checking every slot, relinking
+//! every body and moving the revision. Forgetting a loan costs the module one
+//! walk of its bodies; it never costs a missed change.
+//!
+//! [`Context`]: crate::context::Context
+//!
 //! [`BodiesMut`] is the same guarantee over the whole registry, for a driver
 //! that borrows several bodies at once: loans by id, read-only access to the
 //! rest, and no way to add, remove or replace a slot.
 
 use std::{
     ops::{Deref, DerefMut, Index},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use jstd::registry::{self, Identified, Registry};
@@ -69,6 +81,9 @@ pub struct BodyLoan<'a, 'str> {
     lent: BodyIdentity,
     clock: &'a ShapeClock,
     poisoned: &'a AtomicBool,
+    /// The module's count of outstanding loans: up on hand-out, down when
+    /// settled, so a loan that is never settled stays counted.
+    outstanding: &'a AtomicU64,
 }
 
 impl<'a, 'str> BodyLoan<'a, 'str> {
@@ -77,14 +92,17 @@ impl<'a, 'str> BodyLoan<'a, 'str> {
         slot: FunctionId,
         clock: &'a ShapeClock,
         poisoned: &'a AtomicBool,
+        outstanding: &'a AtomicU64,
     ) -> Self {
         let lent = body.identity();
+        outstanding.fetch_add(1, Ordering::Relaxed);
         Self {
             body,
             slot,
             lent,
             clock,
             poisoned,
+            outstanding,
         }
     }
 
@@ -110,6 +128,7 @@ impl<'str> DerefMut for BodyLoan<'_, 'str> {
 
 impl Drop for BodyLoan<'_, '_> {
     fn drop(&mut self) {
+        self.outstanding.fetch_sub(1, Ordering::Relaxed);
         if self.body.try_id() != Some(self.slot) {
             // Whatever is in the slot now is not a body of this function: the
             // ids stored in it name another function's arenas, or none. The
@@ -142,6 +161,7 @@ pub struct BodiesMut<'a, 'str> {
     bodies: &'a mut Registry<FunctionId, FunctionBody<'str>>,
     clock: &'a ShapeClock,
     poisoned: &'a AtomicBool,
+    outstanding: &'a AtomicU64,
 }
 
 impl<'a, 'str> BodiesMut<'a, 'str> {
@@ -149,11 +169,13 @@ impl<'a, 'str> BodiesMut<'a, 'str> {
         bodies: &'a mut Registry<FunctionId, FunctionBody<'str>>,
         clock: &'a ShapeClock,
         poisoned: &'a AtomicBool,
+        outstanding: &'a AtomicU64,
     ) -> Self {
         Self {
             bodies,
             clock,
             poisoned,
+            outstanding,
         }
     }
 
@@ -178,7 +200,13 @@ impl<'a, 'str> BodiesMut<'a, 'str> {
 
     /// Lends the body of `f` out exclusively, until the loan is dropped.
     pub fn get_mut(&mut self, f: FunctionId) -> BodyLoan<'_, 'str> {
-        BodyLoan::new(&mut self.bodies[f], f, self.clock, self.poisoned)
+        BodyLoan::new(
+            &mut self.bodies[f],
+            f,
+            self.clock,
+            self.poisoned,
+            self.outstanding,
+        )
     }
 
     /// Lends the bodies of `ids` out at once, in the order given. Panics on
@@ -186,11 +214,12 @@ impl<'a, 'str> BodiesMut<'a, 'str> {
     pub fn select_mut(&mut self, ids: &[FunctionId]) -> Vec<BodyLoan<'_, 'str>> {
         let clock = self.clock;
         let poisoned = self.poisoned;
+        let outstanding = self.outstanding;
         self.bodies
             .select_mut(ids)
             .into_iter()
             .zip(ids)
-            .map(|(body, &f)| BodyLoan::new(body, f, clock, poisoned))
+            .map(|(body, &f)| BodyLoan::new(body, f, clock, poisoned, outstanding))
             .collect()
     }
 }
