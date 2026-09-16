@@ -78,9 +78,12 @@ fn run(hex: &str, address: u64) -> Result<Output, String> {
         });
         cursor += len;
     }
+    let context = session
+        .into_context()
+        .map_err(|e| format!("QCode construction could not be published: {e}"))?;
     Ok(Output {
         instructions,
-        qcode: session.into_context().to_string(),
+        qcode: context.to_string(),
     })
 }
 
