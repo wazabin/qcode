@@ -2096,7 +2096,7 @@ impl<'str> Context<'str> {
 
     /// Every function interface, with its id, held in lockstep with the
     /// bodies under the same ids. Written only through the function mutators
-    /// ([`FunctionMutRef`]), since an interface carries the function's address.
+    /// ([`FunctionMutRef`](crate::value::FunctionMutRef)), since an interface carries the function's address.
     pub fn interfaces(
         &self,
     ) -> &Registry<FunctionId, crate::value::function::FunctionInterface<'str>> {
@@ -2180,7 +2180,7 @@ impl<'str> Context<'str> {
     /// with it — a swap, a replacement — is not observable, so handing one
     /// out counts as a change to the module's address-bearing shape: an index
     /// kept across this call is behind afterwards. Prefer the block mutators
-    /// ([`BlockMutRef`], the builder), which move the revision only when an
+    /// ([`BlockMutRef`](crate::value::BlockMutRef), the builder), which move the revision only when an
     /// address actually changes.
     pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
         self.bodies[id.func].block_mut(id)

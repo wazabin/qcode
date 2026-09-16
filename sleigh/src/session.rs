@@ -261,7 +261,7 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
     /// Rebuilds the storage once instructions have interned `budget` more
     /// constants than the architecture defines; see
     /// [`ScratchStore::with_literal_budget`]. The default is
-    /// [`qcode::lift::DEFAULT_LITERAL_BUDGET`].
+    /// [`qcode::lift::scratch::DEFAULT_LITERAL_BUDGET`].
     pub fn with_literal_budget(mut self, budget: usize) -> Self {
         self.store.set_literal_budget(budget);
         self

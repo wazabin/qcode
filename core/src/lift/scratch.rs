@@ -30,8 +30,8 @@
 //! different constant, or nothing. Literal ids are therefore epoch-scoped
 //! exactly like block and instruction ids — valid while the instruction that
 //! produced them is the current one, and never to be resolved after the next
-//! reset. The store gives no way to resolve one at all: [`context`]
-//! (ScratchStore::context) is the raw handle a facade builds on, and the
+//! reset. The store gives no way to resolve one at all:
+//! [`context`](ScratchStore::context) is the raw handle a facade builds on, and the
 //! facade resolves an operand only through the view of the live instruction
 //! that holds it. Varnodes are not affected: an instruction interns none (a
 //! lifter maps its registers when it is built), so a rebuild reproduces the

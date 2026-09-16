@@ -82,8 +82,8 @@ use sleigh::{
 /// carries its specification, so lowering it is checked; this type carries the
 /// same provenance for p-code that has left the instruction behind — kept for
 /// inspection, cached, or deserialized — so the flat entry points can check it
-/// too. [`lower`](Self::lower) takes it from the instruction; [`from_parts`]
-/// (Self::from_parts) is for p-code stored with its fingerprint.
+/// too. [`lower`](Self::lower) takes it from the instruction; [`from_parts`](Self::from_parts)
+/// is for p-code stored with its fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlatPcode {
     fingerprint: SpecFingerprint,

@@ -141,7 +141,7 @@ impl<'str> Deref for BodyMut<'_, 'str> {
 
 /// The verb + read surface of a checked-out function pass, delegating to the
 /// owned `FunctionBody`'s inherent verbs and `self.shared`. The module-scope twin of
-/// each verb is an inherent method on [`Context`]; the
+/// each verb is an inherent method on [`Context`](crate::context::Context); the
 /// primitives below (`function{,_mut}`/`shared`/`view`, and the no-op
 /// call-site cache) are the checked-out specializations.
 impl<'a, 'str> BodyMut<'a, 'str> {
