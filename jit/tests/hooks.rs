@@ -26,7 +26,7 @@ impl BlockExecutor for SharedJit {
         emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
         start: usize,
-        chain: bool,
+        chain: u64,
     ) -> Result<Option<Executed>, EmulatorErrorKind> {
         self.0.borrow_mut().run_block(ctx, emu, block, start, chain)
     }

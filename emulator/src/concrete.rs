@@ -1069,10 +1069,19 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     /// machine has entered it (index 0) or the cache holds another block.
     /// Idempotent until the next step: a block entry is refreshed once, not
     /// once per caller that asks while the machine sits at its head.
-    fn refresh_block_cache(&mut self, ctx: &Context<'_>) {
+    ///
+    /// Returns whether the current block holds any instruction. An empty one
+    /// is not cached: it is the placeholder a VM lifting on demand fills
+    /// before stepping back into the block that led here, and that block's
+    /// list is what [`resume_after`](Self::resume_after) then extends rather
+    /// than rebuilds.
+    fn refresh_block_cache(&mut self, ctx: &Context<'_>) -> bool {
         let block_id = self.block;
         let entered = self.idx == 0 && !self.cache_primed;
         if self.cached_block != Some(block_id) || entered {
+            if !ctx.block(block_id).has_insns() {
+                return false;
+            }
             // The module only gains types while nothing is part-way through a
             // block — lifting happens on block entry — so this rides the same
             // refresh as the instruction list rather than paying per step.
@@ -1083,13 +1092,58 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             self.cached_block = Some(block_id);
             self.cache_primed = true;
         }
+        true
+    }
+
+    /// Positions the machine in `block` right after `last_executed`, which
+    /// the block has grown past since the machine was last in it — a
+    /// straight-line run absorbing the instruction just discovered — and
+    /// returns the index it resumes at. `None` resumes at the block's start.
+    ///
+    /// Everything up to `last_executed` is taken to be as it was, so when
+    /// the cache still holds this block its list is extended from the tail,
+    /// which is as long as the growth, rather than rebuilt from the start,
+    /// which is as long as the block. Discovering a run one instruction at
+    /// a time made the latter quadratic in its length. Should the prefix not
+    /// end where it is expected to — something inserted ahead of the anchor —
+    /// the list is rebuilt in full.
+    pub fn resume_after(
+        &mut self,
+        ctx: &Context<'_>,
+        block: BlockId,
+        last_executed: Option<qcode::value::LocalInsnId>,
+    ) -> usize {
+        let body = ctx.body(block.func);
+        let mut tail: Vec<qcode::value::LocalInsnId> = body
+            .insn_ids(block.local)
+            .rev()
+            .take_while(|&local| Some(local) != last_executed)
+            .collect();
+        tail.reverse();
+        let prefix = body.insn_ids(block.local).len() - tail.len();
+        let extendable = self.cached_block == Some(block)
+            && self.cached_insns.len() >= prefix
+            && (prefix == 0 || self.cached_insns.get(prefix - 1).copied() == last_executed);
+        self.block = block;
+        self.idx = prefix;
+        if extendable {
+            self.cached_insns.truncate(prefix);
+            self.cached_insns.extend(tail);
+            self.refresh_sequence_types(ctx);
+            self.cache_primed = true;
+        } else {
+            self.cached_block = None;
+        }
+        prefix
     }
 
     /// The instruction at position `idx` of the current block, read off the
     /// same cached list [`step`](Self::step) runs from. A block's order is a
     /// linked list; this is how a position in it is read without walking it.
     pub fn insn_at(&mut self, ctx: &Context<'_>, idx: usize) -> Option<InstructionId> {
-        self.refresh_block_cache(ctx);
+        if !self.refresh_block_cache(ctx) {
+            return None;
+        }
         self.cached_insns
             .get(idx)
             .map(|&local| InstructionId::new(self.block.func, local))
@@ -1131,7 +1185,17 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
 
     fn resolve_block_at(ctx: &Context<'_>, index: &AddressIndex, address: u64) -> Option<BlockId> {
         match index.get(address) {
-            Some(AddressTarget::Block(block)) => Some(block),
+            // A block answers for every address it absorbed, so that a branch
+            // to one of them can find the block to split. It is not a place
+            // to enter: control arriving at an absorbed address belongs at
+            // the instruction lifted from it, and entering at the block's
+            // start would rerun everything before it. Only a block that
+            // starts at the address is a target here; anything else is left
+            // for discovery to break apart.
+            Some(AddressTarget::Block(block)) => match BasicBlock::from_id(ctx, block).address() {
+                Some(start) if start != address => None,
+                _ => Some(block),
+            },
             Some(AddressTarget::Function(function)) => FunctionBody::from_id(ctx, function)
                 .root()
                 .map(|root| root.id),
@@ -2099,15 +2163,16 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     fn step_with_event(&mut self, ctx: &Context<'_>) -> crate::Result<StepEvent> {
         self.memory.configure_spaces(ctx);
         let block_id = self.block;
-        self.refresh_block_cache(ctx);
+        let populated = self.refresh_block_cache(ctx);
         // The step about to run moves the machine, so the next call re-checks.
         self.cache_primed = false;
         // A degenerate block — empty, or exhausted without a terminator — is
         // malformed lifter output, not an emulator bug. Report it so a bounded
         // consumer (and a VM running lifted-on-demand code) can stop with a
         // reason instead of aborting the process.
-        let Some(&local) = self.cached_insns.get(self.idx) else {
-            return Err(self.make_empty_block_error(ctx));
+        let local = match self.cached_insns.get(self.idx) {
+            Some(&local) if populated => local,
+            _ => return Err(self.make_empty_block_error(ctx)),
         };
         let insn_id = InstructionId::new(block_id.func, local);
         let insn = InstructionRef::from_id(ctx, insn_id);
@@ -3717,9 +3782,11 @@ mod tests {
         let mut emulator = StandaloneEmulator::new(block);
 
         assert!(emulator.address_index.is_none());
-        assert_eq!(emulator.block_at(&ctx, 0x2001), Some(block));
-        assert!(emulator.address_index.is_some());
         assert_eq!(emulator.block_at(&ctx, 0x2000), Some(block));
+        assert!(emulator.address_index.is_some());
+        // An absorbed address is indexed, so a lift can find the block to
+        // split, but it is not somewhere the machine may enter.
+        assert_eq!(emulator.block_at(&ctx, 0x2001), None);
     }
 
     #[test]

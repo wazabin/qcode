@@ -14,7 +14,6 @@
 //! resume from, or count as a crash. So the loop returns [`VmExit`] and leaves
 //! the machine intact and inspectable.
 
-use qcode::value::LocalInsnId;
 use qcode::{
     address_index::{AddressIndex, AddressTarget},
     context::Context,
@@ -105,11 +104,16 @@ pub trait BlockExecutor {
     /// had run that body.
     ///
     /// `chain` lets the executor run on past `block` into successors it also
-    /// handles, instead of handing control back after one. Deciding a branch
-    /// itself is how an executor keeps control inside its own code rather than
-    /// paying a round trip per block. The caller withholds it when something
-    /// needs to observe every block — a breakpoint is set, say — because blocks
-    /// crossed this way are never offered to the interpreter.
+    /// handles, instead of handing control back after one: it is how many
+    /// operations the executor may retire before it must stop chaining and
+    /// hand control back, and `0` forbids chaining altogether. Deciding a
+    /// branch itself is how an executor keeps control inside its own code
+    /// rather than paying a round trip per block, but a loop compiled whole
+    /// would never come back at all, and the caller's step budget has to be
+    /// able to stop it. The caller passes `0` when something needs to observe
+    /// every block — a breakpoint is set, say — because blocks crossed this
+    /// way are never offered to the interpreter. The first block always runs
+    /// to its end, whatever the allowance.
     ///
     /// `start` is the body index to begin at. It is 0 when a block is
     /// entered, and the instruction after an interrupting op when the
@@ -122,7 +126,7 @@ pub trait BlockExecutor {
         emu: &mut StandaloneEmulator<VmMemory>,
         block: BlockId,
         start: usize,
-        chain: bool,
+        chain: u64,
     ) -> Result<Option<Executed>, EmulatorErrorKind>;
 }
 
@@ -618,16 +622,28 @@ impl<S: CodeSource> Vm<S> {
     /// Returns `None` when the step was ordinary, and `Some(exit)` when the
     /// machine stopped for a reason worth reporting.
     pub fn step(&mut self) -> Option<VmExit> {
+        self.step_within(u64::MAX)
+    }
+
+    /// [`step`](Self::step), with an executor allowed to chain through at
+    /// most `budget` operations before handing control back.
+    fn step_within(&mut self, budget: u64) -> Option<VmExit> {
         // Stopped at an operation nobody has resumed: the machine has not
         // moved, and stepping it would run the op again without its effect.
         if let Some(interrupt) = &self.pending {
             return Some(VmExit::Interrupt(interrupt.clone()));
         }
         // A branch to unlifted code fails *before* the emulator moves, so the
-        // address can be lifted and the same step retried. One retry is enough:
-        // the second failure means the source did not produce the block it
-        // claimed to, which is a source bug rather than a discovery step.
-        for attempt in 0..2 {
+        // address can be lifted and the same step retried. One step may need
+        // more than one discovery: a direct branch lands in an empty
+        // placeholder, the retry lets an executor run the whole of the block
+        // it filled, and the terminator left to the interpreter can be an
+        // indirect branch to code nobody has lifted either. What ends the
+        // retries is the same address coming back, which means the source
+        // did not produce the block it claimed to: a source bug rather than
+        // a discovery step.
+        let mut discovered: Option<u64> = None;
+        loop {
             // At its first instruction a block is between runs, which is the
             // one moment a deferred cleanup can be taken without disturbing a
             // position inside it — and it has to happen before the executor
@@ -649,7 +665,11 @@ impl<S: CodeSource> Vm<S> {
                 let start = self.emu.idx;
                 // Blocks the executor runs are never offered to the interpreter, so
                 // it may only run past the first when nothing needs to see them.
-                let chain = self.breakpoints.is_empty();
+                let chain = if self.breakpoints.is_empty() {
+                    budget
+                } else {
+                    0
+                };
                 match executor.run_block(&self.ctx, &mut self.emu, block, start, chain) {
                     Ok(Some(run)) => {
                         // The operations were retired by the executor; they are
@@ -681,10 +701,23 @@ impl<S: CodeSource> Vm<S> {
                 Err(error) => match error.kind {
                     EmulatorErrorKind::InvalidBlockAddress(addr)
                     | EmulatorErrorKind::UnknownAddress(addr)
-                        if attempt == 0 =>
+                        if discovered != Some(addr) =>
                     {
+                        discovered = Some(addr);
+                        let from = self.emu.block;
                         if let Some(exit) = self.discover(addr) {
                             return Some(exit);
+                        }
+                        // An indirect branch into the middle of the block it
+                        // is in: discovery split that block, which emptied it,
+                        // terminator included. The branch's target is known,
+                        // so the machine goes there directly instead of
+                        // re-running the block from its start.
+                        if self.ctx.contains_block(from)
+                            && !self.ctx.block(from).has_insns()
+                            && self.emu.block == from
+                        {
+                            self.reposition(addr);
                         }
                     }
                     // A direct branch to code that has not been lifted does not
@@ -692,12 +725,15 @@ impl<S: CodeSource> Vm<S> {
                     // *empty* block at that address, and execution walks into
                     // it. So an empty block carrying an address is a request to
                     // discover it, not a malformed-IR error.
-                    EmulatorErrorKind::EmptyBlock(block) if attempt == 0 => {
+                    EmulatorErrorKind::EmptyBlock(block) => {
                         let Some(addr) = BasicBlock::from_id(&self.ctx, block).address() else {
                             return Some(VmExit::Error(
                                 EmulatorErrorKind::EmptyBlock(block).to_string().into(),
                             ));
                         };
+                        if discovered == Some(addr) {
+                            return Some(self.exit_for(EmulatorErrorKind::EmptyBlock(block)));
+                        }
                         // The address may already be lifted: a branch back into
                         // known code still gets a fresh placeholder block in the
                         // branching instruction's own function, and lifting it
@@ -710,6 +746,7 @@ impl<S: CodeSource> Vm<S> {
                             self.stats.resolves += 1;
                             continue;
                         }
+                        discovered = Some(addr);
                         if let Some(exit) = self.discover(addr) {
                             return Some(exit);
                         }
@@ -739,7 +776,6 @@ impl<S: CodeSource> Vm<S> {
                 },
             }
         }
-        None
     }
 
     /// The exit for an interpreter error that is not a memory fault or a
@@ -1045,26 +1081,26 @@ impl<S: CodeSource> Vm<S> {
         if self.ctx.block(head).address.is_none() {
             return (forward > 0).then_some(filled);
         }
-        // Where `filled`'s instructions land: the head's own, less the
-        // terminator that absorption drops.
-        let offset = self.ctx.block(head).insn_count().saturating_sub(1);
+        // What the head has already run: everything it held before the
+        // absorbed instructions were appended, the last of which is the
+        // instruction before its terminator. The machine resumes right after
+        // it, whatever injection inserts after it — an interrupt an injector
+        // places before the first absorbed instruction, say, which has to run
+        // before it. Only this one instruction is remembered, not the whole
+        // prefix: a straight-line run is absorbed one guest instruction at a
+        // time, and collecting the prefix each time is quadratic in the length
+        // of the run, which on a large unrolled function was most of the time
+        // spent discovering it.
+        let last_executed = self.ctx.block(head).last_insn().and_then(|terminator| {
+            qcode::value::Instruction::from_id(&self.ctx, InstructionId::new(head.func, terminator))
+                .prev()
+                .map(|insn| insn.id.local)
+        });
         if qcode_passes::absorb_straight_line(&mut self.ctx, head) == 0 {
             return (forward > 0).then_some(filled);
         }
         self.stats.absorbed += 1;
 
-        // What the head has already run: everything it held before the
-        // absorbed instructions were appended. The machine resumes right
-        // after the last of these still standing, whatever cleanup deletes
-        // ahead of that point or injection inserts after it — an interrupt an
-        // injector places before the first absorbed instruction, say, which
-        // has to run before it.
-        let executed: FxHashSet<LocalInsnId> = self
-            .ctx
-            .body(head.func)
-            .insn_ids(head.local)
-            .take(offset)
-            .collect();
         self.mark_dirty(head);
 
         self.reindex_absorbed(head);
@@ -1076,15 +1112,7 @@ impl<S: CodeSource> Vm<S> {
             // not seen them: rewrite now, so a hook on the instruction about
             // to execute is not missed the first time.
             self.inject(head);
-            let resumed = self
-                .ctx
-                .body(head.func)
-                .insn_ids(head.local)
-                .rposition(|local| executed.contains(&local))
-                .map_or(0, |last| last + 1);
-            self.emu.block = head;
-            self.emu.idx = resumed;
-            self.emu.invalidate_block_cache();
+            self.emu.resume_after(&self.ctx, head, last_executed);
         }
         Some(head)
     }
@@ -1112,7 +1140,7 @@ impl<S: CodeSource> Vm<S> {
             {
                 return VmExit::Breakpoint(pc);
             }
-            match self.step() {
+            match self.step_within(deadline - self.stats.steps) {
                 None => {}
                 Some(VmExit::Interrupt(interrupt)) => {
                     if let Some(exit) = self.dispatch(&interrupt) {
