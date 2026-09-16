@@ -10,6 +10,8 @@ use std::{
 mod footprint;
 #[cfg(test)]
 mod insn_order;
+#[cfg(test)]
+mod use_edges;
 pub use footprint::{Footprint, RamBase, RamField, RamLocations, RamObject, RamRegion};
 
 mod signature;
@@ -27,6 +29,7 @@ use crate::{
         block::{EdgeData, InsnList},
         block_param::{BlockParam, BlockParamId, LocalParamId},
         insn::{LocalInsnId, Mnemonic},
+        uses::{Use, UseArena, UseId, WithUsers},
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable, update_context_name},
@@ -403,7 +406,7 @@ pub struct MemoryInterfaceMap {
     pub outputs: Vec<InterfaceSlot>,
 }
 
-/// A function *body*: arenas, roster, root, reverse use-def, local names. The
+/// A function *body*: arenas, roster, root, use edges, local names. The
 /// caller-reasoning surface lives separately in [`FunctionInterface`], stored in
 /// [`Context::interfaces`](crate::context::Context::interfaces)
 /// under the same [`FunctionId`].
@@ -475,24 +478,32 @@ pub struct FunctionBody<'str> {
     #[serde(default)]
     pub(crate) names: crate::context::NameTable<'str, LocalValueId>,
 
-    /// Reverse use-def map, scoped to this function: for each [`ValueId`] the
-    /// list of *this function's* instructions that use it as an operand. By the
-    /// SSA ownership invariant every user of an instruction/param value is
-    /// intra-function, so an SSA def's users all live here. Shared values
-    /// (literals, varnodes) may be used by many functions; each records only its
-    /// own uses, which is all any pass needs (no pass queries a shared value's
-    /// users program-wide). Kept in sync by
-    /// [`push_insn`](crate::context::Context::push_insn),
-    /// [`remove_instructions`](crate::context::Context::remove_instructions),
-    /// [`Context::replace_all_uses_with`](crate::context::Context::replace_all_uses_with),
-    /// and [`Context::replace_instruction_mnemonic`](crate::context::Context::replace_instruction_mnemonic).
+    /// The operand relation read backwards: one [`Use`] edge per operand
+    /// occurrence in this body, threaded into a singly linked list per used
+    /// value (see [`crate::value::uses`]). A value this body owns — an
+    /// instruction, block parameter, block or temporary — holds the head of
+    /// its own list ([`WithUsers`]); the heads for shared values live in
+    /// [`shared_first_use`](Self::shared_first_use). By the SSA ownership
+    /// invariant every user of a local value is in this body, so a local
+    /// value's list is complete; a shared value's list holds only this body's
+    /// uses, which is all any pass needs.
     ///
-    /// Keyed by the body-local [`LocalValueId`] form of each used value (the
-    /// owning func is this body's, so it is stripped — see
-    /// [`ValueId::strip_func`]); the value list stays composite
-    /// [`InstructionId`]s.
-    #[serde(default)]
-    pub(crate) users: FxHashMap<LocalValueId, Vec<LocalInsnId>>,
+    /// Derived bookkeeping: skipped by serde and rebuilt from the operands
+    /// ([`rebuild_uses`](Self::rebuild_uses)). Kept in step by the verbs that
+    /// create, delete and rewrite instructions
+    /// ([`push_insn`](Self::push_insn), [`remove_instruction`](Self::remove_instruction),
+    /// [`replace_uses_where`](Self::replace_uses_where),
+    /// [`replace_instruction_mnemonic`](Self::replace_instruction_mnemonic), …),
+    /// which are the only ways an installed instruction's operands change.
+    #[serde(skip)]
+    pub(crate) uses: UseArena,
+
+    /// Use-list heads for the shared values this body uses — literals, bytes,
+    /// varnodes, functions, poison — which cannot carry a head themselves:
+    /// use tracking is per body, and bodies are mutated independently. Sparse:
+    /// a value with no use in this body has no entry.
+    #[serde(skip)]
+    pub(crate) shared_first_use: FxHashMap<LocalValueId, UseId>,
 }
 
 /// Aggregate storage statistics for one kind of function-body entity.
@@ -639,6 +650,23 @@ impl DoubleEndedIterator for InsnIds<'_, '_> {
 
 impl ExactSizeIterator for InsnIds<'_, '_> {}
 
+/// The users of a value, walked along its use list (see
+/// [`FunctionBody::local_users_of`]).
+pub struct Users<'a, 'str> {
+    body: &'a FunctionBody<'str>,
+    at: Option<UseId>,
+}
+
+impl Iterator for Users<'_, '_> {
+    type Item = LocalInsnId;
+
+    fn next(&mut self) -> Option<LocalInsnId> {
+        let edge = &self.body.uses[self.at?];
+        self.at = edge.next;
+        Some(edge.user)
+    }
+}
+
 impl<'str> FunctionBody<'str> {
     /// Reports the current arena footprint and logical liveness.
     pub fn arena_stats(&self) -> BodyArenaStats {
@@ -653,7 +681,7 @@ impl<'str> FunctionBody<'str> {
     /// Releases structural capacity retained from peak analysis churn.
     ///
     /// Covers the four body arenas plus the block-owned instruction/parameter/
-    /// edge collections, the roster, and the reverse-use map. IDs, liveness,
+    /// edge collections, the roster, and the use edges. IDs, liveness,
     /// ordering, and every semantic invariant are unchanged — this is an
     /// allocator hint for explicit end-of-mutation boundaries, never a
     /// correctness barrier.
@@ -667,10 +695,8 @@ impl<'str> FunctionBody<'str> {
             block.params.shrink_to_fit();
             block.edges.shrink_to_fit();
         }
-        for insns in self.users.values_mut() {
-            insns.shrink_to_fit();
-        }
-        self.users.shrink_to_fit();
+        self.uses.shrink_to_fit();
+        self.shared_first_use.shrink_to_fit();
     }
 
     /// Install a registry ID onto a freshly [`detached`](Self::detached) body at
@@ -730,7 +756,8 @@ impl<'str> FunctionBody<'str> {
             temps: Registry::default(),
             instruction_addrs: BTreeSet::new(),
             names: crate::context::NameTable::default(),
-            users: FxHashMap::default(),
+            uses: UseArena::default(),
+            shared_first_use: FxHashMap::default(),
         }
     }
 
@@ -754,7 +781,8 @@ impl<'str> FunctionBody<'str> {
             temps: Registry::default(),
             instruction_addrs: BTreeSet::new(),
             names: crate::context::NameTable::default(),
-            users: FxHashMap::default(),
+            uses: UseArena::default(),
+            shared_first_use: FxHashMap::default(),
         }
     }
 
@@ -778,13 +806,19 @@ impl<'str> FunctionBody<'str> {
         self.id = Some(id);
     }
 
-    /// This function's instructions that use `value` as an operand (see
-    /// [`users`](Self::users)). Empty for a value this function never uses.
-    pub(crate) fn local_users_of(&self, value: ValueId) -> &[LocalInsnId] {
-        self.users
-            .get(&value.strip_func())
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+    /// This body's instructions that use `value` as an operand, as body-local
+    /// ids, in no particular order. An instruction using `value` twice is
+    /// yielded twice. Allocation-free; empty for a value owned by another
+    /// function.
+    pub fn local_users_of(&self, value: ValueId) -> Users<'_, 'str> {
+        let head = match value.owning_function() {
+            Some(owner) if owner != self.id() => None,
+            _ => self.first_use_of(value.strip_func()),
+        };
+        Users {
+            body: self,
+            at: head,
+        }
     }
 
     /// Whether any instruction in this body uses `value`.
@@ -800,30 +834,18 @@ impl<'str> FunctionBody<'str> {
         {
             return false;
         }
-        !self.local_users_of(value).is_empty()
+        self.first_use_of(value.strip_func()).is_some()
     }
 
-    /// This body's qualified instruction IDs that use `value`. A value owned by
-    /// another function has no users in this body, even if its local index
-    /// collides with one of this body's values.
+    /// This body's qualified instruction IDs that use `value`, in no
+    /// particular order. A value owned by another function has no users in
+    /// this body, even if its local index collides with one of this body's
+    /// values.
     pub fn users_of(&self, value: ValueId) -> Vec<InstructionId> {
-        if value
-            .owning_function()
-            .is_some_and(|owner| owner != self.id())
-        {
-            return Vec::new();
-        }
+        let func = self.id();
         self.local_users_of(value)
-            .iter()
-            .map(|&local| InstructionId::new(self.id(), local))
+            .map(|local| InstructionId::new(func, local))
             .collect()
-    }
-
-    /// Iterate this function's recorded `(value, users)` reverse-use entries, with
-    /// keys in their stored body-local form (qualify via the owning func at the
-    /// [`FunctionRef`] wrapper). Read-only; used by the users-map consistency verifier.
-    pub fn user_map_entries(&self) -> impl Iterator<Item = (LocalValueId, &[LocalInsnId])> {
-        self.users.iter().map(|(v, u)| (*v, u.as_slice()))
     }
 
     /// This function's body-local entry block id, if any (raw accessor).
@@ -973,7 +995,8 @@ impl<'str> FunctionBody<'str> {
     }
 
     /// Appends a body-local temporary value and returns its qualified ID.
-    pub fn push_temp(&mut self, temp: Temp<'str>) -> TempId {
+    pub fn push_temp(&mut self, mut temp: Temp<'str>) -> TempId {
+        temp.first_use = None;
         assert!(
             usize::from(temp.space) < self.temp_spaces.len(),
             "temporary references a missing local space"
@@ -1051,12 +1074,11 @@ impl<'str> FunctionBody<'str> {
             self.contains_block_param(id),
             "cannot remove stale param {id:?}"
         );
-        let key = ValueId::BlockParam(id).strip_func();
         let name = self.params[id.local].name.clone();
         if let Some(name) = name {
             self.names.forget(name.as_ref());
         }
-        self.users.remove(&key);
+        self.drop_uses_of(LocalValueId::BlockParam(id.local));
         self.params.remove(id.local);
     }
     /// The CFG edge `id`, by its function-local index.
@@ -1074,26 +1096,25 @@ impl<'str> FunctionBody<'str> {
     // `self.function_mut(f)` collapses to `self`, `self.view()` to `self`'s
     // own arena accessors. The owning [`FunctionId`] comes from [`id`](Self::id).
 
-    /// Push a fresh instruction into this body's arena, recording each operand's
-    /// use in the reverse-use map.
+    /// Push a fresh instruction into this body's arena, recording a use edge
+    /// for each of its operands.
     pub fn push_insn(&mut self, insn: Instruction<'str>) -> InstructionId {
         InstructionId::new(self.id(), self.push_insn_local(insn))
     }
 
-    /// Push a fresh instruction into this body's arena, recording each operand's
-    /// use in the reverse-use map, and return its **body-local** id. The id-less
+    /// Push a fresh instruction into this body's arena, recording a use edge
+    /// for each of its operands, and return its **body-local** id. The id-less
     /// twin of [`push_insn`](Self::push_insn), usable on a detached body.
     pub fn push_insn_local(&mut self, mut insn: Instruction<'str>) -> LocalInsnId {
         // A caller may clone a linked instruction as its template; the copy is
-        // a new value in no block, whatever the original's links said.
+        // a new value in no block, used by nothing, whatever the original's
+        // links said.
         insn.parent = None;
         insn.prev = None;
         insn.next = None;
-        let args: Vec<LocalValueId> = insn.mnemonic().args().into_iter().collect();
+        insn.first_use = None;
         let local = self.insns.push(insn);
-        for arg in args {
-            self.users.entry(arg).or_default().push(local);
-        }
+        self.add_operand_uses(local);
         local
     }
 
@@ -1108,7 +1129,8 @@ impl<'str> FunctionBody<'str> {
     /// Push a fresh block into this body's arena and roster, returning its
     /// **body-local** id. The id-less twin of [`push_block`](Self::push_block),
     /// usable on a detached (uninstalled) body.
-    pub fn push_block_local(&mut self, block: BasicBlock<'str>) -> LocalBlockId {
+    pub fn push_block_local(&mut self, mut block: BasicBlock<'str>) -> LocalBlockId {
+        block.first_use = None;
         let local = self.blocks.push(block);
         self.roster.push(local);
         local
@@ -1139,7 +1161,8 @@ impl<'str> FunctionBody<'str> {
     }
 
     /// Push a fresh block parameter into this body's arena.
-    pub fn push_block_param(&mut self, param: BlockParam<'str>) -> BlockParamId {
+    pub fn push_block_param(&mut self, mut param: BlockParam<'str>) -> BlockParamId {
+        param.first_use = None;
         let local = self.params.push(param);
         BlockParamId::new(self.id(), local)
     }
@@ -1150,8 +1173,9 @@ impl<'str> FunctionBody<'str> {
     pub fn push_block_param_local(
         &mut self,
         block: LocalBlockId,
-        param: BlockParam<'str>,
+        mut param: BlockParam<'str>,
     ) -> LocalParamId {
+        param.first_use = None;
         let local = self.params.push(param);
         self.blocks[block].params.push(local);
         local
@@ -1185,14 +1209,6 @@ impl<'str> FunctionBody<'str> {
             back: list.last,
             remaining: list.len,
         }
-    }
-
-    /// The instructions of `block`, in order, qualified.
-    pub fn block_insn_ids(&self, block: BlockId) -> Vec<InstructionId> {
-        let func = self.id();
-        self.insn_ids(block.local)
-            .map(|local| InstructionId::new(func, local))
-            .collect()
     }
 
     /// Links `insn` at the end of `block`, taking it out of the block it was
@@ -1360,8 +1376,8 @@ impl<'str> FunctionBody<'str> {
 
     /// Move the live, non-terminator instruction `insn` immediately before the
     /// live instruction `before`, inferring the destination block from
-    /// `before`. The moved instruction keeps its ID, payload, name, and use-map
-    /// entries. Supports both cross-block motion and reordering within one
+    /// `before`. The moved instruction keeps its ID, payload, name, and use
+    /// edges. Supports both cross-block motion and reordering within one
     /// block.
     pub fn move_insn_before(&mut self, insn: InstructionId, before: InstructionId) {
         let id = self.id();
@@ -1419,35 +1435,116 @@ impl<'str> FunctionBody<'str> {
         self.edges.remove(edge_id);
     }
 
-    /// Replace every use of `old` with `new` across this body's instructions and
-    /// update the reverse use-map (SSA defs only; `old` is intra-function).
+    /// Replace every use of `old` in this body with `new`, moving the use
+    /// edges along. For a value this body owns that is every use there is;
+    /// for a shared value it is this body's uses of it.
     pub fn replace_all_uses_with(&mut self, old: ValueId, new: ValueId) {
+        self.replace_uses_where(old, new, |_, _, _| true);
+    }
+
+    /// Replace the uses of `old` in this body that `select` picks with `new`,
+    /// moving their use edges along. `select` sees the using instruction and
+    /// the operand's index in it, so it can keep to a block, or to one of two
+    /// occurrences in `%x = add %old, %old`, which are distinct edges.
+    /// Allocation-free: it walks `old`'s use list once. The lists of `old`
+    /// and `new` are in flux during the walk, so `select` should read the
+    /// instructions, not the users, of either.
+    ///
+    /// `old` and `new` must each be a value this body owns or a shared value.
+    pub fn replace_uses_where(
+        &mut self,
+        old: ValueId,
+        new: ValueId,
+        mut select: impl FnMut(&FunctionBody<'str>, InstructionId, usize) -> bool,
+    ) {
         if old == new {
             return;
         }
-        let Some(func) = old.owning_function() else {
-            return;
-        };
+        let func = self.id();
+        if let Some(old_owner) = old.owning_function() {
+            assert_eq!(
+                old_owner, func,
+                "cannot replace uses of a value owned by another function"
+            );
+        }
+        if let Some(new_owner) = new.owning_function() {
+            assert_eq!(
+                new_owner, func,
+                "cannot replace uses with a value owned by another function"
+            );
+        }
+        let old = old.strip_func();
+        let new = new.strip_func();
+        // The heads are written back once at the end, not once per edge
+        // moved: the walk starts at `old`'s front, where every moved edge
+        // comes off, and every one goes onto `new`'s front.
+        let new_has_home = self.has_use_home(new);
+        let mut new_head = self.first_use_of(new);
+        let mut old_head = self.first_use_of(old);
+        let mut prev: Option<UseId> = None;
+        let mut at = old_head;
+        while let Some(edge) = at {
+            let Use {
+                user,
+                operand_index,
+                next,
+                ..
+            } = self.uses[edge];
+            at = next;
+            if !select(
+                self,
+                InstructionId::new(func, user),
+                usize::from(operand_index),
+            ) {
+                prev = Some(edge);
+                continue;
+            }
+            match prev {
+                None => old_head = next,
+                Some(prev) => self.uses[prev].next = next,
+            }
+            self.insns[user]
+                .mnemonic_mut()
+                .set_operand(usize::from(operand_index), new);
+            if new_has_home {
+                let moved = &mut self.uses[edge];
+                moved.value = new;
+                moved.next = new_head;
+                new_head = Some(edge);
+            } else {
+                // A dangling operand records no use.
+                self.uses.remove(edge);
+            }
+        }
+        if self.has_use_home(old) {
+            self.set_first_use_of(old, old_head);
+        }
+        if new_has_home {
+            self.set_first_use_of(new, new_head);
+        }
+    }
+
+    /// Sets operand `index` of instruction `id` to `new`, moving its use edge
+    /// along: the way to rewrite one operand of an installed instruction.
+    /// `new` must be a value this body owns or a shared value.
+    pub fn replace_operand(&mut self, id: InstructionId, index: usize, new: ValueId) {
         assert_eq!(
-            func,
+            id.func,
             self.id(),
-            "cannot replace uses of a value owned by another function"
+            "instruction belongs to another function"
         );
         if let Some(new_owner) = new.owning_function() {
             assert_eq!(
                 new_owner,
                 self.id(),
-                "cannot replace uses with a value owned by another function"
+                "cannot use a value owned by another function"
             );
         }
-        let users = self.users_of(old);
-        let old = old.localize(func);
-        let new = new.localize(func);
-        for user in users {
-            self.insn_mut(user).mnemonic_mut().replace_value(old, new);
-            self.users.entry(new).or_default().push(user.localize(func));
-        }
-        self.users.remove(&old);
+        let old = self.insns[id.local]
+            .mnemonic()
+            .operand(index)
+            .unwrap_or_else(|| panic!("{id:?} has no operand {index}"));
+        self.replace_use(old, id.local, index, new.strip_func());
     }
 
     /// Replace every use of instruction `id` with `new`, then remove `id` —
@@ -1465,39 +1562,28 @@ impl<'str> FunctionBody<'str> {
         self.remove_instruction(id);
     }
 
-    /// Physically removes a set of instructions after pruning their operands
-    /// from the reverse-use map. Call after removing them from their parent
-    /// blocks and unlinking any CFG edges owned by terminators.
+    /// Physically removes a set of instructions after taking down their use
+    /// edges. Call after removing them from their parent blocks and unlinking
+    /// any CFG edges owned by terminators.
     pub fn remove_instructions(&mut self, dead: &FxHashSet<LocalInsnId>) {
+        // Removed in id order, so the arena's physical order — which the
+        // dense walks observe — does not depend on the set's iteration order.
         let mut ids: Vec<_> = dead.iter().copied().collect();
         ids.sort_unstable();
-        let mut affected_args: FxHashSet<LocalValueId> = FxHashSet::default();
         for &id in &ids {
             assert!(
                 self.insns.contains(id),
                 "cannot remove stale instruction {id:?}"
             );
-            affected_args.extend(self.insns[id].mnemonic().args());
         }
-        for arg in affected_args {
-            let remove_key = if let Some(users) = self.users.get_mut(&arg) {
-                users.retain(|local| !dead.contains(local));
-                users.is_empty()
-            } else {
-                false
-            };
-            if remove_key {
-                self.users.remove(&arg);
-            }
-        }
+        self.remove_uses_of_dead_instructions(dead);
         for id in ids {
-            self.users.remove(&LocalValueId::Instruction(id));
             self.insns.remove(id);
         }
     }
 
     /// Remove instruction `id` from its block, unlink its outgoing CFG edges if a
-    /// terminator, clear its name, prune its operand use-lists, and physically
+    /// terminator, clear its name, take down its use edges, and physically
     /// drop its payload.
     pub fn remove_instruction(&mut self, id: InstructionId) {
         assert_eq!(
@@ -1505,14 +1591,12 @@ impl<'str> FunctionBody<'str> {
             self.id(),
             "instruction belongs to another function"
         );
-        let func = self.id();
-        let (parent, name, is_terminator, args) = {
+        let (parent, name, is_terminator) = {
             let insn = self.insn(id);
             (
                 insn.parent.map(|l| BlockId::new(self.id(), l)),
                 insn.name.clone(),
                 insn.mnemonic().is_terminator(),
-                insn.mnemonic().args().into_iter().collect::<Vec<_>>(),
             )
         };
 
@@ -1538,18 +1622,8 @@ impl<'str> FunctionBody<'str> {
         if let Some(n) = name {
             self.names.forget(n.as_ref());
         }
-        for arg in args {
-            let remove_key = if let Some(users) = self.users.get_mut(&arg) {
-                users.retain(|&local| local != id.localize(func));
-                users.is_empty()
-            } else {
-                false
-            };
-            if remove_key {
-                self.users.remove(&arg);
-            }
-        }
-        self.users.remove(&ValueId::Instruction(id).strip_func());
+        self.remove_operand_uses(id.local);
+        self.drop_uses_of(LocalValueId::Instruction(id.local));
         self.insns.remove(id.local);
     }
 
@@ -1557,10 +1631,10 @@ impl<'str> FunctionBody<'str> {
     ///
     /// Each comes out of the block's list in constant time either way; what
     /// this saves over [`remove_instruction`](Self::remove_instruction) is
-    /// the reverse-use map, where each operand's user list is pruned once
-    /// rather than once per dead user. Lifting an absorbed guest basic block
-    /// deletes hundreds of instructions sharing a few operands, and that
-    /// product was a real share of translation time.
+    /// the use lists, where each operand's list is walked once rather than
+    /// once per dead user. Lifting an absorbed guest basic block deletes
+    /// hundreds of instructions sharing a few operands, and that product was
+    /// a real share of translation time.
     ///
     /// Terminators are rejected rather than handled: removing one has to tear
     /// down CFG edges too, and no caller of this deletes one — dead-code
@@ -1594,8 +1668,8 @@ impl<'str> FunctionBody<'str> {
         self.purge_instructions(dead, names);
     }
 
-    /// Forgets `dead`'s names, prunes them from every user list they appear in,
-    /// and drops their payloads.
+    /// Forgets `dead`'s names, takes down their use edges, and drops their
+    /// payloads.
     ///
     /// The shared tail of removing instructions in bulk. It does not touch any
     /// block's instruction list — the caller has already unlinked them.
@@ -1603,24 +1677,8 @@ impl<'str> FunctionBody<'str> {
         for name in names {
             self.names.forget(name.as_ref());
         }
-        // Each operand's user list is pruned once, not once per dead user.
-        let mut operands: FxHashSet<LocalValueId> = FxHashSet::default();
+        self.remove_uses_of_dead_instructions(dead);
         for &id in dead {
-            operands.extend(self.insns[id].mnemonic().args());
-        }
-        for arg in operands {
-            let now_empty = if let Some(users) = self.users.get_mut(&arg) {
-                users.retain(|local| !dead.contains(local));
-                users.is_empty()
-            } else {
-                false
-            };
-            if now_empty {
-                self.users.remove(&arg);
-            }
-        }
-        for &id in dead {
-            self.users.remove(&LocalValueId::Instruction(id));
             self.insns.remove(id);
         }
     }
@@ -1684,8 +1742,8 @@ impl<'str> FunctionBody<'str> {
         }
     }
 
-    /// Replace an instruction's mnemonic in place, keeping the reverse use-map in
-    /// sync.
+    /// Replace an instruction's mnemonic in place, keeping the use edges in
+    /// step: the old operands' uses come down, the new operands' go up.
     pub fn replace_instruction_mnemonic(&mut self, id: InstructionId, mnemonic: Mnemonic) {
         assert_eq!(
             id.func,
@@ -1695,36 +1753,321 @@ impl<'str> FunctionBody<'str> {
         self.replace_instruction_mnemonic_local(id.local, mnemonic);
     }
 
-    /// Replace an instruction's mnemonic in place, keeping the reverse use-map in
-    /// sync, over a **body-local** instruction id (id-free; the twin of
+    /// Replace an instruction's mnemonic in place, keeping the use edges in
+    /// step, over a **body-local** instruction id (id-free; the twin of
     /// [`replace_instruction_mnemonic`](Self::replace_instruction_mnemonic),
     /// usable on a detached body).
     pub fn replace_instruction_mnemonic_local(&mut self, id: LocalInsnId, mnemonic: Mnemonic) {
-        let old_args = self.insns[id]
-            .mnemonic()
-            .args()
-            .into_iter()
-            .collect::<Vec<_>>();
-        for arg in old_args {
-            let now_empty = if let Some(users) = self.users.get_mut(&arg) {
-                users.retain(|&local| local != id);
-                users.is_empty()
-            } else {
-                false
-            };
-            if now_empty {
-                self.users.remove(&arg);
+        self.remove_operand_uses(id);
+        *self.insns[id].mnemonic_mut() = mnemonic;
+        self.add_operand_uses(id);
+    }
+
+    // ---- use edges ---------------------------------------------------------
+    //
+    // Every operand occurrence in this body is one `Use` edge, threaded into a
+    // singly linked list per used value whose head the value holds (or, for a
+    // shared value, `shared_first_use` holds). The verbs below are the only
+    // ones that touch the edges; the public verbs that create, delete and
+    // rewrite instructions are built on them, and an installed instruction's
+    // operands never change any other way. Prepending keeps every edge
+    // operation constant-time except for finding one edge in a list, which
+    // costs the value's fanout — small, in practice.
+
+    /// Whether this body has storage for `value`, and so a place for its
+    /// use-list head. Always true for a shared value.
+    fn has_use_home(&self, value: LocalValueId) -> bool {
+        match value {
+            LocalValueId::Instruction(id) => self.insns.contains(id),
+            LocalValueId::BlockParam(id) => self.params.contains(id),
+            LocalValueId::BasicBlock(id) => self.blocks.contains(id),
+            LocalValueId::Temp(id) => usize::from(id) < self.temps.len(),
+            LocalValueId::Literal(_)
+            | LocalValueId::Bytes(_)
+            | LocalValueId::Varnode(_)
+            | LocalValueId::Function(_)
+            | LocalValueId::Poison(_) => true,
+        }
+    }
+
+    /// The head of `value`'s use list: `None` when nothing in this body uses
+    /// it, or when this body has no storage for it.
+    pub(crate) fn first_use_of(&self, value: LocalValueId) -> Option<UseId> {
+        match value {
+            LocalValueId::Instruction(id) => self.insns.get(id).and_then(|i| i.first_use()),
+            LocalValueId::BlockParam(id) => self.params.get(id).and_then(|p| p.first_use()),
+            LocalValueId::BasicBlock(id) => self.blocks.get(id).and_then(|b| b.first_use()),
+            LocalValueId::Temp(id) => (usize::from(id) < self.temps.len())
+                .then(|| self.temps[id].first_use())
+                .flatten(),
+            LocalValueId::Literal(_)
+            | LocalValueId::Bytes(_)
+            | LocalValueId::Varnode(_)
+            | LocalValueId::Function(_)
+            | LocalValueId::Poison(_) => self.shared_first_use.get(&value).copied(),
+        }
+    }
+
+    /// Sets the head of `value`'s use list. Panics when this body has no
+    /// storage for `value`: check [`has_use_home`](Self::has_use_home) first.
+    fn set_first_use_of(&mut self, value: LocalValueId, head: Option<UseId>) {
+        match value {
+            LocalValueId::Instruction(id) => *self.insns[id].first_use_mut() = head,
+            LocalValueId::BlockParam(id) => *self.params[id].first_use_mut() = head,
+            LocalValueId::BasicBlock(id) => *self.blocks[id].first_use_mut() = head,
+            LocalValueId::Temp(id) => *self.temps[id].first_use_mut() = head,
+            LocalValueId::Literal(_)
+            | LocalValueId::Bytes(_)
+            | LocalValueId::Varnode(_)
+            | LocalValueId::Function(_)
+            | LocalValueId::Poison(_) => match head {
+                Some(head) => {
+                    self.shared_first_use.insert(value, head);
+                }
+                None => {
+                    self.shared_first_use.remove(&value);
+                }
+            },
+        }
+    }
+
+    /// Records that `user`'s operand `operand_index` names `value`, at the
+    /// front of `value`'s use list.
+    ///
+    /// `None`, and nothing recorded, when this body has no storage for
+    /// `value`: the operand is dangling, which the integrity check reports,
+    /// and which a clone into another function's arenas leaves behind until
+    /// the caller remaps the operands and rebuilds the edges.
+    pub(crate) fn add_use(
+        &mut self,
+        value: LocalValueId,
+        user: LocalInsnId,
+        operand_index: usize,
+    ) -> Option<UseId> {
+        if !self.has_use_home(value) {
+            return None;
+        }
+        let operand_index = u16::try_from(operand_index).expect("operand index fits a use edge");
+        let next = self.first_use_of(value);
+        let edge = self.uses.push(Use {
+            value,
+            user,
+            operand_index,
+            next,
+        });
+        self.set_first_use_of(value, Some(edge));
+        Some(edge)
+    }
+
+    /// Finds the edge recording that `user`'s operand `operand_index` names
+    /// `value`, with the edge before it in `value`'s list (`None` at the
+    /// head).
+    fn find_use(
+        &self,
+        value: LocalValueId,
+        user: LocalInsnId,
+        operand_index: usize,
+    ) -> Option<(Option<UseId>, UseId)> {
+        let mut prev = None;
+        let mut at = self.first_use_of(value);
+        while let Some(edge) = at {
+            let Use {
+                user: u,
+                operand_index: i,
+                next,
+                ..
+            } = self.uses[edge];
+            if u == user && usize::from(i) == operand_index {
+                return Some((prev, edge));
+            }
+            prev = Some(edge);
+            at = next;
+        }
+        None
+    }
+
+    /// Takes down the edge recording that `user`'s operand `operand_index`
+    /// names `value`. Returns whether there was one.
+    pub(crate) fn remove_use(
+        &mut self,
+        value: LocalValueId,
+        user: LocalInsnId,
+        operand_index: usize,
+    ) -> bool {
+        let Some((prev, edge)) = self.find_use(value, user, operand_index) else {
+            return false;
+        };
+        self.unlink_use(value, prev, edge);
+        self.uses.remove(edge);
+        true
+    }
+
+    /// Rewrites `user`'s operand `operand_index` from `old` to `new`, moving
+    /// its edge from `old`'s list to `new`'s.
+    pub(crate) fn replace_use(
+        &mut self,
+        old: LocalValueId,
+        user: LocalInsnId,
+        operand_index: usize,
+        new: LocalValueId,
+    ) {
+        debug_assert_eq!(
+            self.insns[user].mnemonic().operand(operand_index),
+            Some(old),
+            "operand {operand_index} of {user:?} is not {old:?}"
+        );
+        if old == new {
+            return;
+        }
+        self.insns[user]
+            .mnemonic_mut()
+            .set_operand(operand_index, new);
+        match self.find_use(old, user, operand_index) {
+            Some((prev, edge)) => {
+                self.unlink_use(old, prev, edge);
+                self.relink_use(edge, new);
+            }
+            // A dangling operand had no edge to move; it may have a home now.
+            None => {
+                self.add_use(new, user, operand_index);
             }
         }
-        *self.insns[id].mnemonic_mut() = mnemonic;
-        let new_args = self.insns[id]
-            .mnemonic()
-            .args()
-            .into_iter()
-            .collect::<Vec<_>>();
-        for arg in new_args {
-            self.users.entry(arg).or_default().push(id);
+    }
+
+    /// Unlinks `edge` from `value`'s list, `prev` being the edge before it
+    /// (`None` at the head). The edge stays allocated for the caller to free
+    /// or relink.
+    fn unlink_use(&mut self, value: LocalValueId, prev: Option<UseId>, edge: UseId) {
+        let next = self.uses[edge].next;
+        match prev {
+            None => self.set_first_use_of(value, next),
+            Some(prev) => self.uses[prev].next = next,
         }
+    }
+
+    /// Points the unlinked `edge` at `new` and prepends it to `new`'s list —
+    /// or frees it, when this body has no storage for `new`.
+    fn relink_use(&mut self, edge: UseId, new: LocalValueId) {
+        if !self.has_use_home(new) {
+            self.uses.remove(edge);
+            return;
+        }
+        let head = self.first_use_of(new);
+        let use_ = &mut self.uses[edge];
+        use_.value = new;
+        use_.next = head;
+        self.set_first_use_of(new, Some(edge));
+    }
+
+    /// Records a use edge for each operand of `insn`: on creation, and after
+    /// its mnemonic is swapped.
+    fn add_operand_uses(&mut self, insn: LocalInsnId) {
+        // Inline for up to two operands, which covers most instructions.
+        let operands = self.insns[insn].mnemonic().args();
+        for (index, value) in operands.into_iter().enumerate() {
+            self.add_use(value, insn, index);
+        }
+    }
+
+    /// Takes down the use edges of every operand of `insn`: before it is
+    /// deleted, or its mnemonic swapped.
+    fn remove_operand_uses(&mut self, insn: LocalInsnId) {
+        let operands = self.insns[insn].mnemonic().args();
+        for (index, value) in operands.into_iter().enumerate() {
+            self.remove_use(value, insn, index);
+        }
+    }
+
+    /// Frees every edge in `value`'s use list, for a value about to lose its
+    /// storage. Its users, if any are left, keep naming it: they are dangling
+    /// operands, allowed while a transformation is in progress and reported
+    /// by the integrity check once it is not.
+    fn drop_uses_of(&mut self, value: LocalValueId) {
+        let mut at = self.first_use_of(value);
+        while let Some(edge) = at {
+            at = self.uses.remove(edge).next;
+        }
+        if self.has_use_home(value) {
+            self.set_first_use_of(value, None);
+        }
+    }
+
+    /// Takes down every use edge in and out of the instructions in `dead`,
+    /// which are about to be deleted.
+    ///
+    /// The bulk path: rather than finding each dead instruction's edge in
+    /// each of its operands' lists — a walk per dead user — this walks the
+    /// list of each operand any dead instruction names once, freeing the
+    /// edges whose user is dead. A lifted block deletes hundreds of
+    /// instructions sharing a few operands, and that product mattered. An
+    /// operand that is itself dead is not walked: its whole list goes with
+    /// it.
+    pub(crate) fn remove_uses_of_dead_instructions(&mut self, dead: &FxHashSet<LocalInsnId>) {
+        let mut operands: FxHashSet<LocalValueId> = FxHashSet::default();
+        for &id in dead {
+            self.insns[id].mnemonic().for_each_operand(|value| {
+                if let LocalValueId::Instruction(user) = value
+                    && dead.contains(&user)
+                {
+                    return;
+                }
+                operands.insert(value);
+            });
+        }
+        for value in operands {
+            // The head is written back once, not once per edge unlinked
+            // at the front — which, the lists being prepended to, is where
+            // the edges of the newest users are.
+            let mut head = self.first_use_of(value);
+            let mut prev: Option<UseId> = None;
+            let mut at = head;
+            while let Some(edge) = at {
+                let Use { user, next, .. } = self.uses[edge];
+                at = next;
+                if dead.contains(&user) {
+                    match prev {
+                        None => head = next,
+                        Some(prev) => self.uses[prev].next = next,
+                    }
+                    self.uses.remove(edge);
+                } else {
+                    prev = Some(edge);
+                }
+            }
+            self.set_first_use_of(value, head);
+        }
+        for &id in dead {
+            self.drop_uses_of(LocalValueId::Instruction(id));
+        }
+    }
+
+    /// Rebuilds every use edge from the operands of this body's live
+    /// instructions: after deserialization, which does not carry the edges,
+    /// and after a relocation that rewrote operands wholesale.
+    pub(crate) fn rebuild_uses(&mut self) {
+        self.uses.clear();
+        self.shared_first_use.clear();
+        for mut insn in self.insns.iter_mut() {
+            *insn.first_use_mut() = None;
+        }
+        for mut param in self.params.iter_mut() {
+            *param.first_use_mut() = None;
+        }
+        for mut block in self.blocks.iter_mut() {
+            *block.first_use_mut() = None;
+        }
+        for mut temp in self.temps.iter_mut() {
+            *temp.first_use_mut() = None;
+        }
+        let live: Vec<LocalInsnId> = self.insns.iter().map(|insn| insn.id).collect();
+        for insn in live {
+            self.add_operand_uses(insn);
+        }
+    }
+
+    /// Every use edge in this body, for the integrity check.
+    pub(crate) fn use_edges(&self) -> impl Iterator<Item = (UseId, &Use)> + '_ {
+        self.uses.iter()
     }
 
     /// Set `block`'s name and register it in this body's local name table, over a
@@ -1796,8 +2139,10 @@ impl<'str> FunctionBody<'str> {
         for edge in edges {
             self.remove_cfg_edge(edge);
         }
-        for insn in self.block_insn_ids(block) {
-            self.remove_instruction(insn);
+        // Each removal unlinks the instruction, so the walk snapshots first.
+        let insns: Vec<LocalInsnId> = self.insn_ids(block.local).collect();
+        for insn in insns {
+            self.remove_instruction(InstructionId::new(block.func, insn));
         }
         let params: Vec<BlockParamId> = self
             .block(block)
@@ -2122,16 +2467,13 @@ where
         self.inner().users_of(value)
     }
 
-    /// This function's users of `value` in their stored, body-local form.
+    /// This function's users of `value`, as body-local ids, in no particular
+    /// order; an instruction using `value` twice comes twice.
     ///
-    /// Borrowed rather than built: a pass that reads the list once per
+    /// Walked rather than built: a pass that reads the list once per
     /// instruction should not allocate one per instruction to do it. Qualify
     /// with this function's id when a whole [`InstructionId`] is needed.
-    pub fn local_users_of(&'s self, value: ValueId) -> &'ctx [LocalInsnId] {
-        let func = self.id;
-        if value.owning_function().is_some_and(|owner| owner != func) {
-            return &[];
-        }
+    pub fn local_users_of(&'s self, value: ValueId) -> Users<'ctx, 'str> {
         self.inner().local_users_of(value)
     }
 
@@ -2143,20 +2485,6 @@ where
             return false;
         }
         self.inner().has_users(value)
-    }
-
-    /// Iterate this function's recorded `(value, users)` reverse-use entries
-    /// (see [`FunctionBody::user_map_entries`]).
-    pub fn user_map_entries(&'s self) -> impl Iterator<Item = (ValueId, Vec<InstructionId>)> + 's {
-        let func = self.id;
-        self.inner().user_map_entries().map(move |(v, u)| {
-            (
-                v.qualify(func),
-                u.iter()
-                    .map(|&local| InstructionId::new(func, local))
-                    .collect(),
-            )
-        })
     }
 
     /// Resolve a block/instruction/param/Temp `name` within this function's local name
@@ -2962,7 +3290,8 @@ mod tests {
         let a_ids = FunctionRef::from_id(&ctx, users_a)
             .root()
             .unwrap()
-            .instruction_ids();
+            .iter_instruction_ids()
+            .collect::<Vec<_>>();
         let a_def = ValueId::Instruction(a_ids[0]);
         assert_eq!(
             FunctionRef::from_id(&ctx, users_a).users_of(a_def),
@@ -3007,8 +3336,8 @@ mod tests {
         let b_root = FunctionRef::from_id(&ctx, raw_b).root().unwrap();
         let a_block = a_root.id;
         let b_block = b_root.id;
-        let a_insn = a_root.instruction_ids()[0];
-        let b_insn = b_root.instruction_ids()[0];
+        let a_insn = a_root.first_instruction().unwrap();
+        let b_insn = b_root.first_instruction().unwrap();
         let a_param = a_root.params().next().unwrap().id;
         let b_param = b_root.params().next().unwrap().id;
         assert_eq!(a_block.local, b_block.local);
@@ -3038,8 +3367,7 @@ mod tests {
         // `%x` is used by `%y`; find both.
         let root = FunctionBody::from_id(&ctx, f).root().unwrap().id;
         let insns: Vec<InstructionId> = BasicBlock::from_id(&ctx, root)
-            .instruction_ids()
-            .into_iter()
+            .iter_instruction_ids()
             .collect();
         let x = insns[0];
         let users_before = ctx.bodies[f].users_of(ValueId::Instruction(x));

@@ -11,8 +11,7 @@ use crate::{
     value::{LocalValueId, QCodeView, function::FunctionId},
 };
 
-use super::mnemonic::{Args, MnemonicKind};
-use smallvec::{SmallVec, smallvec};
+use super::mnemonic::MnemonicKind;
 
 /// Builds an aggregate value from its ordered fields. The instruction's result
 /// type is the [`Aggregate`](crate::types::TypeRepr::Aggregate) of the fields'
@@ -25,10 +24,6 @@ pub struct Tuple {
 impl MnemonicKind for Tuple {
     fn opcode(&self) -> &'static str {
         "pack"
-    }
-
-    fn args(&self) -> Args {
-        SmallVec::from_vec(self.fields.clone())
     }
 }
 
@@ -59,10 +54,6 @@ impl Extract {
 impl MnemonicKind for Extract {
     fn opcode(&self) -> &'static str {
         "extract"
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.agg]
     }
 }
 
@@ -112,10 +103,6 @@ impl Gep {
 impl MnemonicKind for Gep {
     fn opcode(&self) -> &'static str {
         "gep"
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.base]
     }
 }
 

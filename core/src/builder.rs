@@ -581,7 +581,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 
     /// Body-local instruction-storage core: appends `mnemonic` (typed `type_id`)
-    /// into the working block's arena, records reverse-uses, honours the address
+    /// into the working block's arena, records its operands' uses, honours the address
     /// and insert-point cursors, and returns the fresh body-local id. Consults no
     /// registry identity, so it drives an id-less (detached) body.
     #[track_caller]
@@ -595,18 +595,9 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         }
 
         let block = self.block;
-        let insn = Instruction::new(type_id, mnemonic);
-        // Inlined `FunctionBody::push_insn`, id-less: append to the arena and
-        // record each operand's reverse-use, keyed by its body-local form.
-        // `Mnemonic::args()` uses a two-element SmallVec. Keep that inline
-        // representation: materializing a `Vec` here allocated once for every
-        // emitted QCode instruction, even for the overwhelmingly common unary
-        // and binary operations.
-        let args = insn.mnemonic().args();
-        let local = self.body.insns.push(insn);
-        for arg in args {
-            self.body.users.entry(arg).or_default().push(local);
-        }
+        let local = self
+            .body
+            .push_insn_local(Instruction::new(type_id, mnemonic));
 
         if let Some(address) = self.address {
             self.body.insns[local].set_address(address);
@@ -2078,15 +2069,17 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         let block = self.block;
         let index = self.body.blocks[block].params.len();
         let type_id = self.shared.types.get_or_make_int(size);
-        let local = self.body.params.push(BlockParam {
-            index,
-            type_id,
-            parent: Some(block),
-            name: None,
-            origin: None,
-        });
-        self.body.blocks[block].params.push(local);
-        local
+        self.body.push_block_param_local(
+            block,
+            BlockParam {
+                index,
+                type_id,
+                parent: Some(block),
+                name: None,
+                origin: None,
+                first_use: None,
+            },
+        )
     }
 
     /// Terminates the current block with a branch to an already-resolved local
@@ -2963,7 +2956,7 @@ mod tests {
         assert_eq!(block.num_params(), 2);
         let param_ids: Vec<_> = block.params().map(|p| p.id).collect();
         assert_eq!(param_ids, [p0_id, p1_id]);
-        assert_eq!(block.instruction_ids().len(), 0);
+        assert_eq!(block.len(), 0);
     }
 
     #[test]
@@ -3108,7 +3101,9 @@ mod tests {
             b.push_bit_negate(val).id
         };
 
-        let ids = BasicBlock::from_id(&ctx, block_id).instruction_ids();
+        let ids = BasicBlock::from_id(&ctx, block_id)
+            .iter_instruction_ids()
+            .collect::<Vec<_>>();
         assert_eq!(ids, [prepended_id, existing_id]);
     }
 
@@ -3137,7 +3132,9 @@ mod tests {
             )
         };
 
-        let ids = BasicBlock::from_id(&ctx, block_id).instruction_ids();
+        let ids = BasicBlock::from_id(&ctx, block_id)
+            .iter_instruction_ids()
+            .collect::<Vec<_>>();
         assert_eq!(ids, [id0, id1, id2, existing_id]);
     }
 
@@ -3161,7 +3158,9 @@ mod tests {
             (b.push_bit_negate(val).id, b.push_bit_negate(val).id)
         };
 
-        let ids = BasicBlock::from_id(&ctx, block_id).instruction_ids();
+        let ids = BasicBlock::from_id(&ctx, block_id)
+            .iter_instruction_ids()
+            .collect::<Vec<_>>();
         assert_eq!(ids, [first_id, inserted0, inserted1, target_id]);
     }
 
@@ -3178,7 +3177,7 @@ mod tests {
         };
 
         let block = BasicBlock::from_id(&ctx, entry);
-        assert_eq!(block.instruction_ids()[0], new_id);
+        assert_eq!(block.first_instruction().unwrap(), new_id);
         // The original branch terminator is still present
         assert!(block.is_terminated());
     }
@@ -3202,7 +3201,9 @@ mod tests {
             (first, middle, last)
         };
 
-        let ids = BasicBlock::from_id(&ctx, block_id).instruction_ids();
+        let ids = BasicBlock::from_id(&ctx, block_id)
+            .iter_instruction_ids()
+            .collect::<Vec<_>>();
         assert_eq!(ids, [middle_id, first_id, last_id]);
     }
 }

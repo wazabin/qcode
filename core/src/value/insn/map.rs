@@ -17,11 +17,7 @@
 
 use crate::value::LocalValueId;
 
-use super::{
-    Callee,
-    mnemonic::{Args, MnemonicKind},
-};
-use smallvec::SmallVec;
+use super::{Callee, mnemonic::MnemonicKind};
 
 /// A total element-wise map `out[i] = body(src[i], captures…)`. The result is
 /// `[U; N]` where `N` is `src`'s length and `U` is the body's return type.
@@ -41,13 +37,6 @@ impl MnemonicKind for Map {
     fn opcode(&self) -> &'static str {
         "map"
     }
-
-    fn args(&self) -> Args {
-        let mut args = SmallVec::with_capacity(1 + self.captures.len());
-        args.push(self.src);
-        args.extend(self.captures.iter().copied());
-        args
-    }
 }
 
 #[cfg(test)]
@@ -56,7 +45,7 @@ mod tests {
         testing::TestContext,
         value::{
             FunctionBody, ValueId,
-            insn::{Callee, Mnemonic, mnemonic::MnemonicKind},
+            insn::{Callee, Mnemonic},
         },
     };
 
@@ -145,7 +134,8 @@ mod tests {
             panic!("push_map should yield an instruction value");
         };
 
-        let m = match tc.ctx.get_insn(map_id).mnemonic().clone() {
+        let mnemonic = tc.ctx.get_insn(map_id).mnemonic().clone();
+        let m = match mnemonic.clone() {
             Mnemonic::Map(m) => m,
             other => panic!("expected Map, got {other:?}"),
         };
@@ -153,12 +143,14 @@ mod tests {
         // `body` is a symbol; `src` + captures are the value operands.
         assert_eq!(m.body, Callee::Real(body));
         assert_eq!(
-            m.args().to_vec(),
+            mnemonic.args().to_vec(),
             vec![src.strip_func(), cap.strip_func()],
             "src then captures are the operands"
         );
         assert!(
-            !m.args().contains(&ValueId::Function(body).strip_func()),
+            !mnemonic
+                .args()
+                .contains(&ValueId::Function(body).strip_func()),
             "body is not an operand"
         );
 

@@ -11,7 +11,7 @@ use crate::value::{
 };
 use smallvec::SmallVec;
 
-/// Operand list returned by [`MnemonicKind::args`]. Inline-stores up to two
+/// Operand list returned by [`Mnemonic::args`]. Inline-stores up to two
 /// operands (covering every fixed-arity instruction — binops, casts, loads,
 /// flags, …), so the pervasive per-instruction operand walks in the analysis
 /// passes don't heap-allocate. Variable-arity ops (calls, tuples, `scan`) spill
@@ -21,14 +21,11 @@ pub type Args = SmallVec<[LocalValueId; 2]>;
 /// Implemented by each concrete instruction type.
 ///
 /// Provides the common interface that [`Mnemonic`] dispatches to: a short
-/// opcode string, argument enumeration, and terminator status.
+/// opcode string and terminator status. Operands are enumerated by
+/// [`Mnemonic::for_each_operand`], in one place for every kind.
 pub trait MnemonicKind {
     /// Short textual opcode, e.g. `"load"`, `"int_add"`, `"branch"`.
     fn opcode(&self) -> &'static str;
-
-    // TODO: replace with a visitor pattern to avoid the need for this method
-    /// Returns the [`LocalValueId`]s of all operands consumed by this instruction.
-    fn args(&self) -> Args;
 
     /// Returns `true` if this instruction ends a basic block.
     ///
@@ -469,6 +466,136 @@ pub enum Mnemonic {
     Scan(Scan),
 }
 
+/// The canonical operand order, written once: `$f` is called on each operand
+/// slot, as `&LocalValueId` by default and as `&mut LocalValueId` with a
+/// trailing `mut`.
+///
+/// A `Callee`, a block target and a memory space are not operands — they
+/// are not values — and neither is a p-code op's destination slot.
+macro_rules! visit_operands {
+    ($mnemonic:expr, $f:ident $(, $m:tt)?) => {
+        match $mnemonic {
+            Mnemonic::Load(m) => $f(& $($m)? m.ptr),
+            Mnemonic::Store(m) => {
+                $f(& $($m)? m.ptr);
+                $f(& $($m)? m.src);
+            }
+            Mnemonic::Branch(m) => {
+                for a in & $($m)? m.args {
+                    $f(a);
+                }
+            }
+            Mnemonic::CBranch(m) => {
+                $f(& $($m)? m.condition);
+                for a in & $($m)? m.success_args {
+                    $f(a);
+                }
+                for a in & $($m)? m.failure_args {
+                    $f(a);
+                }
+            }
+            Mnemonic::BranchInd(m) => $f(& $($m)? m.ptr),
+            Mnemonic::Switch(m) => {
+                $f(& $($m)? m.scrutinee);
+                for case in & $($m)? m.cases {
+                    for a in & $($m)? case.args {
+                        $f(a);
+                    }
+                }
+                for a in & $($m)? m.default_args {
+                    $f(a);
+                }
+            }
+            Mnemonic::TailCall(m) => {
+                for a in & $($m)? m.args {
+                    $f(a);
+                }
+            }
+            Mnemonic::Apply(m) => {
+                for a in & $($m)? m.args {
+                    $f(a);
+                }
+            }
+            Mnemonic::Call(m) => {
+                for a in & $($m)? m.args {
+                    $f(a);
+                }
+            }
+            Mnemonic::CallInd(m) => {
+                $f(& $($m)? m.ptr);
+                for a in & $($m)? m.args {
+                    $f(a);
+                }
+            }
+            Mnemonic::Return(m) => {
+                $f(& $($m)? m.ptr);
+                if let Some(v) = & $($m)? m.value {
+                    $f(v);
+                }
+            }
+            Mnemonic::ReturnValue(m) => $f(& $($m)? m.value),
+            Mnemonic::BadInsn(_) => {}
+            Mnemonic::Unop(m) => $f(& $($m)? m.src),
+            Mnemonic::Binop(m) => {
+                $f(& $($m)? m.lhs);
+                $f(& $($m)? m.rhs);
+            }
+            Mnemonic::Range(m) => $f(& $($m)? m.src),
+            Mnemonic::Zext(m) => $f(& $($m)? m.src),
+            Mnemonic::Sext(m) => $f(& $($m)? m.src),
+            Mnemonic::IntToFloat(m) => $f(& $($m)? m.src),
+            Mnemonic::FloatToFloat(m) => $f(& $($m)? m.src),
+            Mnemonic::FloatToInt(m) => $f(& $($m)? m.src),
+            Mnemonic::IsFloatNaN(m) => $f(& $($m)? m.src),
+            Mnemonic::PopCount(m) => $f(& $($m)? m.src),
+            Mnemonic::LzCount(m) => $f(& $($m)? m.src),
+            Mnemonic::Carry(m) => {
+                $f(& $($m)? m.lhs);
+                $f(& $($m)? m.rhs);
+            }
+            Mnemonic::SCarry(m) => {
+                $f(& $($m)? m.lhs);
+                $f(& $($m)? m.rhs);
+            }
+            Mnemonic::SBorrow(m) => {
+                $f(& $($m)? m.lhs);
+                $f(& $($m)? m.rhs);
+            }
+            Mnemonic::PCodeOp(m) => {
+                for a in & $($m)? m.args {
+                    $f(a);
+                }
+            }
+            Mnemonic::Intrinsic(m) => {
+                for a in & $($m)? m.args {
+                    $f(a);
+                }
+            }
+            Mnemonic::Tuple(m) => {
+                for a in & $($m)? m.fields {
+                    $f(a);
+                }
+            }
+            Mnemonic::Assert(m) => $f(& $($m)? m.condition),
+            Mnemonic::Extract(m) => $f(& $($m)? m.agg),
+            Mnemonic::Gep(m) => $f(& $($m)? m.base),
+            Mnemonic::Map(m) => {
+                $f(& $($m)? m.src);
+                for a in & $($m)? m.captures {
+                    $f(a);
+                }
+            }
+            Mnemonic::Scan(m) => {
+                $f(& $($m)? m.init);
+                $f(& $($m)? m.src);
+                for a in & $($m)? m.captures {
+                    $f(a);
+                }
+            }
+        }
+    };
+}
+
 impl Mnemonic {
     /// The unresolved direct-callee slot carried by this mnemonic, if any.
     pub fn minted_callee_slot(&self) -> Option<u32> {
@@ -604,266 +731,224 @@ impl Mnemonic {
         }
     }
 
+    /// The operands of this mnemonic, in canonical order.
+    ///
+    /// Every use of an operand's position — recording a use edge when an
+    /// instruction is created, rewriting one operand of it, checking the edges
+    /// against the operands — goes through [`for_each_operand`](Self::for_each_operand)
+    /// or its mutable twin, so an operand's index means the same thing
+    /// everywhere. This builds the list those walk.
     pub fn args(&self) -> Args {
-        self.as_kind().args()
+        let mut args = Args::new();
+        self.for_each_operand(|operand| args.push(operand));
+        args
     }
 
-    /// Replace every occurrence of `old` with `new` in this instruction's operands.
+    /// Calls `f` on each operand, in canonical order. Allocation-free; the
+    /// operand's position in this order is its *operand index*.
+    pub fn for_each_operand(&self, mut f: impl FnMut(LocalValueId)) {
+        let mut visit = |operand: &LocalValueId| f(*operand);
+        visit_operands!(self, visit);
+    }
+
+    /// Calls `f` on each operand slot, in the same order as
+    /// [`for_each_operand`](Self::for_each_operand).
+    ///
+    /// Crate-private: an installed instruction's operands are mirrored by its
+    /// body's use edges, which only the body's use-maintaining verbs may
+    /// desynchronize and repair. A detached mnemonic is free to change.
+    pub(crate) fn for_each_operand_mut(&mut self, mut f: impl FnMut(&mut LocalValueId)) {
+        visit_operands!(self, f, mut);
+    }
+
+    /// How many operands this mnemonic has.
+    pub fn operand_count(&self) -> usize {
+        let mut count = 0;
+        self.for_each_operand(|_| count += 1);
+        count
+    }
+
+    /// The operand at `index` in canonical order, if there is one.
+    pub fn operand(&self, index: usize) -> Option<LocalValueId> {
+        let mut at = 0;
+        let mut found = None;
+        self.for_each_operand(|operand| {
+            if at == index {
+                found = Some(operand);
+            }
+            at += 1;
+        });
+        found
+    }
+
+    /// Sets the operand at `index` in canonical order. Panics if there is no
+    /// such operand.
+    pub(crate) fn set_operand(&mut self, index: usize, value: LocalValueId) {
+        let mut at = 0;
+        let mut found = false;
+        self.for_each_operand_mut(|operand| {
+            if at == index {
+                *operand = value;
+                found = true;
+            }
+            at += 1;
+        });
+        assert!(found, "{} has no operand {index}", self.opcode());
+    }
+
+    /// Replace every occurrence of `old` with `new` in this instruction's
+    /// operands (and a p-code op's destination slot, which is a result rather
+    /// than an operand but is a value reference all the same).
+    ///
+    /// For a mnemonic that is not in a body. Once installed, rewrite operands
+    /// through the body, which keeps the use edges in step
+    /// ([`FunctionBody::replace_uses_where`](crate::value::FunctionBody::replace_uses_where)).
     pub fn replace_value(&mut self, old: LocalValueId, new: LocalValueId) {
-        match self {
-            Mnemonic::Load(m) => {
-                if m.ptr == old {
-                    m.ptr = new;
-                }
+        self.for_each_operand_mut(|operand| {
+            if *operand == old {
+                *operand = new;
             }
-            Mnemonic::Store(m) => {
-                if m.ptr == old {
-                    m.ptr = new;
-                }
-                if m.src == old {
-                    m.src = new;
-                }
+        });
+        if let Mnemonic::PCodeOp(m) = self
+            && let Some(dst) = m.dst.as_mut()
+            && *dst == old
+        {
+            *dst = new;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::{
+        LiteralId, LocalBlockId,
+        insn::{LocalInsnId, SwitchArm},
+    };
+
+    fn lit(n: usize) -> LocalValueId {
+        LocalValueId::Literal(LiteralId::from(n))
+    }
+
+    fn insn(n: usize) -> LocalValueId {
+        LocalValueId::Instruction(LocalInsnId::from(n))
+    }
+
+    /// The variable-arity and optional-operand shapes, where the two walks
+    /// could most plausibly drift apart.
+    fn samples() -> Vec<Mnemonic> {
+        let block = LocalBlockId::from(0);
+        vec![
+            Mnemonic::Store(Store {
+                space: crate::space::LocalMemorySpaceId::Temp(
+                    crate::value::LocalTempSpaceId::from(0),
+                ),
+                ptr: lit(0),
+                src: insn(1),
+                size: 8,
+            }),
+            Mnemonic::CBranch(CBranch {
+                condition: insn(0),
+                success_block: block,
+                success_args: vec![lit(1), insn(2)],
+                failure_block: block,
+                failure_args: vec![insn(3)],
+            }),
+            Mnemonic::Switch(Switch {
+                scrutinee: insn(0),
+                cases: vec![
+                    SwitchArm {
+                        value: 1,
+                        target: block,
+                        args: vec![lit(1)],
+                    },
+                    SwitchArm {
+                        value: 2,
+                        target: block,
+                        args: vec![],
+                    },
+                    SwitchArm {
+                        value: 3,
+                        target: block,
+                        args: vec![insn(2), insn(3)],
+                    },
+                ],
+                default: Some(block),
+                default_args: vec![lit(4)],
+            }),
+            Mnemonic::CallInd(CallInd {
+                ptr: insn(0),
+                args: vec![insn(1), insn(1), lit(2)],
+            }),
+            Mnemonic::Return(Return {
+                ptr: insn(0),
+                value: None,
+            }),
+            Mnemonic::Return(Return {
+                ptr: insn(0),
+                value: Some(insn(1)),
+            }),
+            Mnemonic::Scan(Scan {
+                body: crate::value::insn::Callee::Minted(0),
+                init: lit(0),
+                src: insn(1),
+                captures: vec![insn(2), lit(3)],
+            }),
+            Mnemonic::Map(Map {
+                body: crate::value::insn::Callee::Minted(0),
+                src: insn(0),
+                captures: vec![],
+            }),
+            Mnemonic::BadInsn(BadInsn),
+        ]
+    }
+
+    #[test]
+    fn both_walks_visit_the_same_operands_in_the_same_order() {
+        for mut mnemonic in samples() {
+            let read: Vec<_> = mnemonic.args().to_vec();
+            let mut written = Vec::new();
+            mnemonic.for_each_operand_mut(|slot| written.push(*slot));
+            assert_eq!(read, written, "{}", mnemonic.opcode());
+            assert_eq!(mnemonic.operand_count(), read.len());
+            for (index, &operand) in read.iter().enumerate() {
+                assert_eq!(mnemonic.operand(index), Some(operand));
             }
-            Mnemonic::CBranch(m) => {
-                if m.condition == old {
-                    m.condition = new;
-                }
-                m.success_args.iter_mut().for_each(|a| {
-                    if *a == old {
-                        *a = new;
-                    }
-                });
-                m.failure_args.iter_mut().for_each(|a| {
-                    if *a == old {
-                        *a = new;
-                    }
-                });
+            assert_eq!(mnemonic.operand(read.len()), None);
+        }
+    }
+
+    #[test]
+    fn setting_an_operand_changes_that_position_only() {
+        let fresh = insn(99);
+        for mut mnemonic in samples() {
+            let before = mnemonic.args().to_vec();
+            for index in 0..before.len() {
+                let mut expected = before.clone();
+                expected[index] = fresh;
+                let mut edited = mnemonic.clone();
+                edited.set_operand(index, fresh);
+                assert_eq!(edited.args().to_vec(), expected, "{}", mnemonic.opcode());
             }
-            Mnemonic::BranchInd(m) => {
-                if m.ptr == old {
-                    m.ptr = new;
-                }
-            }
-            Mnemonic::Switch(m) => {
-                if m.scrutinee == old {
-                    m.scrutinee = new;
-                }
-                for case in m.cases.iter_mut() {
-                    case.args.iter_mut().for_each(|a| {
-                        if *a == old {
-                            *a = new;
-                        }
-                    });
-                }
-                m.default_args.iter_mut().for_each(|a| {
-                    if *a == old {
-                        *a = new;
-                    }
-                });
-            }
-            Mnemonic::Call(m) => {
-                m.args.iter_mut().for_each(|a| {
-                    if *a == old {
-                        *a = new;
-                    }
-                });
-            }
-            Mnemonic::TailCall(m) => {
-                m.args.iter_mut().for_each(|a| {
-                    if *a == old {
-                        *a = new;
-                    }
-                });
-            }
-            Mnemonic::Apply(m) => {
-                m.args.iter_mut().for_each(|a| {
-                    if *a == old {
-                        *a = new;
-                    }
-                });
-            }
-            Mnemonic::CallInd(m) => {
-                if m.ptr == old {
-                    m.ptr = new;
-                }
-                m.args.iter_mut().for_each(|a| {
-                    if *a == old {
-                        *a = new;
-                    }
-                });
-            }
-            Mnemonic::Return(m) => {
-                if m.ptr == old {
-                    m.ptr = new;
-                }
-                if let Some(v) = m.value.as_mut()
-                    && *v == old
-                {
-                    *v = new;
-                }
-            }
-            Mnemonic::ReturnValue(m) => {
-                if m.value == old {
-                    m.value = new;
-                }
-            }
-            // No operands to rewrite.
-            Mnemonic::BadInsn(_) => {}
-            Mnemonic::Unop(m) => {
-                if m.src == old {
-                    m.src = new;
-                }
-            }
-            Mnemonic::Binop(m) => {
-                if m.lhs == old {
-                    m.lhs = new;
-                }
-                if m.rhs == old {
-                    m.rhs = new;
-                }
-            }
-            Mnemonic::Range(m) => {
-                if m.src == old {
-                    m.src = new;
-                }
-            }
-            Mnemonic::Zext(m) => {
-                if m.src == old {
-                    m.src = new;
-                }
-            }
-            Mnemonic::Sext(m) => {
-                if m.src == old {
-                    m.src = new;
-                }
-            }
-            Mnemonic::IntToFloat(m) => {
-                if m.src == old {
-                    m.src = new;
-                }
-            }
-            Mnemonic::FloatToFloat(m) => {
-                if m.src == old {
-                    m.src = new;
-                }
-            }
-            Mnemonic::FloatToInt(m) => {
-                if m.src == old {
-                    m.src = new;
-                }
-            }
-            Mnemonic::IsFloatNaN(m) => {
-                if m.src == old {
-                    m.src = new;
-                }
-            }
-            Mnemonic::PopCount(m) => {
-                if m.src == old {
-                    m.src = new;
-                }
-            }
-            Mnemonic::LzCount(m) => {
-                if m.src == old {
-                    m.src = new;
-                }
-            }
-            Mnemonic::Carry(m) => {
-                if m.lhs == old {
-                    m.lhs = new;
-                }
-                if m.rhs == old {
-                    m.rhs = new;
-                }
-            }
-            Mnemonic::SCarry(m) => {
-                if m.lhs == old {
-                    m.lhs = new;
-                }
-                if m.rhs == old {
-                    m.rhs = new;
-                }
-            }
-            Mnemonic::SBorrow(m) => {
-                if m.lhs == old {
-                    m.lhs = new;
-                }
-                if m.rhs == old {
-                    m.rhs = new;
-                }
-            }
-            Mnemonic::PCodeOp(m) => {
-                m.args.iter_mut().for_each(|a| {
-                    if *a == old {
-                        *a = new;
-                    }
-                });
-                if let Some(v) = m.dst.as_mut()
-                    && *v == old
-                {
-                    *v = new;
-                }
-            }
-            Mnemonic::Branch(m) => {
-                m.args.iter_mut().for_each(|a| {
-                    if *a == old {
-                        *a = new;
-                    }
-                });
-            }
-            Mnemonic::Intrinsic(m) => {
-                m.args.iter_mut().for_each(|a| {
-                    if *a == old {
-                        *a = new;
-                    }
-                });
-            }
-            Mnemonic::Tuple(m) => {
-                m.fields.iter_mut().for_each(|a| {
-                    if *a == old {
-                        *a = new;
-                    }
-                });
-            }
-            Mnemonic::Assert(m) => {
-                if m.condition == old {
-                    m.condition = new;
-                }
-            }
-            Mnemonic::Extract(m) => {
-                if m.agg == old {
-                    m.agg = new;
-                }
-            }
-            Mnemonic::Gep(m) => {
-                if m.base == old {
-                    m.base = new;
-                }
-            }
-            Mnemonic::Map(m) => {
-                // `body` is a function symbol, not a value operand — left intact.
-                if m.src == old {
-                    m.src = new;
-                }
-                m.captures.iter_mut().for_each(|a| {
-                    if *a == old {
-                        *a = new;
-                    }
-                });
-            }
-            Mnemonic::Scan(m) => {
-                // `body` is a function symbol, not a value operand — left intact.
-                if m.init == old {
-                    m.init = new;
-                }
-                if m.src == old {
-                    m.src = new;
-                }
-                m.captures.iter_mut().for_each(|a| {
-                    if *a == old {
-                        *a = new;
-                    }
-                });
+            // A repeated operand is replaced at every occurrence.
+            if let Some(&first) = before.first() {
+                mnemonic.replace_value(first, fresh);
+                let expected: Vec<_> = before
+                    .iter()
+                    .map(|&v| if v == first { fresh } else { v })
+                    .collect();
+                assert_eq!(mnemonic.args().to_vec(), expected);
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "has no operand 2")]
+    fn setting_a_missing_operand_panics() {
+        let mut mnemonic = Mnemonic::Return(Return {
+            ptr: insn(0),
+            value: Some(insn(1)),
+        });
+        mnemonic.set_operand(2, insn(3));
     }
 }

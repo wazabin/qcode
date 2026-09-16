@@ -26,13 +26,12 @@ use rustc_hash::FxHashMap as HashMap;
 use std::sync::OnceLock;
 
 use super::binop::IntBinop;
-use super::mnemonic::{Args, MnemonicKind};
+use super::mnemonic::MnemonicKind;
 use crate::{
     langref::InsnDoc,
     types::{TypeId, TypeManager},
     value::{BodyView, InstructionId, LocalValueId, QCodeView, ValueId, ValueRef},
 };
-use smallvec::SmallVec;
 
 /// A stable-by-name handle into the intrinsic registry.
 ///
@@ -226,10 +225,6 @@ pub struct IntrinsicApp {
 impl MnemonicKind for IntrinsicApp {
     fn opcode(&self) -> &'static str {
         self.id.name()
-    }
-
-    fn args(&self) -> Args {
-        SmallVec::from_vec(self.args.clone())
     }
 }
 

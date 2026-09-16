@@ -26,7 +26,10 @@ fn mint(ctx: &mut Context<'static>, f: FunctionId, block: BlockId, n: u64) -> In
 }
 
 fn order(ctx: &Context<'_>, block: BlockId) -> Vec<InstructionId> {
-    ctx.bodies[block.func].block_insn_ids(block)
+    ctx.bodies[block.func]
+        .insn_ids(block.local)
+        .map(|local| InstructionId::new(block.func, local))
+        .collect()
 }
 
 fn reverse_order(ctx: &Context<'_>, block: BlockId) -> Vec<InstructionId> {
@@ -165,7 +168,7 @@ fn iteration_walks_both_ends_to_the_middle() {
     assert_eq!(it.next_back().map(|i| i.id), Some(ids[3]));
     assert_eq!(it.next().map(|i| i.id), Some(ids[0]));
     assert_eq!(it.map(|i| i.id).collect::<Vec<_>>(), &ids[1..3]);
-    assert_eq!(view.instruction_ids(), ids);
+    assert_eq!(view.iter_instruction_ids().collect::<Vec<_>>(), ids);
 }
 
 #[test]

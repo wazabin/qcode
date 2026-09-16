@@ -26,11 +26,7 @@
 
 use crate::value::LocalValueId;
 
-use super::{
-    Callee,
-    mnemonic::{Args, MnemonicKind},
-};
-use smallvec::SmallVec;
+use super::{Callee, mnemonic::MnemonicKind};
 
 /// A total left-scan `out[i] = acc_i+1` where `acc_i+1 = body(acc_i, src[i],
 /// captures…)` and `acc_0 = init`. The result is `[U; N]` where `N` is `src`'s
@@ -54,14 +50,6 @@ impl MnemonicKind for Scan {
     fn opcode(&self) -> &'static str {
         "scan"
     }
-
-    fn args(&self) -> Args {
-        let mut args = SmallVec::with_capacity(2 + self.captures.len());
-        args.push(self.init);
-        args.push(self.src);
-        args.extend(self.captures.iter().copied());
-        args
-    }
 }
 
 #[cfg(test)]
@@ -70,7 +58,7 @@ mod tests {
         testing::TestContext,
         value::{
             FunctionBody, ValueId,
-            insn::{Callee, Mnemonic, mnemonic::MnemonicKind},
+            insn::{Callee, Mnemonic},
         },
     };
 
@@ -162,18 +150,21 @@ mod tests {
         let ValueId::Instruction(scan_id) = scan_val else {
             panic!("push_scan should yield an instruction value");
         };
-        let m = match tc.ctx.get_insn(scan_id).mnemonic().clone() {
+        let mnemonic = tc.ctx.get_insn(scan_id).mnemonic().clone();
+        let m = match mnemonic.clone() {
             Mnemonic::Scan(m) => m,
             other => panic!("expected Scan, got {other:?}"),
         };
         assert_eq!(m.body, Callee::Real(body));
         assert_eq!(
-            m.args().to_vec(),
+            mnemonic.args().to_vec(),
             vec![init.strip_func(), src.strip_func(), cap.strip_func()],
             "init, src, then captures are the operands"
         );
         assert!(
-            !m.args().contains(&ValueId::Function(body).strip_func()),
+            !mnemonic
+                .args()
+                .contains(&ValueId::Function(body).strip_func()),
             "body is not an operand"
         );
         // Result type is the array type of `src` (same length, body return elem).

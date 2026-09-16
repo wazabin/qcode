@@ -1148,11 +1148,10 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
 
     fn make_error(&self, ctx: &Context<'_>, kind: EmulatorErrorKind) -> EmulatorError {
         let block = BasicBlock::from_id(ctx, self.block);
-        let ids = block.instruction_ids();
-        let instruction = ids
-            .get(self.idx)
-            .or_else(|| ids.last())
-            .copied()
+        let instruction = block
+            .iter_instruction_ids()
+            .nth(self.idx)
+            .or_else(|| block.last_instruction())
             .expect("cannot construct EmulatorError for empty block");
 
         EmulatorError::new(kind, &Instruction::from_id(ctx, instruction))
@@ -4094,10 +4093,7 @@ mod tests {
         let mut emu = StandaloneEmulator::new(root);
         emu.run_pure(&ctx, sw, &[SizedValue::new(scrutinee, 8)], 1000)
             .ok()?;
-        let term = BasicBlock::from_id(&ctx, emu.block)
-            .instruction_ids()
-            .last()
-            .copied()?;
+        let term = BasicBlock::from_id(&ctx, emu.block).last_instruction()?;
         let Mnemonic::ReturnValue(r) = Instruction::from_id(&ctx, term).mnemonic() else {
             return None;
         };

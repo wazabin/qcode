@@ -419,7 +419,9 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         block: BlockId,
         start: usize,
     ) -> Result<usize, Unsupported> {
-        let insns: Vec<InstructionId> = BasicBlock::from_id(self.ctx, block).instruction_ids();
+        let insns: Vec<InstructionId> = BasicBlock::from_id(self.ctx, block)
+            .iter_instruction_ids()
+            .collect();
         if insns.is_empty() {
             return Err(Unsupported::Terminator("block is empty"));
         }

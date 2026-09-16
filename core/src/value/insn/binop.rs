@@ -3,8 +3,7 @@ use std::fmt::{Display, Formatter};
 use crate::LangRef;
 use crate::value::LocalValueId;
 
-use super::mnemonic::{Args, MnemonicKind};
-use smallvec::smallvec;
+use super::mnemonic::MnemonicKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Binary {
@@ -16,10 +15,6 @@ pub struct Binary {
 impl MnemonicKind for Binary {
     fn opcode(&self) -> &'static str {
         "binop"
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.lhs, self.rhs]
     }
 }
 

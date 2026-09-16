@@ -7,6 +7,7 @@ use crate::{
         block_param::{BlockParam, BlockParamId, BlockParamMutRef, BlockParamRef, LocalParamId},
         function::{FunctionId, FunctionMutRef, FunctionRef},
         insn::{InstructionId, InstructionRef, LocalInsnId, Mnemonic},
+        uses::{UseId, WithUsers},
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
             body_mut::BodyMut,
@@ -96,6 +97,22 @@ pub struct BasicBlock<'str> {
 
     /// Additional addresses that map to this block (accumulated from merged blocks).
     pub extra_addresses: Vec<u64>,
+
+    /// Head of the list of this block's uses as a value (see
+    /// [`crate::value::uses`]). Derived bookkeeping, rebuilt after
+    /// deserialization.
+    #[serde(skip)]
+    pub(crate) first_use: Option<UseId>,
+}
+
+impl WithUsers for BasicBlock<'_> {
+    fn first_use(&self) -> Option<UseId> {
+        self.first_use
+    }
+
+    fn first_use_mut(&mut self) -> &mut Option<UseId> {
+        &mut self.first_use
+    }
 }
 
 /// The ends and length of a block's instruction list. The list itself is
@@ -430,17 +447,35 @@ where
         self.instructions()
     }
 
-    pub fn instruction_ids(&'s self) -> Vec<InstructionId> {
-        self.instructions().map(|insn| insn.id).collect()
+    /// The ids of this block's instructions, in order, walked from either
+    /// end without allocating. A caller that needs a snapshot to mutate the
+    /// block against collects it: `block.iter_instruction_ids().collect::<Vec<_>>()`.
+    pub fn iter_instruction_ids(
+        &'s self,
+    ) -> impl DoubleEndedIterator<Item = InstructionId> + ExactSizeIterator + use<'s, 'str, 'ctx, R>
+    {
+        self.instructions().map(|insn| insn.id)
     }
 
-    /// How many instructions this block holds.
-    ///
-    /// Separate from [`instruction_ids`](Self::instruction_ids) because that
-    /// qualifies every id into a fresh `Vec`, and a caller that wants only the
-    /// count should not allocate for it — the JIT reads this per block
-    /// execution.
-    pub fn instruction_count(&'s self) -> usize {
+    /// The first instruction of this block, if it has one.
+    pub fn first_instruction(&'s self) -> Option<InstructionId> {
+        self.inner()
+            .instructions
+            .first
+            .map(|local| InstructionId::new(self.id.func, local))
+    }
+
+    /// The last instruction of this block — its terminator, once it has one.
+    pub fn last_instruction(&'s self) -> Option<InstructionId> {
+        self.inner()
+            .instructions
+            .last
+            .map(|local| InstructionId::new(self.id.func, local))
+    }
+
+    /// How many instructions this block holds. Constant-time: the JIT reads
+    /// this per block execution.
+    pub fn len(&'s self) -> usize {
         self.inner().instructions.len
     }
 
@@ -799,20 +834,54 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         self.as_ref().num_params()
     }
 
-    pub fn instruction_ids(&self) -> Vec<InstructionId> {
-        self.as_ref().instruction_ids()
+    /// The ids of this block's instructions, in order, walked from either
+    /// end without allocating (see [`BlockRef::iter_instruction_ids`]).
+    pub fn iter_instruction_ids(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = InstructionId> + ExactSizeIterator + '_ {
+        let func = self.id.func;
+        self.ctx.bodies[func]
+            .insn_ids(self.id.local)
+            .map(move |local| InstructionId::new(func, local))
     }
 
-    pub fn instructions(&self) -> impl Iterator<Item = InstructionRef<'str, '_>> {
-        self.as_ref().instructions().collect::<Vec<_>>().into_iter()
+    /// The first instruction of this block, if it has one.
+    pub fn first_instruction(&self) -> Option<InstructionId> {
+        self.as_ref().first_instruction()
+    }
+
+    /// The last instruction of this block — its terminator, once it has one.
+    pub fn last_instruction(&self) -> Option<InstructionId> {
+        self.as_ref().last_instruction()
+    }
+
+    /// How many instructions this block holds.
+    pub fn len(&self) -> usize {
+        self.as_ref().len()
+    }
+
+    /// Does this block have any instructions?
+    pub fn is_empty(&self) -> bool {
+        self.as_ref().is_empty()
+    }
+
+    /// Iterates over the instructions in this block, walked along their
+    /// links without allocating (see [`BlockRef::instructions`]).
+    pub fn instructions(&self) -> InstructionIter<'str, '_> {
+        self.as_ref().instructions()
     }
 
     pub fn address(&self) -> Option<u64> {
         self.as_ref().address()
     }
 
-    pub fn successors(&self) -> impl Iterator<Item = (EdgeId, BlockId)> {
-        self.as_ref().successors().collect::<Vec<_>>().into_iter()
+    /// Iterates over outgoing edges without allocating.
+    pub fn successors(&self) -> impl Iterator<Item = (EdgeId, BlockId)> + '_ {
+        let id = self.id;
+        self.inner().edges.iter().copied().filter_map(move |edge| {
+            let e = self.ctx.edge(id.func, edge);
+            (e.from == id.local).then_some((edge, BlockId::new(id.func, e.to)))
+        })
     }
 
     /// Builder-style address assignment. Panics if `addr` is already mapped.
@@ -880,6 +949,7 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
                 parent: Some(block_id.local),
                 name: None,
                 origin: None,
+                first_use: None,
             },
         );
         self.inner_mut().params.push(id.localize(block_id.func));
@@ -1136,15 +1206,15 @@ mod tests {
         };
 
         assert_eq!(block.num_params(), 0);
-        assert_eq!(block.as_ref().instruction_ids().len(), 0);
+        assert_eq!(block.as_ref().len(), 0);
 
         block.push_param(8);
         assert_eq!(block.num_params(), 1);
-        assert_eq!(block.as_ref().instruction_ids().len(), 0);
+        assert_eq!(block.as_ref().len(), 0);
 
         block.push_param(4);
         assert_eq!(block.num_params(), 2);
-        assert_eq!(block.as_ref().instruction_ids().len(), 0);
+        assert_eq!(block.as_ref().len(), 0);
     }
 
     #[test]
@@ -1256,12 +1326,12 @@ mod tests {
         );
 
         let mut entry_block = BasicBlock::from_id_mut(&mut ctx, entry);
-        assert_eq!(entry_block.instruction_ids().len(), 1);
+        assert_eq!(entry_block.len(), 1);
         assert_eq!(entry_block.successors().count(), 1);
         assert!(entry_block.is_terminated());
 
         entry_block.pop_insn();
-        assert_eq!(entry_block.instruction_ids().len(), 0);
+        assert_eq!(entry_block.len(), 0);
         assert_eq!(entry_block.successors().count(), 0);
         assert!(!entry_block.is_terminated());
     }
@@ -1286,13 +1356,13 @@ mod tests {
 
         let mut entry_block = BasicBlock::from_id_mut(&mut ctx, entry);
         assert_eq!(entry_block.successors().count(), 2);
-        assert_eq!(entry_block.instruction_ids().len(), 2);
+        assert_eq!(entry_block.len(), 2);
         assert!(entry_block.is_terminated());
 
         entry_block.pop_insn();
 
         assert_eq!(entry_block.successors().count(), 0);
-        assert_eq!(entry_block.instruction_ids().len(), 1);
+        assert_eq!(entry_block.len(), 1);
         assert!(!entry_block.is_terminated());
 
         assert_eq!(
@@ -1317,11 +1387,11 @@ mod tests {
         );
 
         let mut entry_block = BasicBlock::from_id_mut(&mut ctx, entry);
-        assert_eq!(entry_block.instruction_ids().len(), 1);
+        assert_eq!(entry_block.len(), 1);
         assert_eq!(entry_block.successors().count(), 0);
 
         entry_block.pop_insn();
-        assert_eq!(entry_block.instruction_ids().len(), 0);
+        assert_eq!(entry_block.len(), 0);
         assert_eq!(entry_block.successors().count(), 0);
     }
 
@@ -1355,11 +1425,10 @@ mod tests {
             "cloned block must have a different name"
         );
 
-        assert_eq!(orig.instruction_ids().len(), cloned.instruction_ids().len());
+        assert_eq!(orig.len(), cloned.len());
         for (orig_id, clone_id) in orig
-            .instruction_ids()
-            .into_iter()
-            .zip(cloned.instruction_ids())
+            .iter_instruction_ids()
+            .zip(cloned.iter_instruction_ids().collect::<Vec<_>>())
         {
             assert_ne!(
                 orig_id, clone_id,

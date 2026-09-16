@@ -6,6 +6,7 @@ use crate::{
     value::{
         LocalBlockId, LocalValueId, ModuleView, QCodeView, Value, ValueId,
         block::{BlockId, BlockRef},
+        uses::{UseId, WithUsers},
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable},
@@ -65,6 +66,21 @@ pub struct BlockParam<'str> {
     /// lets passes like mem2reg reuse an existing param instead of duplicating it,
     /// even for varnodes that have no `name`.
     pub origin: Option<LocalValueId>,
+
+    /// Head of the list of this parameter's uses (see [`crate::value::uses`]).
+    /// Derived bookkeeping, rebuilt after deserialization.
+    #[serde(skip)]
+    pub(crate) first_use: Option<UseId>,
+}
+
+impl WithUsers for BlockParam<'_> {
+    fn first_use(&self) -> Option<UseId> {
+        self.first_use
+    }
+
+    fn first_use_mut(&mut self) -> &mut Option<UseId> {
+        &mut self.first_use
+    }
 }
 
 impl<'str> BlockParam<'str> {
@@ -86,6 +102,7 @@ impl<'str> BlockParam<'str> {
                 parent: Some(block_id.local),
                 name: None,
                 origin: None,
+                first_use: None,
             },
         );
         BlockParamMutRef::from_id(ctx, id)
@@ -102,6 +119,7 @@ impl<'str> BlockParam<'str> {
             parent: Some(parent),
             name: None,
             origin: None,
+            first_use: None,
         }
     }
 
