@@ -3521,6 +3521,57 @@ mod tests {
         );
     }
 
+    /// Temporaries and their spaces stay in append-only registries: nothing
+    /// removes one, their ids are dense (`contains_temp` is a length check),
+    /// they are public, and the wire format carries them in id order. A
+    /// recycling arena would leave holes none of that can represent.
+    #[test]
+    fn temp_registries_are_dense_and_serialize_in_id_order() {
+        let mut ctx = Context::new();
+        let f = ctx.anon_function();
+        let block = ctx.get_or_make_block(0x1000, f);
+        let temps: Vec<_> = (0..3)
+            .map(|i| {
+                ctx.builder(block)
+                    .make_named_temp(Cow::Owned(format!("t{i}")), 8)
+            })
+            .collect();
+        let locals: Vec<usize> = temps.iter().map(|t| usize::from(t.local)).collect();
+        assert_eq!(locals, vec![0, 1, 2], "ids are issued densely");
+        let space = ctx.bodies[f].temps[temps[0].local].space;
+        assert!(ctx.bodies[f].contains_temp_space(TempSpaceId::new(f, space)));
+
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&ctx, config).expect("encode");
+        let (restored, _): (Context<'static>, usize) =
+            bincode::serde::decode_from_slice(&bytes, config).expect("decode");
+        for &temp in &temps {
+            assert!(restored.bodies[f].contains_temp(temp));
+            assert_eq!(
+                restored.bodies[f].temp(temp).name,
+                ctx.bodies[f].temp(temp).name
+            );
+        }
+        assert_eq!(
+            restored.bodies[f]
+                .temps
+                .iter()
+                .map(|t| usize::from(t.id))
+                .collect::<Vec<_>>(),
+            locals
+        );
+        assert_eq!(
+            restored.bodies[f]
+                .temp_spaces()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            ctx.bodies[f]
+                .temp_spaces()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn compact_param_arena_preserves_ids_across_round_trip() {
         let mut ctx = Context::new();

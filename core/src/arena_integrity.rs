@@ -436,7 +436,8 @@ fn verify_use_edges(
     // Every edge names a live user and its operand, and a value with storage.
     let mut edges_per_operand: FxHashMap<(crate::value::LocalInsnId, usize), usize> =
         FxHashMap::default();
-    for (edge_id, edge) in body.use_edges() {
+    for edge in body.use_edges() {
+        let edge_id = edge.id;
         let user = InstructionId::new(fid, edge.user);
         let index = usize::from(edge.operand_index);
         if !live_insns.contains(&edge.user) {
@@ -866,7 +867,7 @@ mod tests {
         let edges = |ctx: &Context<'_>| {
             let mut edges: Vec<_> = ctx.bodies[f]
                 .use_edges()
-                .map(|(_, e)| (format!("{:?}", e.value), e.user, e.operand_index))
+                .map(|e| (format!("{:?}", e.value), e.user, e.operand_index))
                 .collect();
             edges.sort();
             edges

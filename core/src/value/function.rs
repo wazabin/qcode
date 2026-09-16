@@ -1,4 +1,8 @@
-use jstd::{Identifier, registry::Registry, stable_arena::StableArena};
+use jstd::{
+    Identifier,
+    registry::{Identified, Registry},
+    stable_arena::StableArena,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     borrow::Cow,
@@ -2065,8 +2069,8 @@ impl<'str> FunctionBody<'str> {
         }
     }
 
-    /// Every use edge in this body, for the integrity check.
-    pub(crate) fn use_edges(&self) -> impl Iterator<Item = (UseId, &Use)> + '_ {
+    /// Every live use edge in this body, for the integrity check.
+    pub(crate) fn use_edges(&self) -> impl Iterator<Item = Identified<UseId, &Use>> + '_ {
         self.uses.iter()
     }
 
