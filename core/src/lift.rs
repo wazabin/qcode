@@ -24,7 +24,7 @@ pub mod scratch;
 pub mod target;
 
 pub use scratch::ScratchStore;
-pub use target::{Construction, LiftTarget, TargetError};
+pub use target::{Construction, LiftTarget, Promotion, TargetError, Transfer};
 
 use crate::value::{BlockId, InstructionId};
 

@@ -15,9 +15,11 @@
 //! aborting it, takes back every block, instruction, edge and temporary the
 //! instruction added to the function, every placeholder block it registered
 //! for a branch target or fall-through, and the entry block's contents if the
-//! entry existed before. Callees are only created at commit, so a failed
-//! instruction never leaves a function behind either. One thing stays:
-//! constants interned in the module's shared arenas, which are immutable and
+//! entry existed before. Callees — by address or by name — are only created at
+//! commit, and a foreign block a transfer [promotes](Promotion::SplitFunction)
+//! into a function of its own is only split then, so a failed instruction
+//! never leaves a function behind either. One thing stays: constants and
+//! varnodes interned in the module's shared arenas, which are immutable and
 //! unowned, so a spare one is invisible.
 //!
 //! # Splitting is deferred to commit
@@ -46,12 +48,17 @@
 
 use std::fmt;
 
+use std::borrow::Cow;
+
 use crate::{
     address_index::{AddressIndex, AddressTarget},
     builder::Builder,
     context::Context,
-    lift::{CallTarget, ExitKind, Lifted},
-    value::{BasicBlock, BlockId, FunctionBody, FunctionId, LocalBlockId, insn::Callee},
+    lift::{CallTarget, Exit, ExitKind, Lifted},
+    value::{
+        BasicBlock, BlockId, FunctionBody, FunctionId, LocalBlockId,
+        insn::{Callee, Mnemonic},
+    },
 };
 
 /// Why a target could not be bound, or a construction not carried out.
@@ -390,6 +397,55 @@ struct PendingSplit {
     tail: BlockId,
 }
 
+/// A callee the construction promised, by minted slot, and makes real at
+/// commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Minted {
+    /// The function at a machine address, made there if none is.
+    Address(u64),
+    /// The function of a name the semantics give, made if none has it.
+    Named(Box<str>),
+    /// A block of another function, at `address`, that becomes the entry of a
+    /// function of its own when the split lands.
+    Promoted { block: BlockId, address: u64 },
+}
+
+impl Minted {
+    /// The address to report when the slot goes unresolved.
+    fn address(&self) -> Option<u64> {
+        match self {
+            Self::Address(address) | Self::Promoted { address, .. } => Some(*address),
+            Self::Named(_) => None,
+        }
+    }
+}
+
+/// Where a direct transfer to a machine address lands: see
+/// [`Construction::transfer_at`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transfer {
+    /// A block of the host: the transfer is an intra-function branch.
+    Block(BlockId),
+    /// Another function's entry: the transfer is inter-procedural, a tail
+    /// call. A [minted](Callee::Minted) callee is one the commit creates by
+    /// splitting the block it lands on out of its function.
+    Function(Callee),
+}
+
+/// What [`Construction::transfer_at`] does with a target that is a block of
+/// another function, not its entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Promotion {
+    /// Refuse it: [`TargetError::ForeignBlock`].
+    Refuse,
+    /// Make it an entry: at commit the block is split out of its function
+    /// into a function of its own (see [`Context::split_function_at_indexed`]),
+    /// and the transfer is a tail call to that function, reported now as a
+    /// minted callee. Only a block that *starts* at the address is promoted;
+    /// an address interior to a foreign block is refused.
+    SplitFunction,
+}
+
 /// What one construction added, for taking it back.
 #[derive(Debug)]
 struct Journal {
@@ -405,7 +461,7 @@ struct Journal {
     /// deletes them like any other block and the split never happens.
     splits: Vec<PendingSplit>,
     /// Callees the construction promised, by minted slot, to create at commit.
-    minted: Vec<u64>,
+    minted: Vec<Minted>,
     // The body's issued lengths when the construction began.
     insns: usize,
     blocks: usize,
@@ -495,14 +551,62 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
             }
             return Ok(Callee::Real(function));
         }
-        let slot = match self.journal.minted.iter().position(|&a| a == address) {
+        Ok(Callee::Minted(self.mint(Minted::Address(address))))
+    }
+
+    /// The function a call to `name` reaches: the one of that name, or one
+    /// promised under it and made at commit, like [`callee_at`](Self::callee_at).
+    pub fn callee_named(&mut self, name: &str) -> Callee {
+        if let Some(function) = FunctionBody::from_name(self.target.ctx, name) {
+            return Callee::Real(function.id);
+        }
+        Callee::Minted(self.mint(Minted::Named(Box::from(name))))
+    }
+
+    /// Where a direct transfer — a jump, or the fall-through — to `address`
+    /// lands, with the policy for a target owned by another function.
+    ///
+    /// An address of the host, or one nothing owns, is a block of the host as
+    /// [`block_at`](Self::block_at) gives it. Another function's entry is that
+    /// function, to tail-call. A block of another function is refused, or
+    /// [promoted](Promotion::SplitFunction) into a function to tail-call.
+    pub fn transfer_at(
+        &mut self,
+        address: u64,
+        promotion: Promotion,
+    ) -> Result<Transfer, TargetError> {
+        match self.block_at(address) {
+            Ok(block) => Ok(Transfer::Block(block)),
+            Err(TargetError::OwnedByFunction { owner, .. }) => {
+                Ok(Transfer::Function(Callee::Real(owner)))
+            }
+            Err(TargetError::ForeignBlock { owner, .. }) if promotion == Promotion::SplitFunction => {
+                let block = self
+                    .target
+                    .addresses
+                    .block_at(address)
+                    .expect("resolve_block found a foreign block here");
+                if self.target.ctx.block(block).address != Some(address) {
+                    return Err(TargetError::ForeignBlock { address, owner });
+                }
+                Ok(Transfer::Function(Callee::Minted(
+                    self.mint(Minted::Promoted { block, address }),
+                )))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The slot of a promise, made once per distinct promise.
+    fn mint(&mut self, minted: Minted) -> u32 {
+        let slot = match self.journal.minted.iter().position(|m| *m == minted) {
             Some(slot) => slot,
             None => {
-                self.journal.minted.push(address);
+                self.journal.minted.push(minted);
                 self.journal.minted.len() - 1
             }
         };
-        Ok(Callee::Minted(slot as u32))
+        slot as u32
     }
 
     /// A builder positioned at `block`, which must be one of the host's.
@@ -515,57 +619,61 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
     /// their call sites.
     pub fn commit(mut self, lifted: Lifted) -> Result<Lifted, TargetError> {
         let function = self.target.function;
-        // Every promised callee must have a call site the result reports, and
-        // every placeholder the instruction holds must be one of the promised
-        // slots. Checked before anything is created: a function, once made,
-        // cannot be taken back.
+        let own_address = self.journal.address;
+        let unresolved = |minted: Option<&Minted>| TargetError::UnresolvedCallee {
+            address: minted.and_then(Minted::address).unwrap_or(own_address),
+        };
+        // Every placeholder the instruction holds must be one of the promised
+        // slots, every promised slot must have a site, and a structured call
+        // holding one must be reported by the result as a call to what the
+        // slot promises — a call the metadata omits is an instruction only
+        // partly published. (A tail call is reported at the branch it stands
+        // for, which may be a conditional branch elsewhere, so it is only
+        // required to exist.) Checked before anything is created: a function,
+        // once made, cannot be taken back.
         let mut sites: Vec<Vec<crate::value::LocalInsnId>> =
             vec![Vec::new(); self.journal.minted.len()];
-        for exit in lifted.exits() {
-            let ExitKind::Call {
-                callee: CallTarget::Address(address),
-                ..
-            } = exit.kind()
-            else {
-                continue;
-            };
-            if exit.site().func != function {
-                continue;
-            }
-            let body = &self.target.ctx.bodies[function];
-            let slot = body.insns[exit.site().local]
-                .mnemonic()
-                .minted_callee_slot();
-            if let Some(slot) = slot
-                && self.journal.minted.get(slot as usize) == Some(address)
-            {
-                sites[slot as usize].push(exit.site().local);
-            }
-        }
-        if let Some(slot) = sites.iter().position(Vec::is_empty) {
-            let address = self.journal.minted[slot];
-            self.rollback();
-            return Err(TargetError::UnresolvedCallee { address });
-        }
         let body = &self.target.ctx.bodies[function];
+        let reported = |local: crate::value::LocalInsnId| {
+            lifted
+                .exits()
+                .iter()
+                .find(|exit| exit.site() == crate::value::InstructionId::new(function, local))
+                .map(Exit::kind)
+        };
         for raw in self.journal.insns..body.insns.issued_len() {
             let local = raw.into();
             if !body.insns.contains(local) {
                 continue;
             }
-            let Some(slot) = body.insns[local].mnemonic().minted_callee_slot() else {
+            let mnemonic = body.insns[local].mnemonic();
+            let Some(slot) = mnemonic.minted_callee_slot() else {
                 continue;
             };
-            if !sites
-                .get(slot as usize)
-                .is_some_and(|sites| sites.contains(&local))
-            {
-                let address = self.journal.minted.get(slot as usize).copied();
+            let Some(minted) = self.journal.minted.get(slot as usize) else {
                 self.rollback();
-                return Err(TargetError::UnresolvedCallee {
-                    address: address.unwrap_or(self.journal.address),
-                });
+                return Err(unresolved(None));
+            };
+            let consistent = match (mnemonic, reported(local)) {
+                (Mnemonic::Call(_), Some(ExitKind::Call { callee, .. })) => match (minted, callee) {
+                    (Minted::Address(minted), CallTarget::Address(address)) => minted == address,
+                    (Minted::Named(minted), CallTarget::Named(name)) => minted == name,
+                    _ => false,
+                },
+                (Mnemonic::Call(_), _) => false,
+                _ => true,
+            };
+            if !consistent {
+                let error = unresolved(Some(minted));
+                self.rollback();
+                return Err(error);
             }
+            sites[slot as usize].push(local);
+        }
+        if let Some(slot) = sites.iter().position(Vec::is_empty) {
+            let error = unresolved(self.journal.minted.get(slot));
+            self.rollback();
+            return Err(error);
         }
 
         // Every check that can fail has passed: land the splits, then the
@@ -579,13 +687,26 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
             );
         }
         for (slot, sites) in sites.into_iter().enumerate() {
-            let address = self.journal.minted[slot];
-            let real = FunctionBody::from_addr_or_create_indexed(
-                self.target.ctx,
-                self.target.addresses,
-                address,
-            )
-            .id;
+            let real = match &self.journal.minted[slot] {
+                Minted::Address(address) => {
+                    FunctionBody::from_addr_or_create_indexed(
+                        self.target.ctx,
+                        self.target.addresses,
+                        *address,
+                    )
+                    .id
+                }
+                Minted::Named(name) => match FunctionBody::from_name(self.target.ctx, name) {
+                    Some(function) => function.id,
+                    None => FunctionBody::make(self.target.ctx, Cow::Owned(name.to_string()))
+                        .expect("the name was free when it was promised")
+                        .id,
+                },
+                Minted::Promoted { block, .. } => self
+                    .target
+                    .ctx
+                    .split_function_at_indexed(self.target.addresses, *block),
+            };
             let body = &mut self.target.ctx.bodies[function];
             for site in sites {
                 body.insns[site]
@@ -1250,6 +1371,237 @@ mod tests {
         twin.bodies[function].delete_block(block);
         assert!(addresses.is_current(&ctx));
         assert!(!AddressIndex::analyze(&ctx).is_current(&twin));
+    }
+
+    #[test]
+    fn a_named_callee_is_made_at_commit_and_never_by_a_failed_construction() {
+        let mut ctx = Context::new();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let function = host(&mut ctx, &mut addresses, 0x1000);
+        let before = ctx.to_string();
+        {
+            let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+            let mut construction = target.begin(0x1000, 2).unwrap();
+            let callee = construction.callee_named("syscall");
+            assert_eq!(callee, Callee::Minted(0));
+            assert_eq!(construction.callee_named("syscall"), callee, "one slot per name");
+            let entry = construction.entry();
+            construction.builder(entry).push_call(callee);
+            construction.abort();
+        }
+        assert_eq!(ctx.to_string(), before);
+        assert!(FunctionBody::from_name(&ctx, "syscall").is_none());
+
+        let site = {
+            let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+            let mut construction = target.begin(0x1000, 2).unwrap();
+            let callee = construction.callee_named("syscall");
+            let entry = construction.entry();
+            let mut recorder = Recorder::new(0x1000, 2, entry);
+            let site = construction.builder(entry).push_call(callee).id;
+            recorder.exit(
+                site,
+                ExitArm::Unconditional,
+                ExitKind::Call {
+                    callee: CallTarget::Named("syscall".into()),
+                    continuation: Continuation::Next,
+                },
+            );
+            construction.commit(recorder.finish()).unwrap();
+            site
+        };
+        let syscall = FunctionBody::from_name(&ctx, "syscall")
+            .expect("made at commit")
+            .id;
+        let call = crate::value::Instruction::from_id(&ctx, site);
+        assert!(matches!(
+            call.mnemonic(),
+            crate::value::insn::Mnemonic::Call(call) if call.target == Callee::Real(syscall)
+        ));
+        // A later construction names the same function rather than a second.
+        let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+        let mut construction = target.begin(0x1002, 2).unwrap();
+        assert_eq!(construction.callee_named("syscall"), Callee::Real(syscall));
+    }
+
+    #[test]
+    fn a_call_reported_under_another_name_than_its_site_promises_is_refused() {
+        let mut ctx = Context::new();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let function = host(&mut ctx, &mut addresses, 0x1000);
+        let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+        let mut construction = target.begin(0x1000, 2).unwrap();
+        let callee = construction.callee_named("syscall");
+        let entry = construction.entry();
+        let mut recorder = Recorder::new(0x1000, 2, entry);
+        let site = construction.builder(entry).push_call(callee).id;
+        recorder.exit(
+            site,
+            ExitArm::Unconditional,
+            ExitKind::Call {
+                callee: CallTarget::Named("other".into()),
+                continuation: Continuation::Next,
+            },
+        );
+        assert_eq!(
+            construction.commit(recorder.finish()).err(),
+            Some(TargetError::UnresolvedCallee { address: 0x1000 })
+        );
+        assert!(FunctionBody::from_name(&ctx, "syscall").is_none());
+    }
+
+    /// Two functions: the host at 0x1000, and `other` at 0x2000 whose second
+    /// block, at 0x2010, holds code and is reached from its root.
+    fn host_and_other(
+        ctx: &mut Context<'static>,
+        addresses: &mut AddressIndex,
+    ) -> (FunctionId, FunctionId, BlockId) {
+        let function = host(ctx, addresses, 0x1000);
+        let other = host(ctx, addresses, 0x2000);
+        let root = BasicBlock::make(ctx, other)
+            .with_address_indexed(addresses, 0x2000)
+            .id;
+        let foreign = BasicBlock::make(ctx, other)
+            .with_address_indexed(addresses, 0x2010)
+            .id;
+        ctx.builder(root).push_branch(foreign);
+        let zero = ctx.shared.get_const(0, 8);
+        ctx.builder(foreign).push_branchind(zero);
+        (function, other, foreign)
+    }
+
+    #[test]
+    fn a_transfer_resolves_to_a_block_a_function_or_a_promoted_foreign_block() {
+        let mut ctx = Context::new();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let (function, other, foreign) = host_and_other(&mut ctx, &mut addresses);
+        {
+            let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+            let mut construction = target.begin(0x1000, 2).unwrap();
+
+            // The host's own address: a block, made as a placeholder.
+            let Transfer::Block(next) =
+                construction.transfer_at(0x1002, Promotion::Refuse).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(construction.context().block(next).address, Some(0x1002));
+            // Another function's entry: that function, whatever the policy.
+            assert_eq!(
+                construction.transfer_at(0x2000, Promotion::Refuse).unwrap(),
+                Transfer::Function(Callee::Real(other))
+            );
+            // A block of another function: refused, or promoted as a promise.
+            assert_eq!(
+                construction.transfer_at(0x2010, Promotion::Refuse).err(),
+                Some(TargetError::ForeignBlock {
+                    address: 0x2010,
+                    owner: other
+                })
+            );
+            assert_eq!(
+                construction
+                    .transfer_at(0x2010, Promotion::SplitFunction)
+                    .unwrap(),
+                Transfer::Function(Callee::Minted(0))
+            );
+            assert_eq!(
+                construction
+                    .transfer_at(0x2010, Promotion::SplitFunction)
+                    .unwrap(),
+                Transfer::Function(Callee::Minted(0)),
+                "one promise per address"
+            );
+            // Nothing is split yet.
+            assert_eq!(construction.context().block(foreign).address, Some(0x2010));
+            assert_eq!(construction.context().functions().count(), 2);
+        }
+        // An address interior to a foreign block is not promoted.
+        ctx.block_mut(foreign).extra_addresses.push(0x2014);
+        addresses.refresh(&ctx);
+        let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+        let mut construction = target.begin(0x1000, 2).unwrap();
+        assert_eq!(
+            construction
+                .transfer_at(0x2014, Promotion::SplitFunction)
+                .err(),
+            Some(TargetError::ForeignBlock {
+                address: 0x2014,
+                owner: other
+            })
+        );
+    }
+
+    #[test]
+    fn a_promotion_lands_at_commit_and_an_abandoned_one_leaves_the_other_function_alone() {
+        let mut ctx = Context::new();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let (function, other, foreign) = host_and_other(&mut ctx, &mut addresses);
+        let before = (ctx.to_string(), addresses.clone());
+
+        // A jump from the host into the middle of `other`, abandoned.
+        {
+            let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+            let mut construction = target.begin(0x1000, 2).unwrap();
+            let Transfer::Function(callee) = construction
+                .transfer_at(0x2010, Promotion::SplitFunction)
+                .unwrap()
+            else {
+                panic!()
+            };
+            let entry = construction.entry();
+            construction.builder(entry).push_tail_call(callee);
+            construction.abort();
+            assert!(!target.is_poisoned());
+        }
+        assert_eq!(ctx.to_string(), before.0);
+        assert_eq!(addresses, before.1);
+        assert!(addresses.is_current(&ctx));
+
+        // The same jump committed: `other` is split at 0x2010, the new
+        // function owns the block, and the jump is a tail call to it.
+        let site = {
+            let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+            let mut construction = target.begin(0x1000, 2).unwrap();
+            let Transfer::Function(callee) = construction
+                .transfer_at(0x2010, Promotion::SplitFunction)
+                .unwrap()
+            else {
+                panic!()
+            };
+            let entry = construction.entry();
+            let mut recorder = Recorder::new(0x1000, 2, entry);
+            let site = construction.builder(entry).push_tail_call(callee).id;
+            // The original transfer was a branch; the tail call is policy.
+            recorder.exit(
+                site,
+                ExitArm::Unconditional,
+                ExitKind::Branch { target: 0x2010 },
+            );
+            construction.commit(recorder.finish()).unwrap();
+            site
+        };
+        let promoted = addresses.function_at(0x2010).expect("split out at commit");
+        assert_ne!(promoted, other);
+        assert_eq!(ctx.functions().count(), 3);
+        let root = ctx.function(promoted).root_id().expect("the block became its root");
+        assert!(ctx.block(BlockId::new(promoted, root)).has_insns());
+        assert!(!ctx.contains_block(foreign), "rehomed out of `other`");
+        let jump = crate::value::Instruction::from_id(&ctx, site);
+        assert!(matches!(
+            jump.mnemonic(),
+            crate::value::insn::Mnemonic::TailCall(call) if call.target == Callee::Real(promoted)
+        ));
+        // `other`'s root now tail-calls the split-out function too.
+        let other_root = BlockId::new(other, ctx.function(other).root_id().unwrap());
+        assert!(matches!(
+            BasicBlock::from_id(&ctx, other_root)
+                .instructions()
+                .last()
+                .map(|i| i.mnemonic().clone()),
+            Some(crate::value::insn::Mnemonic::TailCall(call)) if call.target == Callee::Real(promoted)
+        ));
+        assert!(addresses.is_current(&ctx));
     }
 
     #[test]
