@@ -188,7 +188,9 @@ fn run(opts: &Opts) -> Result<Output, String> {
         cursor += len;
     }
 
-    let mut context = session.into_context();
+    let mut context = session
+        .into_context()
+        .map_err(|error| format!("the lifted module is unusable: {error}"))?;
     if opts.passes {
         let block_ids: Vec<_> = context.blocks().map(|b| b.id).collect();
         for block_id in block_ids {

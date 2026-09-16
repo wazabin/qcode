@@ -115,7 +115,9 @@ mod engine {
             }
             offset += lifted.length();
         }
-        Ok(session.into_context())
+        session
+            .into_context()
+            .map_err(|error| format!("the lifted module is unusable: {error}"))
     }
 
     fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {

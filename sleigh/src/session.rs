@@ -17,14 +17,20 @@
 //! Both decode with a [`FixedDecoder`] unless given a decoded instruction; a
 //! sweep that carries context forward uses a [`LinearDecoder`] alongside a
 //! session and feeds it decoded instructions.
+//!
+//! A failed lift rolls back; one that cannot poisons the context (see
+//! [`Context::is_poisoned`]), and a session over a poisoned context refuses
+//! to lift or to hand the context over. Disposing of the session is the
+//! recovery; a scratch session recovers by itself, since discarding the
+//! instruction discards the damage.
 
 use qcode::{
     address_index::AddressIndex,
     context::Context,
-    lift::{Exit, ExitArm, ExitKind, LiftTarget, Lifted, ScratchStore},
+    lift::{Exit, ExitArm, ExitKind, LiftTarget, Lifted, ScratchStore, TargetError},
     value::{
-        BlockId, FunctionBody, FunctionId, InstructionId, LiteralId, LocalValueId, Varnode,
-        VarnodeId, VarnodeRef,
+        BlockId, FunctionBody, FunctionId, InstructionId, LocalTempId, LocalValueId, Varnode,
+        VarnodeRef,
         insn::{Callee, Mnemonic},
     },
 };
@@ -72,13 +78,17 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
     }
 
     /// A session continuing in `ctx`, which must be one of this lifter's
-    /// specification. `host` is resolved in that context.
+    /// specification and not [poisoned](Context::is_poisoned). `host` is
+    /// resolved in that context.
     pub fn in_context(
         lifter: &'l SleighLifter<'spec>,
         mut ctx: Context<'static>,
         host: Host,
     ) -> Result<Self, LiftError> {
         lifter.check_compatible(&ctx)?;
+        if ctx.is_poisoned() {
+            return Err(TargetError::Poisoned.into());
+        }
         let mut addresses = AddressIndex::analyze(&ctx);
         let function = Self::select(&mut ctx, &mut addresses, host);
         Ok(Self {
@@ -121,6 +131,19 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
         &self.ctx
     }
 
+    /// Whether a failed lift left the context holding IR it could not take
+    /// back. A poisoned session refuses every further lift and
+    /// [`into_context`](Self::into_context); its context is still readable
+    /// through [`context`](Self::context). See [`Context::is_poisoned`].
+    pub fn is_poisoned(&self) -> bool {
+        self.ctx.is_poisoned()
+    }
+
+    #[cfg(test)]
+    fn context_mut_for_test(&mut self) -> &mut Context<'static> {
+        &mut self.ctx
+    }
+
     /// Decodes the instruction at `address` from `bytes` with the session's
     /// fixed context and lifts it.
     pub fn lift(&mut self, address: u64, bytes: &[u8]) -> Result<Lifted, LiftError> {
@@ -150,9 +173,14 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
             .lift_pcode_into(&mut target, address, length, pcode)
     }
 
-    /// Ends the session and hands over its context.
-    pub fn into_context(self) -> Context<'static> {
-        self.ctx
+    /// Ends the session and hands over its context — unless a failed lift
+    /// [poisoned](Self::is_poisoned) it, in which case the context is not
+    /// published: it would carry IR no instruction accounts for.
+    pub fn into_context(self) -> Result<Context<'static>, LiftError> {
+        if self.ctx.is_poisoned() {
+            return Err(TargetError::Poisoned.into());
+        }
+        Ok(self.ctx)
     }
 
     /// A session that discards each instruction before the next. See
@@ -180,6 +208,19 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
 /// let entry = first.entry();
 /// let second = session.lift(0x1003, b"\x48\x89\xd8").unwrap(); // `first` is still borrowed
 /// let _ = entry.address();
+/// ```
+///
+/// The same goes for a resolved operand: it is a view, not a bare id.
+///
+/// ```compile_fail
+/// # use wazabin_qcode_sleigh::{SleighLifter, session::ScratchSession};
+/// # let spec = sleigh_precompile::x64::spec();
+/// # let lifter = SleighLifter::new(spec).with_flat_control_flow();
+/// let mut session = ScratchSession::new(&lifter).unwrap();
+/// let first = session.lift(0x1000, b"\x48\xc7\xc0\x44\x33\x22\x11").unwrap();
+/// let operand = first.entry().instructions().next().unwrap().operands().next().unwrap();
+/// let second = session.lift(0x1007, b"\x48\x89\xd8").unwrap(); // `operand` still borrows
+/// let _ = operand.as_const();
 /// ```
 ///
 /// While a view is alive the session itself is out of reach, so nothing can
@@ -222,6 +263,15 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
         Ok(self)
     }
 
+    /// Rebuilds the storage once instructions have interned `budget` more
+    /// constants than the architecture defines; see
+    /// [`ScratchStore::with_literal_budget`]. The default is
+    /// [`qcode::lift::DEFAULT_LITERAL_BUDGET`].
+    pub fn with_literal_budget(mut self, budget: usize) -> Self {
+        self.store.set_literal_budget(budget);
+        self
+    }
+
     /// How many instructions have been lifted and discarded. Every block or
     /// instruction handle obtained before the latest lift belongs to an
     /// earlier epoch.
@@ -229,10 +279,16 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
         self.store.epoch()
     }
 
-    /// Distinct constants interned over the session's life; see
+    /// Constants interned since the storage was built or last rebuilt; see
     /// [`ScratchStore::interned_literals`].
     pub fn interned_literals(&self) -> usize {
         self.store.interned_literals()
+    }
+
+    /// How many times the storage was rebuilt to stay within its literal
+    /// budget; see [`ScratchStore::rebuilds`].
+    pub fn rebuilds(&self) -> u64 {
+        self.store.rebuilds()
     }
 
     /// The host function's arena footprint, for measuring what one
@@ -273,8 +329,11 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
 /// Every block and instruction it exposes is a view carrying this borrow, so
 /// none can be kept past the instruction. Raw IR ids do appear inside the
 /// mnemonics a view shows — an operand is a [`LocalValueId`] — and those are
-/// fine to use as keys while the instruction is live; nothing here resolves
-/// one after it.
+/// fine to use as keys while the instruction is live. Nothing here resolves
+/// a bare id: an operand's value comes from [`ScratchInsn::operand`], which
+/// answers only for the operands of the live instruction it is asked
+/// through, so an id kept from an earlier instruction (whose constants the
+/// storage may since have recycled) cannot be read back as a stale value.
 pub struct ScratchLifted<'s, 'l, 'spec, 'b> {
     session: &'s mut ScratchSession<'l, 'spec>,
     instruction: Instruction<'spec, 'b>,
@@ -345,15 +404,49 @@ impl<'s, 'l, 'spec, 'b> ScratchLifted<'s, 'l, 'spec, 'b> {
             id,
         })
     }
+}
 
-    /// The value of an interned constant an operand names.
-    pub fn literal(&self, id: LiteralId) -> u64 {
-        self.ctx().get_literal_value(id)
+/// A resolved operand of a [`ScratchInsn`], valid as long as the instruction.
+#[non_exhaustive]
+pub enum ScratchOperand<'v> {
+    /// An interned constant: its raw value, and its width in bytes. The
+    /// interner masks a constant to its width when it mints it.
+    Const { value: u64, size: usize },
+    /// A register or other named location of the architecture.
+    Varnode(VarnodeRef<'static, 'v>),
+    /// The result of another instruction of the same scratch instruction.
+    Result(ScratchInsn<'v>),
+    /// A body-local temporary: the storage of an instruction-local unique.
+    Temp(LocalTempId),
+    /// A block of the same scratch instruction.
+    Block(ScratchBlock<'v>),
+    /// Any other kind of operand, kept as the key it is.
+    Other(LocalValueId),
+}
+
+impl std::fmt::Debug for ScratchOperand<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Const { value, size } => write!(f, "Const({value:#x}, {size})"),
+            Self::Varnode(varnode) => match varnode.name() {
+                Some(name) => write!(f, "Varnode({name})"),
+                None => write!(f, "Varnode({}:{})", varnode.address(), varnode.size()),
+            },
+            Self::Result(insn) => write!(f, "Result({:?})", insn.id),
+            Self::Temp(temp) => write!(f, "Temp({temp:?})"),
+            Self::Block(block) => write!(f, "Block({:?})", block.id),
+            Self::Other(other) => write!(f, "Other({other:?})"),
+        }
     }
+}
 
-    /// The register or memory location an operand names.
-    pub fn varnode(&self, id: VarnodeId) -> VarnodeRef<'static, '_> {
-        Varnode::from_id(self.ctx(), id)
+impl ScratchOperand<'_> {
+    /// The value of a constant operand.
+    pub fn as_const(&self) -> Option<u64> {
+        match self {
+            Self::Const { value, .. } => Some(*value),
+            _ => None,
+        }
     }
 }
 
@@ -468,6 +561,47 @@ impl<'v> ScratchInsn<'v> {
         LocalValueId::Instruction(self.id.local)
     }
 
+    /// The operands of this instruction, in mnemonic order, resolved.
+    pub fn operands(&self) -> impl Iterator<Item = ScratchOperand<'v>> + 'v {
+        let this = *self;
+        self.mnemonic()
+            .args()
+            .into_iter()
+            .map(move |v| this.resolve(v))
+    }
+
+    /// Resolves `v`, which must be one of this instruction's operands — a
+    /// field of its [`mnemonic`](Self::mnemonic) — and is `None` otherwise.
+    ///
+    /// This is the only way to read a constant's value out of a scratch
+    /// instruction, and it is deliberately narrow: the storage recycles
+    /// constant ids across instructions, so a [`LocalValueId`] is a key within
+    /// the instruction it was read from and nowhere else. Asking through the
+    /// instruction that holds the operand is what makes the answer current.
+    pub fn operand(&self, v: LocalValueId) -> Option<ScratchOperand<'v>> {
+        self.mnemonic().args().contains(&v).then(|| self.resolve(v))
+    }
+
+    fn resolve(&self, v: LocalValueId) -> ScratchOperand<'v> {
+        match v {
+            LocalValueId::Literal(id) => {
+                let literal = &self.ctx.shared.values.literals[id];
+                ScratchOperand::Const {
+                    value: self.ctx.get_literal_value(id),
+                    size: self.ctx.shared.types.size_of(literal.type_id),
+                }
+            }
+            LocalValueId::Varnode(id) => ScratchOperand::Varnode(Varnode::from_id(self.ctx, id)),
+            LocalValueId::Instruction(local) => ScratchOperand::Result(ScratchInsn {
+                ctx: self.ctx,
+                id: InstructionId::new(self.id.func, local),
+            }),
+            LocalValueId::Temp(temp) => ScratchOperand::Temp(temp),
+            LocalValueId::BasicBlock(local) => ScratchOperand::Block(self.block_view(local)),
+            other => ScratchOperand::Other(other),
+        }
+    }
+
     /// The instruction's block.
     pub fn block(&self) -> ScratchBlock<'v> {
         let block = qcode::value::Instruction::from_id(self.ctx, self.id)
@@ -528,6 +662,12 @@ mod tests {
         SleighLifter::new(sleigh_precompile::x64::spec())
     }
 
+    fn session_of<'a, 'l, 'spec>(
+        lifted: &'a ScratchLifted<'_, 'l, 'spec, '_>,
+    ) -> &'a ScratchSession<'l, 'spec> {
+        lifted.session
+    }
+
     #[test]
     fn a_session_accumulates_a_function_and_hands_over_its_context() {
         let lifter = lifter();
@@ -537,7 +677,7 @@ mod tests {
         assert_eq!(first.next_address(), second.address());
         assert_eq!(first.entry().func, session.function());
         assert_eq!(second.entry().func, session.function());
-        let ctx = session.into_context();
+        let ctx = session.into_context().unwrap();
         assert_eq!(
             FunctionBody::from_id(&ctx, first.entry().func).address(),
             Some(0x1000)
@@ -552,7 +692,9 @@ mod tests {
     #[test]
     fn a_session_continues_in_an_existing_context() {
         let lifter = lifter();
-        let ctx = LiftSession::new(&lifter, Host::At(0x1000)).into_context();
+        let ctx = LiftSession::new(&lifter, Host::At(0x1000))
+            .into_context()
+            .unwrap();
         let mut session = LiftSession::in_context(&lifter, ctx, Host::At(0x1000)).unwrap();
         let lifted = session.lift(0x1000, b"\xc3").unwrap();
         assert_eq!(lifted.exits()[0].kind(), &ExitKind::Return);
@@ -562,6 +704,64 @@ mod tests {
         assert_eq!(
             LiftSession::in_context(&lifter, other, Host::Anonymous).err(),
             Some(LiftError::IncompatibleContext)
+        );
+    }
+
+    #[test]
+    fn a_poisoned_session_refuses_to_lift_or_publish() {
+        let lifter = lifter();
+        let mut session = LiftSession::new(&lifter, Host::At(0x1000));
+        session.lift(0x1000, b"\x48\x89\xd8").unwrap();
+        let function = session.function();
+
+        // Poison the session's context the way a failed lift does: a
+        // construction whose rollback cannot account for the function, here
+        // because the emitter wrote into the fall-through placeholder the
+        // first instruction left, which the construction does not own.
+        {
+            let ctx = session.context_mut_for_test();
+            let mut addresses = AddressIndex::analyze(ctx);
+            let placeholder = addresses.block_at(0x1003).unwrap();
+            let mut target = LiftTarget::bind(ctx, &mut addresses, function).unwrap();
+            let mut construction = target.begin(0x1010, 1).unwrap();
+            let zero = construction.context().shared.get_const(0, 8);
+            construction.builder(placeholder).push_branchind(zero);
+            construction.abort();
+        }
+        assert!(session.is_poisoned());
+
+        // The poison is the context's, so it is there after the guard that
+        // set it is gone: the session lifts nothing more...
+        assert_eq!(
+            session.lift(0x1010, b"\xc3").err(),
+            Some(LiftError::Target(TargetError::Poisoned))
+        );
+        // ...its context can still be read, since the module is walkable...
+        assert!(
+            session
+                .context()
+                .block(
+                    session
+                        .context()
+                        .function(function)
+                        .root_id()
+                        .map(|r| BlockId::new(function, r))
+                        .unwrap()
+                )
+                .has_insns()
+        );
+        // ...but it is not published.
+        assert!(matches!(
+            session.into_context(),
+            Err(LiftError::Target(TargetError::Poisoned))
+        ));
+
+        // Nor is a poisoned context accepted to continue in.
+        let mut poisoned = lifter.new_context();
+        poisoned.poison();
+        assert_eq!(
+            LiftSession::in_context(&lifter, poisoned, Host::Anonymous).err(),
+            Some(LiftError::Target(TargetError::Poisoned))
         );
     }
 
@@ -622,7 +822,9 @@ mod tests {
     #[test]
     fn ten_thousand_scratch_lifts_retain_one_instruction() {
         let lifter = lifter().with_flat_control_flow();
-        let mut session = ScratchSession::new(&lifter).unwrap();
+        let mut session = ScratchSession::new(&lifter)
+            .unwrap()
+            .with_literal_budget(1_024);
         // `mov rax, imm32` with a different immediate, address and, every
         // other time, a different instruction and size.
         let mut peak = 0;
@@ -639,9 +841,62 @@ mod tests {
             peak = peak.max(stats.instructions.issued);
             assert!(stats.blocks.issued <= 4, "{stats:?}");
         }
-        // The per-instruction IR stays flat; the stable interner grew only with
-        // the distinct immediates, and never reissued an id.
+        // The per-instruction IR stays flat, and so does shared state: the
+        // 5,000 distinct immediates were interned within the budget, the
+        // storage rebuilt whenever it was exceeded, and no varnode was added.
         assert!(peak < 32, "{peak} instructions for one guest instruction");
-        assert!(session.interned_literals() >= 5_000);
+        assert!(
+            session.interned_literals() <= 1_024 + 8,
+            "{}",
+            session.interned_literals()
+        );
+        assert!(session.rebuilds() >= 4, "{}", session.rebuilds());
+        assert!(session.arena_stats().blocks.issued <= 4);
+    }
+
+    #[test]
+    fn an_operand_is_read_only_through_its_own_instruction() {
+        let lifter = lifter().with_flat_control_flow();
+        // Budget 0: the storage is rebuilt after every instruction that
+        // interned a constant, so a constant id from one instruction is
+        // recycled by the next.
+        let mut session = ScratchSession::new(&lifter).unwrap().with_literal_budget(0);
+        let stale = {
+            let lifted = session
+                .lift(0x1000, b"\x48\xc7\xc0\x44\x33\x22\x11")
+                .unwrap();
+            let store = lifted
+                .entry()
+                .instructions()
+                .find(|insn| matches!(insn.mnemonic(), Mnemonic::Store(_)))
+                .unwrap();
+            let Mnemonic::Store(st) = store.mnemonic() else {
+                unreachable!()
+            };
+            assert_eq!(store.operand(st.src).unwrap().as_const(), Some(0x1122_3344));
+            let operands: Vec<_> = store.operands().collect();
+            assert_eq!(operands.len(), 2);
+            assert!(matches!(&operands[0], ScratchOperand::Varnode(v) if v.name() == Some("RAX")));
+            assert_eq!(operands[1].as_const(), Some(0x1122_3344));
+            // An id that is not this instruction's operand is refused.
+            assert!(
+                store
+                    .operand(LocalValueId::Instruction(0usize.into()))
+                    .is_none()
+            );
+            st.src
+        };
+
+        // `mov rax, rbx`: no constant, so after the rebuild the stale id names
+        // nothing in the storage at all. No instruction of this lift resolves
+        // it — the facade never reaches the interner with a foreign id.
+        let lifted = session.lift(0x1007, b"\x48\x89\xd8").unwrap();
+        assert_eq!(session_of(&lifted).rebuilds(), 1);
+        assert_eq!(session_of(&lifted).interned_literals(), 0);
+        for block in lifted.blocks() {
+            for insn in block.instructions() {
+                assert!(insn.operand(stale).is_none(), "{:?}", insn.mnemonic());
+            }
+        }
     }
 }

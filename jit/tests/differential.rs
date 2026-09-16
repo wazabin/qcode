@@ -31,7 +31,10 @@ fn lift(code: &[u8]) -> (Context<'static>, BlockId) {
     let lifted = session
         .lift(0x1000, code)
         .expect("the instruction decodes and lifts");
-    (session.into_context(), lifted.entry())
+    let ctx = session
+        .into_context()
+        .expect("a successful lift leaves the module usable");
+    (ctx, lifted.entry())
 }
 
 /// Seeds the registers both runs start from.

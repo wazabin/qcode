@@ -103,7 +103,10 @@ fn run() -> Result<(), String> {
     session
         .lift_pcode(address, instruction.len(), &flat)
         .map_err(|error| format!("QCode lowering failed: {error}"))?;
-    println!("\nQCODE:\n{}", session.into_context());
+    let context = session
+        .into_context()
+        .map_err(|error| format!("the lifted module is unusable: {error}"))?;
+    println!("\nQCODE:\n{context}");
     Ok(())
 }
 

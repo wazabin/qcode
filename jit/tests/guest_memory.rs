@@ -34,7 +34,10 @@ fn lift(code: &[u8]) -> (Context<'static>, BlockId) {
     let lifted = session
         .lift(CODE, code)
         .expect("the instruction decodes and lifts");
-    (session.into_context(), lifted.entry())
+    let ctx = session
+        .into_context()
+        .expect("a successful lift leaves the module usable");
+    (ctx, lifted.entry())
 }
 
 /// Puts the machine back to its starting state: a known data page, `RBX`
