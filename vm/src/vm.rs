@@ -14,7 +14,6 @@
 //! resume from, or count as a crash. So the loop returns [`VmExit`] and leaves
 //! the machine intact and inspectable.
 
-use qcode::value::LocalInsnId;
 use qcode::{
     address_index::{AddressIndex, AddressTarget},
     context::Context,
@@ -1082,26 +1081,26 @@ impl<S: CodeSource> Vm<S> {
         if self.ctx.block(head).address.is_none() {
             return (forward > 0).then_some(filled);
         }
-        // Where `filled`'s instructions land: the head's own, less the
-        // terminator that absorption drops.
-        let offset = self.ctx.block(head).insn_count().saturating_sub(1);
+        // What the head has already run: everything it held before the
+        // absorbed instructions were appended, the last of which is the
+        // instruction before its terminator. The machine resumes right after
+        // it, whatever injection inserts after it — an interrupt an injector
+        // places before the first absorbed instruction, say, which has to run
+        // before it. Only this one instruction is remembered, not the whole
+        // prefix: a straight-line run is absorbed one guest instruction at a
+        // time, and collecting the prefix each time is quadratic in the length
+        // of the run, which on a large unrolled function was most of the time
+        // spent discovering it.
+        let last_executed = self.ctx.block(head).last_insn().and_then(|terminator| {
+            qcode::value::Instruction::from_id(&self.ctx, InstructionId::new(head.func, terminator))
+                .prev()
+                .map(|insn| insn.id.local)
+        });
         if qcode_passes::absorb_straight_line(&mut self.ctx, head) == 0 {
             return (forward > 0).then_some(filled);
         }
         self.stats.absorbed += 1;
 
-        // What the head has already run: everything it held before the
-        // absorbed instructions were appended. The machine resumes right
-        // after the last of these still standing, whatever cleanup deletes
-        // ahead of that point or injection inserts after it — an interrupt an
-        // injector places before the first absorbed instruction, say, which
-        // has to run before it.
-        let executed: FxHashSet<LocalInsnId> = self
-            .ctx
-            .body(head.func)
-            .insn_ids(head.local)
-            .take(offset)
-            .collect();
         self.mark_dirty(head);
 
         self.reindex_absorbed(head);
@@ -1113,15 +1112,7 @@ impl<S: CodeSource> Vm<S> {
             // not seen them: rewrite now, so a hook on the instruction about
             // to execute is not missed the first time.
             self.inject(head);
-            let resumed = self
-                .ctx
-                .body(head.func)
-                .insn_ids(head.local)
-                .rposition(|local| executed.contains(&local))
-                .map_or(0, |last| last + 1);
-            self.emu.block = head;
-            self.emu.idx = resumed;
-            self.emu.invalidate_block_cache();
+            self.emu.resume_after(&self.ctx, head, last_executed);
         }
         Some(head)
     }
