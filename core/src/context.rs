@@ -85,11 +85,41 @@ pub struct Context<'str> {
     #[serde(skip)]
     identity: ContextIdentity,
 
-    /// The module-level part of the shape revision — see
-    /// [`revision`](Self::revision): bumped when a function is added or takes
-    /// an address. The per-function part lives in each body.
+    /// The clock every address-bearing change to this module ticks — see
+    /// [`revision`](Self::revision). Shared with every installed body, so a
+    /// change made through a body reaches it without the body knowing its
+    /// module.
     #[serde(skip)]
-    shape: u64,
+    clock: ShapeClock,
+}
+
+/// A counter of changes to a module's address-bearing shape, shared between
+/// a [`Context`] and its function bodies.
+///
+/// A body's mutators run without a handle on their module, yet an index built
+/// for the module must learn of the addresses they move; so the module hands
+/// each body a clone of its clock when the body is installed, and every such
+/// change ticks it. Reading the module's revision is then one load, however
+/// many functions it has.
+#[derive(Debug, Clone, Default)]
+pub struct ShapeClock(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl ShapeClock {
+    pub(crate) fn tick(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn now(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A clock of another module starting at this one's reading: what a clone
+    /// of a module gets, so the two tick apart from then on.
+    fn fork(&self) -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            self.now(),
+        )))
+    }
 }
 
 /// The identity of the architecture description a module was built for.
@@ -153,7 +183,7 @@ impl<'str> Default for Context<'str> {
             bodies: Registry::default(),
             poisoned: false,
             identity: ContextIdentity::fresh(),
-            shape: 0,
+            clock: ShapeClock::default(),
         }
     }
 }
@@ -163,13 +193,18 @@ impl<'str> Clone for Context<'str> {
     /// same ids, but its own [`identity`](Self::identity), so derived state
     /// built for the original does not pass for state built for the clone.
     fn clone(&self) -> Self {
+        let clock = self.clock.fork();
+        let mut bodies = self.bodies.clone();
+        for mut body in bodies.iter_mut() {
+            body.link_clock(clock.clone());
+        }
         Self {
             shared: self.shared.clone(),
             interfaces: self.interfaces.clone(),
-            bodies: self.bodies.clone(),
+            bodies,
             poisoned: self.poisoned,
             identity: ContextIdentity::fresh(),
-            shape: self.shape,
+            clock,
         }
     }
 }
@@ -200,11 +235,13 @@ impl<'de, 'str> serde::Deserialize<'de> for Context<'str> {
                 "function body/interface registries drifted",
             ));
         }
+        let clock = ShapeClock::default();
         for mut body in bodies.iter_mut() {
             let id = body.id;
             body.rehydrate_id(id);
             // The wire carries operands, not the edges derived from them.
             body.rebuild_uses();
+            body.link_clock(clock.clone());
         }
         Ok(Self {
             shared,
@@ -212,7 +249,7 @@ impl<'de, 'str> serde::Deserialize<'de> for Context<'str> {
             bodies,
             poisoned,
             identity: ContextIdentity::fresh(),
-            shape: 0,
+            clock,
         })
     }
 }
@@ -569,18 +606,17 @@ impl<'str> Context<'str> {
     /// an index cannot be kept current across a write that bypasses the
     /// tracked mutators.
     ///
-    /// The count is the sum of a module-level counter and one per function
-    /// body, so reading it is O(functions).
+    /// The count is one shared [`ShapeClock`], so reading it is O(1).
     pub fn revision(&self) -> Revision {
         Revision {
             identity: self.identity,
-            shape: self.shape + self.bodies.iter().map(|body| body.shape()).sum::<u64>(),
+            shape: self.clock.now(),
         }
     }
 
-    /// Counts a change to the module-level address-bearing shape.
+    /// Counts a change to the address-bearing shape.
     pub(crate) fn touch_shape(&mut self) {
-        self.shape += 1;
+        self.clock.tick();
     }
 
     /// Returns the [`SpaceId`] for the named space, or `None` if it has not
@@ -2119,8 +2155,10 @@ impl<'str> Context<'str> {
     pub fn push_function(
         &mut self,
         interface: crate::value::function::FunctionInterface<'str>,
-        body: FunctionBody<'str>,
+        mut body: FunctionBody<'str>,
     ) -> FunctionId {
+        // From here on the body's address-bearing changes are this module's.
+        body.link_clock(self.clock.clone());
         let expected = FunctionId::from(self.bodies.len());
         assert_eq!(
             body.id(),

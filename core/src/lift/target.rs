@@ -1224,6 +1224,35 @@ mod tests {
     }
 
     #[test]
+    fn a_reloaded_or_cloned_module_counts_its_bodies_changes_on_its_own_clock() {
+        let mut ctx = Context::new();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let function = host(&mut ctx, &mut addresses, 0x1000);
+        let block = BasicBlock::make(&mut ctx, function)
+            .with_address_indexed(&mut addresses, 0x1010)
+            .id;
+
+        let bytes = bincode::serde::encode_to_vec(&ctx, bincode::config::standard()).unwrap();
+        let (mut reloaded, _): (Context<'static>, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        let mut index = AddressIndex::analyze(&reloaded);
+        assert!(index.is_current(&reloaded));
+        // A body-level mutation of the reloaded module reaches its clock...
+        reloaded.bodies[function].delete_block(block);
+        assert!(!index.is_current(&reloaded));
+        assert_eq!(
+            LiftTarget::bind_indexed(&mut reloaded, &mut index, function).err(),
+            Some(TargetError::OutdatedIndex)
+        );
+        // ...and not the original's, which the clone below also leaves alone.
+        assert!(addresses.is_current(&ctx));
+        let mut twin = ctx.clone();
+        twin.bodies[function].delete_block(block);
+        assert!(addresses.is_current(&ctx));
+        assert!(!AddressIndex::analyze(&ctx).is_current(&twin));
+    }
+
+    #[test]
     fn exits_survive_a_commit() {
         let mut ctx = Context::new();
         let mut addresses = AddressIndex::analyze(&ctx);

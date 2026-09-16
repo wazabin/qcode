@@ -509,11 +509,12 @@ pub struct FunctionBody<'str> {
     #[serde(skip)]
     pub(crate) shared_first_use: FxHashMap<LocalValueId, UseId>,
 
-    /// This body's part of the module's shape revision (see
-    /// [`Context::revision`](crate::context::Context::revision)): bumped by
-    /// every change to which blocks exist here and which addresses they carry.
+    /// The module's shape clock (see
+    /// [`Context::revision`](crate::context::Context::revision)), ticked by
+    /// every change to which addresses this body's blocks carry. Linked when
+    /// the body is installed; a detached body ticks a clock of its own.
     #[serde(skip)]
-    shape: u64,
+    clock: crate::context::ShapeClock,
 }
 
 /// Aggregate storage statistics for one kind of function-body entity.
@@ -768,7 +769,7 @@ impl<'str> FunctionBody<'str> {
             names: crate::context::NameTable::default(),
             uses: UseArena::default(),
             shared_first_use: FxHashMap::default(),
-            shape: 0,
+            clock: crate::context::ShapeClock::default(),
         }
     }
 
@@ -794,7 +795,7 @@ impl<'str> FunctionBody<'str> {
             names: crate::context::NameTable::default(),
             uses: UseArena::default(),
             shared_first_use: FxHashMap::default(),
-            shape: 0,
+            clock: crate::context::ShapeClock::default(),
         }
     }
 
@@ -1035,7 +1036,7 @@ impl<'str> FunctionBody<'str> {
     /// Only a [`ScratchStore`](crate::lift::ScratchStore) may call this — the
     /// one owner that can vouch no id of the previous epoch survives.
     pub(crate) fn start_epoch(&mut self) {
-        self.shape += 1;
+        self.touch_shape();
         self.insns.clear();
         self.blocks.clear();
         self.params.clear();
@@ -1184,15 +1185,16 @@ impl<'str> FunctionBody<'str> {
         local
     }
 
-    /// This body's part of the shape revision; see
-    /// [`Context::revision`](crate::context::Context::revision).
-    pub fn shape(&self) -> u64 {
-        self.shape
+    /// Counts a change to this body's address-bearing shape on the module's
+    /// clock.
+    pub(crate) fn touch_shape(&mut self) {
+        self.clock.tick();
     }
 
-    /// Counts a change to this body's address-bearing shape.
-    pub(crate) fn touch_shape(&mut self) {
-        self.shape += 1;
+    /// Makes this body tick `clock`: the module's, once the body is installed
+    /// in it.
+    pub(crate) fn link_clock(&mut self, clock: crate::context::ShapeClock) {
+        self.clock = clock;
     }
 
     /// Mint a fresh empty block, owned by this function (arena membership) and
@@ -2226,7 +2228,7 @@ impl<'str> FunctionBody<'str> {
         };
         self.blocks.remove(block.local);
         if addressed {
-            self.shape += 1;
+            self.touch_shape();
         }
     }
 
@@ -2297,7 +2299,7 @@ impl<'str> FunctionBody<'str> {
         // `other` for them is behind now, and one that never listed `other`
         // has nothing to catch up on.
         if b_addr.is_some() || !b_extra.is_empty() {
-            self.shape += 1;
+            self.touch_shape();
         }
         if let Some(addr) = b_addr {
             self.block_mut(keep).extra_addresses.push(addr);
