@@ -20,22 +20,29 @@
 //! constants interned in the module's shared arenas, which are immutable and
 //! unowned, so a spare one is invisible.
 //!
-//! # Splitting is not rolled back — it poisons
+//! # Splitting is deferred to commit
 //!
 //! Resolving a branch target that falls *interior* to an already-lifted block
-//! splits that block, and the split discards its optimized instructions
+//! means splitting that block, and a split discards its optimized instructions
 //! (`split_block_at_address` cannot recover a faithful per-address boundary).
-//! That mutates state older than this construction, and no rollback can put it
-//! back. So a construction that split and then fails does not silently pretend
-//! to have rolled back: it **poisons** the target. The module is left
-//! structurally walkable — both halves are empty, re-liftable placeholders —
-//! but every further construction is refused until the target is discarded.
-//! On the success path the split simply stands as part of the committed lift.
-//! Consumers bind a fresh target per instruction, so a poison is contained to
-//! the failing lift.
+//! That would mutate state older than the construction, which no rollback can
+//! put back — so the construction does not split while it may still fail. It
+//! hands the emitter a fresh, address-less tail block to branch to and records
+//! the split as pending; the split lands at commit, after every fallible check
+//! has passed. An abandoned construction deletes the tail with its other blocks
+//! and the pre-existing block is untouched.
 //!
-//! If a rollback otherwise finds state it cannot account for, the target is
-//! likewise poisoned, so the inconsistency is reported rather than built on.
+//! # Poison
+//!
+//! If a rollback finds state it cannot account for — an instruction, edge or
+//! parameter above its marks that it did not delete, which means the emitter
+//! wrote somewhere the journal does not cover — it does not pretend to have
+//! rolled back. It **poisons the context** ([`Context::poison`]), and from then
+//! on no target binds to that context and no construction begins in it, until
+//! the context is disposed of. The flag lives on the context rather than on
+//! the target because a target is a per-instruction guard: consumers rebind
+//! for every instruction, so a flag on the guard would vanish exactly when the
+//! failed lift returned.
 
 use std::fmt;
 
@@ -69,8 +76,8 @@ pub enum TargetError {
     /// A call recorded in the result names no callee the construction minted,
     /// so the emitted instruction still holds a placeholder callee.
     UnresolvedCallee { address: u64 },
-    /// A previous rollback could not restore the function, so the target no
-    /// longer vouches for it.
+    /// A previous rollback could not restore the context, which is poisoned
+    /// (see [`Context::is_poisoned`]); nothing further is lifted into it.
     Poisoned,
 }
 
@@ -99,7 +106,9 @@ impl fmt::Display for TargetError {
             Self::UnresolvedCallee { address } => {
                 write!(f, "the call to {address:#x} kept its placeholder callee")
             }
-            Self::Poisoned => f.write_str("the target was poisoned by a failed rollback"),
+            Self::Poisoned => {
+                f.write_str("the context was poisoned by a failed rollback and refuses lifting")
+            }
         }
     }
 }
@@ -114,7 +123,6 @@ pub struct LiftTarget<'a, 'str> {
     ctx: &'a mut Context<'str>,
     addresses: &'a mut AddressIndex,
     function: FunctionId,
-    poisoned: bool,
 }
 
 impl<'a, 'str> LiftTarget<'a, 'str> {
@@ -153,11 +161,16 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
     /// [`bind`](Self::bind), which rebuilds the index first. Establishing
     /// provenance without a rebuild needs context/index revision tracking,
     /// which does not exist yet.
+    ///
+    /// A [poisoned](Context::is_poisoned) context is refused outright.
     pub fn bind_indexed(
         ctx: &'a mut Context<'str>,
         addresses: &'a mut AddressIndex,
         function: FunctionId,
     ) -> Result<Self, TargetError> {
+        if ctx.is_poisoned() {
+            return Err(TargetError::Poisoned);
+        }
         if usize::from(function) >= ctx.bodies.len() {
             return Err(TargetError::UnknownFunction(function));
         }
@@ -168,7 +181,6 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
             ctx,
             addresses,
             function,
-            poisoned: false,
         })
     }
 
@@ -185,9 +197,10 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
         self.addresses
     }
 
-    /// Whether a failed rollback has left this target unusable.
+    /// Whether a failed rollback has poisoned the context this target is
+    /// bound to; see [`Context::is_poisoned`].
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned
+        self.ctx.is_poisoned()
     }
 
     /// Opens the construction of the instruction at `address`.
@@ -200,7 +213,7 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
         address: u64,
         length: usize,
     ) -> Result<Construction<'_, 'a, 'str>, TargetError> {
-        if self.poisoned {
+        if self.ctx.is_poisoned() {
             return Err(TargetError::Poisoned);
         }
         let body = &self.ctx.bodies[self.function];
@@ -219,22 +232,34 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
             temps: body.temps.len(),
             temp_spaces: body.temp_spaces.len(),
         };
-        let (entry, resolved) = self.resolve_block(address)?;
-        if resolved == Resolved::Existing && self.ctx.bodies[self.function].block(entry).has_insns()
-        {
-            return Err(TargetError::AlreadyLifted {
-                address,
-                block: entry,
-            });
-        }
+        let entry = match self.resolve_block(address)? {
+            Resolved::Existing(entry) => {
+                if self.ctx.bodies[self.function].block(entry).has_insns() {
+                    return Err(TargetError::AlreadyLifted {
+                        address,
+                        block: entry,
+                    });
+                }
+                entry
+            }
+            Resolved::Free => {
+                journal.entry_created = true;
+                self.make_block(address)
+            }
+            // The entry is interior to a lifted block: it becomes the tail of
+            // a split that lands at commit. Until then the tail is an ordinary
+            // fresh block of the host, so a failure just deletes it.
+            Resolved::Interior(block) => {
+                let tail = BasicBlock::make(self.ctx, self.function).id;
+                journal.splits.push(PendingSplit {
+                    block,
+                    address,
+                    tail,
+                });
+                tail
+            }
+        };
         journal.entry = entry;
-        journal.entry_created = resolved == Resolved::Created;
-        // A split leaves the entry as a fresh empty tail whose original half was
-        // already emptied; the split is a committed, consistent change (see
-        // [`Resolved::Split`]) and is not rolled back.
-        if resolved == Resolved::Split {
-            journal.splits.push(entry);
-        }
         FunctionBody::from_id_mut(self.ctx, self.function).add_block(entry);
         Ok(Construction {
             target: self,
@@ -243,9 +268,9 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
         })
     }
 
-    /// The block of the host at `address`, made if none is there. Reports how
-    /// it was resolved so the construction can journal it.
-    fn resolve_block(&mut self, address: u64) -> Result<(BlockId, Resolved), TargetError> {
+    /// What the host has at `address`, without changing anything: an existing
+    /// block that starts there, a lifted block it is interior to, or nothing.
+    fn resolve_block(&self, address: u64) -> Result<Resolved, TargetError> {
         let function = self.function;
         match self.addresses.get(address) {
             Some(AddressTarget::Function(owner)) => {
@@ -257,10 +282,10 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
                 if owner != function {
                     return Err(TargetError::OwnedByFunction { address, owner });
                 }
-                match self.ctx.bodies[function].root_id() {
-                    Some(root) => Ok((BlockId::new(function, root), Resolved::Existing)),
-                    None => Ok((self.make_block(address), Resolved::Created)),
-                }
+                Ok(match self.ctx.bodies[function].root_id() {
+                    Some(root) => Resolved::Existing(BlockId::new(function, root)),
+                    None => Resolved::Free,
+                })
             }
             Some(AddressTarget::Block(block)) => {
                 let live = usize::from(block.func) < self.ctx.bodies.len()
@@ -281,14 +306,11 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
                 if self.ctx.bodies[function].blocks[block.local].address != Some(address) {
                     // The address is interior to a run that was folded into
                     // one block; something branches there after all.
-                    let tail = self
-                        .ctx
-                        .split_block_at_address(self.addresses, block, address);
-                    return Ok((tail, Resolved::Split));
+                    return Ok(Resolved::Interior(block));
                 }
-                Ok((block, Resolved::Existing))
+                Ok(Resolved::Existing(block))
             }
-            None => Ok((self.make_block(address), Resolved::Created)),
+            None => Ok(Resolved::Free),
         }
     }
 
@@ -300,18 +322,17 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
     }
 }
 
-/// How [`resolve_block`](LiftTarget::resolve_block) satisfied an address.
+/// What [`resolve_block`](LiftTarget::resolve_block) found at an address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Resolved {
-    /// A block that was already there and covers the address exactly.
-    Existing,
-    /// A fresh block the construction made at a free address.
-    Created,
-    /// An existing block was split because the address was interior to it.
-    /// Both halves are now empty placeholders asking to be lifted again — a
-    /// consistent state whether or not this construction succeeds — so the
-    /// split is committed and survives a rollback.
-    Split,
+    /// A block that was already there and starts at the address.
+    Existing(BlockId),
+    /// Nothing; a construction may make a block there.
+    Free,
+    /// The address is interior to this lifted block, which absorbed it. A
+    /// construction that needs a block there gets a fresh tail and splits the
+    /// block at commit (see the [module documentation](self)).
+    Interior(BlockId),
 }
 
 /// A placeholder block the construction made for an address.
@@ -319,6 +340,15 @@ enum Resolved {
 struct Placeholder {
     address: u64,
     block: BlockId,
+}
+
+/// A split of `block` at its interior `address`, promised for commit, whose
+/// new half is `tail`: a fresh block of the host with no address yet.
+#[derive(Debug, Clone, Copy)]
+struct PendingSplit {
+    block: BlockId,
+    address: u64,
+    tail: BlockId,
 }
 
 /// What one construction added, for taking it back.
@@ -331,10 +361,10 @@ struct Journal {
     /// block that existed before, whose contents alone are the construction's.
     entry_created: bool,
     placeholders: Vec<Placeholder>,
-    /// Blocks born from splitting an existing block at an interior address.
-    /// Committed on sight (see [`Resolved::Split`]); a rollback keeps them and
-    /// their index entries rather than deleting them.
-    splits: Vec<BlockId>,
+    /// Splits of lifted blocks this construction branches into, performed at
+    /// commit. Their tails were issued after the block mark, so a rollback
+    /// deletes them like any other block and the split never happens.
+    splits: Vec<PendingSplit>,
     /// Callees the construction promised, by minted slot, to create at commit.
     minted: Vec<u64>,
     // The body's issued lengths when the construction began.
@@ -383,19 +413,33 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
 
     /// The block of the host at `address`, for a branch target or the
     /// fall-through, made as a placeholder if none is there.
+    ///
+    /// An address interior to a lifted block gets the tail of a split that
+    /// happens at commit; asking again for the same address gets the same
+    /// tail.
     pub fn block_at(&mut self, address: u64) -> Result<BlockId, TargetError> {
-        let (block, resolved) = self.target.resolve_block(address)?;
-        match resolved {
-            Resolved::Created => self
-                .journal
-                .placeholders
-                .push(Placeholder { address, block }),
-            // A split is committed and kept on rollback; the emptied original
-            // and the new tail are both consistent placeholders already.
-            Resolved::Split => self.journal.splits.push(block),
-            Resolved::Existing => {}
+        if let Some(split) = self.journal.splits.iter().find(|s| s.address == address) {
+            return Ok(split.tail);
         }
-        Ok(block)
+        match self.target.resolve_block(address)? {
+            Resolved::Existing(block) => Ok(block),
+            Resolved::Free => {
+                let block = self.target.make_block(address);
+                self.journal
+                    .placeholders
+                    .push(Placeholder { address, block });
+                Ok(block)
+            }
+            Resolved::Interior(block) => {
+                let tail = BasicBlock::make(self.target.ctx, self.target.function).id;
+                self.journal.splits.push(PendingSplit {
+                    block,
+                    address,
+                    tail,
+                });
+                Ok(tail)
+            }
+        }
     }
 
     /// The function a direct call to `address` reaches.
@@ -485,6 +529,16 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
             }
         }
 
+        // Every check that can fail has passed: land the splits, then the
+        // callees. Neither can fail, so from here the instruction is committed.
+        for split in std::mem::take(&mut self.journal.splits) {
+            self.target.ctx.split_block_into(
+                self.target.addresses,
+                split.block,
+                split.address,
+                split.tail,
+            );
+        }
         for (slot, sites) in sites.into_iter().enumerate() {
             let address = self.journal.minted[slot];
             let real = FunctionBody::from_addr_or_create_indexed(
@@ -518,26 +572,22 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
         let ctx = &mut *self.target.ctx;
         let addresses = &mut *self.target.addresses;
 
-        // Blocks born from a split are kept: the split already emptied their
-        // pre-existing half, so both are consistent placeholders whether or
-        // not this construction lands (see [`Resolved::Split`]).
-        let preserved: rustc_hash::FxHashSet<LocalBlockId> =
-            self.journal.splits.iter().map(|b| b.local).collect();
-
         // The entry keeps its identity when it existed before: branches from
-        // other instructions already name it. A split entry is preserved, so
-        // clearing it here empties this construction's emissions and leaves the
-        // consistent placeholder behind.
+        // other instructions already name it. Clearing it takes back this
+        // construction's emissions and leaves the empty placeholder behind. (An
+        // entry that is a pending split's tail is cleared here and deleted
+        // below, like any block issued after the mark.)
         if !self.journal.entry_created {
             ctx.bodies[function].clear_block_instructions(self.journal.entry);
         }
-        // Every other block the construction made — its own and the branch/
-        // fall-through placeholders — was issued after the mark. Deleting them
-        // drops their instructions, edges and names. Split blocks are skipped.
+        // Every other block the construction made — its own, the branch/
+        // fall-through placeholders and the tails of pending splits — was
+        // issued after the mark. Deleting them drops their instructions, edges
+        // and names; a pending split simply never happens.
         let body = &mut ctx.bodies[function];
         for raw in (self.journal.blocks..body.blocks.issued_len()).rev() {
             let local: LocalBlockId = raw.into();
-            if body.blocks.contains(local) && !preserved.contains(&local) {
+            if body.blocks.contains(local) {
                 body.delete_block(BlockId::new(function, local));
             }
         }
@@ -554,37 +604,25 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
         body.take_back_temps(self.journal.temps, self.journal.temp_spaces);
 
         // What the mark said is what must be left; anything else was added
-        // somewhere the journal does not know about.
+        // somewhere the journal does not know about — the emitter wrote into a
+        // block it did not own — and cannot be taken back. Reclaim the ids
+        // only when the function is exactly as it was; otherwise poison the
+        // context (see the module documentation).
         let intact = (self.journal.insns..body.insns.issued_len())
             .all(|raw| !body.insns.contains(raw.into()))
             && (self.journal.params..body.params.issued_len())
                 .all(|raw| !body.params.contains(raw.into()))
             && (self.journal.edges..body.edges.issued_len())
-                .all(|raw| !body.edges.contains(raw.into()));
+                .all(|raw| !body.edges.contains(raw.into()))
+            && (self.journal.blocks..body.blocks.issued_len())
+                .all(|raw| !body.blocks.contains(raw.into()));
         if intact {
             body.insns.truncate_issued(self.journal.insns);
             body.params.truncate_issued(self.journal.params);
             body.edges.truncate_issued(self.journal.edges);
-            // Only reclaim block ids when none above the mark is preserved; a
-            // kept split tail lives above it and must keep its id.
-            if preserved.is_empty() {
-                body.blocks.truncate_issued(self.journal.blocks);
-            }
+            body.blocks.truncate_issued(self.journal.blocks);
         } else {
-            self.target.poisoned = true;
-        }
-
-        // A split discarded a pre-existing block's optimized instructions
-        // (`split_block_at_address` cannot recover them — see its docs), which
-        // no rollback can restore. That is a mutation of state older than this
-        // construction, so the transaction did not truly roll back: poison the
-        // target. The module is left structurally walkable (both halves are
-        // empty, re-liftable placeholders), but the target refuses further
-        // constructions until it is discarded, per the failure-atomicity
-        // contract. Consumers bind a fresh target per instruction, so this is
-        // contained to the failing lift.
-        if !self.journal.splits.is_empty() {
-            self.target.poisoned = true;
+            ctx.poison();
         }
     }
 }
@@ -774,57 +812,84 @@ mod tests {
         assert!(root.is_none_or(|root| !ctx.block(BlockId::new(function, root)).has_insns()));
     }
 
-    #[test]
-    fn a_failed_split_poisons_the_target_but_leaves_it_walkable() {
-        let mut ctx = Context::new();
-        let mut addresses = AddressIndex::analyze(&ctx);
-        // A function whose root block absorbed a straight-line run: it starts
-        // at 0x1000 and also covers the interior address 0x1004.
-        let function =
-            FunctionBody::make_at_addr_indexed(&mut ctx, &mut addresses, 0x1000, None).id;
-        let root = BasicBlock::make(&mut ctx, function)
-            .with_address_indexed(&mut addresses, 0x1000)
+    /// A function whose root block absorbed a straight-line run: it starts
+    /// at 0x1000 and also covers the interior address 0x1004, and holds code.
+    fn absorbed_run(
+        ctx: &mut Context<'static>,
+        addresses: &mut AddressIndex,
+    ) -> (FunctionId, BlockId) {
+        let function = FunctionBody::make_at_addr_indexed(ctx, addresses, 0x1000, None).id;
+        let root = BasicBlock::make(ctx, function)
+            .with_address_indexed(addresses, 0x1000)
             .id;
         ctx.block_mut(root).extra_addresses.push(0x1004);
         let zero = ctx.shared.get_const(0, 8);
         ctx.builder(root).push_branchind(zero);
-        addresses.refresh(&ctx);
+        addresses.refresh(ctx);
         assert_eq!(addresses.block_at(0x1004), Some(root));
+        (function, root)
+    }
 
+    #[test]
+    fn a_split_lands_at_commit_and_an_abandoned_one_never_happens() {
+        let mut ctx = Context::new();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let (function, root) = absorbed_run(&mut ctx, &mut addresses);
+        let before = (ctx.to_string(), addresses.clone());
+
+        // An instruction at 0x2000 whose branch lands interior to root, then
+        // abandoned: the pre-existing block is exactly as it was.
         {
             let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
-            // A new instruction at 0x2000 whose branch lands interior to root,
-            // forcing a split; then the construction is abandoned.
             let mut construction = target.begin(0x2000, 2).unwrap();
             let entry = construction.entry();
             let tail = construction.block_at(0x1004).unwrap();
-            assert_ne!(tail, root, "the split makes a new tail block");
+            assert_ne!(tail, root);
+            assert_eq!(
+                construction.block_at(0x1004).unwrap(),
+                tail,
+                "one tail per address"
+            );
+            assert_eq!(
+                construction.context().block(tail).address,
+                None,
+                "not split yet"
+            );
             construction.builder(entry).push_branch(tail);
             construction.abort();
-            // The split mutated pre-existing IR that the rollback cannot
-            // restore, so the target is poisoned and refuses further work.
-            assert!(target.is_poisoned());
-            assert_eq!(target.begin(0x3000, 1).err(), Some(TargetError::Poisoned));
+            assert!(!target.is_poisoned());
         }
+        assert_eq!(ctx.to_string(), before.0);
+        assert_eq!(addresses, before.1);
+        assert!(ctx.block(root).has_insns(), "the run was not split");
+        assert!(!ctx.is_poisoned());
 
-        // The instruction's own work is gone: its entry block and address.
-        assert_eq!(addresses.block_at(0x2000), None);
-        assert_eq!(addresses.function_at(0x2000), None);
-        // The module is left structurally walkable: the split tail exists and
-        // 0x1004 resolves to it, and both halves are empty re-liftable
-        // placeholders.
-        let tail = addresses
-            .block_at(0x1004)
-            .expect("split tail kept in the index");
-        assert_ne!(tail, root);
-        assert!(ctx.body(function).blocks.contains(tail.local));
+        // The same instruction committed: now the split lands.
+        let tail = {
+            let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+            let mut construction = target.begin(0x2000, 2).unwrap();
+            let entry = construction.entry();
+            let tail = construction.block_at(0x1004).unwrap();
+            let mut recorder = Recorder::new(0x2000, 2, entry);
+            let site = construction.builder(entry).push_branch(tail).id;
+            recorder.exit(
+                site,
+                ExitArm::Unconditional,
+                ExitKind::Branch { target: 0x1004 },
+            );
+            construction.commit(recorder.finish()).unwrap();
+            tail
+        };
+        assert_eq!(addresses.block_at(0x1004), Some(tail));
+        assert_eq!(ctx.block(tail).address, Some(0x1004));
         assert!(!ctx.block(tail).has_insns());
         assert!(
             !ctx.block(root).has_insns(),
             "the split emptied the original"
         );
+        assert!(ctx.block(root).extra_addresses.is_empty());
 
-        // A fresh target lifts 0x1004 into the surviving tail.
+        // Both halves are re-liftable, the tail as the entry of its address.
         let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
         let mut construction = target.begin(0x1004, 1).unwrap();
         assert_eq!(construction.entry(), tail);
@@ -835,6 +900,79 @@ mod tests {
         recorder.exit(site, ExitArm::Unconditional, ExitKind::BranchInd);
         construction.commit(recorder.finish()).unwrap();
         assert!(ctx.block(tail).has_insns());
+    }
+
+    #[test]
+    fn an_entry_interior_to_a_run_is_split_at_commit() {
+        let mut ctx = Context::new();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let (function, root) = absorbed_run(&mut ctx, &mut addresses);
+
+        // Lifting 0x1004 itself while root still covers it: the entry is the
+        // tail of a split. Abandoned, nothing changes.
+        {
+            let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+            let construction = target.begin(0x1004, 1).unwrap();
+            assert_ne!(construction.entry(), root);
+            drop(construction);
+        }
+        assert!(ctx.block(root).has_insns());
+        assert_eq!(addresses.block_at(0x1004), Some(root));
+
+        let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+        let mut construction = target.begin(0x1004, 1).unwrap();
+        let entry = construction.entry();
+        // A self-jump resolves to the very block being built.
+        assert_eq!(construction.block_at(0x1004).unwrap(), entry);
+        let mut recorder = Recorder::new(0x1004, 1, entry);
+        let site = construction.builder(entry).push_branch(entry).id;
+        recorder.exit(
+            site,
+            ExitArm::Unconditional,
+            ExitKind::Branch { target: 0x1004 },
+        );
+        construction.commit(recorder.finish()).unwrap();
+        assert_eq!(addresses.block_at(0x1004), Some(entry));
+        assert!(ctx.block(entry).has_insns());
+        assert!(!ctx.block(root).has_insns());
+    }
+
+    #[test]
+    fn an_unaccountable_rollback_poisons_the_context_for_every_later_binding() {
+        let mut ctx = Context::new();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let function = host(&mut ctx, &mut addresses, 0x1000);
+        // A placeholder an earlier instruction left for its fall-through.
+        let other = BasicBlock::make(&mut ctx, function)
+            .with_address_indexed(&mut addresses, 0x1010)
+            .id;
+
+        {
+            let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+            let mut construction = target.begin(0x1000, 1).unwrap();
+            let _ = emit_fallthrough(&mut construction);
+            // The emitter misbehaves: it writes into a block the construction
+            // does not own, which the journal cannot take back.
+            let zero = construction.context().shared.get_const(0, 8);
+            construction.builder(other).push_branchind(zero);
+            construction.abort();
+            assert!(target.is_poisoned());
+            assert_eq!(target.begin(0x1020, 1).err(), Some(TargetError::Poisoned));
+        }
+
+        // The poison outlives the guard: it is the context's.
+        assert!(ctx.is_poisoned());
+        assert!(
+            LiftTarget::bind_indexed(&mut ctx, &mut addresses, function)
+                .is_err_and(|e| e == TargetError::Poisoned)
+        );
+        assert!(
+            LiftTarget::bind(&mut ctx, &mut addresses, function)
+                .is_err_and(|e| e == TargetError::Poisoned)
+        );
+        assert!(ctx.clone().is_poisoned());
+        // The module is still readable — the stray instruction is there to see.
+        assert!(ctx.block(other).has_insns());
     }
 
     #[test]

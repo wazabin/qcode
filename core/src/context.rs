@@ -73,6 +73,12 @@ pub struct Context<'str> {
     /// (leaving an empty body); its [`interface`](Self::interfaces) stays put, so
     /// callers always read the real interface.
     pub bodies: Registry<FunctionId, FunctionBody<'str>>,
+
+    /// Set when a lift into this module failed in a way its rollback could not
+    /// fully undo, so the module may hold IR that no instruction accounts for.
+    /// See [`is_poisoned`](Self::is_poisoned).
+    #[serde(default)]
+    poisoned: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -81,6 +87,8 @@ struct ContextWire<'str> {
     #[serde(default)]
     interfaces: Registry<FunctionId, crate::value::function::FunctionInterface<'str>>,
     bodies: Registry<FunctionId, FunctionBody<'str>>,
+    #[serde(default)]
+    poisoned: bool,
 }
 
 impl<'de, 'str> serde::Deserialize<'de> for Context<'str> {
@@ -92,6 +100,7 @@ impl<'de, 'str> serde::Deserialize<'de> for Context<'str> {
             shared,
             interfaces,
             mut bodies,
+            poisoned,
         } = ContextWire::deserialize(deserializer)?;
         if interfaces.len() != bodies.len() {
             return Err(serde::de::Error::custom(
@@ -108,6 +117,7 @@ impl<'de, 'str> serde::Deserialize<'de> for Context<'str> {
             shared,
             interfaces,
             bodies,
+            poisoned,
         })
     }
 }
@@ -393,6 +403,33 @@ impl<'str> Context<'str> {
         let default_space = Space::new(Some("ram"), 1, 8);
         ctx.shared.default_space = ctx.shared.spaces.push(default_space);
         ctx
+    }
+
+    /// Whether a construction into this module failed without a complete
+    /// rollback, leaving IR no instruction accounts for.
+    ///
+    /// A poisoned module is still readable and walkable, but it is not to be
+    /// built on: every [`LiftTarget`](crate::lift::LiftTarget) binding refuses
+    /// it, and an owning session refuses to hand it over. The flag is part of
+    /// the module — it survives rebinding and serialization — so recovery is
+    /// disposal, or a store that discards the whole damaged epoch (the scratch
+    /// store does, since its host holds nothing but the failed instruction).
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Marks the module as holding IR its construction cannot vouch for. Set
+    /// by a lift whose rollback found state it could not take back; a consumer
+    /// that detects damage of its own may set it too. There is no public way
+    /// to clear it.
+    pub fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
+    /// Clears the poison. Only for an owner that has discarded every body the
+    /// damage could be in — the scratch store, after emptying its one host.
+    pub(crate) fn clear_poison(&mut self) {
+        self.poisoned = false;
     }
 
     /// Returns the [`SpaceId`] for the named space, or `None` if it has not
@@ -754,10 +791,32 @@ impl<'str> Context<'str> {
         block: BlockId,
         addr: u64,
     ) -> BlockId {
+        let tail = BasicBlock::make(self, block.func).id;
+        self.split_block_into(addresses, block, addr, tail);
+        tail
+    }
+
+    /// [`split_block_at_address`](Self::split_block_at_address) with the new
+    /// block supplied: `tail`, an address-less block of `block`'s function,
+    /// takes `addr` (and keeps whatever was already lifted into it for that
+    /// address). A construction that must branch to an interior address
+    /// before it knows it will succeed makes the tail first and splits only
+    /// when it commits, so an abandoned construction never touches `block`.
+    pub fn split_block_into(
+        &mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        block: BlockId,
+        addr: u64,
+        tail: BlockId,
+    ) {
+        debug_assert_eq!(tail.func, block.func, "a split stays in one function");
+        debug_assert!(
+            self.block(tail).address.is_none(),
+            "the tail of a split has no address of its own yet"
+        );
         // `addr` is a branch target, and stays one: a later run through here
         // must not fold across it and undo this split.
         addresses.mark_boundary(addr);
-        let tail = BasicBlock::make(self, block.func).id;
 
         // Emptying `block` drops its terminator, and with it every outgoing
         // edge; the successors are rebuilt when it is lifted again.
@@ -773,7 +832,6 @@ impl<'str> Context<'str> {
         BasicBlock::from_id_mut(self, tail)
             .in_function(block.func)
             .with_address_indexed(addresses, addr);
-        tail
     }
 
     /// Moves `insn` and everything after it into a fresh block of the same

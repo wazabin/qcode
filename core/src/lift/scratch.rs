@@ -28,6 +28,14 @@
 //! per-instruction IR is what keeps total memory flat regardless. A stable
 //! interner is chosen over a budget-triggered rebuild precisely because a
 //! rebuild would reissue literal ids and make a retained id alias.
+//!
+//! # Failure
+//!
+//! A construction that fails rolls itself back; one whose rollback cannot
+//! account for the host [poisons](crate::context::Context::poison) the
+//! context. For scratch storage that is recoverable: the host holds nothing
+//! but the failed instruction, so the next reset, which empties it, clears
+//! the poison along with it.
 
 use crate::{
     address_index::AddressIndex,
@@ -99,10 +107,12 @@ impl ScratchStore {
     }
 
     /// Empties the host function and starts a new epoch, reusing its arena
-    /// capacity. The shared literal interner is deliberately left intact.
+    /// capacity. The shared literal interner is deliberately left intact. A
+    /// poison left by a failed instruction is cleared with the instruction.
     pub fn reset(&mut self) {
         self.epoch += 1;
         self.ctx.bodies[self.function].start_epoch();
+        self.ctx.clear_poison();
         self.addresses.clear();
     }
 
@@ -219,5 +229,37 @@ mod tests {
             0xdead_beef,
             "a retained literal id still resolves to its original value"
         );
+    }
+
+    #[test]
+    fn a_poisoned_instruction_is_discarded_with_its_epoch() {
+        let mut store = ScratchStore::new(Context::new());
+        lift_one(&mut store, 0x1000, 1);
+        {
+            // A second construction in the same epoch that writes into the
+            // previous instruction's fall-through placeholder, which its
+            // rollback cannot undo.
+            let previous = *store
+                .context()
+                .block_ids()
+                .iter()
+                .find(|&&b| !store.context().block(b).has_insns())
+                .expect("the fall-through placeholder is empty");
+            let mut target = store.target().unwrap();
+            let mut construction = target.begin(0x2000, 4).unwrap();
+            let zero = construction.context().shared.get_const(0, 8);
+            construction.builder(previous).push_branchind(zero);
+            construction.abort();
+            assert!(target.is_poisoned());
+        }
+        assert!(store.context().is_poisoned());
+        assert_eq!(store.target().err(), Some(TargetError::Poisoned));
+
+        // The reset empties the host, and with it everything the poison
+        // stood for.
+        store.reset();
+        assert!(!store.context().is_poisoned());
+        lift_one(&mut store, 0x1000, 2);
+        assert_eq!(store.arena_stats().blocks.issued, 3);
     }
 }
