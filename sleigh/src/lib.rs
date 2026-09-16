@@ -18,7 +18,7 @@
 //! use sleigh::Decoder;
 //! use sleigh_precompile::x64;
 //! use qcode::address_index::AddressIndex;
-//! use wazabin_qcode_sleigh::SleighLifter;
+//! use wazabin_qcode_sleigh::{FlatPcode, SleighLifter};
 //!
 //! let spec = x64::spec();
 //!
@@ -26,13 +26,13 @@
 //! let instruction = Decoder::new(spec)
 //!     .decode_one(0x1000, &[0x48, 0x89, 0xd8], &spec.new_context())
 //!     .expect("the bytes decode");
-//! let flat = instruction.pcode_ops().expect("the semantics emit");
+//! let flat = FlatPcode::lower(&instruction).expect("the semantics emit");
 //!
 //! let lifter = SleighLifter::new(spec);
 //! let mut ctx = lifter.new_context();
 //! let mut addresses = AddressIndex::analyze(&ctx);
 //! lifter
-//!     .lift_pcode_indexed(&mut ctx, &mut addresses, 0x1000, instruction.len(), &flat, None)
+//!     .lift_pcode_indexed(&mut ctx, &mut addresses, &flat, None)
 //!     .expect("the p-code lowers");
 //!
 //! println!("{ctx}");
@@ -55,7 +55,7 @@ use jstd::registry::Registry;
 use qcode::{
     address_index::AddressIndex,
     builder::Builder,
-    context::Context,
+    context::{ArchitectureId, Context},
     lift::{
         CallTarget, Construction, Continuation, ExitArm, ExitKind, LiftTarget, Lifted, Recorder,
         TargetError,
@@ -69,9 +69,86 @@ use qcode::{
 };
 use rustc_hash::FxHashMap as HashMap;
 use sleigh::{
-    CompiledSpec, Decoder, Instruction, InstructionPcode, LabelId, Opcode, PcodeOp, PcodePlan,
-    PcodeSink, SPACE_CONST, SpaceId, Varnode,
+    CompiledSpec, Decoder, EmitError, Instruction, InstructionPcode, LabelId, Opcode, PcodeOp,
+    PcodePlan, PcodeSink, SPACE_CONST, SpaceId, SpecFingerprint, Varnode,
 };
+
+/// Already-flattened p-code of one instruction, with the identity of the
+/// specification that produced it.
+///
+/// Flat p-code names registers by space and offset, which mean what a lifter's
+/// specification says they mean; p-code of another specification would be
+/// lowered against the wrong registers, silently. A decoded [`Instruction`]
+/// carries its specification, so lowering it is checked; this type carries the
+/// same provenance for p-code that has left the instruction behind — kept for
+/// inspection, cached, or deserialized — so the flat entry points can check it
+/// too. [`lower`](Self::lower) takes it from the instruction; [`from_parts`]
+/// (Self::from_parts) is for p-code stored with its fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlatPcode {
+    fingerprint: SpecFingerprint,
+    address: u64,
+    length: usize,
+    pcode: InstructionPcode,
+}
+
+impl FlatPcode {
+    /// Flattens `instruction`'s semantics and records which specification
+    /// they came from.
+    pub fn lower(instruction: &Instruction<'_, '_>) -> Result<Self, EmitError> {
+        Ok(Self {
+            fingerprint: instruction.spec().fingerprint(),
+            address: instruction.address(),
+            length: instruction.len(),
+            pcode: instruction.pcode_ops()?,
+        })
+    }
+
+    /// Wraps p-code the caller kept, with the fingerprint of the specification
+    /// that produced it — which the caller must have stored alongside it, as
+    /// the p-code itself does not say. A wrong fingerprint is the caller's
+    /// bug: the lifter trusts it.
+    pub fn from_parts(
+        fingerprint: SpecFingerprint,
+        address: u64,
+        length: usize,
+        pcode: InstructionPcode,
+    ) -> Self {
+        Self {
+            fingerprint,
+            address,
+            length,
+            pcode,
+        }
+    }
+
+    /// The specification the p-code was produced by.
+    pub fn fingerprint(&self) -> SpecFingerprint {
+        self.fingerprint
+    }
+
+    pub fn address(&self) -> u64 {
+        self.address
+    }
+
+    pub fn length(&self) -> usize {
+        self.length
+    }
+
+    /// The operations, for inspection.
+    pub fn pcode(&self) -> &InstructionPcode {
+        &self.pcode
+    }
+
+    pub fn ops(&self) -> &[PcodeOp] {
+        &self.pcode.ops
+    }
+
+    /// Takes the operations back out.
+    pub fn into_pcode(self) -> InstructionPcode {
+        self.pcode
+    }
+}
 
 /// Failure while converting flat p-code to QCode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,11 +175,12 @@ pub enum LiftError {
     /// The destination refused the instruction: its address is taken, a
     /// target belongs to another function, or the index is stale.
     Target(TargetError),
-    /// The context was not built by this lifter's specification, or not by
-    /// one with the same spaces and registers.
+    /// The context was not built for this lifter's specification: it carries
+    /// no architecture stamp, or another specification's.
     IncompatibleContext,
-    /// The decoded instruction was produced by a different specification than
-    /// this lifter's, so its varnodes name registers this lifter cannot map.
+    /// The decoded instruction or flat p-code was produced by a different
+    /// specification than this lifter's, so its varnodes name registers this
+    /// lifter cannot map.
     IncompatibleSpec,
     /// The bytes did not decode.
     Decode(sleigh::DecodeError),
@@ -183,6 +261,9 @@ impl From<sleigh::EmitError> for LiftError {
 /// and name hashing.
 pub struct SleighLifter<'spec> {
     spec: &'spec CompiledSpec,
+    /// The specification's identity, as stamped on every context this lifter
+    /// builds and required of every one it lowers into.
+    architecture: ArchitectureId,
     base: Context<'static>,
     storage: HashMap<Varnode, VarnodeId>,
     unique_space: SpaceId,
@@ -216,7 +297,9 @@ impl<'spec> SleighLifter<'spec> {
 
     /// Creates a lifter for `spec` and prebuilds its immutable QCode state.
     pub fn new(spec: &'spec CompiledSpec) -> Self {
+        let architecture = ArchitectureId::new(spec.fingerprint().as_u128());
         let mut base = Context::default();
+        base.set_architecture(architecture);
         base.shared.default_space = spec.default_space();
         let unique_space = spec
             .spaces()
@@ -259,6 +342,7 @@ impl<'spec> SleighLifter<'spec> {
 
         Self {
             spec,
+            architecture,
             base,
             storage,
             unique_space,
@@ -340,9 +424,7 @@ impl<'spec> SleighLifter<'spec> {
     ) -> Result<Lifted, LiftError> {
         // Both checks precede `function_for`, so a refused instruction never
         // leaves even a host function behind.
-        if !std::ptr::eq(instruction.spec(), self.spec) {
-            return Err(LiftError::IncompatibleSpec);
-        }
+        self.check_instruction(instruction)?;
         self.check_compatible(ctx)?;
         let function = self.function_for(ctx, addresses, instruction.address(), function);
         let mut target = LiftTarget::bind_indexed(ctx, addresses, function)?;
@@ -360,13 +442,7 @@ impl<'spec> SleighLifter<'spec> {
         target: &mut LiftTarget<'_, 'static>,
         instruction: &Instruction<'_, '_>,
     ) -> Result<Lifted, LiftError> {
-        // The instruction's own varnodes only mean what this lifter's register
-        // and storage map says if it was decoded by this specification. A
-        // foreign-spec instruction would otherwise be lowered against the wrong
-        // registers, silently.
-        if !std::ptr::eq(instruction.spec(), self.spec) {
-            return Err(LiftError::IncompatibleSpec);
-        }
+        self.check_instruction(instruction)?;
         self.check_compatible(target.context())?;
         let mut construction = target.begin(instruction.address(), instruction.len())?;
         // The plan carries every fact needed before the builder borrows the
@@ -391,46 +467,38 @@ impl<'spec> SleighLifter<'spec> {
         }
     }
 
-    /// Refuses a context whose architecture is not this lifter's.
+    /// Refuses a context that was not built for this lifter's specification.
     ///
-    /// A context is compatible when it was cloned from this lifter's base, or
-    /// from the base of a lifter for the same specification. This verifies the
-    /// full architectural shape: the same default space, the same spaces by id
-    /// and name, the same register count, and **every** register the lifter
-    /// knows mapped to the same location in the destination — not a sample. A
-    /// context of another specification is therefore rejected unless it happens
-    /// to match this one register-for-register, which for two distinct real
-    /// specifications does not occur.
-    ///
-    /// This is a structural identity check, not a provenance token. A cheaper,
-    /// exact identity — stamping each context with the spec that built it — is
-    /// the same deferred work as context/index revision tracking; until then
-    /// this full comparison is what stands in for it.
+    /// Compatibility is identity, not resemblance: the context must carry the
+    /// [architecture stamp](Context::architecture) of this specification's
+    /// [fingerprint](CompiledSpec::fingerprint), which
+    /// [`new_context`](Self::new_context) — of this lifter or of any lifter for
+    /// the same specification — put there. A context of another specification
+    /// is refused even when its spaces and registers happen to coincide with
+    /// this one's, and so is a context built by hand or reloaded from before
+    /// stamps existed: this lifter's register map names varnodes by the ids
+    /// its own base assigned, and only the stamp says the destination assigned
+    /// them the same way.
     fn check_compatible(&self, ctx: &Context<'static>) -> Result<(), LiftError> {
-        let base = &self.base.shared;
-        let shared = &ctx.shared;
-        let same_spaces = shared.default_space == base.default_space
-            && shared.spaces().count() == base.spaces().count()
-            && shared
-                .spaces()
-                .zip(base.spaces())
-                .all(|(a, b)| a.id == b.id && a.name == b.name);
-        if !same_spaces
-            || shared.registers.len() != base.registers.len()
-            || shared.values.varnodes.len() < base.values.varnodes.len()
-        {
+        if ctx.architecture() != Some(self.architecture) {
             return Err(LiftError::IncompatibleContext);
         }
-        let same_register = |(varnode, id): (&Varnode, &VarnodeId)| {
-            let stored = QcodeVarnode::from_id(ctx, *id);
-            stored.space().id == varnode.space
-                && stored.address() == varnode.offset as i64
-                && stored.size() == varnode.size
-        };
-        // Every register the lifter maps must land where it expects in the
-        // destination — a full comparison, not a sample.
-        if self.storage.iter().any(|r| !same_register(r)) {
-            return Err(LiftError::IncompatibleContext);
+        Ok(())
+    }
+
+    /// Refuses an instruction decoded by another specification.
+    ///
+    /// The instruction's varnodes only mean what this lifter's register map
+    /// says if it was decoded by this specification, so the fingerprints must
+    /// agree. A foreign-spec instruction would otherwise be lowered against
+    /// the wrong registers, silently.
+    fn check_instruction(&self, instruction: &Instruction<'_, '_>) -> Result<(), LiftError> {
+        self.check_fingerprint(instruction.spec().fingerprint())
+    }
+
+    fn check_fingerprint(&self, fingerprint: SpecFingerprint) -> Result<(), LiftError> {
+        if fingerprint != self.spec.fingerprint() {
+            return Err(LiftError::IncompatibleSpec);
         }
         Ok(())
     }
@@ -476,50 +544,41 @@ impl<'spec> SleighLifter<'spec> {
         ))
     }
 
-    /// Lowers already-flattened p-code. This is useful for cached or
-    /// differentially-tested instruction semantics.
+    /// Lowers already-flattened p-code, which must be this specification's
+    /// (see [`FlatPcode`]). This is useful for cached or differentially-tested
+    /// instruction semantics.
     pub fn lift_pcode_indexed(
         &self,
         ctx: &mut Context<'static>,
         addresses: &mut AddressIndex,
-        address: u64,
-        length: usize,
-        pcode: &InstructionPcode,
+        flat: &FlatPcode,
         function: Option<FunctionId>,
     ) -> Result<Lifted, LiftError> {
+        // Both checks precede `function_for`, so refused p-code never leaves
+        // even a host function behind.
+        self.check_fingerprint(flat.fingerprint())?;
         self.check_compatible(ctx)?;
-        let function = self.function_for(ctx, addresses, address, function);
+        let function = self.function_for(ctx, addresses, flat.address(), function);
         let mut target = LiftTarget::bind_indexed(ctx, addresses, function)?;
-        self.lift_pcode_ops_into(&mut target, address, length, &pcode.ops)
+        self.lift_pcode_into(&mut target, flat)
     }
 
     /// Lowers already-flattened p-code into a bound target. See
-    /// [`lift_pcode_indexed`](Self::lift_pcode_indexed).
-    pub fn lift_pcode_into(
-        &self,
-        target: &mut LiftTarget<'_, 'static>,
-        address: u64,
-        length: usize,
-        pcode: &InstructionPcode,
-    ) -> Result<Lifted, LiftError> {
-        self.lift_pcode_ops_into(target, address, length, &pcode.ops)
-    }
-
-    /// Lowers a borrowed flat p-code operation sequence. This is kept private
-    /// because callers needing an inspectable intermediate should use
     /// [`lift_pcode_indexed`](Self::lift_pcode_indexed).
     ///
     /// Unlike the streamed path this has no plan, so it recovers the same facts
     /// by scanning the operations: their direct targets, and the operation
     /// indices local branches resolve to.
-    fn lift_pcode_ops_into(
+    pub fn lift_pcode_into(
         &self,
         target: &mut LiftTarget<'_, 'static>,
-        address: u64,
-        length: usize,
-        pcode: &[PcodeOp],
+        flat: &FlatPcode,
     ) -> Result<Lifted, LiftError> {
+        self.check_fingerprint(flat.fingerprint())?;
         self.check_compatible(target.context())?;
+        let address = flat.address();
+        let length = flat.length();
+        let pcode = flat.ops();
         let plan = Self::plan_from_ops(pcode, self.flat_control_flow)?;
         let mut construction = target.begin(address, length)?;
         let mut emitter = self.emitter(&mut construction, &plan.plan)?;
@@ -1158,7 +1217,7 @@ impl PcodeSink for FlatEmitter<'_, '_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use super::SleighLifter;
+    use super::{FlatPcode, SleighLifter};
     use qcode::address_index::AddressIndex;
     use qcode::lift::{CallTarget, Continuation, Exit, ExitArm, ExitKind, Lifted};
     use qcode::value::{BasicBlock, Instruction};
@@ -1488,6 +1547,99 @@ mod tests {
     }
 
     #[test]
+    fn a_look_alike_specification_is_refused_before_anything_is_mutated() {
+        // Two specifications with the same spaces and the same register at the
+        // same place, one constructor's semantics apart. Structurally they are
+        // indistinguishable; by identity they are not the same specification,
+        // and neither's lifter accepts the other's context, instruction or
+        // flat p-code.
+        let first = tiny_spec(":set is op=1 { r0 = 1:4; }");
+        let alike = tiny_spec(":set is op=1 { r0 = 2:4; }");
+        assert_ne!(first.fingerprint(), alike.fingerprint());
+        let lifter = SleighLifter::new(&first);
+        let other = SleighLifter::new(&alike);
+
+        let mut ctx = other.new_context();
+        let before = (ctx.to_string(), ctx.revision());
+        let instruction = Decoder::new(&first)
+            .decode_one(0x1000, &[1], &first.new_context())
+            .unwrap();
+        assert_eq!(
+            lifter.lift_instruction(&mut ctx, &instruction, None).err(),
+            Some(super::LiftError::IncompatibleContext)
+        );
+        assert_eq!((ctx.to_string(), ctx.revision()), before, "refused untouched");
+
+        let mut ctx = lifter.new_context();
+        let before = (ctx.to_string(), ctx.revision());
+        let foreign = Decoder::new(&alike)
+            .decode_one(0x1000, &[1], &alike.new_context())
+            .unwrap();
+        assert_eq!(
+            lifter.lift_instruction(&mut ctx, &foreign, None).err(),
+            Some(super::LiftError::IncompatibleSpec)
+        );
+        let flat = FlatPcode::lower(&foreign).unwrap();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        assert_eq!(
+            lifter
+                .lift_pcode_indexed(&mut ctx, &mut addresses, &flat, None)
+                .err(),
+            Some(super::LiftError::IncompatibleSpec)
+        );
+        assert_eq!((ctx.to_string(), ctx.revision()), before, "refused untouched");
+        // And through a bound target.
+        let function = ctx.anon_function();
+        let before = ctx.to_string();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let mut target =
+            qcode::lift::LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+        assert_eq!(
+            lifter.lift_pcode_into(&mut target, &flat).err(),
+            Some(super::LiftError::IncompatibleSpec)
+        );
+        let _ = target;
+        assert_eq!(ctx.to_string(), before, "refused untouched");
+        // The provenance of cached p-code is the caller's claim, and it is
+        // trusted: the one honest way to lift cached p-code is to store the
+        // fingerprint with it.
+        let claimed = FlatPcode::from_parts(
+            first.fingerprint(),
+            flat.address(),
+            flat.length(),
+            flat.pcode().clone(),
+        );
+        let mut addresses = AddressIndex::analyze(&ctx);
+        lifter
+            .lift_pcode_indexed(&mut ctx, &mut addresses, &claimed, Some(function))
+            .unwrap();
+
+        // A hand-built module has no stamp, and no lifter accepts it.
+        let mut bare = qcode::context::Context::new();
+        assert_eq!(
+            lifter.lift_instruction(&mut bare, &instruction, None).err(),
+            Some(super::LiftError::IncompatibleContext)
+        );
+
+        // Identity, not instance: another lifter for the same specification
+        // builds an acceptable context, and the stamp survives a clone and a
+        // serialization round trip.
+        let twin = SleighLifter::new(&first);
+        let mut ctx = twin.new_context();
+        lifter.lift_instruction(&mut ctx, &instruction, None).unwrap();
+        let mut cloned = ctx.clone();
+        let next = Decoder::new(&first)
+            .decode_one(0x1001, &[1], &first.new_context())
+            .unwrap();
+        lifter.lift_instruction(&mut cloned, &next, None).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&ctx, bincode::config::standard()).unwrap();
+        let (mut reloaded, _): (qcode::context::Context<'static>, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(reloaded.architecture(), ctx.architecture());
+        lifter.lift_instruction(&mut reloaded, &next, None).unwrap();
+    }
+
+    #[test]
     fn a_function_of_another_context_is_refused() {
         let spec = sleigh_precompile::x64::spec();
         let lifter = SleighLifter::new(spec);
@@ -1541,18 +1693,11 @@ mod tests {
                 .lift_instruction(&mut streamed, &instruction, None)
                 .unwrap();
 
-            let pcode = instruction.pcode_ops().unwrap();
+            let pcode = FlatPcode::lower(&instruction).unwrap();
             let mut flat = lifter.new_context();
             let mut addresses = AddressIndex::analyze(&flat);
             let flat_lifted = lifter
-                .lift_pcode_indexed(
-                    &mut flat,
-                    &mut addresses,
-                    instruction.address(),
-                    instruction.len(),
-                    &pcode,
-                    None,
-                )
+                .lift_pcode_indexed(&mut flat, &mut addresses, &pcode, None)
                 .unwrap();
 
             assert_eq!(

@@ -92,6 +92,31 @@ pub struct Context<'str> {
     shape: u64,
 }
 
+/// The identity of the architecture description a module was built for.
+///
+/// A front end that installs an architecture into a module — spaces,
+/// registers, user operations — stamps the module with the identity of the
+/// description it took them from, such as a compiled SLEIGH specification's
+/// fingerprint. A lifter for a description then accepts a module exactly when
+/// the stamp is that description's: not one that merely has the same registers
+/// in the same places, which a different specification can also have. The
+/// stamp is part of the module and survives cloning and serialization, so a
+/// reloaded module still says what it was built for; a module built by hand
+/// carries none and no lifter accepts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ArchitectureId(u128);
+
+impl ArchitectureId {
+    /// Wraps a front end's own 128-bit identity.
+    pub const fn new(identity: u128) -> Self {
+        Self(identity)
+    }
+
+    pub const fn as_u128(self) -> u128 {
+        self.0
+    }
+}
+
 /// The identity of one [`Context`] instance.
 ///
 /// Every context ever constructed in a process — by [`Context::new`], by
@@ -236,6 +261,11 @@ pub struct Shared<'str> {
     /// established state.
     #[serde(default)]
     pub(crate) protections_known: bool,
+
+    /// The architecture front end this module was built for, when one built
+    /// it; see [`Context::architecture`].
+    #[serde(default)]
+    pub(crate) architecture: Option<ArchitectureId>,
 
     /// The binary format's primary entrypoint, when the loader supplied one.
     /// Analysis passes use this for narrow loader-shaped recognizers such as
@@ -500,6 +530,21 @@ impl<'str> Context<'str> {
     /// damage could be in — the scratch store, after emptying its one host.
     pub(crate) fn clear_poison(&mut self) {
         self.poisoned = false;
+    }
+
+    /// The architecture description this module was built for, if a front end
+    /// stamped one; see [`ArchitectureId`].
+    pub fn architecture(&self) -> Option<ArchitectureId> {
+        self.shared.architecture
+    }
+
+    /// Stamps the module with the architecture description its spaces,
+    /// registers and user operations come from. For the front end that
+    /// installs them, once, when it builds the module: a stamp claims that
+    /// every architectural entity in the module is that description's, and a
+    /// lifter trusts the claim.
+    pub fn set_architecture(&mut self, architecture: ArchitectureId) {
+        self.shared.architecture = Some(architecture);
     }
 
     /// Which module instance this is. See [`ContextIdentity`].

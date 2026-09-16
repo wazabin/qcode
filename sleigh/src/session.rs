@@ -35,9 +35,9 @@ use qcode::{
         insn::{Binop, Callee, IntrinsicId, Mnemonic, Unop},
     },
 };
-use sleigh::{ContextBytes, ContextError, Instruction, InstructionPcode};
+use sleigh::{ContextBytes, ContextError, Instruction};
 
-use crate::{LiftError, SleighLifter, decode::FixedDecoder};
+use crate::{FlatPcode, LiftError, SleighLifter, decode::FixedDecoder};
 
 #[cfg(doc)]
 use crate::decode::LinearDecoder;
@@ -160,18 +160,12 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
         self.lifter.lift_into(&mut target, instruction)
     }
 
-    /// Lifts already-flattened p-code, for a caller inspecting or caching
-    /// that intermediate.
-    pub fn lift_pcode(
-        &mut self,
-        address: u64,
-        length: usize,
-        pcode: &InstructionPcode,
-    ) -> Result<Lifted, LiftError> {
+    /// Lifts already-flattened p-code of the session's specification, for a
+    /// caller inspecting or caching that intermediate.
+    pub fn lift_pcode(&mut self, flat: &FlatPcode) -> Result<Lifted, LiftError> {
         let mut target =
             LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
-        self.lifter
-            .lift_pcode_into(&mut target, address, length, pcode)
+        self.lifter.lift_pcode_into(&mut target, flat)
     }
 
     /// Ends the session and hands over its context — unless a failed lift

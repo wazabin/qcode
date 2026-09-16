@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sleigh::{CompiledSpec, Decoder};
 use std::{fs, process};
 use wazabin_qcode_sleigh::{
+    FlatPcode,
     SleighLifter,
     session::{Host, LiftSession},
 };
@@ -171,11 +172,10 @@ fn run(opts: &Opts) -> Result<Output, String> {
             Err(_) => break,
         };
         let len = instruction.len();
-        let flat = instruction
-            .pcode_ops()
+        let flat = FlatPcode::lower(&instruction)
             .map_err(|e| format!("SLEIGH p-code emission failed at {at:#x}: {e}"))?;
         session
-            .lift_pcode(at, len, &flat)
+            .lift_pcode(&flat)
             .map_err(|e| format!("QCode lowering failed at {at:#x}: {e}"))?;
         instructions.push(Insn {
             address: format!("{at:#x}"),

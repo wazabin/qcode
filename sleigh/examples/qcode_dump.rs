@@ -10,6 +10,7 @@ use std::{env, process};
 use sleigh::Decoder;
 use sleigh_precompile::x64;
 use wazabin_qcode_sleigh::{
+    FlatPcode,
     SleighLifter,
     session::{Host, LiftSession},
 };
@@ -90,18 +91,17 @@ fn run() -> Result<(), String> {
             .map_err(|error| error.to_string())?
             .pretty_print(spec)
     );
-    let flat = instruction
-        .pcode_ops()
+    let flat = FlatPcode::lower(&instruction)
         .map_err(|error| format!("SLEIGH p-code emission failed: {error}"))?;
     println!("\nFLAT PCODE:");
-    for (index, op) in flat.ops.iter().enumerate() {
+    for (index, op) in flat.ops().iter().enumerate() {
         println!("{index:04}: {op:?}");
     }
 
     let lifter = SleighLifter::new(spec);
     let mut session = LiftSession::new(&lifter, Host::At(address));
     session
-        .lift_pcode(address, instruction.len(), &flat)
+        .lift_pcode(&flat)
         .map_err(|error| format!("QCode lowering failed: {error}"))?;
     let context = session
         .into_context()
