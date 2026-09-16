@@ -13,25 +13,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Override these repository variables when the path dependencies are hosted
-  # elsewhere.
-  JSTD_REPOSITORY: ${{ vars.JSTD_REPOSITORY || format('{0}/jstd', github.repository_owner) }}
-  PCODE_TYPES_REPOSITORY: ${{ vars.PCODE_TYPES_REPOSITORY || format('{0}/pcode', github.repository_owner) }}
-  BINARY_REPOSITORY: ${{ vars.BINARY_REPOSITORY || format('{0}/binary', github.repository_owner) }}
-  SLEIGH_REPOSITORY: ${{ vars.SLEIGH_REPOSITORY || format('{0}/sleigh', github.repository_owner) }}
-
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check out path dependencies
-        run: |
-          git clone --depth=1 "https://github.com/${JSTD_REPOSITORY}.git" ../wazabin-jstd
-          git clone --depth=1 "https://github.com/${PCODE_TYPES_REPOSITORY}.git" ../wazabin-pcode
-          git clone --depth=1 "https://github.com/${BINARY_REPOSITORY}.git" ../wazabin-binary
-          git -c url.https://github.com/.insteadOf=git@github.com: clone --depth=1 --recurse-submodules --shallow-submodules "https://github.com/${SLEIGH_REPOSITORY}.git" ../wazabin-sleigh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -46,12 +32,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check out path dependencies
-        run: |
-          git clone --depth=1 "https://github.com/${JSTD_REPOSITORY}.git" ../wazabin-jstd
-          git clone --depth=1 "https://github.com/${PCODE_TYPES_REPOSITORY}.git" ../wazabin-pcode
-          git clone --depth=1 "https://github.com/${BINARY_REPOSITORY}.git" ../wazabin-binary
-          git -c url.https://github.com/.insteadOf=git@github.com: clone --depth=1 --recurse-submodules --shallow-submodules "https://github.com/${SLEIGH_REPOSITORY}.git" ../wazabin-sleigh
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info

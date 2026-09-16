@@ -1516,6 +1516,8 @@ dependencies = [
 [[package]]
 name = "wazabin-binary"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbd522956ba3af684f8df2a1d2b934fe47c3af06ca831850a98f96d92c01e859"
 dependencies = [
  "elf",
  "goblin",
@@ -1525,6 +1527,8 @@ dependencies = [
 [[package]]
 name = "wazabin-jstd"
 version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d153e5272c46dc622cb0c47c53d466c0d52ddad2accb90fa841a394d38155f58"
 dependencies = [
  "rustc-hash",
  "serde",
@@ -1534,6 +1538,8 @@ dependencies = [
 [[package]]
 name = "wazabin-jstd-derive"
 version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d1a53fcd34dc17d4c81d2849be84ffabeaed36b4cb9c4052136d31b6604bbf"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1543,6 +1549,8 @@ dependencies = [
 [[package]]
 name = "wazabin-pcode"
 version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3342b0a36681fc09e5561aeb42c2029308fe33dabe479e43673eb75747c30b94"
 dependencies = [
  "serde",
  "wazabin-jstd",
@@ -1659,6 +1667,8 @@ dependencies = [
 [[package]]
 name = "wazabin-sleigh"
 version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4972010d45fd531e22c9a6f73a61c7a4f78a0a801336aa5ac5d5c97461a291d9"
 dependencies = [
  "pest",
  "pest_derive",
@@ -1671,6 +1681,8 @@ dependencies = [
 [[package]]
 name = "wazabin-sleigh-precompile"
 version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f6ebd309a3beb03558038300cd763f4066f66209135e9003a8ba39cb432699a"
 dependencies = [
  "bincode",
  "serde",
