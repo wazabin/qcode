@@ -1568,7 +1568,11 @@ mod tests {
             lifter.lift_instruction(&mut ctx, &instruction, None).err(),
             Some(super::LiftError::IncompatibleContext)
         );
-        assert_eq!((ctx.to_string(), ctx.revision()), before, "refused untouched");
+        assert_eq!(
+            (ctx.to_string(), ctx.revision()),
+            before,
+            "refused untouched"
+        );
 
         let mut ctx = lifter.new_context();
         let before = (ctx.to_string(), ctx.revision());
@@ -1587,7 +1591,11 @@ mod tests {
                 .err(),
             Some(super::LiftError::IncompatibleSpec)
         );
-        assert_eq!((ctx.to_string(), ctx.revision()), before, "refused untouched");
+        assert_eq!(
+            (ctx.to_string(), ctx.revision()),
+            before,
+            "refused untouched"
+        );
         // And through a bound target.
         let function = ctx.anon_function();
         let before = ctx.to_string();
@@ -1626,7 +1634,9 @@ mod tests {
         // serialization round trip.
         let twin = SleighLifter::new(&first);
         let mut ctx = twin.new_context();
-        lifter.lift_instruction(&mut ctx, &instruction, None).unwrap();
+        lifter
+            .lift_instruction(&mut ctx, &instruction, None)
+            .unwrap();
         let mut cloned = ctx.clone();
         let next = Decoder::new(&first)
             .decode_one(0x1001, &[1], &first.new_context())

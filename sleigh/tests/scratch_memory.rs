@@ -70,21 +70,25 @@ fn instruction(i: u32) -> (u64, Vec<u8>) {
     let address = 0x40_0000 + u64::from(i) * 7 % 0x40_0000;
     let bytes = match i % 16 {
         0 => vec![0x48, 0xc7, 0xc0, le[0], le[1], le[2], le[3]], // mov rax, imm32
-        1 => vec![0x48, 0xb8, wide[0], wide[1], wide[2], wide[3], wide[4], wide[5], wide[6], wide[7]], // movabs rax, imm64
-        2 => vec![0x74, imm8],                                 // jz rel8
-        3 => vec![0xe9, le[0], le[1], le[2], 0x00],            // jmp rel32
-        4 => vec![0xe8, le[0], le[1], le[2], 0x00],            // call rel32
-        5 => vec![0xff, 0xd0],                                 // call rax
-        6 => vec![0xc3],                                       // ret
-        7 => vec![0xf3, 0xa4],                                 // rep movsb
-        8 => vec![0xf3, 0x48, 0xab],                           // rep stosq
-        9 => vec![0xd9, 0x05, le[0], le[1], le[2], 0x00],      // fld dword [disp32]
-        10 => vec![0xde, 0xc9],                                // fmulp
-        11 => vec![0x0f, 0x58, 0xc1],                          // addps xmm0, xmm1
+        1 => vec![
+            0x48, 0xb8, wide[0], wide[1], wide[2], wide[3], wide[4], wide[5], wide[6], wide[7],
+        ], // movabs rax, imm64
+        2 => vec![0x74, imm8],                                   // jz rel8
+        3 => vec![0xe9, le[0], le[1], le[2], 0x00],              // jmp rel32
+        4 => vec![0xe8, le[0], le[1], le[2], 0x00],              // call rel32
+        5 => vec![0xff, 0xd0],                                   // call rax
+        6 => vec![0xc3],                                         // ret
+        7 => vec![0xf3, 0xa4],                                   // rep movsb
+        8 => vec![0xf3, 0x48, 0xab],                             // rep stosq
+        9 => vec![0xd9, 0x05, le[0], le[1], le[2], 0x00],        // fld dword [disp32]
+        10 => vec![0xde, 0xc9],                                  // fmulp
+        11 => vec![0x0f, 0x58, 0xc1],                            // addps xmm0, xmm1
         12 => vec![0xf2, 0x0f, 0x59, 0x04, 0x25, le[0], le[1], le[2], 0x00], // mulsd xmm0, [disp32]
-        13 => vec![0x66, 0x0f, 0x6f, 0xc1],                    // movdqa xmm0, xmm1
+        13 => vec![0x66, 0x0f, 0x6f, 0xc1],                      // movdqa xmm0, xmm1
         14 => vec![0x48, 0x8d, 0x80, le[0], le[1], le[2], le[3]], // lea rax, [rax+disp32]
-        _ => vec![0x48, 0x81, 0x04, 0x25, le[0], le[1], le[2], 0x00, imm8, 0x00, 0x00, 0x00], // add qword [disp32], imm32
+        _ => vec![
+            0x48, 0x81, 0x04, 0x25, le[0], le[1], le[2], 0x00, imm8, 0x00, 0x00, 0x00,
+        ], // add qword [disp32], imm32
     };
     (address, bytes)
 }
@@ -127,12 +131,20 @@ fn total_retained_bytes_stop_growing_after_the_first_budget_cycle() {
             peak_after = peak_after.max(retained);
         }
         if (i + 1) % CHECKPOINT == 0 {
-            checkpoints.push((i + 1, retained, session.rebuilds(), session.interned_literals()));
+            checkpoints.push((
+                i + 1,
+                retained,
+                session.rebuilds(),
+                session.interned_literals(),
+            ));
         }
     }
     assert_eq!(lifted, LIFTS);
 
-    println!("{:>7} {:>14} {:>9} {:>9}", "lifts", "retained (B)", "rebuilds", "literals");
+    println!(
+        "{:>7} {:>14} {:>9} {:>9}",
+        "lifts", "retained (B)", "rebuilds", "literals"
+    );
     for (n, retained, rebuilds, literals) in &checkpoints {
         println!("{n:>7} {retained:>14} {rebuilds:>9} {literals:>9}");
     }
@@ -162,7 +174,10 @@ fn total_retained_bytes_stop_growing_after_the_first_budget_cycle() {
     // And the last checkpoint is no larger than the first cycle's peak plus the
     // allowance either — the footprint is a bounded oscillation, not a ramp.
     let last = checkpoints.last().unwrap().1;
-    assert!(last <= peak_in_first_cycle + allowance, "{last} B at the end");
+    assert!(
+        last <= peak_in_first_cycle + allowance,
+        "{last} B at the end"
+    );
 }
 
 /// Retention per corpus shape, for locating what a shape leaves behind.
@@ -220,7 +235,10 @@ fn retained_bytes_by_stage() {
     let spec = sleigh_precompile::x64::spec();
     let lifter = SleighLifter::new(spec).with_flat_control_flow();
     let decoder = Decoder::new(spec);
-    let shape: u32 = std::env::var("SHAPE").ok().and_then(|s| s.parse().ok()).unwrap_or(11);
+    let shape: u32 = std::env::var("SHAPE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(11);
     const N: u32 = 500;
     for stage in 0..3 {
         let mut store = ScratchStore::new(lifter.new_context());

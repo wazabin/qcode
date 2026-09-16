@@ -580,7 +580,9 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
             Err(TargetError::OwnedByFunction { owner, .. }) => {
                 Ok(Transfer::Function(Callee::Real(owner)))
             }
-            Err(TargetError::ForeignBlock { owner, .. }) if promotion == Promotion::SplitFunction => {
+            Err(TargetError::ForeignBlock { owner, .. })
+                if promotion == Promotion::SplitFunction =>
+            {
                 let block = self
                     .target
                     .addresses
@@ -655,11 +657,15 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
                 return Err(unresolved(None));
             };
             let consistent = match (mnemonic, reported(local)) {
-                (Mnemonic::Call(_), Some(ExitKind::Call { callee, .. })) => match (minted, callee) {
-                    (Minted::Address(minted), CallTarget::Address(address)) => minted == address,
-                    (Minted::Named(minted), CallTarget::Named(name)) => minted == name,
-                    _ => false,
-                },
+                (Mnemonic::Call(_), Some(ExitKind::Call { callee, .. })) => {
+                    match (minted, callee) {
+                        (Minted::Address(minted), CallTarget::Address(address)) => {
+                            minted == address
+                        }
+                        (Minted::Named(minted), CallTarget::Named(name)) => minted == name,
+                        _ => false,
+                    }
+                }
                 (Mnemonic::Call(_), _) => false,
                 _ => true,
             };
@@ -698,9 +704,11 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
                 }
                 Minted::Named(name) => match FunctionBody::from_name(self.target.ctx, name) {
                     Some(function) => function.id,
-                    None => FunctionBody::make(self.target.ctx, Cow::Owned(name.to_string()))
-                        .expect("the name was free when it was promised")
-                        .id,
+                    None => {
+                        FunctionBody::make(self.target.ctx, Cow::Owned(name.to_string()))
+                            .expect("the name was free when it was promised")
+                            .id
+                    }
                 },
                 Minted::Promoted { block, .. } => self
                     .target
@@ -1219,12 +1227,13 @@ mod tests {
         let zero = ctx.shared.get_const(0, 8);
         let scratch = BasicBlock::make(&mut ctx, function).id;
         ctx.builder(scratch).push_branchind(zero);
-        assert!(addresses.is_current(&ctx), "an address-less block is not indexed");
+        assert!(
+            addresses.is_current(&ctx),
+            "an address-less block is not indexed"
+        );
 
         // A block given an address behind the index: the index now omits it.
-        let unlisted = BasicBlock::make(&mut ctx, function)
-            .with_address(0x1010)
-            .id;
+        let unlisted = BasicBlock::make(&mut ctx, function).with_address(0x1010).id;
         assert_eq!(addresses.block_at(0x1010), None);
         assert!(!addresses.is_current(&ctx));
         assert!(addresses.describes(&ctx));
@@ -1248,7 +1257,10 @@ mod tests {
         );
         construction.commit(recorder.finish()).unwrap();
         let _ = target;
-        assert!(addresses.is_current(&ctx), "a construction leaves it current");
+        assert!(
+            addresses.is_current(&ctx),
+            "a construction leaves it current"
+        );
         assert_eq!(
             ctx.block_ids()
                 .iter()
@@ -1332,9 +1344,7 @@ mod tests {
         let mut ctx = Context::new();
         let mut addresses = AddressIndex::analyze(&ctx);
         let function = host(&mut ctx, &mut addresses, 0x1000);
-        let unlisted = BasicBlock::make(&mut ctx, function)
-            .with_address(0x1010)
-            .id;
+        let unlisted = BasicBlock::make(&mut ctx, function).with_address(0x1010).id;
         addresses.mark_current(&ctx);
         let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
         let mut construction = target.begin(0x1000, 1).unwrap();
@@ -1384,7 +1394,11 @@ mod tests {
         let mut target = LiftTarget::bind(&mut ctx, &mut addresses, function).unwrap();
         assert_eq!(target.addresses().block_at(0x1001), None, "refreshed");
         let mut construction = target.begin(0x1001, 1).unwrap();
-        assert_ne!(construction.entry(), placeholder, "a fresh block, not the deleted id");
+        assert_ne!(
+            construction.entry(),
+            placeholder,
+            "a fresh block, not the deleted id"
+        );
         let lifted = emit_fallthrough(&mut construction);
         construction.commit(lifted).unwrap();
         let _ = target;
@@ -1449,7 +1463,11 @@ mod tests {
             let mut construction = target.begin(0x1000, 2).unwrap();
             let callee = construction.callee_named("syscall");
             assert_eq!(callee, Callee::Minted(0));
-            assert_eq!(construction.callee_named("syscall"), callee, "one slot per name");
+            assert_eq!(
+                construction.callee_named("syscall"),
+                callee,
+                "one slot per name"
+            );
             let entry = construction.entry();
             construction.builder(entry).push_call(callee);
             construction.abort();
@@ -1650,7 +1668,10 @@ mod tests {
         let promoted = addresses.function_at(0x2010).expect("split out at commit");
         assert_ne!(promoted, other);
         assert_eq!(ctx.functions().count(), 3);
-        let root = ctx.function(promoted).root_id().expect("the block became its root");
+        let root = ctx
+            .function(promoted)
+            .root_id()
+            .expect("the block became its root");
         assert!(ctx.block(BlockId::new(promoted, root)).has_insns());
         assert!(!ctx.contains_block(foreign), "rehomed out of `other`");
         let jump = crate::value::Instruction::from_id(&ctx, site);

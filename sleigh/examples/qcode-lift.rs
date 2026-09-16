@@ -15,8 +15,7 @@ use serde::{Deserialize, Serialize};
 use sleigh::{CompiledSpec, Decoder};
 use std::{fs, process};
 use wazabin_qcode_sleigh::{
-    FlatPcode,
-    SleighLifter,
+    FlatPcode, SleighLifter,
     session::{Host, LiftSession},
 };
 

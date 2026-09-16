@@ -10,8 +10,7 @@ use std::{env, process};
 use sleigh::Decoder;
 use sleigh_precompile::x64;
 use wazabin_qcode_sleigh::{
-    FlatPcode,
-    SleighLifter,
+    FlatPcode, SleighLifter,
     session::{Host, LiftSession},
 };
 

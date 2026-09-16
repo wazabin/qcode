@@ -29,7 +29,10 @@ fn main() {
     let lifter = SleighLifter::new(spec).with_flat_control_flow();
 
     println!("checked binding alone, by module size (index current):");
-    println!("{:>10} {:>8} {:>12} {:>14} {:>16}", "functions", "blocks", "bind_indexed", "bind(current)", "bind(refresh)");
+    println!(
+        "{:>10} {:>8} {:>12} {:>14} {:>16}",
+        "functions", "blocks", "bind_indexed", "bind(current)", "bind(refresh)"
+    );
     for &functions in &[1usize, 10, 100, 1_000, 10_000] {
         let mut ctx = lifter.new_context();
         let mut addresses = AddressIndex::analyze(&ctx);
