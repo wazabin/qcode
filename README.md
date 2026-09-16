@@ -107,8 +107,8 @@ running the corpus and reporting SLEIGH constructor coverage.
 cargo test --workspace --all-features
 ```
 
-The workspace uses the sibling `wazabin-sleigh`, `wazabin-pcode`,
-`wazabin-binary`, and `wazabin-jstd` checkouts declared in `Cargo.toml`.
+The `wazabin-sleigh`, `wazabin-pcode`, `wazabin-binary` and `wazabin-jstd`
+dependencies come from crates.io.
 
 ## License
 
