@@ -14,7 +14,7 @@
 //! ([`FunctionBody::rebuild_uses`](crate::value::FunctionBody::rebuild_uses)),
 //! and [`UseId`] never leaves the crate.
 
-use jstd::Identifier;
+use jstd::{Identifier, recycling_arena::RecyclingArena};
 
 use crate::value::{LocalValueId, insn::LocalInsnId};
 
@@ -39,126 +39,9 @@ pub(crate) trait WithUsers {
     fn first_use_mut(&mut self) -> &mut Option<UseId>;
 }
 
-/// One arena slot: a live edge, or a free slot on the free list.
-#[derive(Debug, Clone, Copy)]
-enum Slot {
-    Live(Use),
-    /// The next free slot after this one, if any.
-    Free(Option<UseId>),
-}
-
-impl Slot {
-    fn live(&self) -> Option<&Use> {
-        match self {
-            Slot::Live(edge) => Some(edge),
-            Slot::Free(_) => None,
-        }
-    }
-
-    fn live_mut(&mut self) -> Option<&mut Use> {
-        match self {
-            Slot::Live(edge) => Some(edge),
-            Slot::Free(_) => None,
-        }
-    }
-}
-
-/// Slab storage for a body's use edges. A removed slot is reused by the next
-/// insertion (through a free list threaded through the free slots), so a
-/// body that churns — lifting a block, then deleting most of it — does not
-/// grow the arena past its peak. Ids are stable while their edge is live;
-/// nothing outside the body holds one, so reuse is safe.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct UseArena {
-    slots: Vec<Slot>,
-    free: Option<UseId>,
-    live: usize,
-}
-
-impl UseArena {
-    /// Stores `edge`, reusing a freed slot when there is one.
-    pub(crate) fn push(&mut self, edge: Use) -> UseId {
-        self.live += 1;
-        match self.free {
-            Some(id) => {
-                let slot = &mut self.slots[usize::from(id)];
-                let Slot::Free(next) = *slot else {
-                    unreachable!("use {id:?} is on the free list but live");
-                };
-                self.free = next;
-                *slot = Slot::Live(edge);
-                id
-            }
-            None => {
-                let id = UseId::from(self.slots.len());
-                self.slots.push(Slot::Live(edge));
-                id
-            }
-        }
-    }
-
-    /// Frees `id`'s slot, returning the edge it held.
-    pub(crate) fn remove(&mut self, id: UseId) -> Use {
-        let slot = &mut self.slots[usize::from(id)];
-        let Slot::Live(edge) = *slot else {
-            panic!("use {id:?} is already free");
-        };
-        *slot = Slot::Free(self.free);
-        self.free = Some(id);
-        self.live -= 1;
-        edge
-    }
-
-    /// The number of live edges.
-    pub(crate) fn len(&self) -> usize {
-        self.live
-    }
-
-    /// Whether `id` names a live edge.
-    pub(crate) fn contains(&self, id: UseId) -> bool {
-        self.slots
-            .get(usize::from(id))
-            .is_some_and(|slot| slot.live().is_some())
-    }
-
-    /// Every live edge, in slot order.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (UseId, &Use)> + '_ {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(raw, slot)| Some((UseId::from(raw), slot.live()?)))
-    }
-
-    /// Drops every edge.
-    pub(crate) fn clear(&mut self) {
-        self.slots.clear();
-        self.free = None;
-        self.live = 0;
-    }
-
-    /// Releases capacity beyond the slots in use (live or on the free list).
-    pub(crate) fn shrink_to_fit(&mut self) {
-        self.slots.shrink_to_fit();
-    }
-}
-
-impl std::ops::Index<UseId> for UseArena {
-    type Output = Use;
-
-    fn index(&self, id: UseId) -> &Use {
-        self.slots[usize::from(id)]
-            .live()
-            .unwrap_or_else(|| panic!("use {id:?} is free"))
-    }
-}
-
-impl std::ops::IndexMut<UseId> for UseArena {
-    fn index_mut(&mut self, id: UseId) -> &mut Use {
-        self.slots[usize::from(id)]
-            .live_mut()
-            .unwrap_or_else(|| panic!("use {id:?} is free"))
-    }
-}
+/// Body-local slab storage for use edges. Removed slots are reused; `UseId`
+/// remains stable only while its edge is live and never escapes the body.
+pub(crate) type UseArena = RecyclingArena<UseId, Use>;
 
 #[cfg(test)]
 mod tests {
@@ -193,8 +76,108 @@ mod tests {
         assert_eq!(arena.push(edge(5)), UseId::from(3), "then the slab grows");
         assert_eq!(arena.len(), 4);
 
-        let live: Vec<UseId> = arena.iter().map(|(id, _)| id).collect();
+        let live: Vec<UseId> = arena.iter().map(|edge| edge.id).collect();
         assert_eq!(live, vec![a, b, c, UseId::from(3)]);
+    }
+
+    #[test]
+    fn iteration_skips_holes_and_yields_identified_edges() {
+        let mut arena = UseArena::default();
+        assert!(arena.is_empty());
+        let ids: Vec<UseId> = (0..5).map(|raw| arena.push(edge(raw))).collect();
+        arena.remove(ids[1]);
+        arena.remove(ids[3]);
+        assert!(!arena.is_empty());
+        assert_eq!(arena.len(), 3);
+
+        let seen: Vec<(UseId, Use)> = arena.iter().map(|e| (e.id, *e.inner)).collect();
+        assert_eq!(
+            seen,
+            vec![(ids[0], edge(0)), (ids[2], edge(2)), (ids[4], edge(4))]
+        );
+        assert_eq!(arena[ids[2]], edge(2), "indexing yields the payload");
+    }
+
+    #[test]
+    fn free_and_unknown_ids_do_not_resolve() {
+        let mut arena = UseArena::default();
+        let a = arena.push(edge(0));
+        let b = arena.push(edge(1));
+        arena.remove(a);
+
+        assert!(!arena.contains(a));
+        assert!(arena.get(a).is_none());
+        assert!(arena.get_mut(a).is_none());
+        assert!(!arena.contains(UseId::from(7)), "past the slab");
+        assert!(arena.get(UseId::from(7)).is_none());
+
+        let mut live = arena.get_mut(b).expect("b is live");
+        assert_eq!(live.id, b);
+        live.next = Some(b);
+        assert_eq!(arena.get(b).map(|e| e.next), Some(Some(b)));
+
+        // The freed id aliases the next edge stored: a stale `a` would now
+        // read a different edge, which is why no id outlives its edge.
+        assert_eq!(arena.push(edge(9)), a);
+        assert_eq!(arena[a], edge(9));
+    }
+
+    #[test]
+    fn clear_forgets_the_free_list_and_restarts_ids() {
+        let mut arena = UseArena::default();
+        let a = arena.push(edge(0));
+        let b = arena.push(edge(1));
+        arena.remove(a);
+        arena.clear();
+        assert!(arena.is_empty());
+        assert!(!arena.contains(a));
+        assert!(!arena.contains(b));
+        assert_eq!(arena.push(edge(2)), UseId::from(0), "ids restart at zero");
+        assert_eq!(
+            arena.push(edge(3)),
+            UseId::from(1),
+            "the old free list is gone"
+        );
+        arena.shrink_to_fit();
+        assert_eq!(arena.iter().count(), 2);
+    }
+
+    #[test]
+    fn churn_never_grows_the_slab_past_its_peak() {
+        let mut arena = UseArena::default();
+        let mut live: Vec<UseId> = (0..8).map(|raw| arena.push(edge(raw))).collect();
+        let peak = 8;
+        for round in 0..100 {
+            // Drop half, then refill: the slab must reuse the freed slots.
+            for _ in 0..4 {
+                let id = live.remove(round % live.len());
+                arena.remove(id);
+            }
+            for raw in 0..4 {
+                let id = arena.push(edge(raw + round));
+                assert!(usize::from(id) < peak, "slot {id:?} beyond the peak");
+                live.push(id);
+            }
+            assert_eq!(arena.len(), peak);
+            assert_eq!(arena.iter().count(), peak);
+        }
+        let mut seen: Vec<usize> = arena.iter().map(|e| usize::from(e.id)).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..peak).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cloning_copies_the_slots_and_the_free_list() {
+        let mut arena = UseArena::default();
+        let a = arena.push(edge(0));
+        let b = arena.push(edge(1));
+        arena.remove(a);
+        let mut copy = arena.clone();
+        assert_eq!(copy.len(), 1);
+        assert!(!copy.contains(a));
+        assert_eq!(copy[b], edge(1));
+        assert_eq!(copy.push(edge(2)), a, "the clone reuses the same free slot");
+        assert!(!arena.contains(a), "and the original is untouched");
     }
 
     #[test]
