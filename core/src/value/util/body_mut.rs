@@ -2,9 +2,9 @@
 //!
 //! [`BodyView`] gives the read layer a `Copy` static provider that
 //! routes arena reads to the pass's own function. [`BodyMut`] is its mutable
-//! sibling: a single function's arenas borrowed `&mut` in place from
-//! `Context.bodies[id]` for exclusive mutation by one worker (the driver's
-//! `Context::split` hands out disjoint body borrows).
+//! sibling: a single function's arenas borrowed `&mut` in place, through a
+//! [`BodyLoan`](crate::value::BodyLoan), for exclusive mutation by one worker
+//! (the driver's [`Context::split_bodies`] lends disjoint bodies).
 //!
 //! All *shared* data (types, varnodes, spaces, registers, name map) stays behind
 //! the `&Shared` view, reachable read-only. The inherent verb + read methods below
@@ -26,9 +26,10 @@ use crate::{
     },
 };
 
-/// A single function borrowed `&mut` in place from `Context.bodies[id]` for
-/// exclusive mutation (its interface stays in `Context.interfaces[id]`,
-/// reachable read-only through `interfaces`).
+/// A single function borrowed `&mut` in place — out of a
+/// [`BodyLoan`](crate::value::BodyLoan) — for exclusive mutation (its
+/// interface stays in the module's interface registry, reachable read-only
+/// through `interfaces`).
 ///
 /// Out of scope (and asserted against on construction): a function with
 /// *reattributed* blocks — a roster block stored in, or parented to, a different

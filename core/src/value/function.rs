@@ -420,7 +420,34 @@ pub struct MemoryInterfaceMap {
 /// caller-reasoning surface lives separately in [`FunctionInterface`], stored in
 /// [`Context::interfaces`](crate::context::Context::interfaces)
 /// under the same [`FunctionId`].
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+/// The identity of one [`FunctionBody`] *value*.
+///
+/// Every body ever made in a process — constructed, cloned or deserialized —
+/// has a distinct identity, and keeps it for its whole life, through moves.
+/// A module lends its bodies out by [`BodyLoan`](crate::value::BodyLoan),
+/// which remembers the identity it lent and so can tell, when the loan is
+/// returned, whether the slot still holds that value or was given another
+/// (a swap with another module's body, a replacement, a clone put back).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BodyIdentity(u64);
+
+impl BodyIdentity {
+    fn fresh() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Default for BodyIdentity {
+    /// A fresh identity: what a deserialized body gets, since the wire does
+    /// not carry one.
+    fn default() -> Self {
+        Self::fresh()
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct FunctionBody<'str> {
     /// Immutable identity of this body in the lockstep function registries, or
     /// `None` while the body is *detached* (freshly minted by a pass, not yet
@@ -521,6 +548,37 @@ pub struct FunctionBody<'str> {
     /// the body is installed; a detached body ticks a clock of its own.
     #[serde(skip)]
     clock: crate::context::ShapeClock,
+
+    /// Which body value this is; see [`BodyIdentity`]. Never shared: a clone
+    /// gets its own, as does a deserialized body.
+    #[serde(skip)]
+    identity: BodyIdentity,
+}
+
+impl<'str> Clone for FunctionBody<'str> {
+    /// A clone is a new, detached body value: the same contents and ids, its
+    /// own [`identity`](Self::identity), and a clock of its own — it is not
+    /// installed in the module the original is, so its changes must not move
+    /// that module's revision. Installing it links it.
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            root: self.root,
+            insns: self.insns.clone(),
+            blocks: self.blocks.clone(),
+            roster: self.roster.clone(),
+            params: self.params.clone(),
+            edges: self.edges.clone(),
+            temp_spaces: self.temp_spaces.clone(),
+            temps: self.temps.clone(),
+            instruction_addrs: self.instruction_addrs.clone(),
+            names: self.names.clone(),
+            uses: self.uses.clone(),
+            shared_first_use: self.shared_first_use.clone(),
+            clock: crate::context::ShapeClock::default(),
+            identity: BodyIdentity::fresh(),
+        }
+    }
 }
 
 /// Aggregate storage statistics for one kind of function-body entity.
@@ -781,6 +839,7 @@ impl<'str> FunctionBody<'str> {
             uses: UseArena::default(),
             shared_first_use: FxHashMap::default(),
             clock: crate::context::ShapeClock::default(),
+            identity: BodyIdentity::fresh(),
         }
     }
 
@@ -807,7 +866,13 @@ impl<'str> FunctionBody<'str> {
             uses: UseArena::default(),
             shared_first_use: FxHashMap::default(),
             clock: crate::context::ShapeClock::default(),
+            identity: BodyIdentity::fresh(),
         }
+    }
+
+    /// Which body value this is; see [`BodyIdentity`].
+    pub fn identity(&self) -> BodyIdentity {
+        self.identity
     }
 
     /// This body's immutable function identity. Panics on a detached body (one
@@ -903,9 +968,29 @@ impl<'str> FunctionBody<'str> {
         &self.blocks[id.local]
     }
     /// The block `id`, mutably.
+    ///
+    /// A block carries its addresses, and what the holder of a `&mut` does
+    /// with it — a swap, a replacement — is not observable, so handing one
+    /// out counts as a change to the module's address-bearing shape (see
+    /// [`Context::revision`](crate::context::Context::revision)). Prefer the
+    /// block mutators, which move the revision only when an address changes;
+    /// for the parameters, [`block_params_mut`](Self::block_params_mut).
     pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
+        self.touch_shape();
+        self.block_raw_mut(id)
+    }
+
+    /// The block `id`, mutably, for this crate's mutators, which tick the
+    /// clock themselves exactly when they change an address.
+    pub(crate) fn block_raw_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
         assert_eq!(id.func, self.id(), "block belongs to another function");
         &mut self.blocks[id.local]
+    }
+
+    /// The parameters declared at the entry of block `id`, mutably. Parameters
+    /// carry no address, so this moves nothing.
+    pub fn block_params_mut(&mut self, id: BlockId) -> &mut Vec<LocalParamId> {
+        &mut self.block_raw_mut(id).params
     }
 
     /// Whether `id` currently names a live block payload in this body.
@@ -1191,6 +1276,11 @@ impl<'str> FunctionBody<'str> {
     /// usable on a detached (uninstalled) body.
     pub fn push_block_local(&mut self, mut block: BasicBlock<'str>) -> LocalBlockId {
         block.first_use = None;
+        // A block that arrives with addresses — a clone of an installed one —
+        // is an addressed entity an index that was current does not list.
+        if block.address.is_some() || !block.extra_addresses.is_empty() {
+            self.touch_shape();
+        }
         let local = self.blocks.push(block);
         self.roster.push(local);
         local
@@ -1498,10 +1588,10 @@ impl<'str> FunctionBody<'str> {
     pub fn remove_cfg_edge(&mut self, edge_id: EdgeId) {
         let EdgeData { from, to } = *self.edge(edge_id);
         let func = self.id();
-        self.block_mut(BlockId::new(func, from))
+        self.block_raw_mut(BlockId::new(func, from))
             .edges
             .remove(&edge_id);
-        self.block_mut(BlockId::new(func, to))
+        self.block_raw_mut(BlockId::new(func, to))
             .edges
             .remove(&edge_id);
         self.edges.remove(edge_id);
@@ -1809,8 +1899,8 @@ impl<'str> FunctionBody<'str> {
         };
         for eid in outgoing {
             self.edges[eid].from = keep.local;
-            self.block_mut(keep).edges.insert(eid);
-            self.block_mut(remove).edges.remove(&eid);
+            self.block_raw_mut(keep).edges.insert(eid);
+            self.block_raw_mut(remove).edges.remove(&eid);
         }
     }
 
@@ -2313,9 +2403,9 @@ impl<'str> FunctionBody<'str> {
             self.touch_shape();
         }
         if let Some(addr) = b_addr {
-            self.block_mut(keep).extra_addresses.push(addr);
+            self.block_raw_mut(keep).extra_addresses.push(addr);
         }
-        self.block_mut(keep).extra_addresses.extend(b_extra);
+        self.block_raw_mut(keep).extra_addresses.extend(b_extra);
     }
 
     /// Register `name` for `id` in this body's local name table (block/instruction/

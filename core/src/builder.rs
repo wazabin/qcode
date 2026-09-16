@@ -735,7 +735,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 None,
             )
             .expect("name was deduplicated");
-        self.body.block_mut(id).set_name(Some(unique_name));
+        self.body.block_raw_mut(id).set_name(Some(unique_name));
         self.local_labels.insert(name, id.local);
         id
     }

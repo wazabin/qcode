@@ -27,8 +27,10 @@
 //! it. `mark_current` is the one way to claim currency without a rebuild; it
 //! is for a caller that applied a mutation's effects to the index by hand,
 //! and a wrong claim is that caller's bug. The address-bearing fields of
-//! blocks and function interfaces are crate-private, so no change to them
-//! happens outside the mutators that move the revision.
+//! blocks and function interfaces are crate-private, and bodies are only
+//! lent out ([`BodyLoan`](crate::value::BodyLoan)), so no change to what a
+//! module covers happens outside the mutators that move the revision — see
+//! [`Context::revision`].
 
 use rustc_hash::FxHashMap;
 

@@ -10,10 +10,10 @@
 //! ## The context view
 //!
 //! A pass reads the module through a [`PassCtx`] and mutates a single
-//! [`FunctionBody`] borrowed `&mut` from the bodies registry. Splitting a
-//! [`Context`] into those two halves is what [`with_body_mut`] does. Because
-//! `PassCtx` holds only shared references it is `Copy`, so a caller hands the
-//! same view to every helper.
+//! [`FunctionBody`] lent out of the bodies registry. Splitting a [`Context`]
+//! into those two halves is what [`with_body_mut`] does. Because `PassCtx`
+//! holds only shared references it is `Copy`, so a caller hands the same view
+//! to every helper.
 //!
 //! `PassCtx` is the environment-free half of the richer view used by the full
 //! analysis pipeline: it carries the module's shared IR state and published
@@ -54,7 +54,8 @@ use jstd::registry::Registry;
 use qcode::{
     context::{Context, Shared},
     value::{
-        BodyView, FunctionBody, FunctionId, function::FunctionInterface, util::body_mut::BodyMut,
+        BodiesMut, BodyView, FunctionBody, FunctionId, function::FunctionInterface,
+        util::body_mut::BodyMut,
     },
 };
 
@@ -88,7 +89,7 @@ impl<'ctx, 'str> PassCtx<'ctx, 'str> {
     pub fn new(ctx: &'ctx Context<'str>) -> Self {
         Self {
             shared: &ctx.shared,
-            interfaces: &ctx.interfaces,
+            interfaces: ctx.interfaces(),
         }
     }
 
@@ -135,25 +136,15 @@ impl<'ctx, 'str> PassCtx<'ctx, 'str> {
     }
 }
 
-/// Split a context into its mutable bodies registry and the read-only module
-/// view, so a worker can hold one body `&mut` while reading shared state.
-pub fn split<'a, 'str>(
-    ctx: &'a mut Context<'str>,
-) -> (
-    &'a mut Registry<FunctionId, FunctionBody<'str>>,
-    PassCtx<'a, 'str>,
-) {
-    (
-        &mut ctx.bodies,
-        PassCtx {
-            shared: &ctx.shared,
-            interfaces: &ctx.interfaces,
-        },
-    )
+/// Split a context into its lendable bodies and the read-only module view,
+/// so a worker can hold one body `&mut` while reading shared state.
+pub fn split<'a, 'str>(ctx: &'a mut Context<'str>) -> (BodiesMut<'a, 'str>, PassCtx<'a, 'str>) {
+    let (bodies, shared, interfaces) = ctx.split_bodies();
+    (bodies, PassCtx { shared, interfaces })
 }
 
-/// Run `f` against function `fid`'s body borrowed `&mut` out of `ctx`, with the
-/// matching read-only view.
+/// Run `f` against function `fid`'s body lent out of `ctx`, with the matching
+/// read-only view.
 ///
 /// This is the `&mut Context` entry point the block-local passes expose to
 /// callers that hold a whole context and neither a [`FunctionBody`] nor a view.
@@ -162,6 +153,6 @@ pub fn with_body_mut<'str, R>(
     fid: FunctionId,
     f: impl FnOnce(&mut FunctionBody<'str>, PassCtx<'_, 'str>) -> R,
 ) -> R {
-    let (bodies, view) = split(ctx);
-    f(&mut bodies[fid], view)
+    let (mut bodies, view) = split(ctx);
+    f(&mut bodies.get_mut(fid), view)
 }

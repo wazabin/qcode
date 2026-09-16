@@ -164,7 +164,7 @@ pub fn remove_unused_no_pred_block_params<'a, 'str>(
     }
 
     if changed {
-        body.block_mut(block_id).params = kept;
+        *body.block_params_mut(block_id) = kept;
     }
     changed
 }

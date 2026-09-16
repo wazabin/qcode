@@ -36,6 +36,14 @@ use crate::{
     },
 };
 
+/// Proof that a call to a sealed [`QCodeMut`] primitive comes from this
+/// crate: nameable everywhere, constructible only here.
+#[doc(hidden)]
+pub struct Sealed(());
+
+/// The one [`Sealed`] value.
+pub(crate) const SEAL: Sealed = Sealed(());
+
 /// Body-local mutation capability shared by the module host ([`Context`]) and
 /// the checked-out pass host ([`BodyMut`]).
 ///
@@ -51,7 +59,13 @@ pub trait QCodeMut<'str> {
 
     /// The storage of the function `id` (write). The checked-out host panics if
     /// `id` is not its own function.
-    fn function_mut(&mut self, id: FunctionId) -> &mut FunctionBody<'str>;
+    ///
+    /// Sealed: only this crate's verbs route through the bare body, and they
+    /// tick the module's clock exactly when they change an address. A caller
+    /// outside the crate takes a body out as a [`BodyLoan`](crate::value::BodyLoan)
+    /// (through [`Context::body_mut`] or [`Context::split_bodies`]), which
+    /// settles what was done with it.
+    fn function_mut(&mut self, id: FunctionId, _: Sealed) -> &mut FunctionBody<'str>;
 
     /// The storage of the function `id` (read), tied to `&self`. The
     /// borrow-friendly read primitive for host-generic ref code: a fully
@@ -72,17 +86,27 @@ pub trait QCodeMut<'str> {
 
     /// Mutably borrows the instruction `id` from its owning function's arena.
     fn instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
-        &mut self.function_mut(id.func).insns[id.local]
+        &mut self.function_mut(id.func, SEAL).insns[id.local]
     }
 
     /// Mutably borrows the block `id` from its owning function's arena.
+    ///
+    /// Counts as a change to the module's address-bearing shape, like
+    /// [`FunctionBody::block_mut`]: the block carries its addresses, and what
+    /// the holder does with a `&mut` is not observable.
     fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
-        &mut self.function_mut(id.func).blocks[id.local]
+        self.function_mut(id.func, SEAL).block_mut(id)
+    }
+
+    /// The block `id`, mutably, for this crate's verbs (sealed).
+    #[doc(hidden)]
+    fn block_raw_mut(&mut self, id: BlockId, _: Sealed) -> &mut BasicBlock<'str> {
+        &mut self.function_mut(id.func, SEAL).blocks[id.local]
     }
 
     /// Mutably borrows the block parameter `id` from its owning function's arena.
     fn block_param_mut(&mut self, id: BlockParamId) -> &mut BlockParam<'str> {
-        &mut self.function_mut(id.func).params[id.local]
+        &mut self.function_mut(id.func, SEAL).params[id.local]
     }
 
     // ---- body-local verbs (canon: inherent methods on `FunctionBody`) -------
@@ -101,7 +125,7 @@ pub trait QCodeMut<'str> {
         let func = id
             .name_scope_function()
             .expect("register_body_name on a global-scoped value");
-        self.function_mut(func)
+        self.function_mut(func, SEAL)
             .register_body_name(id, name, old_name)
     }
 
@@ -109,12 +133,12 @@ pub trait QCodeMut<'str> {
     /// Positional block and edge-argument rewrites belong to the caller and may
     /// complete later in the same transformation.
     fn remove_block_param(&mut self, id: BlockParamId) {
-        self.function_mut(id.func).remove_block_param(id);
+        self.function_mut(id.func, SEAL).remove_block_param(id);
     }
 
     /// Insert `insn` immediately before `before` in `block`, setting its parent.
     fn insert_insn_before(&mut self, block: BlockId, before: InstructionId, insn: InstructionId) {
-        self.function_mut(block.func)
+        self.function_mut(block.func, SEAL)
             .insert_insn_before(block, before, insn);
     }
 
@@ -123,7 +147,8 @@ pub trait QCodeMut<'str> {
     /// belong to the same function; the destination block is inferred from the
     /// anchor.
     fn move_insn_before(&mut self, insn: InstructionId, before: InstructionId) {
-        self.function_mut(insn.func).move_insn_before(insn, before);
+        self.function_mut(insn.func, SEAL)
+            .move_insn_before(insn, before);
     }
 
     /// Adds a directed edge in the CFG from `from` to `to`, returning its id.
@@ -140,7 +165,7 @@ pub trait QCodeMut<'str> {
             from.func, to.func,
             "cross-function CFG edge {from:?} -> {to:?} (strict IR locality, ruling 2)"
         );
-        self.function_mut(from.func).add_cfg_edge(from, to)
+        self.function_mut(from.func, SEAL).add_cfg_edge(from, to)
     }
 
     /// Replace every use of `old` with `new` across `old`'s owning function,
@@ -156,14 +181,15 @@ pub trait QCodeMut<'str> {
         let Some(func) = old.owning_function() else {
             return;
         };
-        self.function_mut(func).replace_all_uses_with(old, new);
+        self.function_mut(func, SEAL)
+            .replace_all_uses_with(old, new);
     }
 
     /// Remove instruction `id` from its block, unlink its outgoing CFG edges if
     /// a terminator, clear its name, prune its operand use-lists, and
     /// physically drop its payload.
     fn remove_instruction(&mut self, id: InstructionId) {
-        self.function_mut(id.func).remove_instruction(id);
+        self.function_mut(id.func, SEAL).remove_instruction(id);
     }
 
     /// Replace every use of instruction `id` with `new`, then remove `id` —
@@ -171,7 +197,7 @@ pub trait QCodeMut<'str> {
     /// ([`replace_all_uses_with`](Self::replace_all_uses_with) +
     /// [`remove_instruction`](Self::remove_instruction)).
     fn replace_instruction(&mut self, id: InstructionId, new: impl Into<ValueId>) {
-        self.function_mut(id.func)
+        self.function_mut(id.func, SEAL)
             .replace_instruction(id, new.into());
     }
 
@@ -185,14 +211,14 @@ pub trait QCodeMut<'str> {
             by_func.entry(id.func).or_default().insert(id.local);
         }
         for (func, dead) in by_func {
-            self.function_mut(func).remove_instructions(&dead);
+            self.function_mut(func, SEAL).remove_instructions(&dead);
         }
     }
 
     /// Rehome `remove`'s outgoing CFG edges onto `keep`. The direct edge and
     /// `keep`'s forwarding terminator have already been removed by the caller.
     fn rehome_outgoing_edges(&mut self, keep: BlockId, remove: BlockId) {
-        self.function_mut(keep.func)
+        self.function_mut(keep.func, SEAL)
             .rehome_outgoing_edges(keep, remove);
     }
 
@@ -200,28 +226,28 @@ pub trait QCodeMut<'str> {
     /// step. For transforms that change an instruction without changing its
     /// identity, parent block, address, or result type.
     fn replace_instruction_mnemonic(&mut self, id: InstructionId, mnemonic: Mnemonic) {
-        self.function_mut(id.func)
+        self.function_mut(id.func, SEAL)
             .replace_instruction_mnemonic(id, mnemonic);
     }
 
     /// Drop `block` from its function's ownership roster. Ownership is derived
     /// from the storing arena (`block.func`); the arena slot is untouched.
     fn unroster_block(&mut self, block: BlockId) {
-        self.function_mut(block.func).unroster_block(block);
+        self.function_mut(block.func, SEAL).unroster_block(block);
     }
 
     /// Remove `block` from its function: unlink every incident CFG edge, remove
     /// its instructions and params, clear ownership metadata, then drop its
     /// payload.
     fn delete_block(&mut self, block: BlockId) {
-        self.function_mut(block.func).delete_block(block);
+        self.function_mut(block.func, SEAL).delete_block(block);
     }
 
     /// Absorb `other` into `keep`: drop `keep`'s terminal branch, append
     /// `other`'s instructions, rehome its outgoing edges, and remove it.
     /// `edge_ab` is the direct edge `keep -> other`.
     fn absorb_block(&mut self, keep: BlockId, other: BlockId, edge_ab: EdgeId) {
-        self.function_mut(keep.func)
+        self.function_mut(keep.func, SEAL)
             .absorb_block(keep, other, edge_ab);
     }
 }
@@ -236,8 +262,8 @@ impl<'str, H: QCodeMut<'str>> QCodeMut<'str> for &mut H {
         Self: 'v,
         'str: 'v;
 
-    fn function_mut(&mut self, id: FunctionId) -> &mut FunctionBody<'str> {
-        (**self).function_mut(id)
+    fn function_mut(&mut self, id: FunctionId, seal: Sealed) -> &mut FunctionBody<'str> {
+        (**self).function_mut(id, seal)
     }
 
     fn body(&self, id: FunctionId) -> &FunctionBody<'str> {
@@ -264,7 +290,7 @@ impl<'str> QCodeMut<'str> for Context<'str> {
         Self: 'v,
         'str: 'v;
 
-    fn function_mut(&mut self, id: FunctionId) -> &mut FunctionBody<'str> {
+    fn function_mut(&mut self, id: FunctionId, _: Sealed) -> &mut FunctionBody<'str> {
         &mut self.bodies[id]
     }
 
@@ -292,7 +318,7 @@ impl<'a, 'str> QCodeMut<'str> for BodyMut<'a, 'str> {
         Self: 'v,
         'str: 'v;
 
-    fn function_mut(&mut self, id: FunctionId) -> &mut FunctionBody<'str> {
+    fn function_mut(&mut self, id: FunctionId, _: Sealed) -> &mut FunctionBody<'str> {
         BodyMut::function_mut(self, id)
     }
 

@@ -1,7 +1,11 @@
 //! The central arena for all IR state: [`Context`].
 
 use crate::value::QCodeMut;
-use std::{borrow::Cow, fmt::Display};
+use std::{
+    borrow::Cow,
+    fmt::Display,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -12,8 +16,8 @@ use crate::{
     space::{LocalMemorySpaceId, MemorySpaceId, Space, SpaceId, SpaceStore},
     types::TypeManager,
     value::{
-        BasicBlock, BlockParamRef, FunctionBody, FunctionId, FunctionRef, Instruction, ModuleView,
-        QCodeView, TempId, TempSpaceId, ValueId,
+        BasicBlock, BlockParamRef, BodiesMut, BodyLoan, FunctionBody, FunctionId, FunctionRef,
+        Instruction, ModuleView, QCodeView, TempId, TempSpaceId, ValueId,
         block::{BlockId, BlockRef, EdgeData, EdgeId},
         block_param::{BlockParam, BlockParamId},
         insn::{InstructionId, InstructionRef, Mnemonic, PCodeOpId},
@@ -55,30 +59,38 @@ use jstd::registry::{self, Identified, Registry};
 pub struct Context<'str> {
     /// Module-shared IR state: everything that is **not** per-function interface
     /// or body storage (regimes 1–3 of the context-split design — architecture,
-    /// interners, module maps, truths). Reached today behind `&mut Context`;
-    /// [`Context::split()`](Self) (stage 5b-ii c.2) will hand it out as a frozen
-    /// `&Shared` view while the bodies registry is borrowed mutably.
+    /// interners, module maps, truths). Reached behind `&mut Context`, or as
+    /// the frozen `&Shared` view [`split_bodies`](Self::split_bodies) hands
+    /// out while bodies are lent.
     pub shared: Shared<'str>,
 
     /// Per-function *interface* storage — the caller-reasoning surface (name,
     /// address, kind, external-ness, signature) held in lockstep with
-    /// [`bodies`](Self::bodies) under the same [`FunctionId`] space. Never checked
-    /// out: a co-checked-out callee answers interface queries from here.
+    /// [`bodies`](Self::bodies) under the same [`FunctionId`] space. Read
+    /// through [`interfaces`](Self::interfaces) and [`interface`](Self::interface);
+    /// written only by this crate's tracked mutators, since an interface
+    /// carries the function's address.
     #[serde(default)]
-    pub interfaces: Registry<FunctionId, crate::value::function::FunctionInterface<'str>>,
+    pub(crate) interfaces: Registry<FunctionId, crate::value::function::FunctionInterface<'str>>,
 
     /// Per-function *body* storage. Each function owns its instruction/block/param/
     /// edge arenas; the composite-ID accessors ([`Context::instruction`] etc.)
-    /// route through here. A checked-out function's body is moved out of its slot
-    /// (leaving an empty body); its [`interface`](Self::interfaces) stays put, so
-    /// callers always read the real interface.
-    pub bodies: Registry<FunctionId, FunctionBody<'str>>,
+    /// route through here. Read through [`bodies`](Self::bodies) and
+    /// [`body`](Self::body); a body is handed out mutably only as a
+    /// [`BodyLoan`], which settles what the holder did with it against the
+    /// module's revision — see [`revision`](Self::revision). The registry
+    /// itself is never handed out mutably, so bodies cannot be installed,
+    /// removed or swapped except by this crate.
+    pub(crate) bodies: Registry<FunctionId, FunctionBody<'str>>,
 
     /// Set when a lift into this module failed in a way its rollback could not
-    /// fully undo, so the module may hold IR that no instruction accounts for.
-    /// See [`is_poisoned`](Self::is_poisoned).
+    /// fully undo, so the module may hold IR that no instruction accounts for,
+    /// or when a [`BodyLoan`] settled a body that is not the one its slot
+    /// installs. See [`is_poisoned`](Self::is_poisoned). Atomic so a loan,
+    /// which borrows the module's bodies mutably, can set it through a shared
+    /// reference.
     #[serde(default)]
-    poisoned: bool,
+    poisoned: AtomicBool,
 
     /// Which module instance this is; see [`identity`](Self::identity). Never
     /// shared: a clone or a deserialized module gets its own.
@@ -106,11 +118,11 @@ pub struct ShapeClock(std::sync::Arc<std::sync::atomic::AtomicU64>);
 
 impl ShapeClock {
     pub(crate) fn tick(&self) {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.0.fetch_add(1, Ordering::Relaxed);
     }
 
     fn now(&self) -> u64 {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
+        self.0.load(Ordering::Relaxed)
     }
 
     /// A clock of another module starting at this one's reading: what a clone
@@ -181,7 +193,7 @@ impl<'str> Default for Context<'str> {
             shared: Shared::default(),
             interfaces: Registry::default(),
             bodies: Registry::default(),
-            poisoned: false,
+            poisoned: AtomicBool::new(false),
             identity: ContextIdentity::fresh(),
             clock: ShapeClock::default(),
         }
@@ -191,7 +203,9 @@ impl<'str> Default for Context<'str> {
 impl<'str> Clone for Context<'str> {
     /// A clone is a new module instance: it has the same contents and the
     /// same ids, but its own [`identity`](Self::identity), so derived state
-    /// built for the original does not pass for state built for the clone.
+    /// built for the original does not pass for state built for the clone;
+    /// its bodies are linked to its own clock, so their changes move its
+    /// revision and not the original's.
     fn clone(&self) -> Self {
         let clock = self.clock.fork();
         let mut bodies = self.bodies.clone();
@@ -202,7 +216,7 @@ impl<'str> Clone for Context<'str> {
             shared: self.shared.clone(),
             interfaces: self.interfaces.clone(),
             bodies,
-            poisoned: self.poisoned,
+            poisoned: AtomicBool::new(self.is_poisoned()),
             identity: ContextIdentity::fresh(),
             clock,
         }
@@ -247,7 +261,7 @@ impl<'de, 'str> serde::Deserialize<'de> for Context<'str> {
             shared,
             interfaces,
             bodies,
-            poisoned,
+            poisoned: AtomicBool::new(poisoned),
             identity: ContextIdentity::fresh(),
             clock,
         })
@@ -552,7 +566,7 @@ impl<'str> Context<'str> {
     /// disposal, or a store that discards the whole damaged epoch (the scratch
     /// store does, since its host holds nothing but the failed instruction).
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned
+        self.poisoned.load(Ordering::Relaxed)
     }
 
     /// Marks the module as holding IR its construction cannot vouch for. Set
@@ -560,13 +574,13 @@ impl<'str> Context<'str> {
     /// that detects damage of its own may set it too. There is no public way
     /// to clear it.
     pub fn poison(&mut self) {
-        self.poisoned = true;
+        self.poisoned.store(true, Ordering::Relaxed);
     }
 
     /// Clears the poison. Only for an owner that has discarded every body the
     /// damage could be in — the scratch store, after emptying its one host.
     pub(crate) fn clear_poison(&mut self) {
-        self.poisoned = false;
+        self.poisoned.store(false, Ordering::Relaxed);
     }
 
     /// The architecture description this module was built for, if a front end
@@ -600,13 +614,24 @@ impl<'str> Context<'str> {
     /// Derived address state records the revision it was computed at; the
     /// state is current exactly while the revision has not moved
     /// ([`AddressIndex::is_current`](crate::address_index::AddressIndex::is_current)).
-    /// Every such change made through this crate's API is counted. Writing a
-    /// block's or interface's public `address` field directly, or rebuilding a
-    /// body's arenas by hand, is not: those fields are public for reading, and
-    /// an index cannot be kept current across a write that bypasses the
-    /// tracked mutators.
     ///
-    /// The count is one shared [`ShapeClock`], so reading it is O(1).
+    /// Every such change made through the public API is counted, which the
+    /// API guarantees in three ways. The address-bearing fields — a block's
+    /// addresses, an interface's entry address — are crate-private, and each
+    /// mutator that writes one ticks the clock. The registries of bodies and
+    /// interfaces are never reachable mutably, so nothing is installed,
+    /// removed or replaced in them except by this crate, which counts what it
+    /// installs ([`push_function`](Self::push_function),
+    /// [`push_block`](Self::push_block)). And a body is only ever lent out
+    /// mutably, as a [`BodyLoan`] that settles the slot when it is returned:
+    /// a body swapped with another module's, replaced, or restored from a
+    /// clone is counted then, and linked to this module's clock. A bare
+    /// `&mut BasicBlock` cannot be settled that way, so handing one out
+    /// ([`block_mut`](Self::block_mut)) counts as a change outright.
+    ///
+    /// The count is one shared [`ShapeClock`], so reading it is O(1); a loan
+    /// settles in O(1) too, so a caller that keeps its index current across
+    /// instruction-level edits binds it without a rebuild.
     pub fn revision(&self) -> Revision {
         Revision {
             identity: self.identity,
@@ -1029,7 +1054,7 @@ impl<'str> Context<'str> {
             // its, and the index stops pointing at it for them: whichever
             // half covers each address is settled by lifting, not guessed at
             // here.
-            let absorbed = std::mem::take(&mut ctx.block_mut(block).extra_addresses);
+            let absorbed = std::mem::take(&mut ctx.block_raw_mut(block).extra_addresses);
             ctx.bodies[block.func].touch_shape();
             for absorbed_addr in absorbed {
                 addresses.forget(absorbed_addr);
@@ -1442,8 +1467,8 @@ impl<'str> Context<'str> {
             for &e in &extra {
                 addresses.rehome_block(e, old, new);
             }
-            self.block_mut(new).extra_addresses = extra;
-            self.block_mut(new).address = Some(addr);
+            self.block_raw_mut(new).extra_addresses = extra;
+            self.block_raw_mut(new).address = Some(addr);
             self.bodies[new.func].touch_shape();
         }
 
@@ -2033,9 +2058,87 @@ impl<'str> Context<'str> {
         &self.bodies[fid]
     }
 
-    /// The function *body* `fid`, mutably (see [`Context::body`]).
-    pub fn body_mut(&mut self, fid: FunctionId) -> &mut crate::value::FunctionBody<'str> {
-        &mut self.bodies[fid]
+    /// The function *body* `fid`, lent out mutably (see [`Context::body`]).
+    ///
+    /// The loan settles the slot against the module's revision when it is
+    /// dropped, so a body swapped or replaced through it is accounted for;
+    /// see [`BodyLoan`]. The module is borrowed for as long as the loan lives.
+    pub fn body_mut(&mut self, fid: FunctionId) -> BodyLoan<'_, 'str> {
+        BodyLoan::new(&mut self.bodies[fid], fid, &self.clock, &self.poisoned)
+    }
+
+    /// Every function body, with its id, for reading. Mutable access is by
+    /// [loan](Self::body_mut) or through [`split_bodies`](Self::split_bodies).
+    ///
+    /// The registry itself is never reachable mutably, so a body cannot be
+    /// installed, removed or replaced behind the module's revision:
+    ///
+    /// ```compile_fail,E0616
+    /// # use qcode::context::Context;
+    /// let mut ctx = Context::new();
+    /// let other = Context::new();
+    /// ctx.bodies = other.bodies.clone();
+    /// ```
+    ///
+    /// ```compile_fail,E0616
+    /// # use qcode::context::Context;
+    /// let mut ctx = Context::new();
+    /// let mut other = Context::new();
+    /// std::mem::swap(&mut ctx.bodies, &mut other.bodies);
+    /// let _ = std::mem::take(&mut ctx.interfaces);
+    /// ```
+    ///
+    /// Nor is a bare `&mut FunctionBody` obtainable from the mutation
+    /// primitive the verbs route through — it is sealed to this crate:
+    ///
+    /// ```compile_fail,E0423
+    /// # use qcode::{context::Context, value::{QCodeMut, view_mut::Sealed}};
+    /// let mut ctx = Context::new();
+    /// let f = ctx.anon_function();
+    /// let body = QCodeMut::function_mut(&mut ctx, f, Sealed(()));
+    /// ```
+    pub fn bodies(&self) -> &Registry<FunctionId, FunctionBody<'str>> {
+        &self.bodies
+    }
+
+    /// Every function interface, with its id, held in lockstep with the
+    /// bodies under the same ids. Written only through the function mutators
+    /// ([`FunctionMutRef`]), since an interface carries the function's address.
+    pub fn interfaces(
+        &self,
+    ) -> &Registry<FunctionId, crate::value::function::FunctionInterface<'str>> {
+        &self.interfaces
+    }
+
+    /// The published interface of function `fid`.
+    pub fn interface(&self, fid: FunctionId) -> &crate::value::function::FunctionInterface<'str> {
+        &self.interfaces[fid]
+    }
+
+    /// The number of functions in the module.
+    pub fn function_count(&self) -> usize {
+        self.bodies.len()
+    }
+
+    /// Borrows the bodies for lending alongside the frozen module state a
+    /// pass reads: the shared IR state and the interface registry.
+    ///
+    /// This is how a pass driver holds one body — or several disjoint ones —
+    /// mutably while reading the rest of the module; see [`BodiesMut`]. The
+    /// bodies-free halves cannot alias a lent body, and the bodies cannot be
+    /// added to, removed from or replaced through the borrow.
+    pub fn split_bodies(
+        &mut self,
+    ) -> (
+        BodiesMut<'_, 'str>,
+        &Shared<'str>,
+        &Registry<FunctionId, crate::value::function::FunctionInterface<'str>>,
+    ) {
+        (
+            BodiesMut::new(&mut self.bodies, &self.clock, &self.poisoned),
+            &self.shared,
+            &self.interfaces,
+        )
     }
 
     // ----- Composite-id arena routing (moved off `ValueRegistry` in the
@@ -2078,7 +2181,20 @@ impl<'str> Context<'str> {
     }
 
     /// Mutably borrows the basic block `id`.
+    ///
+    /// A block carries its addresses, and what the holder of a `&mut` does
+    /// with it — a swap, a replacement — is not observable, so handing one
+    /// out counts as a change to the module's address-bearing shape: an index
+    /// kept across this call is behind afterwards. Prefer the block mutators
+    /// ([`BlockMutRef`], the builder), which move the revision only when an
+    /// address actually changes.
     pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
+        self.bodies[id.func].block_mut(id)
+    }
+
+    /// The block `id`, mutably, for this crate's mutators, which tick the
+    /// clock themselves exactly when they change an address.
+    pub(crate) fn block_raw_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
         &mut self.bodies[id.func].blocks[id.local]
     }
 
@@ -2133,12 +2249,10 @@ impl<'str> Context<'str> {
         }
     }
 
+    /// Appends `block` to `func`'s body. A block that already carries an
+    /// address moves the module's revision (see [`FunctionBody::push_block`]).
     pub fn push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
-        let local = self.bodies[func].blocks.push(block);
-        let id = BlockId::new(func, local);
-        // A block is born owned by the function whose arena stores it.
-        self.bodies[func].roster.push(local);
-        id
+        self.bodies[func].push_block(block)
     }
 
     pub fn push_block_param(&mut self, func: FunctionId, param: BlockParam<'str>) -> BlockParamId {
@@ -2152,12 +2266,17 @@ impl<'str> Context<'str> {
 
     /// Push a function's interface and body in lockstep, returning the shared
     /// [`FunctionId`]. Both registries must always grow together.
+    ///
+    /// The installed body's address-bearing changes are this module's from
+    /// here on. Installing something that already carries addresses — an
+    /// interface with an entry address, a body with blocks (a clone of an
+    /// installed one, say) — moves the module's revision, since an index that
+    /// was current before does not list them.
     pub fn push_function(
         &mut self,
         interface: crate::value::function::FunctionInterface<'str>,
         mut body: FunctionBody<'str>,
     ) -> FunctionId {
-        // From here on the body's address-bearing changes are this module's.
         body.link_clock(self.clock.clone());
         let expected = FunctionId::from(self.bodies.len());
         assert_eq!(
@@ -2165,6 +2284,9 @@ impl<'str> Context<'str> {
             expected,
             "function body id does not match its registry slot"
         );
+        if interface.address.is_some() || !body.blocks.is_empty() {
+            self.touch_shape();
+        }
         let id = self.bodies.push(body);
         let iid = self.interfaces.push(interface);
         debug_assert_eq!(
@@ -2359,8 +2481,8 @@ impl<'str> Context<'str> {
         &self.bodies[f]
     }
     /// The owning function's storage (write). Alias of [`body_mut`](Self::body_mut).
-    pub fn function_mut(&mut self, f: FunctionId) -> &mut FunctionBody<'str> {
-        &mut self.bodies[f]
+    pub fn function_mut(&mut self, f: FunctionId) -> BodyLoan<'_, 'str> {
+        self.body_mut(f)
     }
 
     /// A read [`BlockRef`] over `id`, module-routed.
@@ -2432,8 +2554,7 @@ impl<'str> Context<'str> {
             };
         }
         match id.name_scope_function() {
-            Some(func) => self
-                .function_mut(func)
+            Some(func) => self.bodies[func]
                 .names
                 .register(name, id.localize(func), old_name),
             None => self.update_name(name, id, old_name),

@@ -231,7 +231,7 @@ pub fn forward_temp_stores(ctx: &mut Context<'_>, block_id: BlockId) -> Cleanup 
         resolved.insert(load_result, survivor);
     }
 
-    let body = ctx.function_mut(func);
+    let mut body = ctx.function_mut(func);
     for (load_result, _) in forwards {
         let survivor = resolved[&load_result];
         body.replace_all_uses_with(load_result, survivor);
