@@ -1610,18 +1610,46 @@ mod tests {
         );
         let _ = target;
         assert_eq!(ctx.to_string(), before, "refused untouched");
-        // The provenance of cached p-code is the caller's claim, and it is
-        // trusted: the one honest way to lift cached p-code is to store the
-        // fingerprint with it.
+    }
+
+    #[test]
+    fn cached_pcode_is_trusted_on_the_fingerprint_it_claims() {
+        // The provenance of cached p-code is the caller's claim: the one
+        // honest way to lift cached p-code is to store the fingerprint with
+        // it, and p-code of a look-alike specification passes under a
+        // forged one.
+        let first = tiny_spec(":set is op=1 { r0 = 1:4; }");
+        let alike = tiny_spec(":set is op=1 { r0 = 2:4; }");
+        let lifter = SleighLifter::new(&first);
+        let foreign = Decoder::new(&alike)
+            .decode_one(0x1000, &[1], &alike.new_context())
+            .unwrap();
+        let flat = FlatPcode::lower(&foreign).unwrap();
         let claimed = FlatPcode::from_parts(
             first.fingerprint(),
             flat.address(),
             flat.length(),
             flat.pcode().clone(),
         );
+        let mut ctx = lifter.new_context();
         let mut addresses = AddressIndex::analyze(&ctx);
+        assert_eq!(
+            lifter
+                .lift_pcode_indexed(&mut ctx, &mut addresses, &flat, None)
+                .err(),
+            Some(super::LiftError::IncompatibleSpec)
+        );
         lifter
-            .lift_pcode_indexed(&mut ctx, &mut addresses, &claimed, Some(function))
+            .lift_pcode_indexed(&mut ctx, &mut addresses, &claimed, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn the_stamp_is_the_specifications_identity_and_survives_a_clone_and_a_reload() {
+        let first = tiny_spec(":set is op=1 { r0 = 1:4; }");
+        let lifter = SleighLifter::new(&first);
+        let instruction = Decoder::new(&first)
+            .decode_one(0x1000, &[1], &first.new_context())
             .unwrap();
 
         // A hand-built module has no stamp, and no lifter accepts it.
@@ -1632,8 +1660,7 @@ mod tests {
         );
 
         // Identity, not instance: another lifter for the same specification
-        // builds an acceptable context, and the stamp survives a clone and a
-        // serialization round trip.
+        // builds an acceptable context.
         let twin = SleighLifter::new(&first);
         let mut ctx = twin.new_context();
         lifter
