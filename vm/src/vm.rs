@@ -762,8 +762,14 @@ impl<S: CodeSource> Vm<S> {
                         self.stats.steps += run.retired;
                         self.stats.native_bodies += 1;
                         // Positioning inside a block the interpreter has not walked
-                        // into invalidates its cached instruction list.
-                        self.emu.invalidate_block_cache();
+                        // into invalidates its cached instruction list. Staying in
+                        // the block it holds does not: the list changes only by
+                        // injection, growth and cleanup, each of which invalidates
+                        // for itself — and a hook that stops on every block would
+                        // otherwise pay for rebuilding the list at every stop.
+                        if run.block != self.emu.block {
+                            self.emu.invalidate_block_cache();
+                        }
                         self.emu.block = run.block;
                         self.emu.idx = run.body;
                         self.note_code_write();
@@ -899,9 +905,8 @@ impl<S: CodeSource> Vm<S> {
             return None;
         }
         let (insn, size, pc, op, operands) = {
-            let insn = BasicBlock::from_id(&self.ctx, block)
-                .instructions()
-                .nth(idx)?;
+            let insn = self.emu.current_instruction(&self.ctx)?;
+            let insn = qcode::value::Instruction::from_id(&self.ctx, insn);
             let Mnemonic::PCodeOp(op) = insn.mnemonic() else {
                 return None;
             };
@@ -977,8 +982,7 @@ impl<S: CodeSource> Vm<S> {
     /// The guest address of the operation the machine is positioned at, if
     /// the op records one.
     fn current_guest_address(&self) -> Option<u64> {
-        let block = BasicBlock::from_id(&self.ctx, self.emu.block);
-        let insn = block.iter_instruction_ids().nth(self.emu.idx)?;
+        let insn = self.emu.current_instruction(&self.ctx)?;
         self.ctx.get_insn(insn).address()
     }
 

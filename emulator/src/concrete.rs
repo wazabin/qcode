@@ -1061,6 +1061,22 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     /// part-way through it. A caller that runs a block's body by some other
     /// means and then positions the emulator *inside* that block breaks the
     /// assumption, and must say so.
+    /// The instruction at the machine's position, if the block has one there.
+    ///
+    /// From the cached instruction list when it is the current block's,
+    /// which makes this O(1) on the paths that ask after every stop; a walk
+    /// of the block otherwise.
+    pub fn current_instruction(&self, ctx: &Context<'_>) -> Option<InstructionId> {
+        if self.cached_block == Some(self.block)
+            && let Some(&local) = self.cached_insns.get(self.idx)
+        {
+            return Some(InstructionId::new(self.block.func, local));
+        }
+        BasicBlock::from_id(ctx, self.block)
+            .iter_instruction_ids()
+            .nth(self.idx)
+    }
+
     pub fn invalidate_block_cache(&mut self) {
         self.cached_block = None;
     }
@@ -1077,7 +1093,16 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
     /// than rebuilds.
     fn refresh_block_cache(&mut self, ctx: &Context<'_>) -> bool {
         let block_id = self.block;
-        let entered = self.idx == 0 && !self.cache_primed;
+        // Entering the block it already holds: the list is rebuilt only if
+        // its length says it changed underneath. Every edit a machine makes
+        // to a block — injection, growth, cleanup, eviction — invalidates
+        // the cache itself, so this is a backstop, and one that costs a
+        // count rather than a walk: an executor that stops in every block
+        // hands the interpreter every block's terminator, and a walk on each
+        // of those was most of what a stop cost.
+        let entered = self.idx == 0
+            && !self.cache_primed
+            && self.cached_insns.len() != BasicBlock::from_id(ctx, block_id).len();
         if self.cached_block != Some(block_id) || entered {
             if !ctx.block(block_id).has_insns() {
                 return false;

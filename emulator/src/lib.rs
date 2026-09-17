@@ -113,6 +113,19 @@ impl EmulatorError {
     /// emptied, split or re-lifted, and an id that no longer resolves is
     /// reported as such rather than indexed.
     pub fn new(kind: EmulatorErrorKind, insn: &InstructionRef<'_, '_>) -> Self {
+        // A stop at a user op is how the machine hands control to the host,
+        // and a hook may do that millions of times in a run; rendering the
+        // instruction for each was most of what such a stop cost.
+        if matches!(
+            kind,
+            EmulatorErrorKind::Interrupt | EmulatorErrorKind::UnsupportedPCodeOp(_)
+        ) {
+            return Self {
+                kind,
+                ctx: String::new(),
+                address: None,
+            };
+        }
         if !insn.exists() {
             return Self {
                 kind,
