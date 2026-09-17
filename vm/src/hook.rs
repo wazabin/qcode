@@ -29,7 +29,7 @@ use qcode::{
     context::Context,
     space::MemorySpaceId,
     value::{
-        BasicBlock, BlockId, InstructionId, ValueId,
+        BasicBlock, BlockId, InstructionId, Value as _, ValueId,
         insn::{Binop, IntBinop, Mnemonic, Store, VM_INTERRUPT},
     },
 };
@@ -77,15 +77,18 @@ impl BlockView<'_> {
 
     /// The site at the block's entry, if the block starts at a guest address.
     ///
-    /// Anchored on the first instruction that is not an interrupt an earlier
-    /// hook placed at the entry, so hooks on the same entry fire in
-    /// registration order and a hook recognises its own anchor when asked
-    /// again.
+    /// Anchored on the first guest instruction: not an interrupt an earlier
+    /// hook placed at the entry, and not the arithmetic, loads and stores
+    /// one emitted there, which carry no guest address. So hooks on the same
+    /// entry fire in registration order, and a hook recognises its own
+    /// anchor when asked again — a block is offered again each time it
+    /// grows, and anchoring on emitted code would instrument the entry once
+    /// per offer.
     pub fn entry(&self) -> Option<Site> {
         let address = self.address()?;
         let anchor = BasicBlock::from_id(self.ctx, self.block)
             .instructions()
-            .find(|insn| !is_interrupt_op(self.ctx, insn.id))
+            .find(|insn| insn.address().is_some() && !is_interrupt_op(self.ctx, insn.id))
             .map(|insn| insn.id)?;
         Some(Site::BlockEntry { address, anchor })
     }
@@ -293,6 +296,28 @@ impl<'a> Emitter<'a> {
         let mut builder = self.ctx.builder(block);
         builder.set_insert_point_before(anchor);
         builder.push_binop(Binop::Int(op), lhs, rhs).id()
+    }
+
+    /// Loads `size` bytes of guest memory at `ptr`, before the anchor.
+    ///
+    /// Guest memory is where a hook keeps state it wants compiled: a
+    /// counter, a coverage map, a log. The host reads it back through the
+    /// [`Mmu`](crate::Mmu) when the run stops.
+    pub fn load(&mut self, ptr: ValueId, size: usize) -> ValueId {
+        let (block, anchor) = (self.block, self.anchor);
+        let space = self.ctx.shared.default_space;
+        let mut builder = self.ctx.builder(block);
+        builder.set_insert_point_before(anchor);
+        builder.push_load::<true>(ptr, size, space).id()
+    }
+
+    /// Stores `value` to guest memory at `ptr`, before the anchor.
+    pub fn store(&mut self, value: ValueId, ptr: ValueId) -> InstructionId {
+        let (block, anchor) = (self.block, self.anchor);
+        let space = self.ctx.shared.default_space;
+        let mut builder = self.ctx.builder(block);
+        builder.set_insert_point_before(anchor);
+        builder.push_store(value, ptr, space).id
     }
 
     /// Zero-extends (or truncates) `value` to `size` bytes.
