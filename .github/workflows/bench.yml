@@ -1,0 +1,64 @@
+name: Bench
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Times the lifting hot path (sleigh/benches/lift.rs) on every push and pull
+  # request. A pull request is compared against its base: the base is benched
+  # first in the same job, on the same runner, and Criterion reports the change
+  # per instruction. Shared runners are noisy, so the job reports and never
+  # fails on a regression; read the summary, and rerun locally with
+  # `--save-baseline`/`--baseline` before believing a small difference.
+  lift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check out the base
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+
+      - name: Bench the base
+        id: base
+        # The base has the bench only once it is on main; a pull request that
+        # adds it is benched on its own.
+        if: github.event_name == 'pull_request' && hashFiles('base/sleigh/benches/lift.rs') != ''
+        working-directory: base
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo bench -p wazabin-qcode-sleigh --bench lift -- --noplot --save-baseline base
+          echo "compare=--baseline base" >> "$GITHUB_OUTPUT"
+
+      - name: Bench
+        run: |
+          cargo bench -p wazabin-qcode-sleigh --bench lift -- --noplot ${{ steps.base.outputs.compare }} \
+            | tee bench.txt
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## Lift bench'
+            if [ -n "${{ steps.base.outputs.compare }}" ]; then
+              echo "Head against base \`${{ github.event.pull_request.base.sha }}\`; a change is reported only outside the noise threshold."
+            fi
+            echo '```'
+            grep -E '^[a-z]+/|time:|change:|Performance|No change' bench.txt || echo 'no results'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

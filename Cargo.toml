@@ -24,6 +24,7 @@ wazabin-qcode-macro = { version = "0.4.2", path = "macro" }
 wazabin-qcode-parser = { version = "0.4.2", path = "parser" }
 
 bincode = { version = "2", features = ["serde"] }
+criterion = "0.8"
 clang = { version = "2", features = ["clang_10_0"] }
 cpp_demangle = "0.5"
 env_logger = "0.11"
