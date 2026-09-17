@@ -175,7 +175,7 @@ impl ScratchStore {
 mod tests {
     use super::*;
     use crate::{
-        lift::{ExitArm, ExitKind, Recorder},
+        lift::{ExitArm, ExitKind},
         value::ValueId,
     };
 
@@ -184,20 +184,18 @@ mod tests {
     fn lift_one(store: &mut ScratchStore, address: u64, immediate: u64) {
         let mut target = store.target().unwrap();
         let mut construction = target.begin(address, 4).unwrap();
-        let entry = construction.entry();
         let next = construction.block_at(address + 4).unwrap();
-        let mut recorder = Recorder::new(address, 4, entry);
-        let mut builder = construction.builder();
-        let temp = builder.make_temp(8);
-        let value = builder.shr().get_const(immediate, 8);
-        builder.push_copy(value, ValueId::Temp(temp));
-        let label = builder.get_or_make_local_label(format!("local_{address:x}").into());
-        builder.push_branch(label);
-        builder.switch_to_block(label);
-        let site = builder.push_branch(next).id;
-        recorder.exit(site, ExitArm::Unconditional, ExitKind::Fallthrough);
-        recorder.continue_in(label);
-        construction.commit(recorder.finish()).unwrap();
+        let mut emitter = construction.emitter();
+        let temp = emitter.make_temp(8);
+        let value = emitter.shr().get_const(immediate, 8);
+        emitter.push_copy(value, ValueId::Temp(temp));
+        let label = emitter.get_or_make_local_label(format!("local_{address:x}").into());
+        emitter.push_branch(label);
+        emitter.switch_to_block(label);
+        let site = emitter.push_branch(next).id;
+        emitter.exit(site, ExitArm::Unconditional, ExitKind::Fallthrough);
+        emitter.continue_in(label);
+        construction.commit().unwrap();
     }
 
     #[test]
@@ -299,9 +297,9 @@ mod tests {
             let mut target = store.target().unwrap();
             let mut construction = target.begin(0x2000, 4).unwrap();
             let zero = construction.context().shared.get_const(0, 8);
-            let mut builder = construction.builder();
-            builder.switch_to_block(previous);
-            builder.push_branchind(zero);
+            let mut emitter = construction.emitter();
+            emitter.switch_to_block(previous);
+            emitter.push_branchind(zero);
             construction.abort();
             assert!(target.is_poisoned());
         }

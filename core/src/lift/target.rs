@@ -48,6 +48,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 
 use rustc_hash::FxHashMap;
 
@@ -55,9 +56,9 @@ use crate::{
     address_index::{AddressIndex, AddressTarget},
     builder::Builder,
     context::Context,
-    lift::{CallTarget, Continuation, ExitKind, Lifted},
+    lift::{CallTarget, ExitArm, ExitKind, Lifted, Recorder},
     value::{
-        BasicBlock, BlockId, FunctionBody, FunctionId, LocalBlockId,
+        BasicBlock, BlockId, FunctionBody, FunctionId, InstructionId, LocalBlockId, LocalInsnId,
         insn::{Callee, Mnemonic},
     },
 };
@@ -84,11 +85,6 @@ pub enum TargetError {
     /// A call recorded in the result names no callee the construction minted,
     /// so the emitted instruction still holds a placeholder callee.
     UnresolvedCallee { address: u64 },
-    /// The result offered at commit does not describe the instruction the
-    /// construction built: another address, length or entry, or a block or
-    /// exit site that is not one of the host's, not live, or not emitted by
-    /// this construction. `reason` names the first mismatch.
-    MismatchedResult { address: u64, reason: &'static str },
     /// A previous rollback could not restore the context, which is poisoned
     /// (see [`Context::is_poisoned`]); nothing further is lifted into it.
     Poisoned,
@@ -127,12 +123,6 @@ impl fmt::Display for TargetError {
             }
             Self::UnresolvedCallee { address } => {
                 write!(f, "the call to {address:#x} kept its placeholder callee")
-            }
-            Self::MismatchedResult { address, reason } => {
-                write!(
-                    f,
-                    "the result does not describe the instruction built at {address:#x}: {reason}"
-                )
             }
             Self::Poisoned => {
                 f.write_str("the context was poisoned by a failed rollback and refuses lifting")
@@ -265,9 +255,6 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
         }
         let body = &self.ctx.bodies[self.function];
         let mut journal = Journal {
-            address,
-            length,
-            entry: BlockId::new(self.function, LocalBlockId::default()),
             entry_created: false,
             placeholders: Vec::new(),
             splits: Vec::new(),
@@ -306,11 +293,11 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
                 tail
             }
         };
-        journal.entry = entry;
         FunctionBody::from_id_mut(self.ctx, self.function).add_block(entry);
         Ok(Construction {
             target: self,
             journal,
+            record: Recorder::new(address, length, entry),
             settled: false,
         })
     }
@@ -461,9 +448,6 @@ pub enum Promotion {
 /// What one construction added, for taking it back.
 #[derive(Debug)]
 struct Journal {
-    address: u64,
-    length: usize,
-    entry: BlockId,
     /// The entry was made by this construction. Otherwise it was an empty
     /// block that existed before, whose contents alone are the construction's.
     entry_created: bool,
@@ -485,29 +469,32 @@ struct Journal {
 
 /// The lowering of one instruction into a [`LiftTarget`].
 ///
-/// Resolve the instruction's module-level targets first, then take a
-/// [`builder`](Self::builder) for its entry and emit. [`commit`](Self::commit)
-/// keeps the result; dropping the construction before that undoes it.
+/// Resolve the instruction's module-level targets first, then take an
+/// [`emitter`](Self::emitter) for its entry and emit, reporting the blocks
+/// and exits as they come. [`commit`](Self::commit) keeps the result;
+/// dropping the construction before that undoes it.
 pub struct Construction<'t, 'a, 'str> {
     target: &'t mut LiftTarget<'a, 'str>,
     journal: Journal,
+    /// The instruction's blocks and exits, as its emitter reports them.
+    record: Recorder,
     settled: bool,
 }
 
 impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
     /// The address being lifted.
     pub fn address(&self) -> u64 {
-        self.journal.address
+        self.record.lifted().address()
     }
 
     /// The instruction's encoded length.
     pub fn length(&self) -> usize {
-        self.journal.length
+        self.record.lifted().length()
     }
 
     /// The block the instruction's p-code starts in.
     pub fn entry(&self) -> BlockId {
-        self.journal.entry
+        self.record.lifted().entry()
     }
 
     pub fn function(&self) -> FunctionId {
@@ -623,68 +610,22 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
         slot as u32
     }
 
-    /// A builder positioned at the [entry](Self::entry). It is bound to the
-    /// host's body, so wherever it is repositioned it stays in the journal.
-    pub fn builder(&mut self) -> Builder<'str, '_> {
-        self.target.ctx.builder(self.journal.entry)
-    }
-
-    /// Checks that `lifted` describes this construction and nothing else:
-    /// its address, length and entry, and that every block and exit site it
-    /// names is one the host holds now and this construction emitted (or the
-    /// entry). Nothing is mutated.
-    fn check_result(&self, lifted: &Lifted) -> Result<(), TargetError> {
-        let function = self.target.function;
-        let journal = &self.journal;
-        let mismatch = |reason| TargetError::MismatchedResult {
-            address: journal.address,
-            reason,
-        };
-        if lifted.address() != journal.address || lifted.length() != journal.length {
-            return Err(mismatch("another address or length"));
+    /// An emitter positioned at the [entry](Self::entry): a builder bound to
+    /// the host's body, so wherever it is repositioned it stays in the
+    /// journal, that also takes the report of what the instruction owns and
+    /// where it leaves.
+    pub fn emitter(&mut self) -> Emitter<'_, 'str> {
+        Emitter {
+            builder: self.target.ctx.builder(self.record.lifted().entry()),
+            record: &mut self.record,
         }
-        if lifted.entry() != journal.entry {
-            return Err(mismatch("another entry block"));
-        }
-        let body = &self.target.ctx.bodies[function];
-        let own_block = |block: BlockId| {
-            block.func == function
-                && body.blocks.contains(block.local)
-                && (block == journal.entry || usize::from(block.local) >= journal.blocks)
-        };
-        if !lifted.blocks().iter().all(|&block| own_block(block)) {
-            return Err(mismatch("a block the construction did not make"));
-        }
-        for exit in lifted.exits() {
-            let site = exit.site();
-            if site.func != function
-                || !body.insns.contains(site.local)
-                || usize::from(site.local) < journal.insns
-            {
-                return Err(mismatch(
-                    "an exit at an instruction the construction did not emit",
-                ));
-            }
-            if let Some(Continuation::Block(block)) = exit.kind().continuation()
-                && !lifted.blocks().contains(&block)
-            {
-                return Err(mismatch(
-                    "a call continuing in a block the result does not own",
-                ));
-            }
-        }
-        Ok(())
     }
 
     /// Keeps the instruction: creates the callees it promised and settles
     /// their call sites.
-    pub fn commit(mut self, lifted: Lifted) -> Result<Lifted, TargetError> {
-        if let Err(error) = self.check_result(&lifted) {
-            self.rollback();
-            return Err(error);
-        }
+    pub fn commit(mut self) -> Result<Lifted, TargetError> {
         let function = self.target.function;
-        let own_address = self.journal.address;
+        let own_address = self.address();
         let unresolved = |minted: Option<&Minted>| TargetError::UnresolvedCallee {
             address: minted.and_then(Minted::address).unwrap_or(own_address),
         };
@@ -695,16 +636,18 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
         // partly published. (A tail call is reported at the branch it stands
         // for, which may be a conditional branch elsewhere, so it is only
         // required to exist.) Checked before anything is created: a function,
-        // once made, cannot be taken back.
-        let mut sites: Vec<Vec<crate::value::LocalInsnId>> =
-            vec![Vec::new(); self.journal.minted.len()];
+        // once made, cannot be taken back. Nothing here allocates when the
+        // instruction promised nothing, which is every instruction of a
+        // flat lowering.
+        let mut sites: Vec<Vec<LocalInsnId>> = vec![Vec::new(); self.journal.minted.len()];
         let body = &self.target.ctx.bodies[function];
-        // Every site is the host's (checked above), so the local id keys it.
-        let mut reported: FxHashMap<crate::value::LocalInsnId, &ExitKind> = FxHashMap::default();
-        for exit in lifted.exits() {
-            reported.entry(exit.site().local).or_insert(exit.kind());
+        let mut reported: FxHashMap<LocalInsnId, &ExitKind> = FxHashMap::default();
+        if !self.journal.minted.is_empty() {
+            for exit in self.record.lifted().exits() {
+                reported.entry(exit.site().local).or_insert(exit.kind());
+            }
         }
-        let reported = |local: crate::value::LocalInsnId| reported.get(&local).copied();
+        let reported = |local: LocalInsnId| reported.get(&local).copied();
         for raw in self.journal.insns..body.insns.issued_len() {
             let local = raw.into();
             if !body.insns.contains(local) {
@@ -786,7 +729,7 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
         }
         self.settled = true;
         self.target.settle_index();
-        Ok(lifted)
+        Ok(self.record.finish())
     }
 
     /// Discards the instruction, undoing everything it added.
@@ -808,8 +751,9 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
         // construction's emissions and leaves the empty placeholder behind. (An
         // entry that is a pending split's tail is cleared here and deleted
         // below, like any block issued after the mark.)
+        let entry = self.record.lifted().entry();
         if !self.journal.entry_created {
-            ctx.bodies[function].clear_block_instructions(self.journal.entry);
+            ctx.bodies[function].clear_block_instructions(entry);
         }
         // Every other block the construction made — its own, the branch/
         // fall-through placeholders and the tails of pending splits — was
@@ -827,10 +771,9 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
                 addresses.forget(placeholder.address);
             }
         }
-        if self.journal.entry_created
-            && addresses.block_at(self.journal.address) == Some(self.journal.entry)
-        {
-            addresses.forget(self.journal.address);
+        let address = self.record.lifted().address();
+        if self.journal.entry_created && addresses.block_at(address) == Some(entry) {
+            addresses.forget(address);
         }
         body.take_back_temps(self.journal.temps, self.journal.temp_spaces);
 
@@ -865,11 +808,60 @@ impl Drop for Construction<'_, '_, '_> {
     }
 }
 
+/// A [`Builder`] into a construction's host that also takes the emitter's
+/// report of the instruction: the blocks it owns and the places control
+/// leaves it, at the operations that make them and before any lowering
+/// choice. It dereferences to the builder.
+///
+/// The report is forward-only, as a p-code sink sees the instruction: a
+/// call's continuation is settled by whatever [continues](Self::continue_in)
+/// after it, or is the next machine instruction when nothing does.
+pub struct Emitter<'c, 'str> {
+    builder: Builder<'str, 'c>,
+    record: &'c mut Recorder,
+}
+
+impl<'c, 'str> Emitter<'c, 'str> {
+    /// Reports a block the instruction owns, in the order they are opened.
+    pub fn block(&mut self, block: BlockId) {
+        self.record.block(block);
+    }
+
+    /// Reports a transfer out of the instruction at `site`.
+    ///
+    /// A call's continuation is settled later: pass
+    /// [`Continuation::Next`](crate::lift::Continuation::Next) and let
+    /// [`continue_in`](Self::continue_in) or the commit decide.
+    pub fn exit(&mut self, site: InstructionId, arm: ExitArm, kind: ExitKind) {
+        self.record.exit(site, arm, kind);
+    }
+
+    /// Reports that the p-code after the last transfer was lowered into
+    /// `block`. If that transfer was a call, `block` is where it returns to.
+    pub fn continue_in(&mut self, block: BlockId) {
+        self.record.continue_in(block);
+    }
+}
+
+impl<'c, 'str> Deref for Emitter<'c, 'str> {
+    type Target = Builder<'str, 'c>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.builder
+    }
+}
+
+impl DerefMut for Emitter<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.builder
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        lift::{Continuation, Exit, ExitArm, Recorder},
+        lift::{Continuation, ExitArm},
         value::{FunctionBody, QCodeMut, ValueId},
     };
 
@@ -878,18 +870,15 @@ mod tests {
     }
 
     /// Builds one straight-line instruction that falls through, as an emitter
-    /// would, and returns its record.
-    fn emit_fallthrough(construction: &mut Construction<'_, '_, '_>) -> Lifted {
-        let entry = construction.entry();
+    /// would.
+    fn emit_fallthrough(construction: &mut Construction<'_, '_, '_>) {
         let next = construction.block_at(construction.address() + 1).unwrap();
-        let mut recorder = Recorder::new(construction.address(), 1, entry);
-        let mut builder = construction.builder();
-        let temp = builder.make_temp(8);
-        let one = builder.shr().get_const(1, 8);
-        builder.push_copy(one, ValueId::Temp(temp));
-        let site = builder.push_branch(next).id;
-        recorder.exit(site, ExitArm::Unconditional, ExitKind::Fallthrough);
-        recorder.finish()
+        let mut emitter = construction.emitter();
+        let temp = emitter.make_temp(8);
+        let one = emitter.shr().get_const(1, 8);
+        emitter.push_copy(one, ValueId::Temp(temp));
+        let site = emitter.push_branch(next).id;
+        emitter.exit(site, ExitArm::Unconditional, ExitKind::Fallthrough);
     }
 
     #[test]
@@ -917,9 +906,9 @@ mod tests {
             let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
 
             let mut construction = target.begin(0x1000, 1).unwrap();
-            let lifted = emit_fallthrough(&mut construction);
+            emit_fallthrough(&mut construction);
             let entry = construction.entry();
-            construction.commit(lifted).unwrap();
+            construction.commit().unwrap();
 
             assert_eq!(
                 target.begin(0x1000, 1).err(),
@@ -954,7 +943,7 @@ mod tests {
             {
                 let mut construction = target.begin(0x1000, 1).unwrap();
                 assert_eq!(construction.entry(), entry);
-                let _ = emit_fallthrough(&mut construction);
+                emit_fallthrough(&mut construction);
                 // A callee that does not exist is only promised.
                 assert_eq!(construction.callee_at(0x2000).unwrap(), Callee::Minted(0));
                 assert_eq!(construction.context().bodies.len(), 1);
@@ -976,8 +965,8 @@ mod tests {
         {
             let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
             let mut construction = target.begin(0x1000, 1).unwrap();
-            let lifted = emit_fallthrough(&mut construction);
-            construction.commit(lifted).unwrap();
+            emit_fallthrough(&mut construction);
+            construction.commit().unwrap();
         }
         assert_eq!(ctx.block(entry).insn_count(), 2);
     }
@@ -991,12 +980,11 @@ mod tests {
             let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
 
             let mut construction = target.begin(0x1000, 5).unwrap();
-            let entry = construction.entry();
             let callee = construction.callee_at(0x2000).unwrap();
             assert_eq!(construction.callee_at(0x2000).unwrap(), callee);
-            let mut recorder = Recorder::new(0x1000, 5, entry);
-            let site = construction.builder().push_call(callee).id;
-            recorder.exit(
+            let mut emitter = construction.emitter();
+            let site = emitter.push_call(callee).id;
+            emitter.exit(
                 site,
                 ExitArm::Unconditional,
                 ExitKind::Call {
@@ -1004,7 +992,7 @@ mod tests {
                     continuation: Continuation::Next,
                 },
             );
-            construction.commit(recorder.finish()).unwrap();
+            construction.commit().unwrap();
             site
         };
 
@@ -1022,69 +1010,6 @@ mod tests {
     }
 
     #[test]
-    fn a_result_that_does_not_describe_the_construction_is_refused_and_undone() {
-        let mut ctx = Context::new();
-        let mut addresses = AddressIndex::analyze(&ctx);
-        let function = host(&mut ctx, &mut addresses, 0x1000);
-        let other = host(&mut ctx, &mut addresses, 0x2000);
-        let foreign = BasicBlock::make(&mut ctx, other)
-            .with_address_indexed(&mut addresses, 0x2000)
-            .id;
-        let before = ctx.to_string();
-        let mismatch = |reason| TargetError::MismatchedResult {
-            address: 0x1000,
-            reason,
-        };
-
-        // Each forged result is refused before anything is created, and the
-        // refusal is a full rollback: the same address lifts afterwards.
-        type Forge<'a> = Box<dyn Fn(&Construction<'_, '_, '_>) -> Lifted + 'a>;
-        let forgeries: Vec<(&str, Forge<'_>)> = vec![
-            (
-                "another address or length",
-                Box::new(|c| Recorder::new(0x1004, 1, c.entry()).finish()),
-            ),
-            (
-                "another entry block",
-                Box::new(|_| Recorder::new(0x1000, 1, foreign).finish()),
-            ),
-            (
-                "a block the construction did not make",
-                Box::new(|c| {
-                    let mut recorder = Recorder::new(0x1000, 1, c.entry());
-                    recorder.block(foreign);
-                    recorder.finish()
-                }),
-            ),
-            (
-                "an exit at an instruction the construction did not emit",
-                Box::new(|c| {
-                    let mut recorder = Recorder::new(0x1000, 1, c.entry());
-                    let stale = crate::value::InstructionId::new(function, 99usize.into());
-                    recorder.exit(stale, ExitArm::Unconditional, ExitKind::Fallthrough);
-                    recorder.finish()
-                }),
-            ),
-        ];
-        for (reason, forge) in forgeries {
-            let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
-            let mut construction = target.begin(0x1000, 1).unwrap();
-            let _ = emit_fallthrough(&mut construction);
-            let forged = forge(&construction);
-            assert_eq!(construction.commit(forged).err(), Some(mismatch(reason)));
-            assert!(!target.is_poisoned());
-            assert_eq!(target.context().to_string(), before, "{reason}");
-        }
-
-        // The honest result of the same emission commits.
-        let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
-        let mut construction = target.begin(0x1000, 1).unwrap();
-        let lifted = emit_fallthrough(&mut construction);
-        construction.commit(lifted).unwrap();
-        assert!(!ctx.block(foreign).has_insns());
-    }
-
-    #[test]
     fn a_call_the_result_does_not_report_is_refused_and_undone() {
         let mut ctx = Context::new();
         let mut addresses = AddressIndex::analyze(&ctx);
@@ -1093,12 +1018,10 @@ mod tests {
             let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
 
             let mut construction = target.begin(0x1000, 5).unwrap();
-            let entry = construction.entry();
             let callee = construction.callee_at(0x2000).unwrap();
-            construction.builder().push_call(callee);
-            let lifted = Recorder::new(0x1000, 5, entry).finish();
+            construction.emitter().push_call(callee);
             assert_eq!(
-                construction.commit(lifted).err(),
+                construction.commit().err(),
                 Some(TargetError::UnresolvedCallee { address: 0x2000 })
             );
             assert!(!target.is_poisoned());
@@ -1150,7 +1073,7 @@ mod tests {
                 None,
                 "not split yet"
             );
-            construction.builder().push_branch(tail);
+            construction.emitter().push_branch(tail);
             construction.abort();
             assert!(!target.is_poisoned());
         }
@@ -1163,16 +1086,15 @@ mod tests {
         let tail = {
             let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
             let mut construction = target.begin(0x2000, 2).unwrap();
-            let entry = construction.entry();
             let tail = construction.block_at(0x1004).unwrap();
-            let mut recorder = Recorder::new(0x2000, 2, entry);
-            let site = construction.builder().push_branch(tail).id;
-            recorder.exit(
+            let mut emitter = construction.emitter();
+            let site = emitter.push_branch(tail).id;
+            emitter.exit(
                 site,
                 ExitArm::Unconditional,
                 ExitKind::Branch { target: 0x1004 },
             );
-            construction.commit(recorder.finish()).unwrap();
+            construction.commit().unwrap();
             tail
         };
         assert_eq!(addresses.block_at(0x1004), Some(tail));
@@ -1188,12 +1110,11 @@ mod tests {
         let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
         let mut construction = target.begin(0x1004, 1).unwrap();
         assert_eq!(construction.entry(), tail);
-        let entry = construction.entry();
-        let mut recorder = Recorder::new(0x1004, 1, entry);
         let zero = construction.context().shared.get_const(0, 8);
-        let site = construction.builder().push_branchind(zero).id;
-        recorder.exit(site, ExitArm::Unconditional, ExitKind::BranchInd);
-        construction.commit(recorder.finish()).unwrap();
+        let mut emitter = construction.emitter();
+        let site = emitter.push_branchind(zero).id;
+        emitter.exit(site, ExitArm::Unconditional, ExitKind::BranchInd);
+        construction.commit().unwrap();
         assert!(ctx.block(tail).has_insns());
     }
 
@@ -1219,14 +1140,14 @@ mod tests {
         let entry = construction.entry();
         // A self-jump resolves to the very block being built.
         assert_eq!(construction.block_at(0x1004).unwrap(), entry);
-        let mut recorder = Recorder::new(0x1004, 1, entry);
-        let site = construction.builder().push_branch(entry).id;
-        recorder.exit(
+        let mut emitter = construction.emitter();
+        let site = emitter.push_branch(entry).id;
+        emitter.exit(
             site,
             ExitArm::Unconditional,
             ExitKind::Branch { target: 0x1004 },
         );
-        construction.commit(recorder.finish()).unwrap();
+        construction.commit().unwrap();
         assert_eq!(addresses.block_at(0x1004), Some(entry));
         assert!(ctx.block(entry).has_insns());
         assert!(!ctx.block(root).has_insns());
@@ -1245,11 +1166,11 @@ mod tests {
         {
             let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
             let mut construction = target.begin(0x1000, 1).unwrap();
-            let _ = emit_fallthrough(&mut construction);
+            emit_fallthrough(&mut construction);
             // The emitter misbehaves: it writes into a block the construction
             // does not own, which the journal cannot take back.
             let zero = construction.context().shared.get_const(0, 8);
-            let mut builder = construction.builder();
+            let mut builder = construction.emitter();
             builder.switch_to_block(other);
             builder.push_branchind(zero);
             construction.abort();
@@ -1373,15 +1294,14 @@ mod tests {
         let mut target = LiftTarget::bind(&mut ctx, &mut addresses, function).unwrap();
         let mut construction = target.begin(0x1000, 1).unwrap();
         assert_eq!(construction.block_at(0x1010).unwrap(), unlisted);
-        let entry = construction.entry();
-        let mut recorder = Recorder::new(0x1000, 1, entry);
-        let site = construction.builder().push_branch(unlisted).id;
-        recorder.exit(
+        let mut emitter = construction.emitter();
+        let site = emitter.push_branch(unlisted).id;
+        emitter.exit(
             site,
             ExitArm::Unconditional,
             ExitKind::Branch { target: 0x1010 },
         );
-        construction.commit(recorder.finish()).unwrap();
+        construction.commit().unwrap();
         let _ = target;
         assert!(
             addresses.is_current(&ctx),
@@ -1476,15 +1396,14 @@ mod tests {
         let mut construction = target.begin(0x1000, 1).unwrap();
         let duplicate = construction.block_at(0x1010).unwrap();
         assert_ne!(duplicate, unlisted);
-        let entry = construction.entry();
-        let mut recorder = Recorder::new(0x1000, 1, entry);
-        let site = construction.builder().push_branch(duplicate).id;
-        recorder.exit(
+        let mut emitter = construction.emitter();
+        let site = emitter.push_branch(duplicate).id;
+        emitter.exit(
             site,
             ExitArm::Unconditional,
             ExitKind::Branch { target: 0x1010 },
         );
-        construction.commit(recorder.finish()).unwrap();
+        construction.commit().unwrap();
         let _ = target;
         assert_eq!(
             ctx.block_ids()
@@ -1504,8 +1423,8 @@ mod tests {
         {
             let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
             let mut construction = target.begin(0x1000, 1).unwrap();
-            let lifted = emit_fallthrough(&mut construction);
-            construction.commit(lifted).unwrap();
+            emit_fallthrough(&mut construction);
+            construction.commit().unwrap();
         }
         assert!(addresses.is_current(&ctx));
         let placeholder = addresses.block_at(0x1001).unwrap();
@@ -1525,8 +1444,8 @@ mod tests {
             placeholder,
             "a fresh block, not the deleted id"
         );
-        let lifted = emit_fallthrough(&mut construction);
-        construction.commit(lifted).unwrap();
+        emit_fallthrough(&mut construction);
+        construction.commit().unwrap();
         let _ = target;
         assert!(addresses.is_current(&ctx));
     }
@@ -1540,7 +1459,7 @@ mod tests {
         {
             let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
             let mut construction = target.begin(0x1000, 1).unwrap();
-            let _ = emit_fallthrough(&mut construction);
+            emit_fallthrough(&mut construction);
             construction.abort();
             // Rebinding right away works: the rollback settled the index.
             target.begin(0x1000, 1).unwrap().abort();
@@ -1594,7 +1513,7 @@ mod tests {
                 callee,
                 "one slot per name"
             );
-            construction.builder().push_call(callee);
+            construction.emitter().push_call(callee);
             construction.abort();
         }
         assert_eq!(ctx.to_string(), before);
@@ -1604,10 +1523,9 @@ mod tests {
             let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
             let mut construction = target.begin(0x1000, 2).unwrap();
             let callee = construction.callee_named("syscall");
-            let entry = construction.entry();
-            let mut recorder = Recorder::new(0x1000, 2, entry);
-            let site = construction.builder().push_call(callee).id;
-            recorder.exit(
+            let mut emitter = construction.emitter();
+            let site = emitter.push_call(callee).id;
+            emitter.exit(
                 site,
                 ExitArm::Unconditional,
                 ExitKind::Call {
@@ -1615,7 +1533,7 @@ mod tests {
                     continuation: Continuation::Next,
                 },
             );
-            construction.commit(recorder.finish()).unwrap();
+            construction.commit().unwrap();
             site
         };
         let syscall = FunctionBody::from_name(&ctx, "syscall")
@@ -1640,10 +1558,9 @@ mod tests {
         let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
         let mut construction = target.begin(0x1000, 2).unwrap();
         let callee = construction.callee_named("syscall");
-        let entry = construction.entry();
-        let mut recorder = Recorder::new(0x1000, 2, entry);
-        let site = construction.builder().push_call(callee).id;
-        recorder.exit(
+        let mut emitter = construction.emitter();
+        let site = emitter.push_call(callee).id;
+        emitter.exit(
             site,
             ExitArm::Unconditional,
             ExitKind::Call {
@@ -1652,7 +1569,7 @@ mod tests {
             },
         );
         assert_eq!(
-            construction.commit(recorder.finish()).err(),
+            construction.commit().err(),
             Some(TargetError::UnresolvedCallee { address: 0x1000 })
         );
         assert!(FunctionBody::from_name(&ctx, "syscall").is_none());
@@ -1758,7 +1675,7 @@ mod tests {
             else {
                 panic!()
             };
-            construction.builder().push_tail_call(callee);
+            construction.emitter().push_tail_call(callee);
             construction.abort();
             assert!(!target.is_poisoned());
         }
@@ -1777,16 +1694,15 @@ mod tests {
             else {
                 panic!()
             };
-            let entry = construction.entry();
-            let mut recorder = Recorder::new(0x1000, 2, entry);
-            let site = construction.builder().push_tail_call(callee).id;
+            let mut emitter = construction.emitter();
+            let site = emitter.push_tail_call(callee).id;
             // The original transfer was a branch; the tail call is policy.
-            recorder.exit(
+            emitter.exit(
                 site,
                 ExitArm::Unconditional,
                 ExitKind::Branch { target: 0x2010 },
             );
-            construction.commit(recorder.finish()).unwrap();
+            construction.commit().unwrap();
             site
         };
         let promoted = addresses.function_at(0x2010).expect("split out at commit");
@@ -1822,16 +1738,11 @@ mod tests {
         let function = host(&mut ctx, &mut addresses, 0x1000);
         let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
         let mut construction = target.begin(0x1000, 1).unwrap();
-        let lifted = emit_fallthrough(&mut construction);
-        let lifted = construction.commit(lifted).unwrap();
+        emit_fallthrough(&mut construction);
+        let lifted = construction.commit().unwrap();
         assert!(lifted.falls_through());
-        assert_eq!(
-            lifted.exits(),
-            &[Exit::new(
-                lifted.exits()[0].site(),
-                ExitArm::Unconditional,
-                ExitKind::Fallthrough
-            )]
-        );
+        assert_eq!(lifted.exits().len(), 1);
+        assert_eq!(lifted.exits()[0].arm(), ExitArm::Unconditional);
+        assert_eq!(lifted.exits()[0].kind(), &ExitKind::Fallthrough);
     }
 }

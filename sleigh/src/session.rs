@@ -944,9 +944,9 @@ mod tests {
             let mut target = LiftTarget::bind(ctx, &mut addresses, function).unwrap();
             let mut construction = target.begin(0x1010, 1).unwrap();
             let zero = construction.context().shared.get_const(0, 8);
-            let mut builder = construction.builder();
-            builder.switch_to_block(placeholder);
-            builder.push_branchind(zero);
+            let mut emitter = construction.emitter();
+            emitter.switch_to_block(placeholder);
+            emitter.push_branchind(zero);
             construction.abort();
         }
         assert!(session.is_poisoned());

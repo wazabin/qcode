@@ -57,7 +57,7 @@ use qcode::{
     builder::Builder,
     context::{ArchitectureId, Context},
     lift::{
-        CallTarget, Construction, Continuation, ExitArm, ExitKind, LiftTarget, Lifted, Recorder,
+        CallTarget, Construction, Continuation, Emitter, ExitArm, ExitKind, LiftTarget, Lifted,
         TargetError,
     },
     space::SpaceType,
@@ -447,10 +447,10 @@ impl<'spec> SleighLifter<'spec> {
         let mut construction = target.begin(instruction.address(), instruction.len())?;
         // The plan carries every fact needed before the builder borrows the
         // function body, so no flat p-code vector is built or re-scanned.
-        let lifted = instruction
+        instruction
             .try_pcode_ops_streamed(|plan| self.emitter(&mut construction, plan))?
             .finish()?;
-        Ok(construction.commit(lifted)?)
+        Ok(construction.commit()?)
     }
 
     /// Resolves the function an instruction at `address` belongs to.
@@ -512,7 +512,6 @@ impl<'spec> SleighLifter<'spec> {
     ) -> Result<FlatEmitter<'_, 'static, 'c>, LiftError> {
         let address = construction.address();
         let length = construction.length();
-        let entry = construction.entry();
 
         let mut branches = HashMap::default();
         for &target in plan.direct_branches() {
@@ -530,15 +529,13 @@ impl<'spec> SleighLifter<'spec> {
         let next = construction.block_at(address + length as u64)?;
 
         Ok(FlatEmitter::new(
-            entry,
             next,
-            construction.builder(),
+            construction.emitter(),
             &self.storage,
             self.unique_space,
             branches,
             calls,
             address,
-            length,
             plan,
             self.flat_control_flow,
         ))
@@ -602,8 +599,8 @@ impl<'spec> SleighLifter<'spec> {
                 _ => emitter.op(op.opcode, op.output, &op.inputs),
             }
         }
-        let lifted = emitter.finish()?;
-        Ok(construction.commit(lifted)?)
+        emitter.finish()?;
+        Ok(construction.commit()?)
     }
 
     /// Rebuilds the plan facts of an already-flattened instruction.
@@ -666,7 +663,10 @@ struct OpRef<'a> {
 /// takes its whole-instruction facts — the blocks its direct branches and
 /// calls reach — from the plan its owner resolved before borrowing the body.
 struct FlatEmitter<'spec, 'str, 'ctx> {
-    builder: Builder<'str, 'ctx>,
+    /// The builder into the construction, which also takes the record of the
+    /// instruction's blocks and exits at the operations that open and take
+    /// them — before `flat` decides what they lower to.
+    builder: Emitter<'ctx, 'str>,
     /// Immutable architectural register locations, shared by every instruction.
     base_storage: &'spec HashMap<Varnode, VarnodeId>,
     /// SLEIGH's unique space, whose varnodes are instruction-local.
@@ -684,9 +684,6 @@ struct FlatEmitter<'spec, 'str, 'ctx> {
     /// Lower the guest's calls and returns as jumps. See
     /// [`SleighLifter::with_flat_control_flow`].
     flat: bool,
-    /// The instruction's blocks and exits, recorded at the operations that
-    /// open and take them — before `flat` decides what they lower to.
-    record: Recorder,
     /// A sink cannot fail, so the first failure is latched and the rest of the
     /// instruction is ignored; its caller discards a partial instruction.
     error: Option<LiftError>,
@@ -695,15 +692,13 @@ struct FlatEmitter<'spec, 'str, 'ctx> {
 impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        entry: BlockId,
         next: BlockId,
-        builder: Builder<'str, 'ctx>,
+        builder: Emitter<'ctx, 'str>,
         base_storage: &'spec HashMap<Varnode, VarnodeId>,
         unique_space: SpaceId,
         branches: HashMap<u64, BlockId>,
         calls: HashMap<u64, Callee>,
         address: u64,
-        length: usize,
         plan: &PcodePlan,
         flat: bool,
     ) -> Self {
@@ -722,23 +717,22 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             address,
             fallthrough: 0,
             flat,
-            record: Recorder::new(address, length, entry),
             error: None,
         }
     }
 
     /// Closes the instruction. Running off the end of its p-code is a
     /// fall-through.
-    fn finish(mut self) -> Result<Lifted, LiftError> {
+    fn finish(mut self) -> Result<(), LiftError> {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
         if !self.builder.is_terminated() {
             let site = self.builder.push_branch(self.next).id;
-            self.record
+            self.builder
                 .exit(site, ExitArm::Unconditional, ExitKind::Fallthrough);
         }
-        Ok(self.record.finish())
+        Ok(())
     }
 
     /// Branches to the instruction's fall-through, the target of a local
@@ -746,7 +740,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
     fn branch_next(&mut self, opcode: Opcode, condition: Option<Varnode>) {
         let next = self.next;
         if let Some((site, arm)) = self.branch_to(opcode, next, condition) {
-            self.record.exit(site, arm, ExitKind::Fallthrough);
+            self.builder.exit(site, arm, ExitKind::Fallthrough);
         }
     }
 
@@ -760,7 +754,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             label.index()
         )));
         self.labels[label.index()] = Some(block);
-        self.record.block(block);
+        self.builder.block(block);
         block
     }
 
@@ -813,7 +807,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             self.address, self.fallthrough
         )));
         self.fallthrough += 1;
-        self.record.block(label);
+        self.builder.block(label);
         label
     }
 
@@ -825,7 +819,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         }
         let label = self.open_fallthrough();
         self.builder.switch_to_block(label);
-        self.record.continue_in(label);
+        self.builder.continue_in(label);
     }
 
     fn input(&mut self, op: &OpRef<'_>, index: usize) -> Result<ValueId, LiftError> {
@@ -1005,7 +999,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             BranchInd => {
                 let target = self.input(op, 0)?;
                 let site = self.builder.push_branchind(target).id;
-                self.record
+                self.builder
                     .exit(site, ExitArm::Unconditional, ExitKind::BranchInd);
                 Ok(())
             }
@@ -1033,7 +1027,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
                         .ok_or(LiftError::InvalidDirectTarget(op.opcode))?;
                     self.builder.push_call(callee).id
                 };
-                self.record.exit(
+                self.builder.exit(
                     site,
                     ExitArm::Unconditional,
                     ExitKind::Call {
@@ -1050,7 +1044,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
                 } else {
                     self.builder.push_call_ind(target).id
                 };
-                self.record.exit(
+                self.builder.exit(
                     site,
                     ExitArm::Unconditional,
                     ExitKind::CallInd {
@@ -1068,7 +1062,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
                 } else {
                     self.builder.push_return(target).id
                 };
-                self.record
+                self.builder
                     .exit(site, ExitArm::Unconditional, ExitKind::Return);
                 Ok(())
             }
@@ -1151,7 +1145,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             .ok_or(LiftError::InvalidDirectTarget(op.opcode))?;
         let condition = op.inputs.get(1).copied();
         if let Some((site, arm)) = self.branch_to(op.opcode, block, condition) {
-            self.record.exit(
+            self.builder.exit(
                 site,
                 arm,
                 ExitKind::Branch {
@@ -1195,7 +1189,7 @@ impl PcodeSink for FlatEmitter<'_, '_, '_> {
             self.builder.push_branch(block);
         }
         self.builder.switch_to_block(block);
-        self.record.continue_in(block);
+        self.builder.continue_in(block);
     }
 
     fn branch_label(&mut self, opcode: Opcode, label: LabelId, condition: Option<Varnode>) {

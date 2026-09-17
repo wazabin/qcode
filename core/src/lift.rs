@@ -24,7 +24,7 @@ pub mod scratch;
 pub mod target;
 
 pub use scratch::ScratchStore;
-pub use target::{Construction, LiftTarget, Promotion, TargetError, Transfer};
+pub use target::{Construction, Emitter, LiftTarget, Promotion, TargetError, Transfer};
 
 use crate::value::{BlockId, InstructionId};
 
@@ -109,10 +109,6 @@ pub struct Exit {
 }
 
 impl Exit {
-    pub fn new(site: InstructionId, arm: ExitArm, kind: ExitKind) -> Self {
-        Self { site, arm, kind }
-    }
-
     /// The emitted operation the exit leaves from: a terminator, or a
     /// structured call that the rest of the instruction continues after.
     pub fn site(&self) -> InstructionId {
@@ -210,14 +206,15 @@ impl Lifted {
 
 /// Builds a [`Lifted`] as an emitter lowers an instruction.
 ///
-/// The emitter reports each block it opens and each transfer at the operation
-/// that makes it, as a p-code sink sees them: forward-only, with no look-ahead.
-/// What follows a call is therefore only known once the next operation
-/// arrives, so the recorder resolves call continuations after the fact — to
-/// the block the emitter [continues in](Self::continue_in), or to the next
-/// machine instruction when nothing followed.
+/// A [`Construction`] owns one, and its [`Emitter`] reports to it: each
+/// block the emitter opens and each transfer at the operation that makes it,
+/// as a p-code sink sees them, forward-only and with no look-ahead. What
+/// follows a call is therefore only known once the next operation arrives, so
+/// the recorder resolves call continuations after the fact — to the block the
+/// emitter [continues in](Self::continue_in), or to the next machine
+/// instruction when nothing followed.
 #[derive(Debug)]
-pub struct Recorder {
+pub(crate) struct Recorder {
     lifted: Lifted,
     /// The call exit whose continuation is not yet known.
     pending_call: Option<usize>,
@@ -226,7 +223,7 @@ pub struct Recorder {
 impl Recorder {
     /// Starts recording an instruction at `address` whose p-code begins in
     /// `entry`.
-    pub fn new(address: u64, length: usize, entry: BlockId) -> Self {
+    pub(crate) fn new(address: u64, length: usize, entry: BlockId) -> Self {
         Self {
             lifted: Lifted {
                 address,
@@ -239,8 +236,12 @@ impl Recorder {
         }
     }
 
+    pub(crate) fn lifted(&self) -> &Lifted {
+        &self.lifted
+    }
+
     /// Records a block the instruction owns, in the order they are opened.
-    pub fn block(&mut self, block: BlockId) {
+    pub(crate) fn block(&mut self, block: BlockId) {
         if !self.lifted.blocks.contains(&block) {
             self.lifted.blocks.push(block);
         }
@@ -251,15 +252,15 @@ impl Recorder {
     /// A call's continuation is settled later: pass
     /// [`Continuation::Next`] and let [`continue_in`](Self::continue_in) or
     /// [`finish`](Self::finish) decide.
-    pub fn exit(&mut self, site: InstructionId, arm: ExitArm, kind: ExitKind) {
+    pub(crate) fn exit(&mut self, site: InstructionId, arm: ExitArm, kind: ExitKind) {
         let is_call = kind.is_call();
-        self.lifted.exits.push(Exit::new(site, arm, kind));
+        self.lifted.exits.push(Exit { site, arm, kind });
         self.pending_call = is_call.then_some(self.lifted.exits.len() - 1);
     }
 
     /// Records that the p-code after the last transfer was lowered into
     /// `block`. If that transfer was a call, `block` is where it returns to.
-    pub fn continue_in(&mut self, block: BlockId) {
+    pub(crate) fn continue_in(&mut self, block: BlockId) {
         self.block(block);
         if let Some(index) = self.pending_call.take() {
             match &mut self.lifted.exits[index].kind {
@@ -271,10 +272,14 @@ impl Recorder {
         }
     }
 
-    /// Closes the record. A call nothing followed returns to the next machine
-    /// instruction.
-    pub fn finish(self) -> Lifted {
-        self.lifted
+    /// Closes the record, leaving it empty. A call nothing followed returns
+    /// to the next machine instruction.
+    pub(crate) fn finish(&mut self) -> Lifted {
+        Lifted {
+            blocks: std::mem::take(&mut self.lifted.blocks),
+            exits: std::mem::take(&mut self.lifted.exits),
+            ..self.lifted
+        }
     }
 }
 
