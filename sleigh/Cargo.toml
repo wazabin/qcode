@@ -32,8 +32,14 @@ name = "bind-overhead"
 path = "benches/bind_overhead.rs"
 harness = false
 
+[[bench]]
+name = "lift"
+path = "benches/lift.rs"
+harness = false
+
 [dev-dependencies]
 bincode.workspace = true
+criterion.workspace = true
 # The coverage test names the constructors the corpus never reaches, which
 # needs read-only access to the specification's symbolic structures.
 sleigh = { package = "wazabin-sleigh", version = "0.1.8", features = ["unstable-introspect"] }
