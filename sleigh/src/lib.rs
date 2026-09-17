@@ -62,7 +62,8 @@ use qcode::{
     },
     space::SpaceType,
     value::{
-        BlockId, FunctionBody, FunctionId, InstructionId, QCodeView, Renameable, Value, ValueId,
+        BlockId, FunctionBody, FunctionId, InstructionId, QCodeView, Renameable, TempId, Value,
+        ValueId,
         insn::{Callee, PCodeOpId},
         varnode::{Varnode as QcodeVarnode, VarnodeId},
     },
@@ -665,6 +666,25 @@ struct OpRef<'a> {
     inputs: &'a [Varnode],
 }
 
+/// Where one instruction-local unique varnode lives.
+///
+/// Flat p-code writes its uniques as mutable locations, but nearly all of them
+/// are written once and read in the same straight-line run of operations, so
+/// the emitter keeps a unique as the SSA value last written to it and gives it
+/// memory only when that value has to cross a block boundary — or when it is
+/// read before it is written, which is the p-code's bug to have and the
+/// temporary's to absorb.
+#[derive(Default, Clone, Copy)]
+struct UniqueSlot {
+    /// The SSA value holding the unique's contents, valid within the current
+    /// block; a value from an earlier block is dropped when a new one opens.
+    value: Option<ValueId>,
+    /// The body-local temporary the unique spills to, made on first need.
+    temp: Option<TempId>,
+    /// Whether `value` has been written since it was last stored to `temp`.
+    dirty: bool,
+}
+
 /// Emits QCode for one instruction's flat p-code.
 ///
 /// The emitter is a [`PcodeSink`]: it never sees a flat p-code vector, and it
@@ -681,7 +701,14 @@ struct FlatEmitter<'spec, 'str, 'ctx> {
     unique_space: SpaceId,
     /// Per-instruction unique-space locations. Unlike register locations these
     /// must not be shared, because SLEIGH's unique space is instruction-local.
-    unique_storage: HashMap<Varnode, ValueId>,
+    unique_storage: HashMap<Varnode, UniqueSlot>,
+    /// The uniques written since their last spill, in write order, so a spill
+    /// stores them deterministically.
+    dirty: Vec<Varnode>,
+    /// Whether the plan has a label that opens a block of this instruction.
+    /// Without one, no p-code after an unconditional transfer can run, so
+    /// nothing needs to survive it.
+    has_local_blocks: bool,
     branches: HashMap<u64, BlockId>,
     calls: HashMap<u64, Callee>,
     /// Blocks for the plan's instruction-local labels, made on first mention.
@@ -715,6 +742,9 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             base_storage,
             unique_space,
             unique_storage: HashMap::default(),
+            dirty: Vec::new(),
+            has_local_blocks: (0..plan.labels().len())
+                .any(|index| !plan.is_terminal(LabelId::from_index(index))),
             branches,
             calls,
             // A terminal label is the instruction's fall-through, not a block.
@@ -777,7 +807,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         condition: Option<Varnode>,
     ) -> Option<(InstructionId, ExitArm)> {
         let condition = match (opcode, condition) {
-            (Opcode::CBranch, Some(condition)) => match self.value(condition) {
+            (Opcode::CBranch, Some(condition)) => match self.raw_value(condition) {
                 Ok(condition) => Some(self.ensure_bool(condition)),
                 Err(error) => {
                     self.fail(error);
@@ -796,12 +826,17 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         };
         Some(match condition {
             Some(condition) => {
+                self.leave_block(true);
                 let fallthrough = self.open_fallthrough();
                 let site = self.builder.push_cbranch(condition, target, fallthrough).id;
                 self.builder.switch_to_block(fallthrough);
+                self.enter_block();
                 (site, ExitArm::Taken)
             }
-            None => (self.builder.push_branch(target).id, ExitArm::Unconditional),
+            None => {
+                self.leave_block(false);
+                (self.builder.push_branch(target).id, ExitArm::Unconditional)
+            }
         })
     }
 
@@ -828,43 +863,86 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         let label = self.open_fallthrough();
         self.builder.switch_to_block(label);
         self.builder.continue_in(label);
+        self.enter_block();
     }
 
     fn input(&mut self, op: &OpRef<'_>, index: usize) -> Result<ValueId, LiftError> {
-        let value = *op.inputs.get(index).ok_or(LiftError::InvalidArity {
-            opcode: op.opcode,
-            expected: index + 1,
-            actual: op.inputs.len(),
-        })?;
+        let value = self.input_varnode(op, index)?;
         self.value(value)
     }
 
+    /// An input read as held, for the consumers that want a `bool`.
+    fn raw_input(&mut self, op: &OpRef<'_>, index: usize) -> Result<ValueId, LiftError> {
+        let value = self.input_varnode(op, index)?;
+        self.raw_value(value)
+    }
+
+    fn input_varnode(&self, op: &OpRef<'_>, index: usize) -> Result<Varnode, LiftError> {
+        op.inputs
+            .get(index)
+            .copied()
+            .ok_or(LiftError::InvalidArity {
+                opcode: op.opcode,
+                expected: index + 1,
+                actual: op.inputs.len(),
+            })
+    }
+
+    /// Reads a varnode as an integer operand. A unique that holds a `bool`
+    /// value — a comparison's result — is widened to its byte here, which is
+    /// what its memory temporary would have held.
     fn value(&mut self, varnode: Varnode) -> Result<ValueId, LiftError> {
+        let value = self.raw_value(varnode)?;
+        let ty = self.builder.view().type_of(value);
+        if self.builder.shr().types.is_bool(ty) {
+            return Ok(self.builder.push_zext(value, 1).id());
+        }
+        Ok(value)
+    }
+
+    /// Reads a varnode as it is held: a `bool` stays a `bool`, for the
+    /// consumers that want one.
+    fn raw_value(&mut self, varnode: Varnode) -> Result<ValueId, LiftError> {
         if varnode.space == SPACE_CONST {
             return Ok(self.builder.shr().get_const(varnode.offset, varnode.size));
         }
-        let value = self.storage(varnode)?;
+        if varnode.space == self.unique_space {
+            return Ok(self.read_unique(varnode));
+        }
+        let value = self.base_storage(varnode)?;
         Ok(self.builder.ensure_local(value))
     }
 
-    /// Resolves a varnode's QCode location, giving each instruction-local
-    /// unique varnode its own body-local temporary on first use. Flat p-code
-    /// varnodes are mutable locations rather than SSA values, so this keeps
-    /// even overlapping unique varnodes isolated as their storage identity
-    /// requires.
-    fn storage(&mut self, varnode: Varnode) -> Result<ValueId, LiftError> {
-        if varnode.space == self.unique_space {
-            let temp = *self
-                .unique_storage
-                .entry(varnode)
-                .or_insert_with(|| ValueId::Temp(self.builder.make_temp(varnode.size)));
-            return Ok(temp);
-        }
+    /// Resolves an architectural varnode's QCode location.
+    fn base_storage(&self, varnode: Varnode) -> Result<ValueId, LiftError> {
         self.base_storage
             .get(&varnode)
             .copied()
             .map(ValueId::Varnode)
             .ok_or(LiftError::UnknownVarnode(varnode))
+    }
+
+    /// The SSA value of a unique: the one last written in this block, else a
+    /// load of its temporary, which is made here if the unique is read before
+    /// it is ever written. Each unique varnode — by space, offset and size —
+    /// has its own slot, so overlapping uniques stay isolated as their storage
+    /// identity requires.
+    fn read_unique(&mut self, varnode: Varnode) -> ValueId {
+        let slot = self.unique_storage.entry(varnode).or_default();
+        if let Some(value) = slot.value {
+            return value;
+        }
+        let temp = *slot
+            .temp
+            .get_or_insert_with(|| self.builder.make_temp(varnode.size));
+        let value = self.builder.ensure_local(ValueId::Temp(temp));
+        let slot = self
+            .unique_storage
+            .get_mut(&varnode)
+            .expect("the slot was just made");
+        slot.value = Some(value);
+        slot.dirty = false;
+        value
     }
 
     fn write(&mut self, output: Option<Varnode>, value: ValueId) -> Result<(), LiftError> {
@@ -874,9 +952,55 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         if output.space == SPACE_CONST {
             return Err(LiftError::UnknownVarnode(output));
         }
-        let destination = self.storage(output)?;
+        if output.space == self.unique_space {
+            let slot = self.unique_storage.entry(output).or_default();
+            slot.value = Some(value);
+            if !slot.dirty {
+                slot.dirty = true;
+                self.dirty.push(output);
+            }
+            return Ok(());
+        }
+        let destination = self.base_storage(output)?;
         self.builder.push_copy(value, destination);
         Ok(())
+    }
+
+    /// Stores every unique written since the last spill to its temporary, so
+    /// a block the control flow reaches next can load it.
+    fn spill(&mut self) {
+        for varnode in std::mem::take(&mut self.dirty) {
+            let slot = self
+                .unique_storage
+                .get_mut(&varnode)
+                .expect("a dirty unique has a slot");
+            let value = slot.value.expect("a dirty unique holds a value");
+            slot.dirty = false;
+            let temp = *slot
+                .temp
+                .get_or_insert_with(|| self.builder.make_temp(varnode.size));
+            self.builder.push_copy(value, ValueId::Temp(temp));
+        }
+    }
+
+    /// Prepares to end the current block with a transfer. Uniques must be in
+    /// memory if p-code of this instruction can run afterwards: always when
+    /// the transfer `continues` in a block of its own (a conditional branch's
+    /// fall-through, a call's continuation), otherwise only when a label can
+    /// bring control back.
+    fn leave_block(&mut self, continues: bool) {
+        if continues || self.has_local_blocks {
+            self.spill();
+        }
+    }
+
+    /// Notes that a new block is current: values held from the previous one
+    /// are not usable in it, so the next read of each unique loads it.
+    fn enter_block(&mut self) {
+        debug_assert!(self.dirty.is_empty(), "a block was left without a spill");
+        for slot in self.unique_storage.values_mut() {
+            slot.value = None;
+        }
     }
 
     fn emit_op(&mut self, op: &OpRef<'_>) -> Result<(), LiftError> {
@@ -923,7 +1047,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             IntNegate => unary(self, |b, a| b.push_bit_negate(a).id()),
             Int2Comp => unary(self, |b, a| b.push_neg(a).id()),
             BoolNegate => {
-                let input = self.input(op, 0)?;
+                let input = self.raw_input(op, 0)?;
                 let input = self.ensure_bool(input);
                 let value = self.builder.push_bool_not(input).id();
                 self.write(op.output, value)
@@ -1006,6 +1130,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             Branch | CBranch => self.direct_branch(op),
             BranchInd => {
                 let target = self.input(op, 0)?;
+                self.leave_block(false);
                 let site = self.builder.push_branchind(target).id;
                 self.builder
                     .exit(site, ExitArm::Unconditional, ExitKind::BranchInd);
@@ -1020,6 +1145,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
                 // The return address is already on the guest's stack by now —
                 // SLEIGH wrote it with ordinary p-code — so in flat mode all
                 // that is left of the call is the jump.
+                self.leave_block(!self.flat);
                 let site = if self.flat {
                     let block = self
                         .branches
@@ -1047,6 +1173,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             }
             CallInd => {
                 let target = self.input(op, 0)?;
+                self.leave_block(!self.flat);
                 let site = if self.flat {
                     self.builder.push_branchind(target).id
                 } else {
@@ -1065,6 +1192,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
                 let target = self.input(op, 0)?;
                 // The stack has already been popped into this value; returning
                 // is a jump to it.
+                self.leave_block(false);
                 let site = if self.flat {
                     self.builder.push_branchind(target).id
                 } else {
@@ -1093,9 +1221,9 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         op: &OpRef<'_>,
         f: fn(&mut Builder<'str, 'ctx>, ValueId, ValueId) -> ValueId,
     ) -> Result<(), LiftError> {
-        let lhs = self.input(op, 0)?;
+        let lhs = self.raw_input(op, 0)?;
         let lhs = self.ensure_bool(lhs);
-        let rhs = self.input(op, 1)?;
+        let rhs = self.raw_input(op, 1)?;
         let rhs = self.ensure_bool(rhs);
         let value = f(&mut self.builder, lhs, rhs);
         self.write(op.output, value)
@@ -1194,10 +1322,12 @@ impl PcodeSink for FlatEmitter<'_, '_, '_> {
             return;
         }
         if !self.builder.is_terminated() {
+            self.spill();
             self.builder.push_branch(block);
         }
         self.builder.switch_to_block(block);
         self.builder.continue_in(block);
+        self.enter_block();
     }
 
     fn branch_label(&mut self, opcode: Opcode, label: LabelId, condition: Option<Varnode>) {
@@ -1922,6 +2052,93 @@ mod tests {
                 emulator.read_register(output_id),
                 Some(expected),
                 "{instruction}"
+            );
+        }
+    }
+
+    /// A specification whose `r0` and `r1` are 4-byte registers, with one
+    /// instruction per test of the unique-space lowering.
+    fn unique_spec() -> CompiledSpec {
+        let mut sources = SourceDb::new();
+        let root = sources.add_file(
+            "uniques.slaspec",
+            "define endian=little;
+             define space ram type=ram_space size=4 default;
+             define space register type=register_space size=4;
+             define register offset=0 size=4 [ r0 r1 ];
+             define token instr(8) op=(0,7);
+             :chain is op=2 { local t:4 = r0 + 1:4; r0 = t * 2:4; }
+             :cross is op=3 {
+                 local t:4 = r0 + 1:4;
+                 if (r0 == 0:4) goto <done>;
+                 r0 = t;
+                 <done>
+                 r1 = t;
+             }",
+        );
+        Compiler::new(&mut sources).compile(root).unwrap()
+    }
+
+    fn register(spec: &CompiledSpec, name: &str) -> sleigh::RegisterId {
+        spec.registers()
+            .find(|register| register.name() == name)
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn uniques_read_in_their_own_block_are_values_not_memory() {
+        let spec = unique_spec();
+        let instruction = Decoder::new(&spec)
+            .decode_one(0x1000, &[2], &spec.new_context())
+            .unwrap();
+        let lifter = SleighLifter::new(&spec);
+        let mut ctx = lifter.new_context();
+        lifter
+            .lift_instruction(&mut ctx, &instruction, None)
+            .unwrap();
+        // Register load, add, multiply, register copy, and machine
+        // fall-through: the unique `t` is the add's result, never stored.
+        assert_eq!(ctx.instructions().count(), 5, "{ctx}");
+
+        let mut emulator = Emulator::from_address(&ctx, 0x1000);
+        emulator.set_register(register(&spec, "r0"), 5).unwrap();
+        while emulator.block().address() != Some(0x1001) {
+            emulator.step().unwrap();
+        }
+        assert_eq!(emulator.read_register(register(&spec, "r0")), Some(12));
+    }
+
+    #[test]
+    fn uniques_read_across_a_block_boundary_go_through_memory() {
+        let spec = unique_spec();
+        let instruction = Decoder::new(&spec)
+            .decode_one(0x1000, &[3], &spec.new_context())
+            .unwrap();
+        let lifter = SleighLifter::new(&spec);
+        let mut ctx = lifter.new_context();
+        lifter
+            .lift_instruction(&mut ctx, &instruction, None)
+            .unwrap();
+        // The entry block: two register loads, the add, the compare, a store
+        // of `t` and of the condition to their temporaries, and the branch.
+        // Then the not-taken block and the label's block each load `t`, store
+        // it to a register, and jump.
+        assert_eq!(ctx.instructions().count(), 13, "{ctx}");
+
+        for (r0, expected_r0, expected_r1) in [(5, 6, 6), (0, 0, 1)] {
+            let mut emulator = Emulator::from_address(&ctx, 0x1000);
+            emulator.set_register(register(&spec, "r0"), r0).unwrap();
+            while emulator.block().address() != Some(0x1001) {
+                emulator.step().unwrap();
+            }
+            assert_eq!(
+                emulator.read_register(register(&spec, "r0")),
+                Some(expected_r0)
+            );
+            assert_eq!(
+                emulator.read_register(register(&spec, "r1")),
+                Some(expected_r1)
             );
         }
     }
