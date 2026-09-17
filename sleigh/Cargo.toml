@@ -27,6 +27,11 @@ path = "examples/qcode_dump.rs"
 name = "qcode-lift"
 path = "examples/qcode-lift.rs"
 
+[[bench]]
+name = "bind-overhead"
+path = "benches/bind_overhead.rs"
+harness = false
+
 [dev-dependencies]
 bincode.workspace = true
 # The coverage test names the constructors the corpus never reaches, which

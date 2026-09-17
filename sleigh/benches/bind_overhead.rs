@@ -8,7 +8,7 @@
 //! per-instruction translation cost the VM reports, so the share is visible.
 //!
 //! ```sh
-//! cargo run --release -p wazabin-qcode-sleigh --example bind-overhead
+//! cargo bench -p wazabin-qcode-sleigh --bench bind-overhead
 //! ```
 
 use std::time::{Duration, Instant};
@@ -32,7 +32,7 @@ fn main() {
     println!("checked binding alone, by module size (index current):");
     println!(
         "{:>10} {:>8} {:>12} {:>14} {:>16} {:>12}",
-        "functions", "blocks", "bind_indexed", "bind(current)", "bind(refresh)", "body_mut"
+        "functions", "blocks", "bind_indexed", "refresh(none)", "refresh(rebuilt)", "body_mut"
     );
     for &functions in &[1usize, 10, 100, 1_000, 10_000] {
         let mut ctx = lifter.new_context();

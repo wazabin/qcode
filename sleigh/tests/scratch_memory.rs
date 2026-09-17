@@ -11,8 +11,11 @@
 //! literal-budget rebuilds — and asserts that, past the first budget cycle,
 //! the live footprint stops growing.
 //!
+//! Live bytes depend on the allocator and the platform, so nothing here runs
+//! under a plain `cargo test`; run it on demand:
+//!
 //! ```sh
-//! cargo test --release -p wazabin-qcode-sleigh --test scratch_memory -- --nocapture
+//! cargo test --release -p wazabin-qcode-sleigh --test scratch_memory -- --ignored --nocapture
 //! ```
 
 use std::{
@@ -94,6 +97,7 @@ fn instruction(i: u32) -> (u64, Vec<u8>) {
 }
 
 #[test]
+#[ignore = "measures live bytes, which depend on the allocator; run on demand"]
 fn total_retained_bytes_stop_growing_after_the_first_budget_cycle() {
     const LIFTS: u32 = 12_000;
     const CHECKPOINT: u32 = 1_000;
