@@ -28,6 +28,13 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  no-downgrades:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/cargo-no-downgrades
+
   coverage:
     runs-on: ubuntu-latest
     steps:
