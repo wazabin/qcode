@@ -28,11 +28,11 @@ use qcode::{
     address_index::AddressIndex,
     context::Context,
     lift::{Exit, ExitArm, ExitKind, LiftTarget, Lifted, ScratchStore, TargetError},
-    space::{LocalMemorySpaceId, SpaceId},
+    space::SpaceId,
     value::{
         BlockId, FunctionBody, FunctionId, InstructionId, LocalTempId, LocalValueId, Varnode,
         VarnodeId,
-        insn::{Binop, Callee, IntrinsicId, Mnemonic, Unop},
+        insn::{Callee, Mnemonic},
     },
 };
 use sleigh::{ContextBytes, ContextError, Instruction};
@@ -180,9 +180,7 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
 
     /// A session that discards each instruction before the next. See
     /// [`ScratchSession::new`].
-    pub fn scratch(
-        lifter: &'l SleighLifter<'spec>,
-    ) -> Result<ScratchSession<'l, 'spec>, LiftError> {
+    pub fn scratch(lifter: &'l SleighLifter<'spec>) -> ScratchSession<'l, 'spec> {
         ScratchSession::new(lifter)
     }
 }
@@ -197,8 +195,8 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
 /// ```compile_fail
 /// # use wazabin_qcode_sleigh::{SleighLifter, session::ScratchSession};
 /// # let spec = sleigh_precompile::x64::spec();
-/// # let lifter = SleighLifter::new(spec).with_flat_control_flow();
-/// let mut session = ScratchSession::new(&lifter).unwrap();
+/// # let lifter = SleighLifter::new(spec);
+/// let mut session = ScratchSession::new(&lifter);
 /// let first = session.lift(0x1000, b"\x48\x89\xd8").unwrap();
 /// let entry = first.entry();
 /// let second = session.lift(0x1003, b"\x48\x89\xd8").unwrap(); // `first` is still borrowed
@@ -210,8 +208,8 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
 /// ```compile_fail
 /// # use wazabin_qcode_sleigh::{SleighLifter, session::ScratchSession};
 /// # let spec = sleigh_precompile::x64::spec();
-/// # let lifter = SleighLifter::new(spec).with_flat_control_flow();
-/// let mut session = ScratchSession::new(&lifter).unwrap();
+/// # let lifter = SleighLifter::new(spec);
+/// let mut session = ScratchSession::new(&lifter);
 /// let first = session.lift(0x1000, b"\x48\xc7\xc0\x44\x33\x22\x11").unwrap();
 /// let operand = first.entry().instructions().next().unwrap().operands().next().unwrap();
 /// let second = session.lift(0x1007, b"\x48\x89\xd8").unwrap(); // `operand` still borrows
@@ -224,8 +222,8 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
 /// ```compile_fail
 /// # use wazabin_qcode_sleigh::{SleighLifter, session::ScratchSession};
 /// # let spec = sleigh_precompile::x64::spec();
-/// # let lifter = SleighLifter::new(spec).with_flat_control_flow();
-/// let mut session = ScratchSession::new(&lifter).unwrap();
+/// # let lifter = SleighLifter::new(spec);
+/// let mut session = ScratchSession::new(&lifter);
 /// let lifted = session.lift(0x1000, b"\x48\x89\xd8").unwrap();
 /// let epoch = session.epoch(); // `lifted` still borrows the session
 /// let _ = lifted.entry();
@@ -237,18 +235,17 @@ pub struct ScratchSession<'l, 'spec> {
 }
 
 impl<'l, 'spec> ScratchSession<'l, 'spec> {
-    /// A scratch session for `lifter`, which must lower calls and returns as
-    /// jumps: a structured call creates its callee function, and a function
-    /// cannot be discarded with the instruction that created it.
-    pub fn new(lifter: &'l SleighLifter<'spec>) -> Result<Self, LiftError> {
-        if !lifter.flat_control_flow {
-            return Err(LiftError::ScratchNeedsFlatControlFlow);
-        }
-        Ok(Self {
+    /// A scratch session for `lifter`. It lowers calls and returns as jumps
+    /// (as [`SleighLifter::with_flat_control_flow`] does) whatever the lifter
+    /// would: a structured call creates its callee function, and a function
+    /// cannot be discarded with the instruction that created it. The exits
+    /// still report calls and returns as what they were.
+    pub fn new(lifter: &'l SleighLifter<'spec>) -> Self {
+        Self {
             lifter,
             decoder: FixedDecoder::new(lifter.spec()),
             store: ScratchStore::new(lifter.new_context()),
-        })
+        }
     }
 
     /// Decodes every address with `context` instead of the specification's
@@ -310,7 +307,7 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
     ) -> Result<ScratchLifted<'s, 'l, 'spec, 'b>, LiftError> {
         self.store.reset();
         let mut target = self.store.target()?;
-        let lifted = self.lifter.lift_into(&mut target, &instruction)?;
+        let lifted = self.lifter.lower(&mut target, &instruction, true)?;
         Ok(ScratchLifted {
             session: self,
             instruction,
@@ -323,8 +320,8 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
 ///
 /// Every block, instruction and operand it exposes is a view carrying this
 /// borrow, so none can be kept past the instruction. Operands are read by
-/// role or position from the live instruction ([`ScratchInsn::kind`],
-/// [`ScratchInsn::operands`]); nothing here takes a bare id and resolves it.
+/// position from the live instruction ([`ScratchInsn::operands`]); nothing
+/// here takes a bare id and resolves it.
 /// The storage recycles constant ids between instructions, so an id kept
 /// from an earlier one may now number a different constant, and a facade
 /// that resolved ids would hand back that other value. Raw
@@ -353,26 +350,11 @@ impl<'s, 'l, 'spec, 'b> ScratchLifted<'s, 'l, 'spec, 'b> {
         self.instruction.bytes()
     }
 
-    pub fn address(&self) -> u64 {
-        self.lifted.address()
-    }
-
-    pub fn length(&self) -> usize {
-        self.lifted.length()
-    }
-
-    pub fn next_address(&self) -> u64 {
-        self.lifted.next_address()
-    }
-
-    /// See [`Lifted::falls_through`].
-    pub fn falls_through(&self) -> bool {
-        self.lifted.falls_through()
-    }
-
-    /// See [`Lifted::calls`].
-    pub fn calls(&self) -> bool {
-        self.lifted.calls()
+    /// The plain result: address, length, exits and how control leaves. The
+    /// block and instruction ids in it are this epoch's keys, not handles;
+    /// the views below are the way to what they name.
+    pub fn lifted(&self) -> &Lifted {
+        &self.lifted
     }
 
     /// Every place control leaves the instruction, in emission order.
@@ -491,101 +473,6 @@ impl ScratchVarnode<'_> {
     }
 }
 
-/// A scratch instruction's operation with its operands resolved: the
-/// [`Mnemonic`] as seen through the live instruction. Operands are named by
-/// their role so a caller need not know operand order.
-///
-/// Not every mnemonic has a view; [`Other`](Self::Other) covers the rest, whose
-/// operands are still reachable positionally through
-/// [`ScratchInsn::operands`].
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum ScratchMnemonic<'v> {
-    Load {
-        space: LocalMemorySpaceId,
-        ptr: ScratchOperand<'v>,
-        size: usize,
-    },
-    Store {
-        space: LocalMemorySpaceId,
-        ptr: ScratchOperand<'v>,
-        src: ScratchOperand<'v>,
-        size: usize,
-    },
-    Binop {
-        op: Binop,
-        lhs: ScratchOperand<'v>,
-        rhs: ScratchOperand<'v>,
-    },
-    Unop {
-        op: Unop,
-        src: ScratchOperand<'v>,
-    },
-    Zext {
-        src: ScratchOperand<'v>,
-        size: usize,
-    },
-    Sext {
-        src: ScratchOperand<'v>,
-        size: usize,
-    },
-    Range {
-        src: ScratchOperand<'v>,
-        start: usize,
-        size: usize,
-    },
-    Carry {
-        lhs: ScratchOperand<'v>,
-        rhs: ScratchOperand<'v>,
-    },
-    SCarry {
-        lhs: ScratchOperand<'v>,
-        rhs: ScratchOperand<'v>,
-    },
-    SBorrow {
-        lhs: ScratchOperand<'v>,
-        rhs: ScratchOperand<'v>,
-    },
-    PopCount {
-        src: ScratchOperand<'v>,
-    },
-    LzCount {
-        src: ScratchOperand<'v>,
-    },
-    Intrinsic {
-        id: IntrinsicId,
-        args: Vec<ScratchOperand<'v>>,
-    },
-    Branch {
-        target: ScratchBlock<'v>,
-    },
-    CBranch {
-        condition: ScratchOperand<'v>,
-        taken: ScratchBlock<'v>,
-        not_taken: ScratchBlock<'v>,
-    },
-    BranchInd {
-        ptr: ScratchOperand<'v>,
-    },
-    Switch {
-        scrutinee: ScratchOperand<'v>,
-    },
-    /// A direct call; `callee` is the callee's entry address when it has one.
-    Call {
-        callee: Option<u64>,
-    },
-    CallInd {
-        ptr: ScratchOperand<'v>,
-    },
-    TailCall {
-        callee: Option<u64>,
-    },
-    Return,
-    BadInsn,
-    /// A mnemonic without a role view; see [`ScratchInsn::opcode`].
-    Other,
-}
-
 /// One exit of a scratch instruction.
 pub struct ScratchExit<'v> {
     exit: &'v Exit,
@@ -690,8 +577,7 @@ impl std::fmt::Debug for ScratchInsn<'_> {
 impl<'v> ScratchInsn<'v> {
     /// The raw mnemonic. The operand ids inside are keys, not handles: the
     /// facade resolves none of them, and they must not be carried to another
-    /// instruction. Prefer [`kind`](Self::kind), which resolves the operands
-    /// by role.
+    /// instruction. [`operands`](Self::operands) resolves them.
     pub fn mnemonic(&self) -> &'v Mnemonic {
         self.ctx.instruction(self.id).mnemonic()
     }
@@ -699,86 +585,6 @@ impl<'v> ScratchInsn<'v> {
     /// The operand other instructions name this one's result by.
     pub fn result(&self) -> LocalValueId {
         LocalValueId::Instruction(self.id.local)
-    }
-
-    /// The instruction's operation with its operands resolved by role.
-    pub fn kind(&self) -> ScratchMnemonic<'v> {
-        let op = |v: LocalValueId| self.resolve(v);
-        match self.mnemonic() {
-            Mnemonic::Load(l) => ScratchMnemonic::Load {
-                space: l.space,
-                ptr: op(l.ptr),
-                size: l.size,
-            },
-            Mnemonic::Store(st) => ScratchMnemonic::Store {
-                space: st.space,
-                ptr: op(st.ptr),
-                src: op(st.src),
-                size: st.size,
-            },
-            Mnemonic::Binop(b) => ScratchMnemonic::Binop {
-                op: b.op,
-                lhs: op(b.lhs),
-                rhs: op(b.rhs),
-            },
-            Mnemonic::Unop(u) => ScratchMnemonic::Unop {
-                op: u.op.clone(),
-                src: op(u.src),
-            },
-            Mnemonic::Zext(z) => ScratchMnemonic::Zext {
-                src: op(z.src),
-                size: z.size,
-            },
-            Mnemonic::Sext(z) => ScratchMnemonic::Sext {
-                src: op(z.src),
-                size: z.size,
-            },
-            Mnemonic::Range(r) => ScratchMnemonic::Range {
-                src: op(r.src),
-                start: r.start,
-                size: r.size,
-            },
-            Mnemonic::Carry(c) => ScratchMnemonic::Carry {
-                lhs: op(c.lhs),
-                rhs: op(c.rhs),
-            },
-            Mnemonic::SCarry(c) => ScratchMnemonic::SCarry {
-                lhs: op(c.lhs),
-                rhs: op(c.rhs),
-            },
-            Mnemonic::SBorrow(c) => ScratchMnemonic::SBorrow {
-                lhs: op(c.lhs),
-                rhs: op(c.rhs),
-            },
-            Mnemonic::PopCount(p) => ScratchMnemonic::PopCount { src: op(p.src) },
-            Mnemonic::LzCount(p) => ScratchMnemonic::LzCount { src: op(p.src) },
-            Mnemonic::Intrinsic(i) => ScratchMnemonic::Intrinsic {
-                id: i.id,
-                args: i.args.iter().map(|&a| op(a)).collect(),
-            },
-            Mnemonic::Branch(b) => ScratchMnemonic::Branch {
-                target: self.block_view(b.target),
-            },
-            Mnemonic::CBranch(c) => ScratchMnemonic::CBranch {
-                condition: op(c.condition),
-                taken: self.block_view(c.success_block),
-                not_taken: self.block_view(c.failure_block),
-            },
-            Mnemonic::BranchInd(b) => ScratchMnemonic::BranchInd { ptr: op(b.ptr) },
-            Mnemonic::Switch(sw) => ScratchMnemonic::Switch {
-                scrutinee: op(sw.scrutinee),
-            },
-            Mnemonic::Call(_) => ScratchMnemonic::Call {
-                callee: self.callee_address(),
-            },
-            Mnemonic::CallInd(c) => ScratchMnemonic::CallInd { ptr: op(c.ptr) },
-            Mnemonic::TailCall(_) => ScratchMnemonic::TailCall {
-                callee: self.callee_address(),
-            },
-            Mnemonic::Return(_) | Mnemonic::ReturnValue(_) => ScratchMnemonic::Return,
-            Mnemonic::BadInsn(_) => ScratchMnemonic::BadInsn,
-            _ => ScratchMnemonic::Other,
-        }
     }
 
     /// The operands of this instruction, in mnemonic order, resolved.
@@ -979,18 +785,9 @@ mod tests {
     }
 
     #[test]
-    fn a_scratch_session_needs_flat_control_flow() {
-        let lifter = lifter();
-        assert_eq!(
-            ScratchSession::new(&lifter).err(),
-            Some(LiftError::ScratchNeedsFlatControlFlow)
-        );
-    }
-
-    #[test]
     fn a_scratch_lift_is_independent_of_the_previous_one() {
-        let lifter = lifter().with_flat_control_flow();
-        let mut session = ScratchSession::new(&lifter).unwrap();
+        let lifter = lifter();
+        let mut session = ScratchSession::new(&lifter);
         let first_blocks = {
             let lifted = session.lift(0x1000, b"\xe8\x10\x00\x00\x00").unwrap();
             assert_eq!(lifted.decoded().to_string(), "CALL 4117");
@@ -1022,22 +819,20 @@ mod tests {
 
     #[test]
     fn a_failed_scratch_lift_does_not_spoil_the_next() {
-        let lifter = lifter().with_flat_control_flow();
-        let mut session = ScratchSession::new(&lifter).unwrap();
+        let lifter = lifter();
+        let mut session = ScratchSession::new(&lifter);
         assert!(matches!(
             session.lift(0x1000, b"\x0f\xff").err(),
             Some(LiftError::Decode(_))
         ));
         let lifted = session.lift(0x1000, b"\x48\x89\xd8").unwrap();
-        assert!(lifted.falls_through());
+        assert!(lifted.lifted().falls_through());
     }
 
     #[test]
     fn ten_thousand_scratch_lifts_retain_one_instruction() {
-        let lifter = lifter().with_flat_control_flow();
-        let mut session = ScratchSession::new(&lifter)
-            .unwrap()
-            .with_literal_budget(1_024);
+        let lifter = lifter();
+        let mut session = ScratchSession::new(&lifter).with_literal_budget(1_024);
         // `mov rax, imm32` with a different immediate, address and, every
         // other time, a different instruction and size.
         let mut peak = 0;
@@ -1049,7 +844,7 @@ mod tests {
                 vec![0x74, imm[0]]
             };
             let lifted = session.lift(0x1000 + u64::from(i) * 7, &bytes).unwrap();
-            assert!(lifted.falls_through());
+            assert!(lifted.lifted().falls_through());
             let stats = session.arena_stats();
             peak = peak.max(stats.instructions.issued);
             assert!(stats.blocks.issued <= 4, "{stats:?}");
@@ -1069,10 +864,10 @@ mod tests {
 
     #[test]
     fn a_recycled_constant_id_is_never_a_way_to_a_value() {
-        let lifter = lifter().with_flat_control_flow();
+        let lifter = lifter();
         // Budget 0: the storage is rebuilt after every instruction that
         // interned a constant, so the next one reuses the first free id.
-        let mut session = ScratchSession::new(&lifter).unwrap().with_literal_budget(0);
+        let mut session = ScratchSession::new(&lifter).with_literal_budget(0);
         fn store_of<'v>(lifted: &'v ScratchLifted<'_, '_, '_, '_>) -> ScratchInsn<'v> {
             lifted
                 .entry()
@@ -1087,13 +882,10 @@ mod tests {
             }
         }
         fn value(insn: &ScratchInsn<'_>) -> u64 {
-            match insn.kind() {
-                ScratchMnemonic::Store { src, ptr, .. } => {
-                    assert!(matches!(ptr, ScratchOperand::Varnode(v) if v.name() == Some("RAX")));
-                    src.as_const().unwrap()
-                }
-                other => panic!("{other:?}"),
-            }
+            let operands: Vec<_> = insn.operands().collect();
+            assert_eq!(operands.len(), 2);
+            assert!(matches!(operands[0], ScratchOperand::Varnode(v) if v.name() == Some("RAX")));
+            operands[1].as_const().unwrap()
         }
 
         let first_id = {
@@ -1102,9 +894,6 @@ mod tests {
                 .unwrap();
             let store = store_of(&lifted);
             assert_eq!(value(&store), 0x1122_3344);
-            let operands: Vec<_> = store.operands().collect();
-            assert_eq!(operands.len(), 2);
-            assert_eq!(operands[1].as_const(), Some(0x1122_3344));
             raw_id(&store)
         };
         assert_eq!(session.rebuilds(), 0);

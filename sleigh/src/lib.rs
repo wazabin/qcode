@@ -184,9 +184,6 @@ pub enum LiftError {
     IncompatibleSpec,
     /// The bytes did not decode.
     Decode(sleigh::DecodeError),
-    /// A scratch session needs a lifter that lowers calls as jumps; see
-    /// [`session::ScratchSession::new`].
-    ScratchNeedsFlatControlFlow,
 }
 
 impl std::fmt::Display for LiftError {
@@ -226,9 +223,6 @@ impl std::fmt::Display for LiftError {
                 f.write_str("the instruction was decoded by another specification")
             }
             Self::Decode(error) => error.fmt(f),
-            Self::ScratchNeedsFlatControlFlow => {
-                f.write_str("a scratch session needs flat control flow")
-            }
         }
     }
 }
@@ -442,13 +436,26 @@ impl<'spec> SleighLifter<'spec> {
         target: &mut LiftTarget<'_, 'static>,
         instruction: &Instruction<'_, '_>,
     ) -> Result<Lifted, LiftError> {
+        self.lower(target, instruction, self.flat_control_flow)
+    }
+
+    /// [`lift_into`](Self::lift_into) with the control-flow lowering chosen
+    /// by the caller rather than the lifter: a scratch session lowers calls
+    /// as jumps whatever the lifter would, since a callee function cannot be
+    /// discarded with the instruction that made it.
+    pub(crate) fn lower(
+        &self,
+        target: &mut LiftTarget<'_, 'static>,
+        instruction: &Instruction<'_, '_>,
+        flat: bool,
+    ) -> Result<Lifted, LiftError> {
         self.check_instruction(instruction)?;
         self.check_compatible(target.context())?;
         let mut construction = target.begin(instruction.address(), instruction.len())?;
         // The plan carries every fact needed before the builder borrows the
         // function body, so no flat p-code vector is built or re-scanned.
         instruction
-            .try_pcode_ops_streamed(|plan| self.emitter(&mut construction, plan))?
+            .try_pcode_ops_streamed(|plan| self.emitter(&mut construction, plan, flat))?
             .finish()?;
         Ok(construction.commit()?)
     }
@@ -509,6 +516,7 @@ impl<'spec> SleighLifter<'spec> {
         &self,
         construction: &'c mut Construction<'_, 'a, 'static>,
         plan: &PcodePlan,
+        flat: bool,
     ) -> Result<FlatEmitter<'_, 'static, 'c>, LiftError> {
         let address = construction.address();
         let length = construction.length();
@@ -519,7 +527,7 @@ impl<'spec> SleighLifter<'spec> {
         }
         let mut calls = HashMap::default();
         for &target in plan.direct_calls() {
-            if self.flat_control_flow {
+            if flat {
                 // Just another branch target, resolved in this same function.
                 branches.insert(target, construction.block_at(target)?);
             } else {
@@ -537,7 +545,7 @@ impl<'spec> SleighLifter<'spec> {
             calls,
             address,
             plan,
-            self.flat_control_flow,
+            flat,
         ))
     }
 
@@ -578,7 +586,7 @@ impl<'spec> SleighLifter<'spec> {
         let pcode = flat.ops();
         let plan = Self::plan_from_ops(pcode, self.flat_control_flow)?;
         let mut construction = target.begin(address, length)?;
-        let mut emitter = self.emitter(&mut construction, &plan.plan)?;
+        let mut emitter = self.emitter(&mut construction, &plan.plan, self.flat_control_flow)?;
         for (index, op) in pcode.iter().enumerate() {
             if let Some(&label) = plan.labels.get(&index) {
                 emitter.label(label);

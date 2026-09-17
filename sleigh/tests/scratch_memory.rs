@@ -102,10 +102,8 @@ fn total_retained_bytes_stop_growing_after_the_first_budget_cycle() {
     const BUDGET: usize = 2_048;
 
     let spec = sleigh_precompile::x64::spec();
-    let lifter = SleighLifter::new(spec).with_flat_control_flow();
-    let mut session = ScratchSession::new(&lifter)
-        .unwrap()
-        .with_literal_budget(BUDGET);
+    let lifter = SleighLifter::new(spec);
+    let mut session = ScratchSession::new(&lifter).with_literal_budget(BUDGET);
     let baseline = live();
 
     let mut checkpoints: Vec<(u32, usize, u64, usize)> = Vec::new();
