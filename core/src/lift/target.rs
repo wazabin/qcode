@@ -85,6 +85,11 @@ pub enum TargetError {
     /// A call recorded in the result names no callee the construction minted,
     /// so the emitted instruction still holds a placeholder callee.
     UnresolvedCallee { address: u64 },
+    /// A call was promised to `address`, but `block` stands there — a block
+    /// lifted earlier, of any function, or a placeholder this very
+    /// instruction made for a branch or its fall-through — and a function
+    /// cannot be made over a block that is not its own.
+    CallIntoBlock { address: u64, block: BlockId },
     /// A previous rollback could not restore the context, which is poisoned
     /// (see [`Context::is_poisoned`]); nothing further is lifted into it.
     Poisoned,
@@ -123,6 +128,9 @@ impl fmt::Display for TargetError {
             }
             Self::UnresolvedCallee { address } => {
                 write!(f, "the call to {address:#x} kept its placeholder callee")
+            }
+            Self::CallIntoBlock { address, block } => {
+                write!(f, "{address:#x} is called, but {block:?} stands there")
             }
             Self::Poisoned => {
                 f.write_str("the context was poisoned by a failed rollback and refuses lifting")
@@ -686,6 +694,18 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
             self.rollback();
             return Err(error);
         }
+        // A callee promised where a block stands would be made over that
+        // block; the block may be this instruction's own placeholder, made
+        // after the promise, so this is checked here and not when promising.
+        for minted in &self.journal.minted {
+            let Minted::Address(address) = *minted else {
+                continue;
+            };
+            if let Some(block) = self.target.addresses.block_at(address) {
+                self.rollback();
+                return Err(TargetError::CallIntoBlock { address, block });
+            }
+        }
 
         // Every check that can fail has passed: land the splits, then the
         // callees. Neither can fail, so from here the instruction is committed.
@@ -1007,6 +1027,69 @@ mod tests {
             call.mnemonic(),
             crate::value::insn::Mnemonic::Call(call) if call.target == Callee::Real(callee)
         ));
+    }
+
+    #[test]
+    fn a_call_to_an_address_a_block_covers_is_refused_and_undone() {
+        let mut ctx = Context::new();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let function = host(&mut ctx, &mut addresses, 0x1000);
+        let before = (ctx.to_string(), addresses.clone());
+        // A call whose p-code ends with it, returning to the fall-through,
+        // whose placeholder every emitter resolves first.
+        let call_into = |construction: &mut Construction<'_, '_, '_>, address: u64| {
+            let callee = construction.callee_at(address).unwrap();
+            let next = construction.block_at(construction.address() + 1).unwrap();
+            let mut emitter = construction.emitter();
+            let site = emitter.push_call(callee).id;
+            emitter.exit(
+                site,
+                ExitArm::Unconditional,
+                ExitKind::Call {
+                    callee: CallTarget::Address(address),
+                    continuation: Continuation::Next,
+                },
+            );
+            next
+        };
+
+        // `call $+1`: the callee's address is the instruction's own
+        // fall-through, whose placeholder this construction holds.
+        {
+            let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+            let mut construction = target.begin(0x1000, 1).unwrap();
+            let next = call_into(&mut construction, 0x1001);
+            assert_eq!(
+                construction.commit().err(),
+                Some(TargetError::CallIntoBlock {
+                    address: 0x1001,
+                    block: next
+                })
+            );
+            assert!(!target.is_poisoned());
+        }
+        assert_eq!(ctx.to_string(), before.0);
+        assert_eq!(addresses, before.1);
+        assert!(addresses.is_current(&ctx));
+        assert_eq!(ctx.bodies.len(), 1, "no function was made");
+
+        // A block another instruction left is refused the same way.
+        let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+        let mut construction = target.begin(0x1000, 1).unwrap();
+        emit_fallthrough(&mut construction);
+        construction.commit().unwrap();
+        let placeholder = target.addresses().block_at(0x1001).unwrap();
+        let mut construction = target.begin(0x1010, 1).unwrap();
+        call_into(&mut construction, 0x1001);
+        assert_eq!(
+            construction.commit().err(),
+            Some(TargetError::CallIntoBlock {
+                address: 0x1001,
+                block: placeholder
+            })
+        );
+        assert_eq!(target.context().bodies.len(), 1);
+        assert_eq!(target.addresses().block_at(0x1001), Some(placeholder));
     }
 
     #[test]
