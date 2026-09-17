@@ -155,7 +155,9 @@ impl<'spec> LinearDecoder<'spec> {
     ///
     /// Nothing is committed: [`advance`](Self::advance) does that once the
     /// caller has lowered the instruction, so a failed lift leaves the sweep
-    /// where it was.
+    /// where it was. Decoding takes `&self`, so the same address may be
+    /// decoded more than once — with a different context, say — and the
+    /// sweep advances past whichever instruction the caller commits.
     pub fn decode<'bytes>(
         &self,
         address: u64,

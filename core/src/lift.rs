@@ -156,7 +156,7 @@ impl Lifted {
     /// [`Fallthrough`](ExitKind::Fallthrough) exit and a
     /// [`Next`](Continuation::Next) continuation land.
     pub fn next_address(&self) -> u64 {
-        self.address + self.length as u64
+        self.address.wrapping_add(self.length as u64)
     }
 
     /// The block control enters the instruction through.
