@@ -100,7 +100,7 @@ pub enum TargetError {
     /// The index was computed for this context, but the context's
     /// address-bearing shape has changed since without it, so it may omit an
     /// entity the context has. Refresh it, or bind through
-    /// [`LiftTarget::bind`], which does.
+    /// [`LiftTarget::bind_or_refresh`], which does.
     OutdatedIndex,
 }
 
@@ -170,7 +170,7 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
     ///
     /// [`bind_indexed`](Self::bind_indexed) refuses instead of rebuilding, for
     /// a caller that would rather learn its index fell behind.
-    pub fn bind(
+    pub fn bind_or_refresh(
         ctx: &'a mut Context<'str>,
         addresses: &'a mut AddressIndex,
         function: FunctionId,
@@ -199,7 +199,7 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
     /// This is the hot-path binding for a caller that keeps its index current
     /// on purpose — an emulator that lifts on demand, a session that threads
     /// one index through a run — and wants to know when it has not. Everyone
-    /// else uses [`bind`](Self::bind).
+    /// else uses [`bind_or_refresh`](Self::bind_or_refresh).
     ///
     /// A [poisoned](Context::is_poisoned) context is refused outright.
     pub fn bind_indexed(
@@ -1268,7 +1268,7 @@ mod tests {
                 .is_err_and(|e| e == TargetError::Poisoned)
         );
         assert!(
-            LiftTarget::bind(&mut ctx, &mut addresses, function)
+            LiftTarget::bind_or_refresh(&mut ctx, &mut addresses, function)
                 .is_err_and(|e| e == TargetError::Poisoned)
         );
         assert!(ctx.clone().is_poisoned());
@@ -1339,7 +1339,7 @@ mod tests {
             Some(TargetError::ForeignIndex)
         );
         // The safe binding rebuilds it for this context instead.
-        LiftTarget::bind(&mut ctx, &mut foreign, function).unwrap();
+        LiftTarget::bind_or_refresh(&mut ctx, &mut foreign, function).unwrap();
         assert!(foreign.is_current(&ctx));
         // A revision travels with its context through moves, not clones.
         let moved = ctx;
@@ -1374,7 +1374,7 @@ mod tests {
 
         // The safe binding refreshes, and a construction branching to that
         // address finds the block rather than making a second one.
-        let mut target = LiftTarget::bind(&mut ctx, &mut addresses, function).unwrap();
+        let mut target = LiftTarget::bind_or_refresh(&mut ctx, &mut addresses, function).unwrap();
         let mut construction = target.begin(0x1000, 1).unwrap();
         assert_eq!(construction.block_at(0x1010).unwrap(), unlisted);
         let mut emitter = construction.emitter();
@@ -1420,7 +1420,7 @@ mod tests {
             Some(TargetError::ForeignIndex)
         );
         {
-            let mut target = LiftTarget::bind(&mut ctx, &mut addresses, function).unwrap();
+            let mut target = LiftTarget::bind_or_refresh(&mut ctx, &mut addresses, function).unwrap();
             let mut construction = target.begin(0x1000, 1).unwrap();
             assert_eq!(construction.block_at(0x1010).unwrap(), existing);
             construction.abort();
@@ -1431,7 +1431,7 @@ mod tests {
         addresses.set_block(0x1010, stray);
         assert!(!addresses.is_current(&ctx));
         {
-            let mut target = LiftTarget::bind(&mut ctx, &mut addresses, function).unwrap();
+            let mut target = LiftTarget::bind_or_refresh(&mut ctx, &mut addresses, function).unwrap();
             let mut construction = target.begin(0x1000, 1).unwrap();
             assert_eq!(construction.block_at(0x1010).unwrap(), existing);
             construction.abort();
@@ -1519,7 +1519,7 @@ mod tests {
             LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).err(),
             Some(TargetError::OutdatedIndex)
         );
-        let mut target = LiftTarget::bind(&mut ctx, &mut addresses, function).unwrap();
+        let mut target = LiftTarget::bind_or_refresh(&mut ctx, &mut addresses, function).unwrap();
         assert_eq!(target.addresses().block_at(0x1001), None, "refreshed");
         let mut construction = target.begin(0x1001, 1).unwrap();
         assert_ne!(

@@ -52,7 +52,7 @@ fn block_found_by_a_safe_binding(
     function: FunctionId,
     address: u64,
 ) -> BlockId {
-    let mut target = LiftTarget::bind(ctx, addresses, function).unwrap();
+    let mut target = LiftTarget::bind_or_refresh(ctx, addresses, function).unwrap();
     let mut construction = target
         .begin(function_address(target.context(), function), 1)
         .unwrap();
@@ -272,7 +272,7 @@ fn a_poisoned_module_is_refused_by_every_binding() {
     let (mut ctx, mut addresses, function, _) = module(0x1000);
     ctx.poison();
     assert_eq!(
-        LiftTarget::bind(&mut ctx, &mut addresses, function).err(),
+        LiftTarget::bind_or_refresh(&mut ctx, &mut addresses, function).err(),
         Some(TargetError::Poisoned)
     );
     assert_eq!(

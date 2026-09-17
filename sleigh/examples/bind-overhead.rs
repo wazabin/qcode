@@ -63,7 +63,7 @@ fn main() {
 
         let started = Instant::now();
         for _ in 0..CALLS {
-            let target = LiftTarget::bind(&mut ctx, &mut addresses, host).unwrap();
+            let target = LiftTarget::bind_or_refresh(&mut ctx, &mut addresses, host).unwrap();
             std::hint::black_box(target.function());
         }
         let current = started.elapsed();
@@ -73,7 +73,7 @@ fn main() {
         let started = Instant::now();
         for _ in 0..refresh_calls {
             addresses.clear();
-            let target = LiftTarget::bind(&mut ctx, &mut addresses, host).unwrap();
+            let target = LiftTarget::bind_or_refresh(&mut ctx, &mut addresses, host).unwrap();
             std::hint::black_box(target.function());
         }
         let refresh = started.elapsed();

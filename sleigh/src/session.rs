@@ -941,7 +941,7 @@ mod tests {
             let ctx = session.context_mut_for_test();
             let mut addresses = AddressIndex::analyze(ctx);
             let placeholder = addresses.block_at(0x1003).unwrap();
-            let mut target = LiftTarget::bind(ctx, &mut addresses, function).unwrap();
+            let mut target = LiftTarget::bind_or_refresh(ctx, &mut addresses, function).unwrap();
             let mut construction = target.begin(0x1010, 1).unwrap();
             let zero = construction.context().shared.get_const(0, 8);
             let mut emitter = construction.emitter();
