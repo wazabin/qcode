@@ -153,6 +153,9 @@ pub struct LiftTarget<'a, 'str> {
     ctx: &'a mut Context<'str>,
     addresses: &'a mut AddressIndex,
     function: FunctionId,
+    /// Whether constructions name what they emit; see
+    /// [`without_debug_names`](Self::without_debug_names).
+    naming: bool,
 }
 
 impl<'a, 'str> LiftTarget<'a, 'str> {
@@ -227,7 +230,18 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
             ctx,
             addresses,
             function,
+            naming: true,
         })
+    }
+
+    /// Constructions into this target give their values no debug names: no
+    /// register load named after its register, no block after its label.
+    /// For IR that is read once and discarded — a scratch lift — where the
+    /// names are minted, deduplicated and dropped without being printed.
+    /// The IR means the same with or without them.
+    pub fn without_debug_names(mut self) -> Self {
+        self.naming = false;
+        self
     }
 
     /// The function instructions are lowered into.
@@ -624,8 +638,10 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
     /// journal, that also takes the report of what the instruction owns and
     /// where it leaves.
     pub fn emitter(&mut self) -> Emitter<'_, 'str> {
+        let mut builder = self.target.ctx.builder(self.record.lifted().entry());
+        builder.set_naming(self.target.naming);
         Emitter {
-            builder: self.target.ctx.builder(self.record.lifted().entry()),
+            builder,
             record: &mut self.record,
         }
     }

@@ -306,7 +306,9 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
         instruction: Instruction<'spec, 'b>,
     ) -> Result<ScratchLifted<'s, 'l, 'spec, 'b>, LiftError> {
         self.store.reset();
-        let mut target = self.store.target()?;
+        // The instruction is read through the session's views and discarded,
+        // never printed: its debug names would be minted for nothing.
+        let mut target = self.store.target()?.without_debug_names();
         let lifted = self.lifter.lower(&mut target, &instruction, true)?;
         Ok(ScratchLifted {
             session: self,

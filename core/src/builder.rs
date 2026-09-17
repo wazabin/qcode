@@ -94,6 +94,11 @@ pub struct Builder<'str, 'ctx> {
     /// If it is not the case, the block might be invalid
     pub(crate) is_terminated: bool,
 
+    /// Whether emitted values get debug names: a register load named after
+    /// its register, a label's block after its label. Off for IR that is
+    /// read once and discarded, where the names cost more than they say.
+    naming: bool,
+
     /// Where a pushed instruction goes: before this instruction of the
     /// current block, or at its end (`None`, the default). Consecutive
     /// pushes land in push order before it, so they form a contiguous
@@ -268,6 +273,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             shared,
             interfaces,
             is_terminated,
+            naming: true,
             block,
             namespace: HashMap::default(),
             local_labels: HashMap::default(),
@@ -297,8 +303,36 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 
     /// Returns `true` if the current block ends with a terminator instruction.
+    ///
+    /// The builder holds the body exclusively, so it knows: it read the block
+    /// when it moved there and set the flag with every terminator it pushed.
     pub fn is_terminated(&self) -> bool {
-        self.block_is_terminated(self.block)
+        debug_assert!(
+            self.insert_point.is_some()
+                || self.is_terminated == self.block_is_terminated(self.block),
+            "the builder's terminated flag drifted from its block"
+        );
+        self.is_terminated
+    }
+
+    /// Whether emitted values get debug names. See [`set_naming`](Self::set_naming).
+    pub fn naming(&self) -> bool {
+        self.naming
+    }
+
+    /// Turns debug names on or off: with them off, a register load is not
+    /// named after its register and [`push_anonymous_block`](Self::push_anonymous_block)
+    /// is the block to make. Names are documentation, not semantics: the IR
+    /// means the same either way, and reads the same to every consumer that
+    /// does not print it.
+    pub fn set_naming(&mut self, naming: bool) {
+        self.naming = naming;
+    }
+
+    /// Makes a block of this body with no name and no address, for a lowering
+    /// that keeps its own handle on it and has no name worth registering.
+    pub fn push_anonymous_block(&mut self) -> BlockId {
+        self.body.push_block(BasicBlock::detached())
     }
 
     /// Whether a body-local block ends with a terminator, read straight from the
@@ -780,7 +814,9 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 let id = self.push_load_local::<false>(src, size, space);
 
                 // If the varnode has a name, give the load a related name.
-                if let (Some(name), LocalValueId::Instruction(local)) = (name, id) {
+                if let (true, Some(name), LocalValueId::Instruction(local)) =
+                    (self.naming, name, id)
+                {
                     let unique = self.body.names.unique(name.to_lowercase().into());
                     self.rename_insn_local(local, unique)
                         .expect("This name was deduplicated");

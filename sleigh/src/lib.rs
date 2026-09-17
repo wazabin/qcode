@@ -49,7 +49,7 @@ pub mod decode;
 pub mod session;
 pub mod vm_source;
 
-use std::borrow::Cow;
+use std::{borrow::Cow, cell::RefCell};
 
 use jstd::registry::Registry;
 use qcode::{
@@ -522,28 +522,41 @@ impl<'spec> SleighLifter<'spec> {
         let address = construction.address();
         let length = construction.length();
 
-        let mut branches = HashMap::default();
-        for &target in plan.direct_branches() {
-            branches.insert(target, construction.block_at(target)?);
-        }
-        let mut calls = HashMap::default();
-        for &target in plan.direct_calls() {
-            if flat {
-                // Just another branch target, resolved in this same function.
-                branches.insert(target, construction.block_at(target)?);
-            } else {
-                calls.insert(target, construction.callee_at(target)?);
+        let mut workspace = take_workspace();
+        let filled = (|| {
+            for &target in plan.direct_branches() {
+                workspace
+                    .branches
+                    .insert(target, construction.block_at(target)?);
             }
-        }
-        let next = construction.block_at(address + length as u64)?;
+            for &target in plan.direct_calls() {
+                if flat {
+                    // Just another branch target, resolved in this same function.
+                    workspace
+                        .branches
+                        .insert(target, construction.block_at(target)?);
+                } else {
+                    workspace
+                        .calls
+                        .insert(target, construction.callee_at(target)?);
+                }
+            }
+            construction.block_at(address + length as u64)
+        })();
+        let next = match filled {
+            Ok(next) => next,
+            Err(error) => {
+                return_workspace(workspace);
+                return Err(error.into());
+            }
+        };
 
         Ok(FlatEmitter::new(
             next,
             construction.emitter(),
             &self.storage,
             self.unique_space,
-            branches,
-            calls,
+            workspace,
             address,
             plan,
             flat,
@@ -666,6 +679,44 @@ struct OpRef<'a> {
     inputs: &'a [Varnode],
 }
 
+/// The per-instruction tables of a [`FlatEmitter`], kept between
+/// instructions so their capacity is: an instruction fills them, the next
+/// one clears them, and neither allocates once the tables have seen the
+/// busiest lowering of the session.
+#[derive(Default)]
+struct Workspace {
+    unique_storage: HashMap<Varnode, UniqueSlot>,
+    dirty: Vec<Varnode>,
+    branches: HashMap<u64, BlockId>,
+    calls: HashMap<u64, Callee>,
+    labels: Vec<Option<BlockId>>,
+}
+
+impl Workspace {
+    fn clear(&mut self) {
+        self.unique_storage.clear();
+        self.dirty.clear();
+        self.branches.clear();
+        self.calls.clear();
+        self.labels.clear();
+    }
+}
+
+thread_local! {
+    /// The workspace of the last emitter on this thread, empty. A nested
+    /// lowering — there is none — would find it taken and start from empty.
+    static WORKSPACE: RefCell<Workspace> = RefCell::default();
+}
+
+fn take_workspace() -> Workspace {
+    WORKSPACE.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+fn return_workspace(mut workspace: Workspace) {
+    workspace.clear();
+    WORKSPACE.with(|slot| *slot.borrow_mut() = workspace);
+}
+
 /// Where one instruction-local unique varnode lives.
 ///
 /// Flat p-code writes its uniques as mutable locations, but nearly all of them
@@ -731,26 +782,27 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         builder: Emitter<'ctx, 'str>,
         base_storage: &'spec HashMap<Varnode, VarnodeId>,
         unique_space: SpaceId,
-        branches: HashMap<u64, BlockId>,
-        calls: HashMap<u64, Callee>,
+        mut workspace: Workspace,
         address: u64,
         plan: &PcodePlan,
         flat: bool,
     ) -> Self {
+        // A terminal label is the instruction's fall-through, not a block.
+        workspace.labels.extend(
+            (0..plan.labels().len())
+                .map(|index| plan.is_terminal(LabelId::from_index(index)).then_some(next)),
+        );
         Self {
             builder,
             base_storage,
             unique_space,
-            unique_storage: HashMap::default(),
-            dirty: Vec::new(),
+            unique_storage: workspace.unique_storage,
+            dirty: workspace.dirty,
             has_local_blocks: (0..plan.labels().len())
                 .any(|index| !plan.is_terminal(LabelId::from_index(index))),
-            branches,
-            calls,
-            // A terminal label is the instruction's fall-through, not a block.
-            labels: (0..plan.labels().len())
-                .map(|index| plan.is_terminal(LabelId::from_index(index)).then_some(next))
-                .collect(),
+            branches: workspace.branches,
+            calls: workspace.calls,
+            labels: workspace.labels,
             next,
             address,
             fallthrough: 0,
@@ -786,11 +838,8 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         if let Some(block) = self.labels[label.index()] {
             return block;
         }
-        let block = self.builder.get_or_make_local_label(Cow::Owned(format!(
-            "pcode_{:x}_{}",
-            self.address,
-            label.index()
-        )));
+        let (address, index) = (self.address, label.index());
+        let block = self.fresh_block(|| format!("pcode_{address:x}_{index}"));
         self.labels[label.index()] = Some(block);
         self.builder.block(block);
         block
@@ -845,13 +894,22 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
     }
 
     fn open_fallthrough(&mut self) -> BlockId {
-        let label = self.builder.get_or_make_local_label(Cow::Owned(format!(
-            "pcode_fallthrough_{:x}_{}",
-            self.address, self.fallthrough
-        )));
+        let (address, index) = (self.address, self.fallthrough);
+        let label = self.fresh_block(|| format!("pcode_fallthrough_{address:x}_{index}"));
         self.fallthrough += 1;
         self.builder.block(label);
         label
+    }
+
+    /// A new block of the host for this instruction's own control flow,
+    /// named by `name` when the builder names things. The emitter keeps its
+    /// own handle on every block it makes, so it never looks one up by name.
+    fn fresh_block(&mut self, name: impl FnOnce() -> String) -> BlockId {
+        if self.builder.naming() {
+            self.builder.get_or_make_local_label(Cow::Owned(name()))
+        } else {
+            self.builder.push_anonymous_block()
+        }
     }
 
     /// Opens a block for p-code that follows a terminator: the continuation
@@ -1290,6 +1348,18 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             );
         }
         Ok(())
+    }
+}
+
+impl Drop for FlatEmitter<'_, '_, '_> {
+    fn drop(&mut self) {
+        return_workspace(Workspace {
+            unique_storage: std::mem::take(&mut self.unique_storage),
+            dirty: std::mem::take(&mut self.dirty),
+            branches: std::mem::take(&mut self.branches),
+            calls: std::mem::take(&mut self.calls),
+            labels: std::mem::take(&mut self.labels),
+        });
     }
 }
 
