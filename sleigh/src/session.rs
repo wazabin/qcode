@@ -499,7 +499,8 @@ impl<'v> ScratchExit<'v> {
 }
 
 /// A block of a scratch instruction. Two views are equal when they show the
-/// same block.
+/// same block of the same session: ids are recycled, so an id alone does not
+/// name a block across sessions.
 #[derive(Clone, Copy)]
 pub struct ScratchBlock<'v> {
     ctx: &'v Context<'static>,
@@ -508,7 +509,7 @@ pub struct ScratchBlock<'v> {
 
 impl PartialEq for ScratchBlock<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+        std::ptr::eq(self.ctx, other.ctx) && self.id == other.id
     }
 }
 
@@ -516,6 +517,7 @@ impl Eq for ScratchBlock<'_> {}
 
 impl std::hash::Hash for ScratchBlock<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::hash(self.ctx, state);
         self.id.hash(state);
     }
 }
@@ -553,7 +555,8 @@ impl<'v> ScratchBlock<'v> {
     }
 }
 
-/// An instruction of a scratch block.
+/// An instruction of a scratch block. Two views are equal when they show the
+/// same instruction of the same session, as for [`ScratchBlock`].
 #[derive(Clone, Copy)]
 pub struct ScratchInsn<'v> {
     ctx: &'v Context<'static>,
@@ -562,7 +565,7 @@ pub struct ScratchInsn<'v> {
 
 impl PartialEq for ScratchInsn<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+        std::ptr::eq(self.ctx, other.ctx) && self.id == other.id
     }
 }
 
@@ -815,6 +818,28 @@ mod tests {
         assert_eq!(not_taken.address(), None);
         assert_eq!(lifted.blocks().nth(1), Some(not_taken));
         assert_eq!(session.epoch(), 2);
+    }
+
+    #[test]
+    fn views_of_different_sessions_are_never_equal() {
+        let lifter = lifter();
+        let mut first = ScratchSession::new(&lifter);
+        let mut second = ScratchSession::new(&lifter);
+        let a = first.lift(0x1000, b"\x48\x89\xd8").unwrap();
+        let b = second.lift(0x1000, b"\x48\x89\xd8").unwrap();
+        assert_eq!(a.entry(), a.entry());
+        assert_ne!(a.entry(), b.entry(), "same id, another session");
+        assert_ne!(
+            a.entry().instructions().next(),
+            b.entry().instructions().next()
+        );
+        fn hash_of(block: ScratchBlock<'_>) -> u64 {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            block.hash(&mut hasher);
+            hasher.finish()
+        }
+        assert_ne!(hash_of(a.entry()), hash_of(b.entry()));
     }
 
     #[test]
