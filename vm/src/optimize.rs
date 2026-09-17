@@ -120,7 +120,7 @@ fn live_out_temps(
         if block.address().is_some() {
             continue;
         }
-        for insn_id in block.instruction_ids() {
+        for insn_id in block.iter_instruction_ids() {
             let Mnemonic::Load(Load { space, ptr, .. }) =
                 *Instruction::from_id(ctx, insn_id).mnemonic()
             else {

@@ -220,7 +220,7 @@ pub struct VmSnapshot {
     block: BlockId,
     /// The op at that position — its id and guest address — so it can be
     /// found again after its block changes shape.
-    op: Option<(LocalInsnId, Option<u64>)>,
+    op: Option<(InstructionId, Option<u64>)>,
     /// The guest instruction the position starts, if it starts one: where
     /// the machine can be put by lifting alone.
     boundary: Option<u64>,
@@ -1094,19 +1094,15 @@ impl<S: CodeSource> Vm<S> {
     pub fn instruction_boundary(&self) -> Option<u64> {
         let block = self.emu.block;
         let idx = self.emu.idx;
-        let ids = self.ctx.block(block).instruction_ids();
-        let address_of = |local: LocalInsnId| {
-            self.ctx
-                .get_insn(InstructionId::new(block.func, local))
-                .address()
-        };
+        let ids: Vec<InstructionId> = BasicBlock::from_id(&self.ctx, block)
+            .iter_instruction_ids()
+            .collect();
+        let address_of = |id: InstructionId| self.ctx.get_insn(id).address();
         // The op here carries a different address from the op before it, or
         // is the first of a block that starts at an address of its own.
         match (idx, ids.get(idx)) {
             (0, _) => self.ctx.block(block).address,
-            (_, Some(&local)) => {
-                address_of(local).filter(|&addr| address_of(ids[idx - 1]) != Some(addr))
-            }
+            (_, Some(&id)) => address_of(id).filter(|&addr| address_of(ids[idx - 1]) != Some(addr)),
             _ => None,
         }
     }
@@ -1127,27 +1123,25 @@ impl<S: CodeSource> Vm<S> {
         }
         let block = self.emu.block;
         let idx = self.emu.idx;
-        let ids = self.ctx.block(block).instruction_ids();
-        let address_of = |local: LocalInsnId| {
-            self.ctx
-                .get_insn(InstructionId::new(block.func, local))
-                .address()
-        };
-        let op = ids.get(idx).map(|&local| (local, address_of(local)));
+        let ids: Vec<InstructionId> = BasicBlock::from_id(&self.ctx, block)
+            .iter_instruction_ids()
+            .collect();
+        let address_of = |id: InstructionId| self.ctx.get_insn(id).address();
+        let op = ids.get(idx).map(|&id| (id, address_of(id)));
         let boundary = self.instruction_boundary();
         // Values from earlier in the block that the rest of it reads. Only
         // those: the value table is sized by the module, not by the block,
         // and the snapshot must not be.
-        let before: FxHashSet<LocalInsnId> = ids[..idx.min(ids.len())].iter().copied().collect();
+        let before: FxHashSet<InstructionId> = ids[..idx.min(ids.len())].iter().copied().collect();
         let mut live = Vec::new();
         let mut seen = FxHashSet::default();
-        for &local in &ids[idx.min(ids.len())..] {
-            let insn = self.ctx.get_insn(InstructionId::new(block.func, local));
+        for &id in &ids[idx.min(ids.len())..] {
+            let insn = self.ctx.get_insn(id);
             for operand in insn.operands() {
                 let ValueId::Instruction(id) = operand else {
                     continue;
                 };
-                if !before.contains(&id.local) || !seen.insert(id) {
+                if !before.contains(&id) || !seen.insert(id) {
                     continue;
                 }
                 if let Some(value) = self.emu.insn_values.get(&id) {
@@ -1190,15 +1184,15 @@ impl<S: CodeSource> Vm<S> {
         let position = if !self.ctx.contains_block(block) {
             None
         } else {
-            let ids = self.ctx.block(block).instruction_ids();
+            let ids: Vec<InstructionId> = BasicBlock::from_id(&self.ctx, block)
+                .iter_instruction_ids()
+                .collect();
             match snapshot.op {
                 // The same op, wherever a cleanup ahead of it has moved it.
-                Some((local, addr)) => ids.iter().position(|&l| l == local).filter(|_| {
-                    self.ctx
-                        .get_insn(InstructionId::new(block.func, local))
-                        .address()
-                        == addr
-                }),
+                Some((id, addr)) => ids
+                    .iter()
+                    .position(|&l| l == id)
+                    .filter(|_| self.ctx.get_insn(id).address() == addr),
                 // An empty placeholder: still the same one if it has no code.
                 None => ids.is_empty().then_some(0),
             }
