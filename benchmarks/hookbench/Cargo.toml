@@ -1,0 +1,31 @@
+[package]
+name = "hookbench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Instrumentation cost under QCode, Unicorn and icicle-emu on the Embench images"
+
+[workspace]
+
+[dependencies]
+qcode = { package = "wazabin-qcode", path = "../../core" }
+qcode_vm = { package = "wazabin-qcode-vm", path = "../../vm" }
+qcode_jit = { package = "wazabin-qcode-jit", path = "../../jit" }
+qcode_userland = { package = "wazabin-qcode-userland", path = "../../userland" }
+wazabin-qcode-sleigh = { path = "../../sleigh" }
+sleigh-precompile = { package = "wazabin-sleigh-precompile", version = "0.1.6" }
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+unicorn-engine = { path = "/home/jack/dev/unicorn/bindings/rust/unicorn-engine", default-features = false, features = ["arch_x86"], optional = true }
+icicle-vm = { path = "/home/jack/dev/icicle-emu/icicle-vm", optional = true }
+pcode = { path = "/home/jack/dev/icicle-emu/sleigh/pcode", optional = true }
+
+[features]
+default = []
+unicorn = ["dep:unicorn-engine"]
+icicle = ["dep:icicle-vm", "dep:pcode"]
+
+[profile.release]
+debug = 1
