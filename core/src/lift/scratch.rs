@@ -40,7 +40,7 @@
 //! # Failure
 //!
 //! A construction that fails rolls itself back; one whose rollback cannot
-//! account for the host [poisons](crate::context::Context::poison) the
+//! account for the host [poisons](crate::context::Context::is_poisoned) the
 //! context. For scratch storage that is recoverable: the host holds nothing
 //! but the failed instruction, so the next reset, which empties it, clears
 //! the poison along with it.

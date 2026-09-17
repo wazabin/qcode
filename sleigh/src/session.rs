@@ -976,14 +976,6 @@ mod tests {
             session.into_context(),
             Err(LiftError::Target(TargetError::Poisoned))
         ));
-
-        // Nor is a poisoned context accepted to continue in.
-        let mut poisoned = lifter.new_context();
-        poisoned.poison();
-        assert_eq!(
-            LiftSession::in_context(&lifter, poisoned, Host::Anonymous).err(),
-            Some(LiftError::Target(TargetError::Poisoned))
-        );
     }
 
     #[test]

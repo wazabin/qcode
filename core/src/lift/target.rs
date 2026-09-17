@@ -39,7 +39,7 @@
 //! If a rollback finds state it cannot account for — an instruction, edge or
 //! parameter above its marks that it did not delete, which means the emitter
 //! wrote somewhere the journal does not cover — it does not pretend to have
-//! rolled back. It **poisons the context** ([`Context::poison`]), and from then
+//! rolled back. It **poisons the context** ([`Context::is_poisoned`]), and from then
 //! on no target binds to that context and no construction begins in it, until
 //! the context is disposed of. The flag lives on the context rather than on
 //! the target because a target is a per-instruction guard: consumers rebind
@@ -165,8 +165,9 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
     /// computed for another context, or left behind by a mutation made
     /// without it — is rebuilt here, which costs O(module) once per such
     /// event and nothing otherwise. A caller that threads its index through
-    /// every mutation pays the rebuild never; one that cannot pays it only
-    /// when it has to.
+    /// every mutation pays the rebuild never; one that hands out
+    /// [`Context::block_mut`] or a [`BodyMut`](crate::value::BodyMut) between
+    /// lifts pays it at the next binding, every time.
     ///
     /// [`bind_indexed`](Self::bind_indexed) refuses instead of rebuilding, for
     /// a caller that would rather learn its index fell behind.
@@ -1420,7 +1421,8 @@ mod tests {
             Some(TargetError::ForeignIndex)
         );
         {
-            let mut target = LiftTarget::bind_or_refresh(&mut ctx, &mut addresses, function).unwrap();
+            let mut target =
+                LiftTarget::bind_or_refresh(&mut ctx, &mut addresses, function).unwrap();
             let mut construction = target.begin(0x1000, 1).unwrap();
             assert_eq!(construction.block_at(0x1010).unwrap(), existing);
             construction.abort();
@@ -1431,7 +1433,8 @@ mod tests {
         addresses.set_block(0x1010, stray);
         assert!(!addresses.is_current(&ctx));
         {
-            let mut target = LiftTarget::bind_or_refresh(&mut ctx, &mut addresses, function).unwrap();
+            let mut target =
+                LiftTarget::bind_or_refresh(&mut ctx, &mut addresses, function).unwrap();
             let mut construction = target.begin(0x1000, 1).unwrap();
             assert_eq!(construction.block_at(0x1010).unwrap(), existing);
             construction.abort();

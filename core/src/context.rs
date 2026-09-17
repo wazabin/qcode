@@ -563,10 +563,9 @@ impl<'str> Context<'str> {
     }
 
     /// Marks the module as holding IR its construction cannot vouch for. Set
-    /// by a lift whose rollback found state it could not take back; a consumer
-    /// that detects damage of its own may set it too. There is no public way
-    /// to clear it.
-    pub fn poison(&mut self) {
+    /// only by a lift whose rollback found state it could not take back;
+    /// nothing else has grounds to, and there is no public way to clear it.
+    pub(crate) fn poison(&mut self) {
         self.poisoned = true;
     }
 

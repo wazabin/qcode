@@ -269,8 +269,19 @@ fn a_block_handed_out_mutably_counts_as_a_change_but_its_parameters_do_not() {
 
 #[test]
 fn a_poisoned_module_is_refused_by_every_binding() {
-    let (mut ctx, mut addresses, function, _) = module(0x1000);
-    ctx.poison();
+    let (mut ctx, mut addresses, function, block) = module(0x1000);
+    // The one way to poison a module: a construction whose rollback finds an
+    // emission it cannot account for, here into a block it does not own.
+    {
+        let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+        let mut construction = target.begin(0x2000, 1).unwrap();
+        let zero = construction.context().shared.get_const(0, 8);
+        let mut emitter = construction.emitter();
+        emitter.switch_to_block(block);
+        emitter.push_branchind(zero);
+        construction.abort();
+    }
+    assert!(ctx.is_poisoned());
     assert_eq!(
         LiftTarget::bind_or_refresh(&mut ctx, &mut addresses, function).err(),
         Some(TargetError::Poisoned)
