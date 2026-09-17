@@ -1,4 +1,4 @@
-use crate::value::{QCodeMut, view_mut::SEAL};
+use crate::value::QCodeMut;
 use crate::{
     context::Context,
     error::Result,
@@ -764,7 +764,7 @@ impl<'str, H: QCodeMut<'str>> BaseRef<H, BlockId> {
 
     /// Sets (or clears) this block's comment. Own-block edit, host-routed.
     pub fn set_comment(&mut self, comment: Option<String>) {
-        self.ctx.block_raw_mut(self.id, SEAL).comment = comment;
+        self.ctx.block_raw_mut(self.id).comment = comment;
     }
 
     /// Sets this block's name and registers it in the owning function's local name
@@ -781,7 +781,7 @@ impl<'str, H: QCodeMut<'str>> BaseRef<H, BlockId> {
             .map(str::to_owned);
         self.ctx
             .register_body_name(self.id.into(), name.clone(), old_name.as_deref())?;
-        self.ctx.block_raw_mut(self.id, SEAL).name = Some(name);
+        self.ctx.block_raw_mut(self.id).name = Some(name);
         Ok(())
     }
 
@@ -791,7 +791,7 @@ impl<'str, H: QCodeMut<'str>> BaseRef<H, BlockId> {
     /// [`push_insn`](Self::push_insn), which do not.
     pub fn insert_insn_at_index(&mut self, index: usize, insn_id: InstructionId) {
         let block = self.id;
-        self.ctx.function_mut(block.func, SEAL).insert_insn_at(
+        self.ctx.function_mut(block.func).insert_insn_at(
             block.local,
             index,
             insn_id.localize(block.func),
@@ -802,7 +802,7 @@ impl<'str, H: QCodeMut<'str>> BaseRef<H, BlockId> {
     pub fn push_insn(&mut self, id: InstructionId) {
         let block = self.id;
         self.ctx
-            .function_mut(block.func, SEAL)
+            .function_mut(block.func)
             .append_insn_local(block.local, id.localize(block.func));
     }
 

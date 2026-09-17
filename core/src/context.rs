@@ -2084,11 +2084,11 @@ impl<'str> Context<'str> {
     /// Nor is a bare `&mut FunctionBody` obtainable from the mutation
     /// primitive the verbs route through — it is sealed to this crate:
     ///
-    /// ```compile_fail,E0423
-    /// # use qcode::{context::Context, value::{QCodeMut, view_mut::Sealed}};
+    /// ```compile_fail,E0603
+    /// # use qcode::{context::Context, value::view_mut::sealed::Storage};
     /// let mut ctx = Context::new();
     /// let f = ctx.anon_function();
-    /// let body = QCodeMut::function_mut(&mut ctx, f, Sealed(()));
+    /// let body = ctx.function_mut(f);
     /// ```
     pub fn bodies(&self) -> &Registry<FunctionId, FunctionBody<'str>> {
         &self.bodies
