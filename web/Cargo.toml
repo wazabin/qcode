@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 [dependencies]
 qcode = { package = "wazabin-qcode", path = "../core" }
 wazabin-qcode-sleigh = { path = "../sleigh" }
-sleigh = { package = "wazabin-sleigh", version = "0.1.8" }
+sleigh = { package = "wazabin-sleigh", version = "0.1.9" }
 sleigh-precompile = { package = "wazabin-sleigh-precompile", version = "0.1.8" }
 wasm-bindgen = "0.2"
 serde = { version = "1", features = ["derive"] }
