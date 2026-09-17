@@ -93,10 +93,18 @@ pub struct BasicBlock<'str> {
     pub edges: HashSet<EdgeId, FxBuildHasher>,
 
     /// The address of this block, if it corresponds to a machine address.
-    pub address: Option<u64>,
+    ///
+    /// Crate-private on purpose: an address is what an
+    /// [`AddressIndex`](crate::address_index::AddressIndex) lists, and the
+    /// module's [shape revision](crate::context::Context::revision) counts
+    /// every change to it, so it is only ever written by the mutators that
+    /// tick that clock. Read it through [`address`](Self::address).
+    pub(crate) address: Option<u64>,
 
-    /// Additional addresses that map to this block (accumulated from merged blocks).
-    pub extra_addresses: Vec<u64>,
+    /// Additional addresses that map to this block (accumulated from merged
+    /// blocks). Crate-private for the same reason as [`address`](Self::address);
+    /// read through [`extra_addresses`](Self::extra_addresses).
+    pub(crate) extra_addresses: Vec<u64>,
 
     /// Head of the list of this block's uses as a value (see
     /// [`crate::value::uses`]). Derived bookkeeping, rebuilt after
@@ -129,6 +137,17 @@ pub struct InsnList {
 }
 
 impl<'str> BasicBlock<'str> {
+    /// The machine address this block starts at, if any.
+    pub fn address(&self) -> Option<u64> {
+        self.address
+    }
+
+    /// The further addresses this block covers: those of the blocks it
+    /// absorbed.
+    pub fn extra_addresses(&self) -> &[u64] {
+        &self.extra_addresses
+    }
+
     /// The first instruction of this block, if it has one.
     pub fn first_insn(&self) -> Option<LocalInsnId> {
         self.instructions.first
@@ -745,7 +764,7 @@ impl<'str, H: QCodeMut<'str>> BaseRef<H, BlockId> {
 
     /// Sets (or clears) this block's comment. Own-block edit, host-routed.
     pub fn set_comment(&mut self, comment: Option<String>) {
-        self.ctx.block_mut(self.id).comment = comment;
+        self.ctx.block_raw_mut(self.id).comment = comment;
     }
 
     /// Sets this block's name and registers it in the owning function's local name
@@ -762,7 +781,7 @@ impl<'str, H: QCodeMut<'str>> BaseRef<H, BlockId> {
             .map(str::to_owned);
         self.ctx
             .register_body_name(self.id.into(), name.clone(), old_name.as_deref())?;
-        self.ctx.block_mut(self.id).name = Some(name);
+        self.ctx.block_raw_mut(self.id).name = Some(name);
         Ok(())
     }
 
@@ -920,7 +939,7 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     }
 
     pub(in crate::value) fn inner_mut(&mut self) -> &mut BasicBlock<'str> {
-        self.ctx.block_mut(self.id)
+        self.ctx.block_raw_mut(self.id)
     }
 
     pub fn parent_mut(&mut self) -> Option<FunctionMutRef<'str, '_>> {
@@ -971,7 +990,7 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
             Some(block.local),
             "after_id not found in block"
         );
-        self.ctx.function_mut(block.func).link_after(
+        self.ctx.bodies[block.func].link_after(
             block.local,
             after_id.localize(block.func),
             insn_id.localize(block.func),
@@ -1006,9 +1025,7 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     pub fn extend_insns(&mut self, insns: &[InstructionId]) {
         let block = self.id;
         for &id in insns {
-            self.ctx
-                .function_mut(block.func)
-                .append_insn_local(block.local, id.localize(block.func));
+            self.ctx.bodies[block.func].append_insn_local(block.local, id.localize(block.func));
         }
     }
 
@@ -1020,21 +1037,36 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         self.set_address_indexed(&mut addresses, addr)
     }
 
+    /// Makes this block cover `addr` as well, as absorbing a block that
+    /// started there would. The module's shape revision counts it; an index
+    /// the caller keeps must be refreshed or [pointed here]
+    /// (crate::address_index::AddressIndex::set_block) and vouched for.
+    pub fn cover_address(&mut self, addr: u64) {
+        self.inner_mut().extra_addresses.push(addr);
+        self.ctx.bodies[self.id.func].touch_shape();
+    }
+
     /// Assigns an address through a caller-owned construction index.
     pub fn set_address_indexed(
         &mut self,
         addresses: &mut crate::address_index::AddressIndex,
         addr: u64,
     ) -> Result<()> {
+        let current = addresses.is_current(self.ctx);
         let old_address = self.inner().address;
         self.inner_mut().address = Some(addr);
-        if let Err(error) = self
+        self.ctx.bodies[self.id.func].touch_shape();
+        let registered = self
             .ctx
-            .set_address_indexed(addresses, addr, self.id.into())
-        {
+            .set_address_indexed(addresses, addr, self.id.into());
+        if registered.is_err() {
             self.inner_mut().address = old_address;
-            return Err(error);
         }
+        // Registered or restored, the index reflects the block either way.
+        if current {
+            addresses.mark_current(self.ctx);
+        }
+        registered?;
 
         if self.name().is_none() {
             let label = self

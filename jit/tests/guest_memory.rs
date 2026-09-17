@@ -9,11 +9,14 @@
 //! execution exercises the fallback, the second the inline path, and both have
 //! to agree with the interpreter.
 
-use qcode::{address_index::AddressIndex, context::Context, value::BlockId};
+use qcode::{context::Context, value::BlockId};
 use qcode_emulator::{EmulatorMemory, StandaloneEmulator};
 use qcode_jit::Jit;
 use qcode_vm::{FaultKind, PAGE_SIZE, VmMemory, perm};
-use wazabin_qcode_sleigh::SleighLifter;
+use wazabin_qcode_sleigh::{
+    SleighLifter,
+    session::{Host, LiftSession},
+};
 
 /// Where the test programs live, and where their data does.
 const CODE: u64 = 0x1000;
@@ -27,13 +30,14 @@ fn lifter() -> &'static SleighLifter<'static> {
 }
 
 fn lift(code: &[u8]) -> (Context<'static>, BlockId) {
-    let lifter = lifter();
-    let mut ctx = lifter.new_context();
-    let mut index = AddressIndex::analyze(&ctx);
-    let block = lifter
-        .decode_and_lift_indexed(&mut ctx, &mut index, CODE, code, None)
+    let mut session = LiftSession::new(lifter(), Host::At(CODE));
+    let lifted = session
+        .lift(CODE, code)
         .expect("the instruction decodes and lifts");
-    (ctx, block)
+    let ctx = session
+        .into_context()
+        .expect("a successful lift leaves the module usable");
+    (ctx, lifted.entry())
 }
 
 /// Puts the machine back to its starting state: a known data page, `RBX`

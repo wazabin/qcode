@@ -1,7 +1,7 @@
 //! Terminator rewriting shared by the CFG and DCE transforms.
 
 use qcode::value::{
-    BlockId, FunctionBody, QCodeView, ValueId,
+    BlockId, BodyMut, QCodeMut, QCodeView, ValueId,
     insn::{Branch, Mnemonic},
     util::base_ref::BaseRef,
 };
@@ -9,7 +9,7 @@ use qcode::value::{
 use crate::PassCtx;
 
 pub fn replace_terminator_with_branch<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut BodyMut<'_, 'str>,
     cx: PassCtx<'a, 'str>,
     block: BlockId,
     target: BlockId,
@@ -53,7 +53,6 @@ pub fn replace_terminator_with_branch<'a, 'str>(
         );
     } else {
         let branch = body.push_mnemonic(
-            cx.shr(),
             Mnemonic::Branch(Branch {
                 target: local_target,
                 args,
@@ -61,12 +60,7 @@ pub fn replace_terminator_with_branch<'a, 'str>(
             0,
         );
         let end = cx.body_view(body).block_ref(block).len();
-        {
-            // TODO(5b-ii): `BaseRef::insert_insn_at_index` is not mirrored on
-            // `FunctionBody`; go through a temporary host.
-            let mut host = cx.host(body);
-            BaseRef::new(host.reborrow(), block).insert_insn_at_index(end, branch);
-        }
+        BaseRef::new(body.reborrow(), block).insert_insn_at_index(end, branch);
     }
     body.add_cfg_edge(block, target);
 }

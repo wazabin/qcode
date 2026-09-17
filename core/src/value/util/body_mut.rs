@@ -1,40 +1,86 @@
-//! The exclusive mutation backing for a function pass ([`BodyMut`]).
+//! Exclusive access to one installed function body ([`BodyMut`]), and to
+//! several at once ([`BodiesMut`]).
 //!
 //! [`BodyView`] gives the read layer a `Copy` static provider that
 //! routes arena reads to the pass's own function. [`BodyMut`] is its mutable
-//! sibling: a single function's arenas borrowed `&mut` in place from
-//! `Context.bodies[id]` for exclusive mutation by one worker (the driver's
-//! `Context::split` hands out disjoint body borrows).
+//! sibling: a single function's arenas borrowed `&mut` in place, for
+//! exclusive mutation by one worker (the driver's [`Context::split_bodies`](crate::context::Context::split_bodies)
+//! hands out disjoint bodies).
+//!
+//! A [`Context`](crate::context::Context) never hands out a bare `&mut FunctionBody`, and never its
+//! bodies registry mutably: what a holder does with one is not observable —
+//! it could move a body out with `mem::replace`, swap it with a body of
+//! another module that happens to use the same ids, or put back a clone
+//! taken before a tracked deletion — and every one of those changes which
+//! addresses the module covers without any tracked mutator running. So the
+//! body behind a `BodyMut` is reachable only through its verbs, each of which
+//! ticks the module's clock exactly when it changes an address, and for
+//! reading (by [`Deref`]). Replacing the body is not an operation the API
+//! has.
 //!
 //! All *shared* data (types, varnodes, spaces, registers, name map) stays behind
 //! the `&Shared` view, reachable read-only. The inherent verb + read methods below
 //! route each write to the borrowed function's arena; a function pass must not mutate another
 //! function (asserted). The module-scope twin of every verb is an inherent method
-//! on [`Context`]; the shorter-lived reborrow needed to
+//! on [`Context`](crate::context::Context); the shorter-lived reborrow needed to
 //! hand the host to a value that owns it by value (a [`Builder`](crate::builder::Builder)
 //! or a mutation `BaseRef`) is [`BodyMut::reborrow`].
 
+use std::ops::{Deref, Index};
+
+use jstd::registry::{self, Identified, Registry};
+
 use crate::{
-    context::Context,
+    context::Shared,
     error::{Error, ErrorTy, Result},
     value::{
         BlockParamRef, BlockRef, BodyView, FunctionBody, FunctionId, FunctionRef, InstructionRef,
-        QCodeView, ValueId,
+        QCodeView, TempSpace, TempSpaceId, ValueId,
         block::{BasicBlock, BlockId, EdgeData, EdgeId},
         block_param::{BlockParam, BlockParamId},
+        function::FunctionInterface,
         insn::{Instruction, InstructionId, Mnemonic},
     },
 };
 
-/// A single function borrowed `&mut` in place from `Context.bodies[id]` for
-/// exclusive mutation (its interface stays in `Context.interfaces[id]`,
-/// reachable read-only through `interfaces`).
+/// A single function borrowed `&mut` in place — through
+/// [`Context::body_mut`](crate::context::Context::body_mut) or [`BodiesMut`] — for exclusive mutation (its
+/// interface stays in the module's interface registry, reachable read-only
+/// through `interfaces`).
+///
+/// Dereferences to the body for reading. The body itself is reachable
+/// mutably only through the verbs, so it cannot be replaced or swapped
+/// behind the module's revision:
+///
+/// ```compile_fail,E0596
+/// # use qcode::context::Context;
+/// let mut left = Context::new();
+/// let mut right = Context::new();
+/// let f = left.anon_function();
+/// let _ = right.anon_function();
+/// std::mem::swap(&mut *left.body_mut(f), &mut *right.body_mut(f));
+/// ```
+///
+/// ```compile_fail,E0594
+/// # use qcode::{context::Context, value::FunctionBody};
+/// let mut ctx = Context::new();
+/// let f = ctx.anon_function();
+/// *ctx.body_mut(f) = FunctionBody::detached();
+/// ```
+///
+/// ```compile_fail,E0616
+/// # use qcode::context::Context;
+/// let mut ctx = Context::new();
+/// let f = ctx.anon_function();
+/// let (mut bodies, _, _) = ctx.split_bodies();
+/// let _ = std::mem::take(bodies.get_mut(f).fun);
+/// ```
 ///
 /// Out of scope (and asserted against on construction): a function with
 /// *reattributed* blocks — a roster block stored in, or parented to, a different
 /// function. Those functions go through the sequential (module) path.
 pub struct BodyMut<'a, 'str> {
-    pub fun: &'a mut FunctionBody<'str>,
+    pub(crate) fun: &'a mut FunctionBody<'str>,
     /// The module's shared IR state, **read-only**. A checked-out function pass
     /// reaches shared data (types, literals, spaces, registers) immutably; it
     /// mints types/literals through the interners' `&self` paths, and mints no
@@ -53,7 +99,7 @@ impl<'a, 'str> BodyMut<'a, 'str> {
     /// ownership is now derived from the storing arena (a rostered block lives in
     /// `fun`'s own arena by construction), so there is no reattribution state left
     /// to scan for here.
-    pub fn new(
+    pub(crate) fn new(
         fun: &'a mut FunctionBody<'str>,
         shared: &'a crate::context::Shared<'str>,
         interfaces: &'a jstd::registry::Registry<
@@ -66,13 +112,6 @@ impl<'a, 'str> BodyMut<'a, 'str> {
             shared,
             interfaces,
         }
-    }
-
-    /// Wrap `fun` (checked out under `id`) over a whole module `&Context` — the
-    /// module/test-scope convenience constructor (narrows to the shared state +
-    /// interface registry).
-    pub fn from_ctx(fun: &'a mut FunctionBody<'str>, ctx: &'a Context<'str>) -> Self {
-        Self::new(fun, &ctx.shared, &ctx.interfaces)
     }
 
     /// A shorter-lived `BodyMut` reborrowing this one's exclusive references, so
@@ -92,16 +131,25 @@ impl<'a, 'str> BodyMut<'a, 'str> {
     }
 }
 
+impl<'str> Deref for BodyMut<'_, 'str> {
+    type Target = FunctionBody<'str>;
+
+    fn deref(&self) -> &Self::Target {
+        self.fun
+    }
+}
+
 /// The verb + read surface of a checked-out function pass, delegating to the
 /// owned `FunctionBody`'s inherent verbs and `self.shared`. The module-scope twin of
-/// each verb is an inherent method on [`Context`]; the
+/// each verb is an inherent method on [`Context`](crate::context::Context); the
 /// primitives below (`function{,_mut}`/`shared`/`view`, and the no-op
 /// call-site cache) are the checked-out specializations.
 impl<'a, 'str> BodyMut<'a, 'str> {
     // ---- primitives ---------------------------------------------------------
 
-    /// The owned function's storage (write). Panics if `f` is not this function.
-    pub fn function_mut(&mut self, f: FunctionId) -> &mut FunctionBody<'str> {
+    /// The owned function's storage (write), for this crate's verbs. Panics
+    /// if `f` is not this function.
+    pub(crate) fn function_mut(&mut self, f: FunctionId) -> &mut FunctionBody<'str> {
         assert_eq!(
             f,
             self.fun.id(),
@@ -185,6 +233,22 @@ impl<'a, 'str> BodyMut<'a, 'str> {
         self.fun.push_mnemonic_with_type(mnemonic, type_id)
     }
 
+    /// Adds a function-local temporary space; see
+    /// [`FunctionBody::push_temp_space`].
+    pub fn push_temp_space(&mut self, space: TempSpace) -> TempSpaceId {
+        self.fun.push_temp_space(space)
+    }
+
+    /// Resolves the pass-local minted-callee placeholders in this body once
+    /// the minted functions are installed; see
+    /// [`FunctionBody::resolve_minted_callees`].
+    pub fn resolve_minted_callees(
+        &mut self,
+        installed: &[FunctionId],
+    ) -> std::result::Result<usize, u32> {
+        self.fun.resolve_minted_callees(installed)
+    }
+
     // ---- CFG / use-map verbs ------------------------------------------------
     //
     // The body-local mutation verbs live on the [`QCodeMut`] trait
@@ -230,5 +294,86 @@ impl<'a, 'str> BodyMut<'a, 'str> {
                 unimplemented!("a checked-out host has read-only shared access (mints via &self)")
             }
         }
+    }
+}
+
+/// The bodies of a module, borrowed for a driver that holds several
+/// exclusively at once, alongside the frozen module state they read.
+///
+/// Reads index the registry as usual; mutable access is a [`BodyMut`] per
+/// body, one ([`get_mut`](Self::get_mut)) or a disjoint set
+/// ([`select_mut`](Self::select_mut)) at a time. There is no way to add,
+/// remove or replace a slot: the registry stays in lockstep with the module's
+/// interfaces, and every body in it stays the module's.
+pub struct BodiesMut<'a, 'str> {
+    bodies: &'a mut Registry<FunctionId, FunctionBody<'str>>,
+    shared: &'a Shared<'str>,
+    interfaces: &'a Registry<FunctionId, FunctionInterface<'str>>,
+}
+
+impl<'a, 'str> BodiesMut<'a, 'str> {
+    pub(crate) fn new(
+        bodies: &'a mut Registry<FunctionId, FunctionBody<'str>>,
+        shared: &'a Shared<'str>,
+        interfaces: &'a Registry<FunctionId, FunctionInterface<'str>>,
+    ) -> Self {
+        Self {
+            bodies,
+            shared,
+            interfaces,
+        }
+    }
+
+    /// The number of functions in the module.
+    pub fn len(&self) -> usize {
+        self.bodies.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bodies.is_empty()
+    }
+
+    /// The body of `f`, for reading.
+    pub fn get(&self, f: FunctionId) -> &FunctionBody<'str> {
+        &self.bodies[f]
+    }
+
+    /// Every body with its id, in registry order.
+    pub fn iter(&self) -> registry::Iter<'_, FunctionId, FunctionBody<'str>> {
+        self.bodies.iter()
+    }
+
+    /// The body of `f`, exclusively.
+    pub fn get_mut(&mut self, f: FunctionId) -> BodyMut<'_, 'str> {
+        BodyMut::new(&mut self.bodies[f], self.shared, self.interfaces)
+    }
+
+    /// The bodies of `ids` at once, in the order given. Panics on a repeated
+    /// or unknown id, as [`Registry::select_mut`] does.
+    pub fn select_mut(&mut self, ids: &[FunctionId]) -> Vec<BodyMut<'_, 'str>> {
+        let shared = self.shared;
+        let interfaces = self.interfaces;
+        self.bodies
+            .select_mut(ids)
+            .into_iter()
+            .map(|body| BodyMut::new(body, shared, interfaces))
+            .collect()
+    }
+}
+
+impl<'str> Index<FunctionId> for BodiesMut<'_, 'str> {
+    type Output = FunctionBody<'str>;
+
+    fn index(&self, f: FunctionId) -> &Self::Output {
+        &self.bodies[f]
+    }
+}
+
+impl<'a, 'str> IntoIterator for &'a BodiesMut<'_, 'str> {
+    type Item = Identified<FunctionId, &'a FunctionBody<'str>>;
+    type IntoIter = registry::Iter<'a, FunctionId, FunctionBody<'str>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.bodies.iter()
     }
 }

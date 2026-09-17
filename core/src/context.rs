@@ -1,7 +1,7 @@
 //! The central arena for all IR state: [`Context`].
 
 use crate::value::QCodeMut;
-use std::{borrow::Cow, fmt::Display};
+use std::{borrow::Cow, fmt::Display, sync::atomic::Ordering};
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -12,8 +12,8 @@ use crate::{
     space::{LocalMemorySpaceId, MemorySpaceId, Space, SpaceId, SpaceStore},
     types::TypeManager,
     value::{
-        BasicBlock, BlockParamRef, FunctionBody, FunctionId, FunctionRef, Instruction, ModuleView,
-        QCodeView, TempId, TempSpaceId, ValueId,
+        BasicBlock, BlockParamRef, BodiesMut, BodyMut, FunctionBody, FunctionId, FunctionRef,
+        Instruction, ModuleView, QCodeView, TempId, TempSpaceId, ValueId,
         block::{BlockId, BlockRef, EdgeData, EdgeId},
         block_param::{BlockParam, BlockParamId},
         insn::{InstructionId, InstructionRef, Mnemonic, PCodeOpId},
@@ -51,28 +51,169 @@ use jstd::registry::{self, Identified, Registry};
 /// and space identifiers. When names are owned (e.g. generated names), they
 /// are stored as `Cow::Owned`; when they are borrowed from source data they are
 /// `Cow::Borrowed` and must outlive the context.
-#[derive(Default, Clone, serde::Serialize)]
+#[derive(serde::Serialize)]
 pub struct Context<'str> {
     /// Module-shared IR state: everything that is **not** per-function interface
     /// or body storage (regimes 1–3 of the context-split design — architecture,
-    /// interners, module maps, truths). Reached today behind `&mut Context`;
-    /// [`Context::split()`](Self) (stage 5b-ii c.2) will hand it out as a frozen
-    /// `&Shared` view while the bodies registry is borrowed mutably.
+    /// interners, module maps, truths). Reached behind `&mut Context`, or as
+    /// the frozen `&Shared` view [`split_bodies`](Self::split_bodies) hands
+    /// out while bodies are borrowed.
     pub shared: Shared<'str>,
 
     /// Per-function *interface* storage — the caller-reasoning surface (name,
     /// address, kind, external-ness, signature) held in lockstep with
-    /// [`bodies`](Self::bodies) under the same [`FunctionId`] space. Never checked
-    /// out: a co-checked-out callee answers interface queries from here.
+    /// [`bodies`](Self::bodies) under the same [`FunctionId`] space. Read
+    /// through [`interfaces`](Self::interfaces) and [`interface`](Self::interface);
+    /// written only by this crate's tracked mutators, since an interface
+    /// carries the function's address.
     #[serde(default)]
-    pub interfaces: Registry<FunctionId, crate::value::function::FunctionInterface<'str>>,
+    pub(crate) interfaces: Registry<FunctionId, crate::value::function::FunctionInterface<'str>>,
 
     /// Per-function *body* storage. Each function owns its instruction/block/param/
     /// edge arenas; the composite-ID accessors ([`Context::instruction`] etc.)
-    /// route through here. A checked-out function's body is moved out of its slot
-    /// (leaving an empty body); its [`interface`](Self::interfaces) stays put, so
-    /// callers always read the real interface.
-    pub bodies: Registry<FunctionId, FunctionBody<'str>>,
+    /// route through here. Read through [`bodies`](Self::bodies) and
+    /// [`body`](Self::body); a body is handed out mutably only as a
+    /// [`BodyMut`], whose verbs count what they change — see
+    /// [`revision`](Self::revision). Neither the registry nor a bare
+    /// `&mut FunctionBody` is ever handed out, so bodies cannot be installed,
+    /// removed, replaced or swapped except by this crate.
+    pub(crate) bodies: Registry<FunctionId, FunctionBody<'str>>,
+
+    /// Set when a lift into this module failed in a way its rollback could not
+    /// fully undo, so the module may hold IR that no instruction accounts for.
+    /// See [`is_poisoned`](Self::is_poisoned).
+    #[serde(default)]
+    poisoned: bool,
+
+    /// Which module instance this is; see [`identity`](Self::identity). Never
+    /// shared: a clone or a deserialized module gets its own.
+    #[serde(skip)]
+    identity: ContextIdentity,
+
+    /// The clock every address-bearing change to this module ticks — see
+    /// [`revision`](Self::revision). Shared with every installed body, so a
+    /// change made through a body reaches it without the body knowing its
+    /// module.
+    #[serde(skip)]
+    clock: ShapeClock,
+}
+
+/// A counter of changes to a module's address-bearing shape, shared between
+/// a [`Context`] and its function bodies.
+///
+/// A body's mutators run without a handle on their module, yet an index built
+/// for the module must learn of the addresses they move; so the module hands
+/// each body a clone of its clock when the body is installed, and every such
+/// change ticks it. Reading the module's revision is then one load, however
+/// many functions it has.
+#[derive(Debug, Clone, Default)]
+pub struct ShapeClock(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl ShapeClock {
+    pub(crate) fn tick(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn now(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// A clock of another module starting at this one's reading: what a clone
+    /// of a module gets, so the two tick apart from then on.
+    fn fork(&self) -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            self.now(),
+        )))
+    }
+}
+
+/// The identity of the architecture description a module was built for.
+///
+/// A front end that installs an architecture into a module — spaces,
+/// registers, user operations — stamps the module with the identity of the
+/// description it took them from, such as a compiled SLEIGH specification's
+/// fingerprint. A lifter for a description then accepts a module exactly when
+/// the stamp is that description's: not one that merely has the same registers
+/// in the same places, which a different specification can also have. The
+/// stamp is part of the module and survives cloning and serialization, so a
+/// reloaded module still says what it was built for; a module built by hand
+/// carries none and no lifter accepts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ArchitectureId(u128);
+
+impl ArchitectureId {
+    /// Wraps a front end's own 128-bit identity.
+    pub const fn new(identity: u128) -> Self {
+        Self(identity)
+    }
+
+    pub const fn as_u128(self) -> u128 {
+        self.0
+    }
+}
+
+/// The identity of one [`Context`] instance.
+///
+/// Every context ever constructed in a process — by [`Context::new`], by
+/// cloning, by deserializing — has a distinct identity, and keeps it for its
+/// whole life. Derived state built *from* a context, such as an
+/// [`AddressIndex`](crate::address_index::AddressIndex), records the identity
+/// so that it can later tell the context it describes from any other,
+/// including a clone whose ids happen to coincide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContextIdentity(u64);
+
+impl ContextIdentity {
+    fn fresh() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// The address-bearing shape of a [`Context`] at one moment: which module
+/// instance it is, and how many times the set of addressed entities has been
+/// changed since it was made. See [`Context::revision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Revision {
+    pub identity: ContextIdentity,
+    pub shape: u64,
+}
+
+impl<'str> Default for Context<'str> {
+    fn default() -> Self {
+        Self {
+            shared: Shared::default(),
+            interfaces: Registry::default(),
+            bodies: Registry::default(),
+            poisoned: false,
+            identity: ContextIdentity::fresh(),
+            clock: ShapeClock::default(),
+        }
+    }
+}
+
+impl<'str> Clone for Context<'str> {
+    /// A clone is a new module instance: it has the same contents and the
+    /// same ids, but its own [`identity`](Self::identity), so derived state
+    /// built for the original does not pass for state built for the clone;
+    /// its bodies are linked to its own clock, so their changes move its
+    /// revision and not the original's.
+    fn clone(&self) -> Self {
+        let clock = self.clock.fork();
+        let mut bodies = self.bodies.clone();
+        for mut body in bodies.iter_mut() {
+            body.link_clock(clock.clone());
+        }
+        Self {
+            shared: self.shared.clone(),
+            interfaces: self.interfaces.clone(),
+            bodies,
+            poisoned: self.poisoned,
+            identity: ContextIdentity::fresh(),
+            clock,
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -81,6 +222,8 @@ struct ContextWire<'str> {
     #[serde(default)]
     interfaces: Registry<FunctionId, crate::value::function::FunctionInterface<'str>>,
     bodies: Registry<FunctionId, FunctionBody<'str>>,
+    #[serde(default)]
+    poisoned: bool,
 }
 
 impl<'de, 'str> serde::Deserialize<'de> for Context<'str> {
@@ -92,22 +235,28 @@ impl<'de, 'str> serde::Deserialize<'de> for Context<'str> {
             shared,
             interfaces,
             mut bodies,
+            poisoned,
         } = ContextWire::deserialize(deserializer)?;
         if interfaces.len() != bodies.len() {
             return Err(serde::de::Error::custom(
                 "function body/interface registries drifted",
             ));
         }
+        let clock = ShapeClock::default();
         for mut body in bodies.iter_mut() {
             let id = body.id;
             body.rehydrate_id(id);
             // The wire carries operands, not the edges derived from them.
             body.rebuild_uses();
+            body.link_clock(clock.clone());
         }
         Ok(Self {
             shared,
             interfaces,
             bodies,
+            poisoned,
+            identity: ContextIdentity::fresh(),
+            clock,
         })
     }
 }
@@ -156,6 +305,11 @@ pub struct Shared<'str> {
     /// established state.
     #[serde(default)]
     pub(crate) protections_known: bool,
+
+    /// The architecture front end this module was built for, when one built
+    /// it; see [`Context::architecture`].
+    #[serde(default)]
+    pub(crate) architecture: Option<ArchitectureId>,
 
     /// The binary format's primary entrypoint, when the loader supplied one.
     /// Analysis passes use this for narrow loader-shaped recognizers such as
@@ -393,6 +547,94 @@ impl<'str> Context<'str> {
         let default_space = Space::new(Some("ram"), 1, 8);
         ctx.shared.default_space = ctx.shared.spaces.push(default_space);
         ctx
+    }
+
+    /// Whether a construction into this module failed without a complete
+    /// rollback, leaving IR no instruction accounts for.
+    ///
+    /// A poisoned module is still readable and walkable, but it is not to be
+    /// built on: every [`LiftTarget`](crate::lift::LiftTarget) binding refuses
+    /// it, and an owning session refuses to hand it over. The flag is part of
+    /// the module — it survives rebinding and serialization — so recovery is
+    /// disposal, or a store that discards the whole damaged epoch (the scratch
+    /// store does, since its host holds nothing but the failed instruction).
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Marks the module as holding IR its construction cannot vouch for. Set
+    /// only by a lift whose rollback found state it could not take back;
+    /// nothing else has grounds to, and there is no public way to clear it.
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
+    /// Clears the poison. Only for an owner that has discarded every body the
+    /// damage could be in — the scratch store, after emptying its one host.
+    pub(crate) fn clear_poison(&mut self) {
+        self.poisoned = false;
+    }
+
+    /// The architecture description this module was built for, if a front end
+    /// stamped one; see [`ArchitectureId`].
+    pub fn architecture(&self) -> Option<ArchitectureId> {
+        self.shared.architecture
+    }
+
+    /// Stamps the module with the architecture description its spaces,
+    /// registers and user operations come from. For the front end that
+    /// installs them, once, when it builds the module: a stamp claims that
+    /// every architectural entity in the module is that description's, and a
+    /// lifter trusts the claim.
+    pub fn set_architecture(&mut self, architecture: ArchitectureId) {
+        self.shared.architecture = Some(architecture);
+    }
+
+    /// Which module instance this is. See [`ContextIdentity`].
+    pub fn identity(&self) -> ContextIdentity {
+        self.identity
+    }
+
+    /// The module's shape revision: its identity, and a count of every change
+    /// so far to the set of entities that carry a machine address — an
+    /// address assigned to a function or block, an addressed block deleted,
+    /// absorbed into another or split, a body's epoch restarted. Creating a
+    /// function or block that has no address yet does not move it, since an
+    /// index need not list what has no address; nor do instruction-level
+    /// edits.
+    ///
+    /// Derived address state records the revision it was computed at; the
+    /// state is current exactly while the revision has not moved
+    /// ([`AddressIndex::is_current`](crate::address_index::AddressIndex::is_current)).
+    ///
+    /// Every such change made through the public API is counted, which the
+    /// API guarantees in three ways. The address-bearing fields — a block's
+    /// addresses, an interface's entry address — are crate-private, and each
+    /// mutator that writes one ticks the clock. The registries of bodies and
+    /// interfaces are never reachable mutably, so nothing is installed,
+    /// removed or replaced in them except by this crate, which counts what it
+    /// installs ([`push_function`](Self::push_function),
+    /// [`push_block`](Self::push_block)). And a body is reachable mutably
+    /// only through its verbs — [`body_mut`](Self::body_mut) hands out a
+    /// [`BodyMut`], never a `&mut FunctionBody` — so a body cannot be
+    /// swapped with another module's, replaced, or restored from a clone;
+    /// every installed body is on this module's clock for as long as it is
+    /// installed. A bare `&mut BasicBlock` is the one exception, so handing
+    /// one out ([`block_mut`](Self::block_mut)) counts as a change outright.
+    ///
+    /// The count is one shared [`ShapeClock`], so reading it is O(1), and
+    /// so is handing out a body, so a caller that keeps its index current
+    /// across instruction-level edits binds it without a rebuild.
+    pub fn revision(&self) -> Revision {
+        Revision {
+            identity: self.identity,
+            shape: self.clock.now(),
+        }
+    }
+
+    /// Counts a change to the address-bearing shape.
+    pub(crate) fn touch_shape(&mut self) {
+        self.clock.tick();
     }
 
     /// Returns the [`SpaceId`] for the named space, or `None` if it has not
@@ -663,6 +905,18 @@ impl<'str> Context<'str> {
         addr: u64,
         func: FunctionId,
     ) -> BlockId {
+        addresses.tracked(self, |ctx, addresses| {
+            ctx.get_or_make_block_untracked(addresses, addr, func)
+        })
+    }
+
+    #[track_caller]
+    fn get_or_make_block_untracked(
+        &mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        addr: u64,
+        func: FunctionId,
+    ) -> BlockId {
         use crate::address_index::AddressTarget;
 
         if let Some(AddressTarget::Function(owner)) = addresses.get(addr) {
@@ -754,26 +1008,54 @@ impl<'str> Context<'str> {
         block: BlockId,
         addr: u64,
     ) -> BlockId {
-        // `addr` is a branch target, and stays one: a later run through here
-        // must not fold across it and undo this split.
-        addresses.mark_boundary(addr);
-        let tail = BasicBlock::make(self, block.func).id;
+        addresses.tracked(self, |ctx, addresses| {
+            let tail = BasicBlock::make(ctx, block.func).id;
+            ctx.split_block_into(addresses, block, addr, tail);
+            tail
+        })
+    }
 
-        // Emptying `block` drops its terminator, and with it every outgoing
-        // edge; the successors are rebuilt when it is lifted again.
-        self.bodies[block.func].clear_block_instructions(block);
+    /// [`split_block_at_address`](Self::split_block_at_address) with the new
+    /// block supplied: `tail`, an address-less block of `block`'s function,
+    /// takes `addr` (and keeps whatever was already lifted into it for that
+    /// address). A construction that must branch to an interior address
+    /// before it knows it will succeed makes the tail first and splits only
+    /// when it commits, so an abandoned construction never touches `block`.
+    pub fn split_block_into(
+        &mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        block: BlockId,
+        addr: u64,
+        tail: BlockId,
+    ) {
+        debug_assert_eq!(tail.func, block.func, "a split stays in one function");
+        debug_assert!(
+            self.block(tail).address.is_none(),
+            "the tail of a split has no address of its own yet"
+        );
+        addresses.tracked(self, |ctx, addresses| {
+            // `addr` is a branch target, and stays one: a later run through
+            // here must not fold across it and undo this split.
+            addresses.mark_boundary(addr);
 
-        // `addr` and everything else absorbed into `block` stop being its, and
-        // the index stops pointing at it for them: whichever half covers each
-        // address is settled by lifting, not guessed at here.
-        let absorbed = std::mem::take(&mut self.block_mut(block).extra_addresses);
-        for absorbed_addr in absorbed {
-            addresses.forget(absorbed_addr);
-        }
-        BasicBlock::from_id_mut(self, tail)
-            .in_function(block.func)
-            .with_address_indexed(addresses, addr);
-        tail
+            // Emptying `block` drops its terminator, and with it every
+            // outgoing edge; the successors are rebuilt when it is lifted
+            // again.
+            ctx.bodies[block.func].clear_block_instructions(block);
+
+            // `addr` and everything else absorbed into `block` stop being
+            // its, and the index stops pointing at it for them: whichever
+            // half covers each address is settled by lifting, not guessed at
+            // here.
+            let absorbed = std::mem::take(&mut ctx.block_raw_mut(block).extra_addresses);
+            ctx.bodies[block.func].touch_shape();
+            for absorbed_addr in absorbed {
+                addresses.forget(absorbed_addr);
+            }
+            BasicBlock::from_id_mut(ctx, tail)
+                .in_function(block.func)
+                .with_address_indexed(addresses, addr);
+        });
     }
 
     /// Moves `insn` and everything after it into a fresh block of the same
@@ -981,6 +1263,17 @@ impl<'str> Context<'str> {
         target: FunctionId,
         olds: &[BlockId],
     ) -> HashMap<BlockId, BlockId> {
+        addresses.tracked(self, |ctx, addresses| {
+            ctx.rehome_owned_blocks_untracked(addresses, target, olds)
+        })
+    }
+
+    fn rehome_owned_blocks_untracked(
+        &mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        target: FunctionId,
+        olds: &[BlockId],
+    ) -> HashMap<BlockId, BlockId> {
         // Body-local temporary values and spaces move with blocks that reference
         // them. Collect the exact dependency closure first: operand/origin temps,
         // explicit load/store spaces, and pointer provenance carried by types.
@@ -1167,8 +1460,9 @@ impl<'str> Context<'str> {
             for &e in &extra {
                 addresses.rehome_block(e, old, new);
             }
-            self.block_mut(new).extra_addresses = extra;
-            self.block_mut(new).address = Some(addr);
+            self.block_raw_mut(new).extra_addresses = extra;
+            self.block_raw_mut(new).address = Some(addr);
+            self.bodies[new.func].touch_shape();
         }
 
         // Phase 5: delete the originals (unlinks their old edges, physically
@@ -1273,6 +1567,16 @@ impl<'str> Context<'str> {
     /// Indexed construction variant of
     /// [`split_function_at`](Self::split_function_at).
     pub fn split_function_at_indexed(
+        &mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        block: BlockId,
+    ) -> FunctionId {
+        addresses.tracked(self, |ctx, addresses| {
+            ctx.split_function_at_untracked(addresses, block)
+        })
+    }
+
+    fn split_function_at_untracked(
         &mut self,
         addresses: &mut crate::address_index::AddressIndex,
         block: BlockId,
@@ -1747,9 +2051,87 @@ impl<'str> Context<'str> {
         &self.bodies[fid]
     }
 
-    /// The function *body* `fid`, mutably (see [`Context::body`]).
-    pub fn body_mut(&mut self, fid: FunctionId) -> &mut crate::value::FunctionBody<'str> {
-        &mut self.bodies[fid]
+    /// The function *body* `fid`, mutably (see [`Context::body`]): its
+    /// verbs, over the module's shared state and interfaces, read-only. See
+    /// [`BodyMut`]. The module is borrowed for as long as the host lives.
+    pub fn body_mut(&mut self, fid: FunctionId) -> BodyMut<'_, 'str> {
+        BodyMut::new(&mut self.bodies[fid], &self.shared, &self.interfaces)
+    }
+
+    /// Every function body, with its id, for reading. Mutable access is
+    /// through [`body_mut`](Self::body_mut) or
+    /// [`split_bodies`](Self::split_bodies).
+    ///
+    /// The registry itself is never reachable mutably, so a body cannot be
+    /// installed, removed or replaced behind the module's revision:
+    ///
+    /// ```compile_fail,E0616
+    /// # use qcode::context::Context;
+    /// let mut ctx = Context::new();
+    /// let other = Context::new();
+    /// ctx.bodies = other.bodies.clone();
+    /// ```
+    ///
+    /// ```compile_fail,E0616
+    /// # use qcode::context::Context;
+    /// let mut ctx = Context::new();
+    /// let mut other = Context::new();
+    /// std::mem::swap(&mut ctx.bodies, &mut other.bodies);
+    /// let _ = std::mem::take(&mut ctx.interfaces);
+    /// ```
+    ///
+    /// Nor is a bare `&mut FunctionBody` obtainable from the mutation
+    /// primitive the verbs route through — it is sealed to this crate:
+    ///
+    /// ```compile_fail,E0603
+    /// # use qcode::{context::Context, value::view_mut::sealed::Storage};
+    /// let mut ctx = Context::new();
+    /// let f = ctx.anon_function();
+    /// let body = ctx.function_mut(f);
+    /// ```
+    pub fn bodies(&self) -> &Registry<FunctionId, FunctionBody<'str>> {
+        &self.bodies
+    }
+
+    /// Every function interface, with its id, held in lockstep with the
+    /// bodies under the same ids. Written only through the function mutators
+    /// ([`FunctionMutRef`](crate::value::FunctionMutRef)), since an interface carries the function's address.
+    pub fn interfaces(
+        &self,
+    ) -> &Registry<FunctionId, crate::value::function::FunctionInterface<'str>> {
+        &self.interfaces
+    }
+
+    /// The published interface of function `fid`.
+    pub fn interface(&self, fid: FunctionId) -> &crate::value::function::FunctionInterface<'str> {
+        &self.interfaces[fid]
+    }
+
+    /// The number of functions in the module.
+    pub fn function_count(&self) -> usize {
+        self.bodies.len()
+    }
+
+    /// Borrows the bodies for mutation, one or several disjoint ones at a
+    /// time, alongside the frozen module state a pass reads: the shared IR
+    /// state and the interface registry.
+    ///
+    /// This is how a pass driver holds one body — or several disjoint ones —
+    /// mutably while reading the rest of the module; see [`BodiesMut`]. The
+    /// bodies-free halves cannot alias a borrowed body, and the bodies cannot
+    /// be added to, removed from or replaced through the borrow.
+    pub fn split_bodies(
+        &mut self,
+    ) -> (
+        BodiesMut<'_, 'str>,
+        &Shared<'str>,
+        &Registry<FunctionId, crate::value::function::FunctionInterface<'str>>,
+    ) {
+        (
+            BodiesMut::new(&mut self.bodies, &self.shared, &self.interfaces),
+            &self.shared,
+            &self.interfaces,
+        )
     }
 
     // ----- Composite-id arena routing (moved off `ValueRegistry` in the
@@ -1792,7 +2174,20 @@ impl<'str> Context<'str> {
     }
 
     /// Mutably borrows the basic block `id`.
+    ///
+    /// A block carries its addresses, and what the holder of a `&mut` does
+    /// with it — a swap, a replacement — is not observable, so handing one
+    /// out counts as a change to the module's address-bearing shape: an index
+    /// kept across this call is behind afterwards. Prefer the block mutators
+    /// ([`BlockMutRef`](crate::value::BlockMutRef), the builder), which move the revision only when an
+    /// address actually changes.
     pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
+        self.bodies[id.func].block_mut(id)
+    }
+
+    /// The block `id`, mutably, for this crate's mutators, which tick the
+    /// clock themselves exactly when they change an address.
+    pub(crate) fn block_raw_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
         &mut self.bodies[id.func].blocks[id.local]
     }
 
@@ -1847,12 +2242,10 @@ impl<'str> Context<'str> {
         }
     }
 
+    /// Appends `block` to `func`'s body. A block that already carries an
+    /// address moves the module's revision (see [`FunctionBody::push_block`]).
     pub fn push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
-        let local = self.bodies[func].blocks.push(block);
-        let id = BlockId::new(func, local);
-        // A block is born owned by the function whose arena stores it.
-        self.bodies[func].roster.push(local);
-        id
+        self.bodies[func].push_block(block)
     }
 
     pub fn push_block_param(&mut self, func: FunctionId, param: BlockParam<'str>) -> BlockParamId {
@@ -1866,17 +2259,27 @@ impl<'str> Context<'str> {
 
     /// Push a function's interface and body in lockstep, returning the shared
     /// [`FunctionId`]. Both registries must always grow together.
+    ///
+    /// The installed body's address-bearing changes are this module's from
+    /// here on. Installing something that already carries addresses — an
+    /// interface with an entry address, a body with blocks (a clone of an
+    /// installed one, say) — moves the module's revision, since an index that
+    /// was current before does not list them.
     pub fn push_function(
         &mut self,
         interface: crate::value::function::FunctionInterface<'str>,
-        body: FunctionBody<'str>,
+        mut body: FunctionBody<'str>,
     ) -> FunctionId {
+        body.link_clock(self.clock.clone());
         let expected = FunctionId::from(self.bodies.len());
         assert_eq!(
             body.id(),
             expected,
             "function body id does not match its registry slot"
         );
+        if interface.address.is_some() || !body.blocks.is_empty() {
+            self.touch_shape();
+        }
         let id = self.bodies.push(body);
         let iid = self.interfaces.push(interface);
         debug_assert_eq!(
@@ -2070,10 +2473,6 @@ impl<'str> Context<'str> {
     pub fn function(&self, f: FunctionId) -> &FunctionBody<'str> {
         &self.bodies[f]
     }
-    /// The owning function's storage (write). Alias of [`body_mut`](Self::body_mut).
-    pub fn function_mut(&mut self, f: FunctionId) -> &mut FunctionBody<'str> {
-        &mut self.bodies[f]
-    }
 
     /// A read [`BlockRef`] over `id`, module-routed.
     pub fn block_ref(&self, id: BlockId) -> BlockRef<'str, '_, ModuleView<'_, 'str>> {
@@ -2144,8 +2543,7 @@ impl<'str> Context<'str> {
             };
         }
         match id.name_scope_function() {
-            Some(func) => self
-                .function_mut(func)
+            Some(func) => self.bodies[func]
                 .names
                 .register(name, id.localize(func), old_name),
             None => self.update_name(name, id, old_name),
@@ -2265,6 +2663,12 @@ impl<'str, Id: Copy + Eq> NameTable<'str, Id> {
     /// Whether `name` is taken.
     pub fn contains(&self, name: &str) -> bool {
         self.map.contains_key(name)
+    }
+
+    /// Forgets every name, keeping the table's capacity.
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+        self.suffix_hint.clear();
     }
 
     /// Register `name` for `id`, forgetting `old_name` first. Errors if `name`

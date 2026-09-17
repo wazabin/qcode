@@ -24,7 +24,10 @@ mod engine {
     use qcode_emulator::{Emulator, EmulatorError, EmulatorErrorKind};
     use sleigh::{CompiledSpec, Decoder, Opcode, SymbolKind, Varnode};
     use sleigh_precompile::x64;
-    use wazabin_qcode_sleigh::SleighLifter;
+    use wazabin_qcode_sleigh::{
+        SleighLifter,
+        session::{Host, LiftSession},
+    };
 
     /// Flag table: (name, bit-mask in RFLAGS word)
     const FLAGS: &[(&str, u64)] = &[
@@ -98,25 +101,23 @@ mod engine {
     fn lift_x64(bytes: &[u8], address: u64) -> Result<Context<'static>, String> {
         let spec: &CompiledSpec = x64::spec();
         let lifter = SleighLifter::new(spec);
-        let decode_context = spec.new_context();
-        let decoder = Decoder::new(spec);
-        let mut context = lifter.new_context();
-        let function = context.anon_function();
+        // Every instruction of a row decodes with the default context: a row
+        // is a hardware trace, not a sweep whose earlier instructions set the
+        // mode of later ones.
+        let mut session = LiftSession::new(&lifter, Host::Anonymous);
         let mut offset = 0;
         while offset < bytes.len() {
-            let instruction = decoder
-                .decode_one(address + offset as u64, &bytes[offset..], &decode_context)
-                .map_err(|error| format!("decode failed at byte {offset}: {error}"))?;
-            let length = instruction.len();
-            if length == 0 {
+            let lifted = session
+                .lift(address + offset as u64, &bytes[offset..])
+                .map_err(|error| format!("lift failed at byte {offset}: {error}"))?;
+            if lifted.length() == 0 {
                 return Err(format!("decoded zero-length instruction at byte {offset}"));
             }
-            lifter
-                .lift_instruction(&mut context, &instruction, Some(function))
-                .map_err(|error| format!("lift failed at byte {offset}: {error}"))?;
-            offset += length;
+            offset += lifted.length();
         }
-        Ok(context)
+        session
+            .into_context()
+            .map_err(|error| format!("the lifted module is unusable: {error}"))
     }
 
     fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {

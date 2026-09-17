@@ -25,8 +25,8 @@ use crate::{
     context::{Context, Shared},
     error::Result,
     value::{
-        BasicBlock, BodyView, FunctionBody, FunctionId, Instruction, ModuleView, QCodeView,
-        ValueId,
+        BasicBlock, BodyView, FunctionBody, FunctionId, Instruction, LocalParamId, ModuleView,
+        QCodeView, ValueId,
         block::{BlockId, EdgeId},
         block_param::BlockParam,
         block_param::BlockParamId,
@@ -36,22 +36,40 @@ use crate::{
     },
 };
 
+/// The bare-storage primitive of a mutation host, sealed to this crate: the
+/// module is unnameable outside it, so only this crate's verbs route through
+/// the bare body, and they tick the module's clock exactly when they change
+/// an address. A caller outside the crate reaches a body through a
+/// [`BodyMut`] (from [`Context::body_mut`] or [`Context::split_bodies`]),
+/// whose verbs are exactly the [`QCodeMut`] ones.
+pub(crate) mod sealed {
+    use crate::value::{BasicBlock, BlockId, FunctionBody, FunctionId};
+
+    pub trait Storage<'str> {
+        /// The storage of the function `id` (write). The checked-out host
+        /// panics if `id` is not its own function.
+        fn function_mut(&mut self, id: FunctionId) -> &mut FunctionBody<'str>;
+
+        /// The block `id`, mutably, without counting an address change.
+        fn block_raw_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
+            &mut self.function_mut(id.func).blocks[id.local]
+        }
+    }
+}
+
 /// Body-local mutation capability shared by the module host ([`Context`]) and
 /// the checked-out pass host ([`BodyMut`]).
 ///
-/// The primitives (`function_mut`, `shr`, `interfaces`, `view`) are the whole
-/// per-host surface; every verb is a provided method delegating to the
-/// [`FunctionBody`] canon through the function named by its arguments' ids.
-pub trait QCodeMut<'str> {
+/// The primitives (`shr`, `interfaces`, `view`, and the sealed storage) are
+/// the whole per-host surface; every verb is a provided method delegating to
+/// the [`FunctionBody`] canon through the function named by its arguments'
+/// ids.
+pub trait QCodeMut<'str>: sealed::Storage<'str> {
     /// The host's `Copy` read provider ([`ModuleView`] or [`BodyView`]).
     type View<'v>: QCodeView<'v, 'str>
     where
         Self: 'v,
         'str: 'v;
-
-    /// The storage of the function `id` (write). The checked-out host panics if
-    /// `id` is not its own function.
-    fn function_mut(&mut self, id: FunctionId) -> &mut FunctionBody<'str>;
 
     /// The storage of the function `id` (read), tied to `&self`. The
     /// borrow-friendly read primitive for host-generic ref code: a fully
@@ -76,13 +94,26 @@ pub trait QCodeMut<'str> {
     }
 
     /// Mutably borrows the block `id` from its owning function's arena.
+    ///
+    /// Counts as a change to the module's address-bearing shape, like
+    /// [`FunctionBody::block_mut`]: the block carries its addresses, and what
+    /// the holder does with a `&mut` is not observable.
     fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
-        &mut self.function_mut(id.func).blocks[id.local]
+        self.function_mut(id.func).block_mut(id)
     }
 
     /// Mutably borrows the block parameter `id` from its owning function's arena.
     fn block_param_mut(&mut self, id: BlockParamId) -> &mut BlockParam<'str> {
         &mut self.function_mut(id.func).params[id.local]
+    }
+
+    /// Mutably borrows the parameter list of the block `id`; see
+    /// [`FunctionBody::block_params_mut`]. Not an address-bearing change.
+    fn block_params_mut<'a>(&'a mut self, id: BlockId) -> &'a mut Vec<LocalParamId>
+    where
+        'str: 'a,
+    {
+        self.function_mut(id.func).block_params_mut(id)
     }
 
     // ---- body-local verbs (canon: inherent methods on `FunctionBody`) -------
@@ -189,6 +220,13 @@ pub trait QCodeMut<'str> {
         }
     }
 
+    /// Removes the instructions `dead` of `block`, all at once; see
+    /// [`FunctionBody::remove_block_instructions`].
+    fn remove_block_instructions(&mut self, block: BlockId, dead: &FxHashSet<LocalInsnId>) {
+        self.function_mut(block.func)
+            .remove_block_instructions(block, dead);
+    }
+
     /// Rehome `remove`'s outgoing CFG edges onto `keep`. The direct edge and
     /// `keep`'s forwarding terminator have already been removed by the caller.
     fn rehome_outgoing_edges(&mut self, keep: BlockId, remove: BlockId) {
@@ -229,16 +267,18 @@ pub trait QCodeMut<'str> {
 /// A `&mut` to a host is itself a host, so a `BaseRef<&mut Context, _>`
 /// mutation ref (whose `ctx` field is a reborrowable `&mut Context`) satisfies
 /// the same generic bound as a by-value `BodyMut` host.
+impl<'str, H: QCodeMut<'str>> sealed::Storage<'str> for &mut H {
+    fn function_mut(&mut self, id: FunctionId) -> &mut FunctionBody<'str> {
+        (**self).function_mut(id)
+    }
+}
+
 impl<'str, H: QCodeMut<'str>> QCodeMut<'str> for &mut H {
     type View<'v>
         = H::View<'v>
     where
         Self: 'v,
         'str: 'v;
-
-    fn function_mut(&mut self, id: FunctionId) -> &mut FunctionBody<'str> {
-        (**self).function_mut(id)
-    }
 
     fn body(&self, id: FunctionId) -> &FunctionBody<'str> {
         (**self).body(id)
@@ -257,16 +297,18 @@ impl<'str, H: QCodeMut<'str>> QCodeMut<'str> for &mut H {
     }
 }
 
+impl<'str> sealed::Storage<'str> for Context<'str> {
+    fn function_mut(&mut self, id: FunctionId) -> &mut FunctionBody<'str> {
+        &mut self.bodies[id]
+    }
+}
+
 impl<'str> QCodeMut<'str> for Context<'str> {
     type View<'v>
         = ModuleView<'v, 'str>
     where
         Self: 'v,
         'str: 'v;
-
-    fn function_mut(&mut self, id: FunctionId) -> &mut FunctionBody<'str> {
-        &mut self.bodies[id]
-    }
 
     fn body(&self, id: FunctionId) -> &FunctionBody<'str> {
         &self.bodies[id]
@@ -285,16 +327,18 @@ impl<'str> QCodeMut<'str> for Context<'str> {
     }
 }
 
+impl<'str> sealed::Storage<'str> for BodyMut<'_, 'str> {
+    fn function_mut(&mut self, id: FunctionId) -> &mut FunctionBody<'str> {
+        BodyMut::function_mut(self, id)
+    }
+}
+
 impl<'a, 'str> QCodeMut<'str> for BodyMut<'a, 'str> {
     type View<'v>
         = BodyView<'v, 'str>
     where
         Self: 'v,
         'str: 'v;
-
-    fn function_mut(&mut self, id: FunctionId) -> &mut FunctionBody<'str> {
-        BodyMut::function_mut(self, id)
-    }
 
     fn body(&self, id: FunctionId) -> &FunctionBody<'str> {
         BodyMut::function(self, id)

@@ -62,7 +62,13 @@ pub struct FunctionInterface<'str> {
     pub name: Cow<'str, str>,
 
     /// Optional entry address (from binary).
-    pub address: Option<u64>,
+    ///
+    /// Crate-private: an entry address is what an
+    /// [`AddressIndex`](crate::address_index::AddressIndex) lists and the
+    /// module's [shape revision](crate::context::Context::revision) counts, so
+    /// only the mutators that tick that clock write it. Read it through
+    /// [`address`](Self::address).
+    pub(crate) address: Option<u64>,
 
     /// Whether this is an external (imported) function.
     ///
@@ -414,7 +420,7 @@ pub struct MemoryInterfaceMap {
 /// caller-reasoning surface lives separately in [`FunctionInterface`], stored in
 /// [`Context::interfaces`](crate::context::Context::interfaces)
 /// under the same [`FunctionId`].
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct FunctionBody<'str> {
     /// Immutable identity of this body in the lockstep function registries, or
     /// `None` while the body is *detached* (freshly minted by a pass, not yet
@@ -508,6 +514,39 @@ pub struct FunctionBody<'str> {
     /// a value with no use in this body has no entry.
     #[serde(skip)]
     pub(crate) shared_first_use: FxHashMap<LocalValueId, UseId>,
+
+    /// The module's shape clock (see
+    /// [`Context::revision`](crate::context::Context::revision)), ticked by
+    /// every change to which addresses this body's blocks carry. Linked when
+    /// the body is installed; a detached body ticks a clock of its own.
+    #[serde(skip)]
+    clock: crate::context::ShapeClock,
+}
+
+impl<'str> Clone for FunctionBody<'str> {
+    /// A clone is a new, detached body value: the same contents and ids, and
+    /// a clock of its own — it is not installed in the module the original
+    /// is, so its changes must not move that module's revision. Installing
+    /// it ([`Context::push_function`](crate::context::Context::push_function))
+    /// links it.
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            root: self.root,
+            insns: self.insns.clone(),
+            blocks: self.blocks.clone(),
+            roster: self.roster.clone(),
+            params: self.params.clone(),
+            edges: self.edges.clone(),
+            temp_spaces: self.temp_spaces.clone(),
+            temps: self.temps.clone(),
+            instruction_addrs: self.instruction_addrs.clone(),
+            names: self.names.clone(),
+            uses: self.uses.clone(),
+            shared_first_use: self.shared_first_use.clone(),
+            clock: crate::context::ShapeClock::default(),
+        }
+    }
 }
 
 /// Aggregate storage statistics for one kind of function-body entity.
@@ -589,6 +628,11 @@ pub enum FunctionKind {
 }
 
 impl<'str> FunctionInterface<'str> {
+    /// The function's entry address, if it has one.
+    pub fn address(&self) -> Option<u64> {
+        self.address
+    }
+
     /// A fresh interface named `name`, with default (empty) signature/kind.
     pub fn new(name: Cow<'str, str>) -> Self {
         Self {
@@ -762,6 +806,7 @@ impl<'str> FunctionBody<'str> {
             names: crate::context::NameTable::default(),
             uses: UseArena::default(),
             shared_first_use: FxHashMap::default(),
+            clock: crate::context::ShapeClock::default(),
         }
     }
 
@@ -787,6 +832,7 @@ impl<'str> FunctionBody<'str> {
             names: crate::context::NameTable::default(),
             uses: UseArena::default(),
             shared_first_use: FxHashMap::default(),
+            clock: crate::context::ShapeClock::default(),
         }
     }
 
@@ -883,9 +929,29 @@ impl<'str> FunctionBody<'str> {
         &self.blocks[id.local]
     }
     /// The block `id`, mutably.
+    ///
+    /// A block carries its addresses, and what the holder of a `&mut` does
+    /// with it — a swap, a replacement — is not observable, so handing one
+    /// out counts as a change to the module's address-bearing shape (see
+    /// [`Context::revision`](crate::context::Context::revision)). Prefer the
+    /// block mutators, which move the revision only when an address changes;
+    /// for the parameters, [`block_params_mut`](Self::block_params_mut).
     pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
+        self.touch_shape();
+        self.block_raw_mut(id)
+    }
+
+    /// The block `id`, mutably, for this crate's mutators, which tick the
+    /// clock themselves exactly when they change an address.
+    pub(crate) fn block_raw_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
         assert_eq!(id.func, self.id(), "block belongs to another function");
         &mut self.blocks[id.local]
+    }
+
+    /// The parameters declared at the entry of block `id`, mutably. Parameters
+    /// carry no address, so this moves nothing.
+    pub fn block_params_mut(&mut self, id: BlockId) -> &mut Vec<LocalParamId> {
+        &mut self.block_raw_mut(id).params
     }
 
     /// Whether `id` currently names a live block payload in this body.
@@ -1021,6 +1087,42 @@ impl<'str> FunctionBody<'str> {
         TempId::new(self.id(), local)
     }
 
+    /// Empties the body and starts a new epoch of its arenas: every id is
+    /// invalid, and will be issued again, from zero.
+    ///
+    /// Only a [`ScratchStore`](crate::lift::ScratchStore) may call this — the
+    /// one owner that can vouch no id of the previous epoch survives.
+    pub(crate) fn start_epoch(&mut self) {
+        self.touch_shape();
+        self.insns.clear();
+        self.blocks.clear();
+        self.params.clear();
+        self.edges.clear();
+        self.roster.clear();
+        self.root = None;
+        self.temps.truncate(0);
+        self.temp_spaces.truncate(0);
+        self.instruction_addrs.clear();
+        self.names.clear();
+        self.uses.clear();
+        self.shared_first_use.clear();
+    }
+
+    /// Drops the temporaries and temporary spaces appended since the body had
+    /// `temps` and `temp_spaces` of them, with their names.
+    ///
+    /// For a construction taking back an instruction it could not finish:
+    /// nothing may still refer to the dropped temporaries.
+    pub(crate) fn take_back_temps(&mut self, temps: usize, temp_spaces: usize) {
+        for raw in temps..self.temps.len() {
+            if let Some(name) = &self.temps[crate::value::LocalTempId::from(raw)].name {
+                self.names.forget(name);
+            }
+        }
+        self.temps.truncate(temps);
+        self.temp_spaces.truncate(temp_spaces);
+    }
+
     /// Resolves a qualified temporary-space ID against this body.
     #[track_caller]
     pub fn temp_space(&self, id: TempSpaceId) -> &TempSpace {
@@ -1135,9 +1237,26 @@ impl<'str> FunctionBody<'str> {
     /// usable on a detached (uninstalled) body.
     pub fn push_block_local(&mut self, mut block: BasicBlock<'str>) -> LocalBlockId {
         block.first_use = None;
+        // A block that arrives with addresses — a clone of an installed one —
+        // is an addressed entity an index that was current does not list.
+        if block.address.is_some() || !block.extra_addresses.is_empty() {
+            self.touch_shape();
+        }
         let local = self.blocks.push(block);
         self.roster.push(local);
         local
+    }
+
+    /// Counts a change to this body's address-bearing shape on the module's
+    /// clock.
+    pub(crate) fn touch_shape(&mut self) {
+        self.clock.tick();
+    }
+
+    /// Makes this body tick `clock`: the module's, once the body is installed
+    /// in it.
+    pub(crate) fn link_clock(&mut self, clock: crate::context::ShapeClock) {
+        self.clock = clock;
     }
 
     /// Mint a fresh empty block, owned by this function (arena membership) and
@@ -1430,10 +1549,10 @@ impl<'str> FunctionBody<'str> {
     pub fn remove_cfg_edge(&mut self, edge_id: EdgeId) {
         let EdgeData { from, to } = *self.edge(edge_id);
         let func = self.id();
-        self.block_mut(BlockId::new(func, from))
+        self.block_raw_mut(BlockId::new(func, from))
             .edges
             .remove(&edge_id);
-        self.block_mut(BlockId::new(func, to))
+        self.block_raw_mut(BlockId::new(func, to))
             .edges
             .remove(&edge_id);
         self.edges.remove(edge_id);
@@ -1741,8 +1860,8 @@ impl<'str> FunctionBody<'str> {
         };
         for eid in outgoing {
             self.edges[eid].from = keep.local;
-            self.block_mut(keep).edges.insert(eid);
-            self.block_mut(remove).edges.remove(&eid);
+            self.block_raw_mut(keep).edges.insert(eid);
+            self.block_raw_mut(remove).edges.remove(&eid);
         }
     }
 
@@ -2165,7 +2284,14 @@ impl<'str> FunctionBody<'str> {
         if let Some(name) = name {
             self.names.forget(&name);
         }
+        let addressed = {
+            let block = &self.blocks[block.local];
+            block.address.is_some() || !block.extra_addresses.is_empty()
+        };
         self.blocks.remove(block.local);
+        if addressed {
+            self.touch_shape();
+        }
     }
 
     /// Absorb `other` into `keep`: drop `keep`'s terminal branch, append `other`'s
@@ -2231,10 +2357,16 @@ impl<'str> FunctionBody<'str> {
             self.names.forget(&name);
         }
         self.blocks.remove(other.local);
-        if let Some(addr) = b_addr {
-            self.block_mut(keep).extra_addresses.push(addr);
+        // The addresses `other` carried move to `keep`: an index naming
+        // `other` for them is behind now, and one that never listed `other`
+        // has nothing to catch up on.
+        if b_addr.is_some() || !b_extra.is_empty() {
+            self.touch_shape();
         }
-        self.block_mut(keep).extra_addresses.extend(b_extra);
+        if let Some(addr) = b_addr {
+            self.block_raw_mut(keep).extra_addresses.push(addr);
+        }
+        self.block_raw_mut(keep).extra_addresses.extend(b_extra);
     }
 
     /// Register `name` for `id` in this body's local name table (block/instruction/
@@ -2359,17 +2491,24 @@ impl<'str> FunctionBody<'str> {
         let name = name.unwrap_or_else(|| Cow::Owned(format!("fn_{address:x}")));
         let name = ctx.shared.name_map.unique(name);
         let id = FunctionId::from(ctx.bodies.len());
+        // A current index stays current: the function and its address both
+        // go into it here.
+        let current = addresses.is_current(ctx);
         let pushed = ctx.push_function(
             FunctionInterface::new(name.clone()),
             FunctionBody::empty_with_id(id),
         );
         debug_assert_eq!(pushed, id);
 
-        Self::from_id_mut(ctx, id)
+        let function = Self::from_id_mut(ctx, id)
             .with_name(name)
             .expect("Function name is not unique")
             .with_address_indexed(addresses, address)
-            .expect("Function address is not unique")
+            .expect("Function address is not unique");
+        if current {
+            addresses.mark_current(function.ctx);
+        }
+        function
     }
 
     /// Like [`FunctionBody::make_at_addr`] but marks the result as external.
@@ -2939,16 +3078,21 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         addresses: &mut crate::address_index::AddressIndex,
         address: u64,
     ) -> Result<()> {
+        let current = addresses.is_current(self.ctx);
         let old_address = self.interface().address;
         self.interface_mut().address = Some(address);
-        if let Err(error) = self
+        self.ctx.touch_shape();
+        let result = self
             .ctx
-            .set_address_indexed(addresses, address, self.id.into())
-        {
+            .set_address_indexed(addresses, address, self.id.into());
+        if result.is_err() {
             self.interface_mut().address = old_address;
-            return Err(error);
         }
-        Ok(())
+        // Registered or restored, the index reflects the interface either way.
+        if current {
+            addresses.mark_current(self.ctx);
+        }
+        result
     }
 
     fn with_address_indexed(

@@ -61,6 +61,7 @@ pub mod discovery;
 pub mod error;
 pub mod intrinsics;
 pub mod langref;
+pub mod lift;
 pub mod lower;
 pub mod memory_image;
 pub mod obligation;

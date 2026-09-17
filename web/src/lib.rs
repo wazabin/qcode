@@ -3,11 +3,14 @@
 //! `lift(hex, address)` mirrors `qcode-lift --arch x64` without passes and
 //! returns the same JSON shape: the decoded instructions and the QCode text.
 
-use qcode::{address_index::AddressIndex, value::function::FunctionBody};
 use serde::Serialize;
 use sleigh::Decoder;
 use wasm_bindgen::prelude::*;
-use wazabin_qcode_sleigh::SleighLifter;
+use wazabin_qcode_sleigh::{
+    FlatPcode,
+    SleighLifter,
+    session::{Host, LiftSession},
+};
 
 #[derive(Serialize)]
 struct Output {
@@ -46,10 +49,7 @@ fn run(hex: &str, address: u64) -> Result<Output, String> {
     let spec = sleigh_precompile::x64::spec();
     let decoder = Decoder::new(spec);
     let lifter = SleighLifter::new(spec);
-    let mut context = lifter.new_context();
-    let mut addresses = AddressIndex::analyze(&context);
-    let function =
-        FunctionBody::make_at_addr_indexed(&mut context, &mut addresses, address, None).id;
+    let mut session = LiftSession::new(&lifter, Host::At(address));
 
     let mut instructions = Vec::new();
     let mut cursor = 0usize;
@@ -63,11 +63,10 @@ fn run(hex: &str, address: u64) -> Result<Output, String> {
             Err(_) => break,
         };
         let len = instruction.len();
-        let flat = instruction
-            .pcode_ops()
+        let flat = FlatPcode::lower(&instruction)
             .map_err(|e| format!("SLEIGH p-code emission failed at {at:#x}: {e}"))?;
-        lifter
-            .lift_pcode_indexed(&mut context, &mut addresses, at, len, &flat, Some(function))
+        session
+            .lift_pcode(&flat)
             .map_err(|e| format!("QCode lowering failed at {at:#x}: {e}"))?;
         instructions.push(Insn {
             address: format!("{at:#x}"),
@@ -79,6 +78,9 @@ fn run(hex: &str, address: u64) -> Result<Output, String> {
         });
         cursor += len;
     }
+    let context = session
+        .into_context()
+        .map_err(|e| format!("QCode construction could not be published: {e}"))?;
     Ok(Output {
         instructions,
         qcode: context.to_string(),

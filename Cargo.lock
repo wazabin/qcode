@@ -1537,9 +1537,9 @@ dependencies = [
 
 [[package]]
 name = "wazabin-jstd-derive"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d1a53fcd34dc17d4c81d2849be84ffabeaed36b4cb9c4052136d31b6604bbf"
+checksum = "d259a9144a26a22a773bf1f1a66218695498afea0fc84d06f41657f124d40bd5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1638,6 +1638,7 @@ dependencies = [
 name = "wazabin-qcode-sleigh"
 version = "0.4.2"
 dependencies = [
+ "bincode",
  "clap",
  "csv",
  "indicatif",

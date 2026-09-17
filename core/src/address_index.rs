@@ -3,11 +3,39 @@
 //! [`AddressIndex`] is derived state: consumers build it for a [`Context`], keep
 //! it only while that context remains structurally unchanged, and rebuild it
 //! after mutation. It is intentionally not stored in or serialized with the IR.
+//!
+//! # Provenance
+//!
+//! An index remembers the [`Revision`] of the context it was computed for —
+//! which module instance, and at what point in that module's history of
+//! address-bearing changes. It is [current](AddressIndex::is_current) while the
+//! context is still at that revision. The mutators of this crate that take an
+//! index alongside the context (`*_indexed`) move the context's revision and,
+//! when the index was current going in, bring it along, so a caller that
+//! threads one index through every mutation keeps it current for free; a
+//! mutation made without the index leaves it behind, and it stays behind until
+//! it is [refreshed](AddressIndex::refresh). A checked binding
+//! ([`LiftTarget`](crate::lift::LiftTarget)) uses this to tell a complete index
+//! from one that omits something, without rescanning the module.
+//!
+//! Editing the index's contents by hand — [`forget`](AddressIndex::forget),
+//! [`set_block`](AddressIndex::set_block),
+//! [`rehome_block`](AddressIndex::rehome_block),
+//! [`register`](AddressIndex::register) — drops its provenance outright: an
+//! index that has been edited follows from no revision of the context until
+//! it is refreshed, or the caller [vouches](AddressIndex::mark_current) for
+//! it. `mark_current` is the one way to claim currency without a rebuild; it
+//! is for a caller that applied a mutation's effects to the index by hand,
+//! and a wrong claim is that caller's bug. The address-bearing fields of
+//! blocks and function interfaces are crate-private, and a body is reachable
+//! mutably only through its verbs ([`BodyMut`](crate::value::BodyMut)), so
+//! no change to what a module covers happens outside the mutators that move
+//! the revision — see [`Context::revision`].
 
 use rustc_hash::FxHashMap;
 
 use crate::{
-    context::Context,
+    context::{Context, Revision},
     error::{Error, ErrorTy, Result},
     value::{BlockId, FunctionBody, FunctionId, ValueId},
 };
@@ -20,7 +48,10 @@ pub enum AddressTarget {
 }
 
 /// An immutable, disposable address-to-entity snapshot.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Equality compares contents — the addresses and what they name — and not
+/// provenance, which is read through [`provenance`](Self::provenance).
+#[derive(Debug, Clone, Default)]
 pub struct AddressIndex {
     targets: FxHashMap<u64, AddressTarget>,
     /// Addresses known to start a block because something branches to them.
@@ -31,7 +62,18 @@ pub struct AddressIndex {
     /// loop header — the branch target that is discovered *after* the run
     /// through it — would otherwise repeat forever.
     boundaries: rustc_hash::FxHashSet<u64>,
+    /// The context revision this index reflects, if it is known to reflect
+    /// one; see the [module documentation](self).
+    provenance: Option<Revision>,
 }
+
+impl PartialEq for AddressIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.targets == other.targets && self.boundaries == other.boundaries
+    }
+}
+
+impl Eq for AddressIndex {}
 
 impl AddressIndex {
     /// Computes an index for the current live shape of `ctx`.
@@ -64,13 +106,74 @@ impl AddressIndex {
         Self {
             targets,
             boundaries: rustc_hash::FxHashSet::default(),
+            provenance: Some(ctx.revision()),
         }
+    }
+
+    /// Forgets every address and boundary, keeping the index's capacity. The
+    /// index then describes no context until it is refreshed or marked.
+    pub fn clear(&mut self) {
+        self.targets.clear();
+        self.boundaries.clear();
+        self.provenance = None;
     }
 
     /// Recomputes this index after a structural mutation that changes several
     /// addresses at once (for example function splitting or block rehoming).
     pub fn refresh(&mut self, ctx: &Context<'_>) {
         *self = Self::analyze(ctx);
+    }
+
+    /// The context revision this index reflects: the one it was computed at,
+    /// carried forward by every tracked mutation since. `None` for an index
+    /// that was cleared or built by [`default`](Self::default).
+    pub fn provenance(&self) -> Option<Revision> {
+        self.provenance
+    }
+
+    /// Whether this index reflects `ctx` as it is now: it was computed for
+    /// this very context instance (not a clone, not another module with the
+    /// same ids), and every address-bearing change since was made with it.
+    /// Then no address the context covers is missing from it.
+    pub fn is_current(&self, ctx: &Context<'_>) -> bool {
+        self.provenance == Some(ctx.revision())
+    }
+
+    /// Whether this index was computed for `ctx` at all, whatever has changed
+    /// since.
+    pub fn describes(&self, ctx: &Context<'_>) -> bool {
+        self.provenance
+            .is_some_and(|revision| revision.identity == ctx.identity())
+    }
+
+    /// Declares that this index reflects `ctx` as it is now.
+    ///
+    /// This is the low-level, caller-maintained path: the caller mutated the
+    /// context without threading this index through, applied the effects by
+    /// hand ([`set_block`](Self::set_block), [`forget`](Self::forget),
+    /// [`register`](Self::register)), and vouches that nothing is missing. A
+    /// checked binding trusts the claim; a wrong one lets a construction make a
+    /// second block or function at an address the context already covers.
+    /// Prefer the tracked `*_indexed` mutators, or a [`refresh`](Self::refresh),
+    /// wherever the claim is not obviously true.
+    pub fn mark_current(&mut self, ctx: &Context<'_>) {
+        self.provenance = Some(ctx.revision());
+    }
+
+    /// Runs a mutation of `ctx` that updates this index as it goes, and keeps
+    /// the index current across it if it was current before. An index that was
+    /// already behind stays behind: the mutation cannot know what it missed.
+    pub(crate) fn tracked<'str, R>(
+        &mut self,
+        ctx: &mut Context<'str>,
+        mutation: impl FnOnce(&mut Context<'str>, &mut Self) -> R,
+    ) -> R {
+        let current = self.is_current(ctx);
+        let result = mutation(ctx, self);
+        if current {
+            self.mark_current(ctx);
+        }
+        result
     }
 
     /// Re-point `addr` from a relocated block `old` to its clone `new`, in place.
@@ -82,15 +185,22 @@ impl AddressIndex {
     /// function-over-block precedence (a function entry that deliberately shadows
     /// its root block, or another block that already owns the address, is left
     /// untouched).
+    ///
+    /// Like every edit of the index's contents this drops its provenance: what
+    /// the index says no longer follows from any revision of the context, until
+    /// the caller [vouches](Self::mark_current) for it or refreshes.
     pub fn rehome_block(&mut self, addr: u64, old: BlockId, new: BlockId) {
+        self.provenance = None;
         if self.targets.get(&addr) == Some(&AddressTarget::Block(old)) {
             self.targets.insert(addr, AddressTarget::Block(new));
         }
     }
 
     /// Drops `address` from the index, so it resolves to nothing until it is
-    /// registered again. Used when a block stops covering an address.
+    /// registered again. Used when a block stops covering an address. Drops
+    /// the index's provenance, as [`rehome_block`](Self::rehome_block) does.
     pub fn forget(&mut self, address: u64) {
+        self.provenance = None;
         self.targets.remove(&address);
     }
 
@@ -98,8 +208,10 @@ impl AddressIndex {
     ///
     /// For a caller that has just made `block` cover an address another block
     /// used to — absorbing that block, typically, which leaves the index
-    /// naming something deleted.
+    /// naming something deleted. Drops the index's provenance, as
+    /// [`rehome_block`](Self::rehome_block) does.
     pub fn set_block(&mut self, address: u64, block: BlockId) {
+        self.provenance = None;
         self.targets.insert(address, AddressTarget::Block(block));
     }
 
@@ -117,13 +229,16 @@ impl AddressIndex {
     ///
     /// A function and one of its own blocks may intentionally share an entry
     /// address; the function remains the indexed target and the block becomes
-    /// its root. Every other collision is rejected.
+    /// its root. Every other collision is rejected. Drops the index's
+    /// provenance, as [`rehome_block`](Self::rehome_block) does; the tracked
+    /// mutators that call this restore it once context and index agree again.
     pub fn register(
         &mut self,
         ctx: &mut Context<'_>,
         address: u64,
         target: AddressTarget,
     ) -> Result<()> {
+        self.provenance = None;
         let Some(existing) = self.targets.get(&address).copied() else {
             self.targets.insert(address, target);
             return Ok(());

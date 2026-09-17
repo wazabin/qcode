@@ -3778,7 +3778,7 @@ mod tests {
         let mut ctx = Context::new();
         let function = ctx.anon_function();
         let block = BasicBlock::make(&mut ctx, function).with_address(0x2000).id;
-        ctx.block_mut(block).extra_addresses.push(0x2001);
+        BasicBlock::from_id_mut(&mut ctx, block).cover_address(0x2001);
         let mut emulator = StandaloneEmulator::new(block);
 
         assert!(emulator.address_index.is_none());
@@ -4746,11 +4746,10 @@ mod tests {
         register.ty = SpaceType::Register;
         let register = ctx.add_space(register);
         let function = ctx.anon_function();
-        let temporary = MemorySpaceId::Temp(ctx.bodies[function].push_temp_space(TempSpace::new(
-            Some("scratch"),
-            1,
-            8,
-        )));
+        let temporary = MemorySpaceId::Temp(
+            ctx.body_mut(function)
+                .push_temp_space(TempSpace::new(Some("scratch"), 1, 8)),
+        );
         let mut memory = EmulatedMemory::default();
         memory.configure_spaces(&ctx);
 
@@ -4790,8 +4789,12 @@ mod tests {
         let mut ctx = Context::new();
         let first_fn = FunctionBody::make(&mut ctx, "first".into()).unwrap().id;
         let second_fn = FunctionBody::make(&mut ctx, "second".into()).unwrap().id;
-        let first = ctx.bodies[first_fn].push_temp_space(TempSpace::new(None, 1, 8));
-        let second = ctx.bodies[second_fn].push_temp_space(TempSpace::new(None, 1, 8));
+        let first = ctx
+            .body_mut(first_fn)
+            .push_temp_space(TempSpace::new(None, 1, 8));
+        let second = ctx
+            .body_mut(second_fn)
+            .push_temp_space(TempSpace::new(None, 1, 8));
         assert_eq!(first.local, second.local, "fixture must collide local IDs");
         let first = MemorySpaceId::Temp(first);
         let second = MemorySpaceId::Temp(second);
@@ -4828,7 +4831,9 @@ mod tests {
             let fid = FunctionBody::make(ctx, name.into()).unwrap().id;
             let root = BasicBlock::make(ctx, fid).id;
             FunctionBody::from_id_mut(ctx, fid).set_root(root).unwrap();
-            let space = ctx.bodies[fid].push_temp_space(TempSpace::new(None, 1, 8));
+            let space = ctx
+                .body_mut(fid)
+                .push_temp_space(TempSpace::new(None, 1, 8));
             let mut b = (ctx).builder(root);
             let ptr = b.shr().get_const(0x20, 8);
             let value = b.shr().get_const(byte, 1);

@@ -109,6 +109,7 @@ pub use poison::{Poison, PoisonId, PoisonRef};
 pub use temp::{
     LocalTempId, LocalTempSpaceId, Temp, TempId, TempRef, TempSpace, TempSpaceId, TempSpaceRef,
 };
+pub use util::body_mut::{BodiesMut, BodyMut};
 pub use util::named::{Named, Renameable};
 pub use varnode::{Varnode, VarnodeId, VarnodeRef, register::Register, register::RegisterId};
 

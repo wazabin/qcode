@@ -16,7 +16,7 @@
 
 use qcode::{
     context::Context,
-    value::{BasicBlock, ValueId},
+    value::{BasicBlock, QCodeMut, ValueId},
 };
 use rustc_hash::FxHashSet;
 use std::time::Instant;
@@ -60,14 +60,14 @@ fn a_value_with_many_users_costs_each_of_them_once() {
 
         // Every user of the shared value is rewritten to a literal.
         let start = Instant::now();
-        ctx.bodies[f].replace_all_uses_with(shared, other);
+        ctx.body_mut(f).replace_all_uses_with(shared, other);
         let rewrite = start.elapsed();
-        assert!(!ctx.bodies[f].has_users(shared));
+        assert!(!ctx.body(f).has_users(shared));
 
         // Then all but the last go, sharing their operand.
         let start = Instant::now();
         let dead: FxHashSet<_> = ids[..n - 1].iter().map(|id| id.local).collect();
-        ctx.bodies[f].remove_block_instructions(block, &dead);
+        ctx.body_mut(f).remove_block_instructions(block, &dead);
         let delete = start.elapsed();
         assert_eq!(BasicBlock::from_id(&ctx, block).instructions().count(), 1);
 
