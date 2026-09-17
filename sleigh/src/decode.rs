@@ -23,6 +23,7 @@
 
 use sleigh::{
     CompiledSpec, ContextBytes, ContextDatabase, ContextError, DecodeError, Decoder, Instruction,
+    SpecFingerprint,
 };
 
 /// Decodes any address with one fixed context. See the [module
@@ -82,6 +83,12 @@ pub enum LinearDecodeError {
         expected: u64,
         actual: u64,
     },
+    /// The instruction was decoded by another specification, so its context
+    /// effects mean nothing to this sweep.
+    ForeignSpecification {
+        expected: SpecFingerprint,
+        actual: SpecFingerprint,
+    },
     Decode(DecodeError),
 }
 
@@ -92,6 +99,12 @@ impl std::fmt::Display for LinearDecodeError {
                 write!(
                     f,
                     "expected {expected:#x} next in the sweep, got {actual:#x}"
+                )
+            }
+            Self::ForeignSpecification { expected, actual } => {
+                write!(
+                    f,
+                    "the instruction was decoded by specification {actual}, the sweep uses {expected}"
                 )
             }
             Self::Decode(error) => error.fmt(f),
@@ -111,6 +124,7 @@ impl From<DecodeError> for LinearDecodeError {
 /// the addresses after it. See the [module documentation](self).
 pub struct LinearDecoder<'spec> {
     decoder: Decoder<'spec>,
+    fingerprint: SpecFingerprint,
     contexts: ContextDatabase,
     next: u64,
 }
@@ -120,6 +134,7 @@ impl<'spec> LinearDecoder<'spec> {
     pub fn new(spec: &'spec CompiledSpec, start: u64) -> Self {
         Self {
             decoder: Decoder::new(spec),
+            fingerprint: spec.fingerprint(),
             contexts: ContextDatabase::new(spec),
             next: start,
         }
@@ -158,7 +173,15 @@ impl<'spec> LinearDecoder<'spec> {
     }
 
     /// Commits `instruction`'s context effects and moves the sweep past it.
+    /// The instruction must be the sweep's next one, decoded by its
+    /// specification: an instruction of another specification is refused
+    /// before anything is committed.
     pub fn advance(&mut self, instruction: &Instruction<'_, '_>) -> Result<(), LinearDecodeError> {
+        let expected = self.fingerprint;
+        let actual = instruction.spec().fingerprint();
+        if actual != expected {
+            return Err(LinearDecodeError::ForeignSpecification { expected, actual });
+        }
         if instruction.address() != self.next {
             return Err(LinearDecodeError::OutOfOrder {
                 expected: self.next,
@@ -187,20 +210,55 @@ mod tests {
     /// instructions for the same byte, and whose `switch` instruction sets it
     /// for what follows.
     fn spec() -> CompiledSpec {
+        spec_with("")
+    }
+
+    /// The same specification with `extra` appended: a look-alike that
+    /// decodes the same bytes to the same text, under another fingerprint.
+    fn spec_with(extra: &str) -> CompiledSpec {
         let mut sources = SourceDb::new();
         let root = sources.add_file(
             "modes.slaspec",
-            "define endian=little;
+            format!(
+                "define endian=little;
              define space ram type=ram_space size=4 default;
              define space register type=register_space size=4;
              define register offset=0 size=4 [ r0 contextreg ];
              define context contextreg mode=(0,0);
              define token instr(8) op=(0,7);
-             :one is mode=0 & op=1 { r0 = 1:4; }
-             :two is mode=1 & op=1 { r0 = 2:4; }
-             :switch is op=2 [ mode=1; globalset(inst_next, mode); ] { r0 = 0:4; }",
+             :one is mode=0 & op=1 {{ r0 = 1:4; }}
+             :two is mode=1 & op=1 {{ r0 = 2:4; }}
+             :switch is op=2 [ mode=1; globalset(inst_next, mode); ] {{ r0 = 0:4; }}
+             {extra}"
+            ),
         );
         Compiler::new(&mut sources).compile(root).unwrap()
+    }
+
+    #[test]
+    fn a_linear_decoder_refuses_an_instruction_of_another_specification() {
+        let spec = spec();
+        let look_alike = spec_with(":three is op=3 { r0 = 3:4; }");
+        let mut decoder = LinearDecoder::new(&spec, 0x1000);
+        // Decoded at the expected address, by a decoder of the other
+        // specification: the text agrees, the provenance does not.
+        let foreign = Decoder::new(&look_alike)
+            .decode_one(0x1000, &[2, 1], &look_alike.new_context())
+            .unwrap();
+        assert_eq!(foreign.to_string(), "switch");
+        assert_eq!(
+            decoder.advance(&foreign).unwrap_err(),
+            LinearDecodeError::ForeignSpecification {
+                expected: spec.fingerprint(),
+                actual: look_alike.fingerprint(),
+            }
+        );
+        // Nothing was committed: the sweep is where it was, in its default
+        // context, so the next byte still decodes as `one`.
+        assert_eq!(decoder.next_address(), 0x1000);
+        let own = decoder.decode(0x1000, &[2, 1]).unwrap();
+        decoder.advance(&own).unwrap();
+        assert_eq!(decoder.decode(0x1001, &[1]).unwrap().to_string(), "two");
     }
 
     #[test]
