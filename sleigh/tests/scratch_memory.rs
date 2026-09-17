@@ -61,6 +61,17 @@ fn live() -> usize {
     LIVE.load(Ordering::Relaxed)
 }
 
+/// The allocator counts the whole process, so the tests of this binary take
+/// turns: one measuring while another frees its session would see the
+/// counter move under it.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The `i`th instruction of the corpus: one of sixteen shapes, with every
 /// immediate, displacement, branch target and address derived from `i` so no
 /// two rounds through the shapes repeat a constant.
@@ -99,6 +110,7 @@ fn instruction(i: u32) -> (u64, Vec<u8>) {
 #[test]
 #[ignore = "measures live bytes, which depend on the allocator; run on demand"]
 fn total_retained_bytes_stop_growing_after_the_first_budget_cycle() {
+    let _serial = serial();
     const LIFTS: u32 = 12_000;
     const CHECKPOINT: u32 = 1_000;
     // Small enough that the corpus, which interns a few constants per lift,
@@ -186,6 +198,7 @@ fn total_retained_bytes_stop_growing_after_the_first_budget_cycle() {
 #[test]
 #[ignore = "diagnostic: prints per-shape retained bytes"]
 fn retained_bytes_per_shape() {
+    let _serial = serial();
     use qcode::lift::ScratchStore;
     use sleigh::Decoder;
     let spec = sleigh_precompile::x64::spec();
@@ -232,6 +245,7 @@ fn retained_bytes_per_shape() {
 #[test]
 #[ignore = "diagnostic: splits retention between decode, flatten and lower"]
 fn retained_bytes_by_stage() {
+    let _serial = serial();
     use qcode::lift::ScratchStore;
     use sleigh::Decoder;
     let spec = sleigh_precompile::x64::spec();
