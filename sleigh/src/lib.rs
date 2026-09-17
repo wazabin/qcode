@@ -532,7 +532,7 @@ impl<'spec> SleighLifter<'spec> {
         Ok(FlatEmitter::new(
             entry,
             next,
-            construction.builder(entry),
+            construction.builder(),
             &self.storage,
             self.unique_space,
             branches,

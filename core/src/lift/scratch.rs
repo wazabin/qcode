@@ -187,7 +187,7 @@ mod tests {
         let entry = construction.entry();
         let next = construction.block_at(address + 4).unwrap();
         let mut recorder = Recorder::new(address, 4, entry);
-        let mut builder = construction.builder(entry);
+        let mut builder = construction.builder();
         let temp = builder.make_temp(8);
         let value = builder.shr().get_const(immediate, 8);
         builder.push_copy(value, ValueId::Temp(temp));
@@ -299,7 +299,9 @@ mod tests {
             let mut target = store.target().unwrap();
             let mut construction = target.begin(0x2000, 4).unwrap();
             let zero = construction.context().shared.get_const(0, 8);
-            construction.builder(previous).push_branchind(zero);
+            let mut builder = construction.builder();
+            builder.switch_to_block(previous);
+            builder.push_branchind(zero);
             construction.abort();
             assert!(target.is_poisoned());
         }
