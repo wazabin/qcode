@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -18,7 +19,8 @@ jobs:
   # request. A pull request is compared against its base: the base is benched
   # first in the same job, on the same runner, and Criterion reports the change
   # per instruction. Shared runners are noisy, so the job reports and never
-  # fails on a regression; read the summary, and rerun locally with
+  # fails on a regression; read the table, in the job summary and in a sticky
+  # comment on the pull request, and rerun locally with
   # `--save-baseline`/`--baseline` before believing a small difference.
   lift:
     runs-on: ubuntu-latest
@@ -50,21 +52,30 @@ jobs:
           echo "compare=--baseline base" >> "$GITHUB_OUTPUT"
 
       - name: Bench
+        # bash for pipefail, so the tee does not hide a failed bench.
+        shell: bash
         env:
           CRITERION_HOME: ${{ github.workspace }}/target/criterion
         run: |
           cargo bench -p wazabin-qcode-sleigh --bench lift -- --noplot ${{ steps.base.outputs.compare }} \
             | tee bench.txt
 
-      - name: Summary
+      - name: Tabulate
         if: always()
         run: |
           {
             echo '## Lift bench'
             if [ -n "${{ steps.base.outputs.compare }}" ]; then
-              echo "Head against base \`${{ github.event.pull_request.base.sha }}\`; a change is reported only outside the noise threshold."
+              echo "Head \`${{ github.event.pull_request.head.sha }}\` against base \`${{ github.event.pull_request.base.sha }}\`."
             fi
-            echo '```'
-            grep -E '^[a-z]+/|time:|change:|Performance|No change' bench.txt || echo 'no results'
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo
+            python3 .github/scripts/bench-table.py < bench.txt
+          } > bench.md
+          cat bench.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment
+        if: always() && github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: lift-bench
+          path: bench.md
