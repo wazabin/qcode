@@ -239,6 +239,9 @@ pub fn run(image: &[u8], jit: bool, instr: Instr) -> Outcome {
         match &exit {
             VmExit::Interrupt(i) if matches!(i.kind, InterruptKind::Explicit { code } if code == CODE) => {
                 host_calls.set(host_calls.get() + 1);
+                if std::env::var_os("HOOKBENCH_TRACE").is_some() {
+                    eprintln!("cb pc={:x?} args={:x?}", i.pc, i.args);
+                }
                 match instr {
                     Instr::WatchCb => {
                         let addr = i.args[0].unwrap_or(0);

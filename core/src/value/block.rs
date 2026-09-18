@@ -111,6 +111,12 @@ pub struct BasicBlock<'str> {
     /// deserialization.
     #[serde(skip)]
     pub(crate) first_use: Option<UseId>,
+
+    /// The stamp of the last change to this block's instructions (see
+    /// [`revision`](Self::revision)). Runtime bookkeeping: a loaded module
+    /// starts every block at zero.
+    #[serde(skip)]
+    pub(crate) revision: u64,
 }
 
 impl WithUsers for BasicBlock<'_> {
@@ -161,6 +167,20 @@ impl<'str> BasicBlock<'str> {
     /// How many instructions this block holds.
     pub fn insn_count(&self) -> usize {
         self.instructions.len
+    }
+
+    /// A stamp that changes whenever this block's instructions do: one is
+    /// linked in or out, or has an operand or its mnemonic replaced.
+    ///
+    /// The stamps come from one counter per function body, so a value is
+    /// never issued twice: two readings of the same block with equal
+    /// revisions saw the same instructions with the same operands, which is
+    /// what lets anything derived from a block — compiled code, say — be
+    /// kept as long as the block it came from and no longer. The instruction
+    /// count cannot say as much: a block emptied and lifted again from the
+    /// same bytes holds as many instructions as before, under new ids.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Whether this block holds any instruction.
@@ -496,6 +516,12 @@ where
     /// this per block execution.
     pub fn len(&'s self) -> usize {
         self.inner().instructions.len
+    }
+
+    /// The stamp of the last change to this block's instructions; see
+    /// [`BasicBlock::revision`]. Constant-time, like [`len`](Self::len).
+    pub fn revision(&'s self) -> u64 {
+        self.inner().revision
     }
 
     /// Does this block have any instructions?
@@ -1171,6 +1197,56 @@ mod tests {
             })
             .collect();
         assert_eq!(children, ["body"]);
+    }
+
+    #[test]
+    fn revision_moves_with_every_edit_and_never_comes_back() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 X;
+            varnode i64 Y;
+
+            <block>
+                %x = load(X:8, &X);
+                %y = load(Y:8, &Y);
+                %sum = i64 %x + i64 %y;
+                return at i64 0;
+            "
+        );
+        let mut seen = vec![BasicBlock::from_id(&ctx, block).revision()];
+        let mut expect_moved = |ctx: &Context<'_>, seen: &mut Vec<u64>, what: &str| {
+            let now = BasicBlock::from_id(ctx, block).revision();
+            assert!(!seen.contains(&now), "{what} reissued revision {now}");
+            seen.push(now);
+        };
+
+        // The same instructions, in the same order, are still a new revision:
+        // a block emptied and refilled has been rebuilt, whatever it holds.
+        let ids: Vec<LocalInsnId> = ctx.body_mut(block.func).take_insns(block.local);
+        expect_moved(&ctx, &mut seen, "take_insns");
+        for &id in &ids {
+            ctx.body_mut(block.func).link_last(block.local, id);
+            expect_moved(&ctx, &mut seen, "link_last");
+        }
+        assert_eq!(BasicBlock::from_id(&ctx, block).len(), 4);
+
+        // Rewriting an operand leaves the list alone and still moves it.
+        let sum = InstructionId::new(block.func, ids[2]);
+        let x = ValueId::Instruction(InstructionId::new(block.func, ids[0]));
+        let y = ValueId::Instruction(InstructionId::new(block.func, ids[1]));
+        ctx.body_mut(block.func).replace_operand(sum, 1, x);
+        expect_moved(&ctx, &mut seen, "replace_operand");
+        ctx.body_mut(block.func).replace_all_uses_with(x, y);
+        expect_moved(&ctx, &mut seen, "replace_all_uses_with");
+        let mnemonic = ctx.get_insn(sum).mnemonic().clone();
+        ctx.body_mut(block.func)
+            .replace_instruction_mnemonic(sum, mnemonic);
+        expect_moved(&ctx, &mut seen, "replace_instruction_mnemonic");
+
+        ctx.body_mut(block.func).unlink(ids[2]);
+        expect_moved(&ctx, &mut seen, "unlink");
     }
 
     #[test]

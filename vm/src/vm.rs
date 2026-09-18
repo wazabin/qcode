@@ -980,28 +980,11 @@ impl<S: CodeSource> Vm<S> {
         self.pending = None;
         self.stats.steps += 1;
         self.emu.idx += 1;
-        // The executor is offered the rest of the block only from a guest
-        // instruction boundary: the op past the interrupt starts a guest
-        // instruction, or the interrupt itself sat at one. Compiled code
-        // re-entered in the middle of an instruction's p-code — a hook that
-        // stops right before a store, say — has been seen to go wrong where
-        // the interpreter does not (a wrong base register a few instructions
-        // on, in Embench's edn and huffbench), so the interpreter finishes
-        // such an instruction's block and the executor takes the next one.
-        let idx = self.emu.idx;
-        let boundary = if idx < 2 {
-            true
-        } else {
-            let after = self.emu.insn_at(&self.ctx, idx);
-            let before = self.emu.insn_at(&self.ctx, idx - 2);
-            match (after, before) {
-                (Some(after), Some(before)) => {
-                    self.ctx.get_insn(after).address() != self.ctx.get_insn(before).address()
-                }
-                _ => true,
-            }
-        };
-        self.offer_rest = boundary;
+        // Wherever the op sat — between two guest instructions or inside
+        // one's p-code — the executor may take the rest of the block: what it
+        // needs from the part already run is in the value table, under ids
+        // the block's revision vouches for.
+        self.offer_rest = true;
         Ok(())
     }
 

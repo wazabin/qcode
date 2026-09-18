@@ -457,6 +457,11 @@ pub struct FunctionBody<'str> {
     #[serde(default)]
     pub(crate) roster: Vec<LocalBlockId>,
 
+    /// The last block revision stamp issued (see [`BasicBlock::revision`]).
+    /// Every change to a block's instructions takes the next one.
+    #[serde(skip)]
+    revisions: u64,
+
     /// Block-parameter storage for this function.
     pub(crate) params: StableArena<LocalParamId, BlockParam<'str>>,
 
@@ -761,6 +766,9 @@ impl<'str> FunctionBody<'str> {
         for mut insn in self.insns.iter_mut() {
             patched += usize::from(insn.mnemonic_mut().resolve_minted_callee(slot, real));
         }
+        if patched > 0 {
+            self.touch_all();
+        }
         patched
     }
 
@@ -784,6 +792,9 @@ impl<'str> FunctionBody<'str> {
             mnemonic.resolve_minted_callee(slot, real);
             patched += 1;
         }
+        if patched > 0 {
+            self.touch_all();
+        }
         Ok(patched)
     }
 
@@ -798,6 +809,7 @@ impl<'str> FunctionBody<'str> {
             insns: StableArena::default(),
             blocks: StableArena::default(),
             roster: Vec::new(),
+            revisions: 0,
             params: StableArena::default(),
             edges: StableArena::default(),
             temp_spaces: Registry::default(),
@@ -824,6 +836,7 @@ impl<'str> FunctionBody<'str> {
             insns: StableArena::default(),
             blocks: StableArena::default(),
             roster: Vec::new(),
+            revisions: 0,
             params: StableArena::default(),
             edges: StableArena::default(),
             temp_spaces: Registry::default(),
@@ -1336,6 +1349,28 @@ impl<'str> FunctionBody<'str> {
     // block moves it: the verbs unlink first, so no list is ever left with
     // a member whose links lead elsewhere.
 
+    /// Stamps `block` with the next revision: its instructions have changed.
+    fn touch(&mut self, block: LocalBlockId) {
+        self.revisions += 1;
+        self.blocks[block].revision = self.revisions;
+    }
+
+    /// Stamps every block: an edit that walked the whole arena rather than
+    /// one block, and is rare enough not to keep track of which it reached.
+    fn touch_all(&mut self) {
+        for block in std::mem::take(&mut self.roster) {
+            self.touch(block);
+            self.roster.push(block);
+        }
+    }
+
+    /// Stamps the block `insn` is in, if it is in one.
+    fn touch_parent(&mut self, insn: LocalInsnId) {
+        if let Some(block) = self.insns[insn].parent {
+            self.touch(block);
+        }
+    }
+
     /// The instructions of `block`, in order.
     pub fn insn_ids(&self, block: LocalBlockId) -> InsnIds<'_, 'str> {
         let list = self.blocks[block].instructions;
@@ -1365,6 +1400,7 @@ impl<'str> FunctionBody<'str> {
         let list = &mut self.blocks[block].instructions;
         list.last = Some(insn);
         list.len += 1;
+        self.touch(block);
     }
 
     /// Links `insn` immediately before `before`, which must be in `block`,
@@ -1392,6 +1428,7 @@ impl<'str> FunctionBody<'str> {
             None => self.blocks[block].instructions.first = Some(insn),
         }
         self.blocks[block].instructions.len += 1;
+        self.touch(block);
     }
 
     /// Links `insn` immediately after `after`, which must be in `block`.
@@ -1426,6 +1463,7 @@ impl<'str> FunctionBody<'str> {
             None => self.blocks[block].instructions.last = prev,
         }
         self.blocks[block].instructions.len -= 1;
+        self.touch(block);
     }
 
     /// Links `insn` at position `index` of `block`, walking to it.
@@ -1453,6 +1491,7 @@ impl<'str> FunctionBody<'str> {
             i.next = None;
         }
         self.blocks[block].instructions = InsnList::default();
+        self.touch(block);
         ids
     }
 
@@ -1642,6 +1681,7 @@ impl<'str> FunctionBody<'str> {
             self.insns[user]
                 .mnemonic_mut()
                 .set_operand(usize::from(operand_index), new);
+            self.touch_parent(user);
             if new_has_home {
                 let moved = &mut self.uses[edge];
                 moved.value = new;
@@ -1897,6 +1937,7 @@ impl<'str> FunctionBody<'str> {
         self.remove_operand_uses(id);
         *self.insns[id].mnemonic_mut() = mnemonic;
         self.add_operand_uses(id);
+        self.touch_parent(id);
     }
 
     // ---- use edges ---------------------------------------------------------
@@ -2058,6 +2099,7 @@ impl<'str> FunctionBody<'str> {
         self.insns[user]
             .mnemonic_mut()
             .set_operand(operand_index, new);
+        self.touch_parent(user);
         match self.find_use(old, user, operand_index) {
             Some((prev, edge)) => {
                 self.unlink_use(old, prev, edge);

@@ -20,9 +20,9 @@ use rustc_hash::FxHashMap;
 use crate::compile::{BLOCK_OK, BlockTranslator, Export, Helpers, SpaceTable, Unsupported};
 
 /// What is known about one block: the index of its native code, or the reason
-/// the compiler declined it, together with the instruction count that answer
+/// the compiler declined it, together with the block revision that answer
 /// was reached for.
-type CacheEntry = Option<(usize, Result<usize, Unsupported>)>;
+type CacheEntry = Option<(u64, Result<usize, Unsupported>)>;
 
 /// A block that has been compiled to native code.
 struct Compiled {
@@ -80,12 +80,14 @@ pub struct Jit {
     /// it was declined. Declining is cached too, so a block the compiler cannot
     /// take is only examined once.
     ///
-    /// Each entry records the instruction count it was made for, because a
+    /// Each entry records the block revision it was made for, because a
     /// block is *not* immutable here: a VM that lifts on demand first presents
     /// an empty placeholder (which the compiler rightly declines), then fills
-    /// it, then runs a cleanup pass over it. Trusting the entry regardless of
-    /// count would freeze that first decline forever and the block would never
-    /// be compiled.
+    /// it, runs a cleanup pass over it, and may later empty it and lift it
+    /// again from the same bytes — as many instructions as before, under new
+    /// ids. Trusting the entry regardless would freeze that first decline
+    /// forever, and code compiled from the earlier ids would read and write
+    /// the interpreter's value table by ids that no longer mean anything.
     ///
     /// Stored as slots indexed by the block id's two components rather than in
     /// a map: this is read on *every* block execution, and hashing a
@@ -94,7 +96,7 @@ pub struct Jit {
     cache: Vec<Vec<CacheEntry>>,
     /// The same, for entries part-way into a block — the continuation after
     /// an interrupt. Rare enough to hash.
-    partial: FxHashMap<(BlockId, usize), (usize, Result<usize, Unsupported>)>,
+    partial: FxHashMap<(BlockId, usize), (u64, Result<usize, Unsupported>)>,
     /// Reused across runs so a hot block does not allocate to be entered.
     scratch: Vec<*mut u8>,
     /// Likewise for the export buffer compiled code writes its terminator
@@ -206,10 +208,10 @@ impl Jit {
         block: BlockId,
         start: usize,
     ) -> Result<usize, Unsupported> {
-        let count = ctx.block(block).insn_count();
+        let revision = ctx.block(block).revision();
         if start != 0 {
-            if let Some((cached_count, known)) = self.partial.get(&(block, start))
-                && *cached_count == count
+            if let Some((cached_revision, known)) = self.partial.get(&(block, start))
+                && *cached_revision == revision
             {
                 return known.clone();
             }
@@ -219,14 +221,14 @@ impl Jit {
                 Err(_) => self.stats.declined += 1,
             }
             self.partial
-                .insert((block, start), (count, outcome.clone()));
+                .insert((block, start), (revision, outcome.clone()));
             return outcome;
         }
         let func: usize = block.func.into();
         let local: usize = block.local.into();
-        if let Some(Some((cached_count, known))) =
+        if let Some(Some((cached_revision, known))) =
             self.cache.get(func).and_then(|slots| slots.get(local))
-            && *cached_count == count
+            && *cached_revision == revision
         {
             return known.clone();
         }
@@ -243,7 +245,7 @@ impl Jit {
         if local >= slots.len() {
             slots.resize(local + 1, None);
         }
-        slots[local] = Some((count, outcome.clone()));
+        slots[local] = Some((revision, outcome.clone()));
         outcome
     }
 
