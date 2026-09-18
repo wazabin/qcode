@@ -102,7 +102,7 @@ print()
 print("## Compiled instrumentation on qcode-jit: overhead per event (ns, median over images)\n")
 print("| instrumentation | ns/event | events per image (median) | sites per image (median) |")
 print("|---|---:|---:|---:|")
-for k in ["block-ir", "insn-ir", "edge-ir", "cmp-ir"]:
+for k in ["block-ir", "insn-ir"]:
     costs, evs, sites = [], [], []
     for img in images:
         a, b = by[("qcode-jit", "none")].get(img), by[("qcode-jit", k)].get(img)
