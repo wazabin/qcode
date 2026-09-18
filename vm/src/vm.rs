@@ -681,6 +681,11 @@ impl<S: CodeSource> Vm<S> {
         }
         self.injectors = injectors;
         self.injected.insert(block, self.generation);
+        // An injector may have added a memory space for its own state. The
+        // memory learns of it now, before an executor addresses it: a flat
+        // space first touched by compiled code would otherwise be created
+        // unconfigured, and read as unwritten by the interpreter afterwards.
+        qcode_emulator::EmulatorMemory::configure_spaces(&mut self.emu.memory, &self.ctx);
         // The interpreter may hold this block's instruction list, and it has
         // changed.
         self.emu.invalidate_block_cache();

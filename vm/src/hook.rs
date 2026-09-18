@@ -27,7 +27,7 @@
 
 use qcode::{
     context::Context,
-    space::MemorySpaceId,
+    space::{MemorySpaceId, Space, SpaceId, SpaceType},
     value::{
         BasicBlock, BlockId, InstructionId, Value as _, ValueId,
         insn::{Binop, IntBinop, Mnemonic, Store, VM_INTERRUPT},
@@ -296,6 +296,45 @@ impl<'a> Emitter<'a> {
         let mut builder = self.ctx.builder(block);
         builder.set_insert_point_before(anchor);
         builder.push_binop(Binop::Int(op), lhs, rhs).id()
+    }
+
+    /// A flat space for the hook's own state, created on first use and
+    /// shared by every hook that asks for `name`.
+    ///
+    /// State a hook keeps in guest RAM goes through the machine's TLB,
+    /// permission and initialisation tracking on every access, since the
+    /// guest could reach it; state in a flat space is a host buffer that
+    /// compiled code addresses by base pointer and constant offset, like a
+    /// register. A counter belongs here; a map indexed by a computed
+    /// address does not, since compiled code reaches flat spaces only at
+    /// constant addresses.
+    pub fn state_space(&mut self, name: &str) -> SpaceId {
+        if let Some(id) = self.ctx.try_get_space(name) {
+            return id;
+        }
+        let (word_size, addr_size) = {
+            let default = Space::from_id(self.ctx, self.ctx.shared.default_space);
+            (default.word_size, default.addr_size)
+        };
+        let mut space = Space::new(Some(name), word_size, addr_size);
+        space.ty = SpaceType::Register;
+        self.ctx.add_space(space)
+    }
+
+    /// Loads `size` bytes at `ptr` in `space`, before the anchor.
+    pub fn load_from(&mut self, space: SpaceId, ptr: ValueId, size: usize) -> ValueId {
+        let (block, anchor) = (self.block, self.anchor);
+        let mut builder = self.ctx.builder(block);
+        builder.set_insert_point_before(anchor);
+        builder.push_load::<true>(ptr, size, space).id()
+    }
+
+    /// Stores `value` at `ptr` in `space`, before the anchor.
+    pub fn store_to(&mut self, space: SpaceId, value: ValueId, ptr: ValueId) -> InstructionId {
+        let (block, anchor) = (self.block, self.anchor);
+        let mut builder = self.ctx.builder(block);
+        builder.set_insert_point_before(anchor);
+        builder.push_store(value, ptr, space).id
     }
 
     /// Loads `size` bytes of guest memory at `ptr`, before the anchor.
