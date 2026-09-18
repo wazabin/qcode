@@ -26,6 +26,13 @@ if os.path.exists(up):
         f = line.split()
         if len(f) == 6 and f[0] == "unicorn-py":
             upy[f[1]][f[2]] = (float(f[3]) * 1e6, int(f[4]), f[5] == "ok")
+afl = defaultdict(dict)
+ap = os.path.join(res, "afl-qemu.txt")
+if os.path.exists(ap):
+    for line in open(ap):
+        f = line.split()
+        if len(f) == 5 and f[0][0].isalpha():
+            afl[f[1]][f[0]] = (int(f[2]), f[3] == "1")
 images = sorted({r["image"] for r in rows})
 
 def gm(xs):
@@ -42,6 +49,10 @@ def slow(engine, k):
         kk = {"block-cb": "block-cb", "insn-cb": "insn-cb", "watch-cb": "watch-cb", "watch-ir": "watch-cb"}.get(k)
         if not kk: return None, 0
         xs = [upy[kk][i][0] / upy["none"][i][0] for i in images if i in upy.get(kk, {}) and i in upy.get("none", {}) and upy[kk][i][2]]
+        return gm(xs), len(xs)
+    if engine == "afl-qemu":
+        if k != "edge-ir": return None, 0
+        xs = [afl["afl-inst"][i][0] / afl["afl-none"][i][0] for i in images if i in afl.get("afl-inst", {}) and i in afl.get("afl-none", {}) and afl["afl-inst"][i][1]]
         return gm(xs), len(xs)
     xs = []
     for i in images:
@@ -66,12 +77,12 @@ def per_call(engine, k):
             cs.append((b["elapsed_ns"] - a["elapsed_ns"]) / b["host_calls"])
     return (statistics.median(cs) if cs else None), len(cs)
 
-KINDS = ["block-ir", "block-cb", "insn-ir", "insn-cb", "edge-ir", "watch-ir", "watch-cb", "cmp-ir", "cmp-cb"]
-ENGINES = [("qcode-jit", "QCode JIT", "s1"), ("icicle", "icicle", "s2"), ("unicorn", "Unicorn (C API)", "s3"), ("unicorn-py", "Unicorn (Python)", "s4"), ("native", "Native, compiler-instrumented", "s5")]
-LABEL = {"block-ir": "Block counter, compiled", "block-cb": "Block counter, callback", "insn-ir": "Instruction counter, compiled", "insn-cb": "Instruction counter, callback", "edge-ir": "AFL edge map, compiled", "watch-ir": "Write watch, range check compiled", "watch-cb": "Write watch, callback per store", "cmp-ir": "Compare log, compiled", "cmp-cb": "Compare log, callback"}
+KINDS = ["block-ir", "block-ram", "block-cb", "insn-ir", "insn-ram", "insn-cb", "edge-ir", "watch-ir", "watch-cb", "cmp-ir", "cmp-cb"]
+ENGINES = [("qcode-jit", "QCode JIT", "s1"), ("icicle", "icicle", "s2"), ("unicorn", "Unicorn (C API)", "s3"), ("unicorn-py", "Unicorn (Python)", "s4"), ("afl-qemu", "AFL++ QEMU mode", "s6"), ("native", "Native, compiler-instrumented", "s5")]
+LABEL = {"block-ir": "Block counter, compiled, hook space", "block-ram": "Block counter, compiled, guest RAM", "block-cb": "Block counter, callback", "insn-ir": "Instruction counter, compiled, hook space", "insn-ram": "Instruction counter, compiled, guest RAM", "insn-cb": "Instruction counter, callback", "edge-ir": "AFL edge map, compiled", "watch-ir": "Write watch, range check compiled", "watch-cb": "Write watch, callback per store", "cmp-ir": "Compare log, compiled", "cmp-cb": "Compare log, callback"}
 
 slowdown = {(e, k): slow(e, k) for e, _, _ in ENGINES for k in KINDS}
-calls = {(e, k): per_call(e, k) for e, _, _ in ENGINES if e != "native" for k in ["block-cb", "insn-cb", "watch-cb", "cmp-cb"]}
+calls = {(e, k): per_call(e, k) for e, _, _ in ENGINES if e not in ("native", "afl-qemu") for k in ["block-cb", "insn-cb", "watch-cb", "cmp-cb"]}
 
 def fmt_x(v):
     return f"{v:.2f}×" if v else "—"
@@ -113,7 +124,7 @@ def bar_chart(kinds, engines, get, maxv, unit, log=True, width=760):
 maxslow = max([v for (v, n) in slowdown.values() if v] + [10]) * 1.3
 chart1 = bar_chart(KINDS, ENGINES, lambda e, k: slowdown[(e, k)], maxslow, "×")
 maxcall = max([v for (v, n) in calls.values() if v] + [100]) * 1.3
-chart2 = bar_chart(["block-cb", "insn-cb", "watch-cb", "cmp-cb"], [x for x in ENGINES if x[0] != "native"], lambda e, k: calls[(e, k)], maxcall, " ns")
+chart2 = bar_chart(["block-cb", "insn-cb", "watch-cb", "cmp-cb"], [x for x in ENGINES if x[0] not in ("native", "afl-qemu")], lambda e, k: calls[(e, k)], maxcall, " ns")
 
 # ---- qcode per-image compiled vs callback
 def ms(ns): return f"{ns/1e6:.1f}"
@@ -122,7 +133,7 @@ for i in images:
     base = by[("qcode-jit", "none")].get(i)
     if not base: continue
     cells = [i, ms(base["elapsed_ns"])]
-    for k in ["block-ir", "block-cb", "insn-ir", "insn-cb", "edge-ir", "watch-ir", "cmp-ir"]:
+    for k in ["block-ir", "block-ram", "block-cb", "insn-ir", "insn-ram", "insn-cb", "edge-ir", "watch-ir", "cmp-ir"]:
         r = by[("qcode-jit", k)].get(i)
         cells.append((f"{r['elapsed_ns']/base['elapsed_ns']:.2f}×" if r["verified"] else "✗") if r else "")
     img_rows.append(cells)
@@ -135,6 +146,7 @@ for i in images:
     for e in ["qcode-interp", "qcode-jit", "icicle", "unicorn"]:
         r = by[(e, "none")].get(i); c.append(ms(r["elapsed_ns"]) + ("" if r["verified"] else " ✗") if r else "")
     u = upy.get("none", {}).get(i); c.append(f"{u[0]/1e6:.1f}" if u else "")
+    q = afl.get("afl-none", {}).get(i); c.append(f"{q[0]/1e6:.3f}" if q else "")
     base_rows.append(c)
 
 fails = [r for r in rows if not r["verified"]]
@@ -159,15 +171,15 @@ page = f"""<title>QCode Hook Costs</title>
 <style>
 :root {{
   --bg: #f7f7f4; --surface: #ffffff; --ink: #14161a; --ink-2: #4d5259; --ink-3: #7d838c; --rule: #dcdfe3; --accent: #1c5cab;
-  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #8a8f98; --grid: #e6e8ec; --bad: #d03b3b;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #8a8f98; --s6: #e87ba4; --grid: #e6e8ec; --bad: #d03b3b;
   color-scheme: light;
 }}
 @media (prefers-color-scheme: dark) {{ :root:not([data-theme="light"]) {{
   --bg: #17181b; --surface: #1f2126; --ink: #f2f3f5; --ink-2: #c3c6cc; --ink-3: #8d929b; --rule: #33363d; --accent: #86b6ef;
-  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #8a8f98; --grid: #2b2e34; --bad: #e66767; color-scheme: dark; }} }}
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #8a8f98; --s6: #d55181; --grid: #2b2e34; --bad: #e66767; color-scheme: dark; }} }}
 :root[data-theme="dark"] {{
   --bg: #17181b; --surface: #1f2126; --ink: #f2f3f5; --ink-2: #c3c6cc; --ink-3: #8d929b; --rule: #33363d; --accent: #86b6ef;
-  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #8a8f98; --grid: #2b2e34; --bad: #e66767; color-scheme: dark; }}
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #8a8f98; --s6: #d55181; --grid: #2b2e34; --bad: #e66767; color-scheme: dark; }}
 body {{ background: var(--bg); color: var(--ink); font-family: "IBM Plex Sans", system-ui, sans-serif; font-size: 15px; line-height: 1.5; margin: 0; padding-block: 32px 64px; padding-inline: 16px; }}
 main {{ max-width: 980px; margin: 0 auto; }}
 h1 {{ font-family: "Fraunces", Georgia, serif; font-weight: 600; font-size: 2.2rem; line-height: 1.1; margin: 0 0 8px; text-wrap: balance; }}
@@ -184,10 +196,10 @@ p {{ max-width: 68ch; color: var(--ink-2); }}
 .chart .tick, .chart .lab, .chart .val, .chart .na {{ font-family: "IBM Plex Mono", monospace; font-size: 11px; fill: var(--ink-2); }}
 .chart .lab {{ font-family: "IBM Plex Sans", sans-serif; fill: var(--ink); font-size: 12px; }}
 .chart .who {{ fill: var(--ink-3); }}
-.chart .s1 {{ fill: var(--s1); }} .chart .s2 {{ fill: var(--s2); }} .chart .s3 {{ fill: var(--s3); }} .chart .s4 {{ fill: var(--s4); }} .chart .s5 {{ fill: var(--s5); }}
+.chart .s1 {{ fill: var(--s1); }} .chart .s2 {{ fill: var(--s2); }} .chart .s3 {{ fill: var(--s3); }} .chart .s4 {{ fill: var(--s4); }} .chart .s5 {{ fill: var(--s5); }} .chart .s6 {{ fill: var(--s6); }}
 .legend {{ display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: .85rem; color: var(--ink-2); margin: 4px 0 12px; }}
 .legend span::before {{ content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }}
-.legend .s1::before {{ background: var(--s1); }} .legend .s2::before {{ background: var(--s2); }} .legend .s3::before {{ background: var(--s3); }} .legend .s4::before {{ background: var(--s4); }} .legend .s5::before {{ background: var(--s5); }}
+.legend .s1::before {{ background: var(--s1); }} .legend .s2::before {{ background: var(--s2); }} .legend .s3::before {{ background: var(--s3); }} .legend .s4::before {{ background: var(--s4); }} .legend .s5::before {{ background: var(--s5); }} .legend .s6::before {{ background: var(--s6); }}
 .scroll {{ overflow-x: auto; }}
 table {{ border-collapse: collapse; width: 100%; font-size: .88rem; }}
 th, td {{ padding: 6px 10px; border-bottom: 1px solid var(--rule); text-align: left; white-space: nowrap; }}
@@ -203,7 +215,7 @@ code {{ font-family: "IBM Plex Mono", monospace; font-size: .9em; }}
 <main>
 <div class="eyebrow">Embench-IoT · {n_img} images · x86-64 · min of 5 runs</div>
 <h1>What a hook costs when it compiles</h1>
-<p class="lede">The same instrumentation written two ways under QCode — as IR the machine compiles with the guest, and as a host callback the machine stops for — against icicle-emu, Unicorn through its C API and through Python (the shape Qiling builds on), and native binaries instrumented by the compiler.</p>
+<p class="lede">The same instrumentation written two ways under QCode — as IR the machine compiles with the guest, and as a host callback the machine stops for — against icicle-emu, Unicorn through its C API and through Python (the shape Qiling builds on), AFL++'s QEMU mode, and native binaries instrumented by the compiler.</p>
 
 <div class="tiles">
   <div class="tile"><div class="n">{fmt_x(h_block_ir)}</div><div class="l">QCode JIT: block counter compiled to IR</div></div>
@@ -219,20 +231,22 @@ code {{ font-family: "IBM Plex Mono", monospace; font-size: .9em; }}
 
 <h2>What one host callback costs</h2>
 <p>Extra time over the uninstrumented run divided by the number of times the host was entered; median over images with at least 10,000 calls.</p>
-<div class="legend">{"".join(f'<span class="{c}">{html.escape(n)}</span>' for e, n, c in ENGINES if e != "native")}</div>
+<div class="legend">{"".join(f'<span class="{c}">{html.escape(n)}</span>' for e, n, c in ENGINES if e not in ("native", "afl-qemu"))}</div>
 {chart2}
 
 <h2>Baselines: the uninstrumented run, per image</h2>
-<p>Milliseconds; native is one iteration of the benchmark function, the emulators run the image once from <code>main</code> to its return. ✗ marks a run that did not verify.</p>
-{table(["image", "native", "qcode-interp", "qcode-jit", "icicle", "unicorn", "unicorn-py"], base_rows)}
+<p>Milliseconds. Native and AFL++ QEMU time one warm iteration of the benchmark function (min of 30) inside the process; QCode, icicle and Unicorn run the freestanding image once from <code>main</code> to its return, so their number includes translating the code. ✗ marks a run that did not verify.</p>
+{table(["image", "native", "qcode-interp", "qcode-jit", "icicle", "unicorn", "unicorn-py", "AFL++ QEMU"], base_rows)}
 
 <h2>QCode JIT, per image: compiled instrumentation against the callback</h2>
 <p>Slowdown relative to that image's uninstrumented run.</p>
-{table(["image", "base ms", "block-ir", "block-cb", "insn-ir", "insn-cb", "edge-ir", "watch-ir", "cmp-ir"], img_rows)}
+{table(["image", "base ms", "block-ir", "block-ram", "block-cb", "insn-ir", "insn-ram", "insn-cb", "edge-ir", "watch-ir", "cmp-ir"], img_rows)}
 
 <h2>How to read this</h2>
 <ul>
 <li><b>What "compiled" means per engine.</b> QCode: the hook emits QCode before the site (loads, stores, arithmetic, a conditional detour to an interrupt) and the JIT compiles it with the block. icicle: an injector splices p-code into the lifted block. Unicorn has no compiled form — every hook is a C callback, and Qiling adds Python dispatch on top. Native: <code>gcc -fsanitize-coverage=trace-pc</code> and <code>trace-cmp</code>, plus four hardware watchpoints through <code>perf</code> for the write watch.</li>
+<li><b>Where the hook keeps its state decides most of the compiled cost.</b> A counter in guest RAM goes through the JIT's inline TLB lookup, permission check and initialisation-bit update on every access, because the guest could reach it; the same counter in a flat hook space — a host buffer compiled code addresses by base pointer and constant offset, as it does a register — costs what icicle's trace store costs. The edge map still lives in RAM: compiled code reaches a flat space only at a constant offset, and the map is indexed by a computed one.</li>
+<li><b>AFL++ QEMU mode</b> is the fuzzing instrumentation people actually run: an edge map updated by TCG ops inlined into every translated block. Its overhead over the same QEMU with instrumentation switched off (<code>AFL_QEMU_INST_RANGES</code> set to an empty range) is within noise, on a base that is itself 5 to 10× slower than native. It is measured on the native binaries under <code>afl-qemu-trace</code>, so it appears on the edge-map row and in the baseline table.</li>
 <li><b>Sites are not the same across engines.</b> QCode's block is the lifted block after absorption, which is the guest's basic block; its comparison site is every integer comparison in the p-code, which on x86 includes every flag computation, so <code>cmp-*</code> instruments an order of magnitude more sites than Unicorn's <code>cmp</code>-instruction hook. Counts are in the full table.</li>
 <li><b>The write watch</b> covers 32 bytes at the start of each image's writable segment; the number of hits varies from none to hundreds of thousands per image, and the per-hit cost is what the second chart isolates.</li>
 <li><b>Why the callback is expensive under QCode.</b> A callback is a machine stop: compiled code exits, the interpreter describes the interrupt, the table dispatches, the machine resumes and compiled code is re-entered. Three accidental costs in that path were removed while building this benchmark (a diagnostic string rendered per stop, an O(n) walk to find the position, a rebuilt instruction list per block); what remains is the design. Under icicle the callback is a native call from JIT code; under Unicorn a C call from TCG code.</li>

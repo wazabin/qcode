@@ -54,8 +54,8 @@ print()
 
 # 2. Slowdown of each instrumentation relative to the engine's own baseline.
 print("## Slowdown relative to each engine's own baseline (geometric mean over images)\n")
-kinds = ["block-ir", "block-cb", "insn-ir", "insn-cb", "edge-ir", "watch-ir", "watch-cb", "cmp-ir", "cmp-cb"]
-native_kind = {"block-ir": "block", "block-cb": "block", "edge-ir": "edge", "cmp-ir": "cmp", "cmp-cb": "cmp", "watch-ir": "watch", "watch-cb": "watch"}
+kinds = ["block-ir", "block-ram", "block-cb", "insn-ir", "insn-ram", "insn-cb", "edge-ir", "watch-ir", "watch-cb", "cmp-ir", "cmp-cb"]
+native_kind = {"block-ir": "block", "block-ram": "block", "block-cb": "block", "edge-ir": "edge", "cmp-ir": "cmp", "cmp-cb": "cmp", "watch-ir": "watch", "watch-cb": "watch"}
 print("| instrumentation | native (compiler) | qcode-jit | icicle | unicorn | qcode-interp |")
 print("|---|---:|---:|---:|---:|---:|")
 for k in kinds:
@@ -102,7 +102,7 @@ print()
 print("## Compiled instrumentation on qcode-jit: overhead per event (ns, median over images)\n")
 print("| instrumentation | ns/event | events per image (median) | sites per image (median) |")
 print("|---|---:|---:|---:|")
-for k in ["block-ir", "insn-ir"]:
+for k in ["block-ir", "block-ram", "insn-ir", "insn-ram"]:
     costs, evs, sites = [], [], []
     for img in images:
         a, b = by[("qcode-jit", "none")].get(img), by[("qcode-jit", k)].get(img)

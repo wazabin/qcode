@@ -27,6 +27,14 @@ done
 (cd "$HERE/target/native" && for b in $(ls *.plain | sed 's/\.plain$//'); do
   for v in plain block edge cmp watch; do "./$b.$v" 30 "$b" "$v"; done
 done) > "$OUT/native.txt" 2>&1
+# AFL++ QEMU mode on the native binaries, instrumented and not.
+if [ -n "${AFL_QEMU_TRACE:-}" ]; then
+  (cd "$HERE/target/native" && for b in $(ls *.plain | sed 's/\.plain$//'); do
+    "$AFL_QEMU_TRACE" "./$b.plain" 30 "$b" afl-inst 2>/dev/null | tail -1
+    AFL_QEMU_INST_RANGES=0x1-0x2 "$AFL_QEMU_TRACE" "./$b.plain" 30 "$b" afl-none 2>/dev/null | tail -1
+  done) > "$OUT/afl-qemu.txt"
+fi
+(cd "$HERE/python" && python3 unicorn_py.py "$IMAGES" 3 > "$OUT/unicorn-py.txt" 2>&1)
 # The interpreter is two orders of magnitude slower than the JIT: a subset of
 # images, and only the instrumentation that is IR.
 for img in crc32 tarfind depthconv matmult-int; do

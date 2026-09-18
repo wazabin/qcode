@@ -11,9 +11,11 @@ whether the benchmark verified its own result.
 
 | kind | what it does | QCode | icicle | Unicorn | native |
 |---|---|---|---|---|---|
-| block-ir | `counter += 1` in guest memory at every block entry | IR | p-code injector | — | `-fsanitize-coverage=trace-pc` |
+| block-ir | `counter += 1` in a flat hook space at every block entry | IR | p-code injector | — | `-fsanitize-coverage=trace-pc` |
+| block-ram | the same counter in guest RAM, through the MMU | IR | — | — | — |
 | block-cb | a host callback at every block entry | interrupt | `Op::Hook` | `UC_HOOK_BLOCK` | — |
-| insn-ir | `counter += 1` before every guest instruction | IR | p-code injector | — | — |
+| insn-ir | `counter += 1` in a flat hook space before every guest instruction | IR | p-code injector | — | — |
+| insn-ram | the same counter in guest RAM | IR | — | — | — |
 | insn-cb | a host callback before every guest instruction | interrupt | `Op::Hook` | `UC_HOOK_CODE` | — |
 | edge-ir | an AFL-style edge map in guest memory | IR | — | — | trace-pc + map |
 | watch-ir | stores to 32 bytes: range check as IR, host on a hit | IR + interrupt | MMU hook | `UC_HOOK_MEM_WRITE` | 4 hardware watchpoints |
@@ -50,6 +52,11 @@ point `GHIDRA_SRC` at a directory holding `Ghidra/Processors` (pypcode's
 GHIDRA_SRC=... REPEAT=5 ./run-all.sh      # everything, JSON under target/results
 ./report.py target/results > RESULTS.md   # the tables
 ```
+
+AFL++ QEMU mode is timed on the native binaries: `afl-qemu-trace` from an
+AFL++ checkout with `qemu_mode` built, instrumented and with
+`AFL_QEMU_INST_RANGES=0x1-0x2` as the uninstrumented baseline, into
+`target/results/afl-qemu.txt` (see the loop in `run-all.sh`).
 
 `HOOKBENCH_STATS=1` prints the VM's counters after each QCode run and
 `HOOKBENCH_DUMP=file` writes the instrumented IR.

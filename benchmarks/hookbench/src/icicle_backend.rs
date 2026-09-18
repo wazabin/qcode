@@ -59,6 +59,8 @@ impl CodeInjector for CounterInjector {
 pub fn run(image: &[u8], instr: Instr) -> Option<Outcome> {
     let kind = match instr {
         Instr::None | Instr::BlockIr | Instr::BlockCb | Instr::InsnIr | Instr::InsnCb => instr,
+        Instr::BlockRam => Instr::BlockIr,
+        Instr::InsnRam => Instr::InsnIr,
         Instr::WatchIr | Instr::WatchCb => Instr::WatchCb,
         _ => return None,
     };

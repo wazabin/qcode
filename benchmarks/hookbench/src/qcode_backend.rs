@@ -52,6 +52,8 @@ impl<H: Hook> Hook for Counted<H> {
 /// `counter += 1` in guest memory at every block entry or every instruction.
 struct CounterIr {
     per_instruction: bool,
+    /// Keep the counter in a flat hook space rather than guest RAM.
+    flat: bool,
 }
 
 fn bump(emit: &mut Emitter<'_>, at: u64) {
@@ -71,7 +73,17 @@ impl Hook for CounterIr {
         }
     }
     fn instrument(&mut self, _site: &Site, emit: &mut Emitter<'_>) {
-        bump(emit, COUNTER);
+        if self.flat {
+            // The counter in a flat space of the hook's own, at offset 0.
+            let space = emit.state_space("hook");
+            let p = emit.constant(0, 8);
+            let v = emit.load_from(space, p, 8);
+            let one = emit.constant(1, 8);
+            let v1 = emit.binop(IntBinop::Add, v, one);
+            emit.store_to(space, v1, p);
+        } else {
+            bump(emit, COUNTER);
+        }
     }
 }
 
@@ -187,8 +199,10 @@ pub fn run(image: &[u8], jit: bool, instr: Instr) -> Outcome {
     let counted = |hook: Box<dyn Hook>| Counted { hook: Dyn(hook), sites: sites.clone() };
     match instr {
         Instr::None => {}
-        Instr::BlockIr => vm.add_hook(counted(Box::new(CounterIr { per_instruction: false }))),
-        Instr::InsnIr => vm.add_hook(counted(Box::new(CounterIr { per_instruction: true }))),
+        Instr::BlockIr => vm.add_hook(counted(Box::new(CounterIr { per_instruction: false, flat: true }))),
+        Instr::BlockRam => vm.add_hook(counted(Box::new(CounterIr { per_instruction: false, flat: false }))),
+        Instr::InsnIr => vm.add_hook(counted(Box::new(CounterIr { per_instruction: true, flat: true }))),
+        Instr::InsnRam => vm.add_hook(counted(Box::new(CounterIr { per_instruction: true, flat: false }))),
         Instr::EdgeIr => vm.add_hook(counted(Box::new(EdgeIr))),
         Instr::CmpIr => vm.add_hook(counted(Box::new(CmpLogIr))),
         Instr::WatchCb => vm.add_hook(counted(Box::new(StoreCb))),
@@ -244,7 +258,16 @@ pub fn run(image: &[u8], jit: bool, instr: Instr) -> Outcome {
     let finished = bare::returned(&exit);
     let verified = finished && bare::register(&mut vm, "EAX") == Some(0);
     match instr {
-        Instr::BlockIr | Instr::InsnIr => events.set(read_u64(&vm, COUNTER)),
+        Instr::BlockIr | Instr::InsnIr => {
+            let space = vm.context().try_get_space("hook").expect("the hook space exists");
+            let v = vm
+                .memory_mut()
+                .flat_mut()
+                .read_u128(qcode::space::MemorySpaceId::Shared(space), 0, 8)
+                .unwrap_or(0);
+            events.set(v as u64);
+        }
+        Instr::BlockRam | Instr::InsnRam => events.set(read_u64(&vm, COUNTER)),
         Instr::EdgeIr => {
             let mut map = vec![0u8; (EDGE_MASK + 1) as usize];
             vm.memory().mmu.read(EDGE_MAP, &mut map).unwrap();

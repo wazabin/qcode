@@ -24,9 +24,11 @@
 
 | instrumentation | native (compiler) | qcode-jit | icicle | unicorn | qcode-interp |
 |---|---:|---:|---:|---:|---:|
-| block-ir | 2.34× | 1.31× (n=17) | 1.04× (n=16) |  | 1.05× (n=4) |
+| block-ir | 2.34× | 1.26× (n=17) | 1.04× (n=16) |  | 1.05× (n=4) |
+| block-ram | 2.34× | 1.41× (n=17) |  |  |  |
 | block-cb | 2.34× | 5.47× (n=17) | 1.08× (n=17) | 1.13× (n=17) |  |
-| insn-ir |  | 1.77× (n=17) | 1.08× (n=17) |  | 1.20× (n=4) |
+| insn-ir |  | 1.33× (n=17) | 1.08× (n=17) |  | 1.20× (n=4) |
+| insn-ram |  | 1.85× (n=17) |  |  |  |
 | insn-cb |  | 14.69× (n=17) | 1.33× (n=17) | 3.71× (n=17) |  |
 | edge-ir | 3.13× | 1.55× (n=17) |  |  | 1.11× (n=4) |
 | watch-ir | 1.99× | 1.71× (n=17) | 1.11× (n=17) | 1.87× (n=17) | 1.07× (n=4) |
@@ -48,8 +50,10 @@
 
 | instrumentation | ns/event | events per image (median) | sites per image (median) |
 |---|---:|---:|---:|
-| block-ir | 30.7 | 586384 | 71 |
-| insn-ir | 19.0 | 2797078 | 496 |
+| block-ir | 20.9 | 586384 | 71 |
+| block-ram | 51.3 | 586384 | 71 |
+| insn-ir | 6.6 | 2797078 | 496 |
+| insn-ram | 20.2 | 2797078 | 496 |
 
 ## Runs that did not verify
 
@@ -236,23 +240,40 @@
 | qcode-jit | block-cb | tarfind | 288.9 | 331253 | 331253 | 0 | ok |
 | qcode-jit | block-cb | ud | 563.2 | 748654 | 748654 | 0 | ok |
 | qcode-jit | block-cb | xgboost | 738.3 | 1317252 | 1317252 | 0 | ok |
-| qcode-jit | block-ir | aha-mont64 | 72.1 | 0 | 428535 | 43 | ok |
-| qcode-jit | block-ir | crc32 | 37.2 | 0 | 350902 | 19 | ok |
-| qcode-jit | block-ir | depthconv | 44.3 | 0 | 635575 | 31 | ok |
-| qcode-jit | block-ir | edn | 93.4 | 0 | 817048 | 79 | ok |
-| qcode-jit | block-ir | huffbench | 141.9 | 0 | 797622 | 149 | ok |
-| qcode-jit | block-ir | matmult-int | 70.3 | 0 | 1200608 | 48 | ok |
-| qcode-jit | block-ir | md5sum | 82.3 | 0 | 586384 | 76 | ok |
-| qcode-jit | block-ir | nettle-aes | 112.3 | 0 | 115772 | 71 | ok |
-| qcode-jit | block-ir | nettle-sha256 | 660.0 | 0 | 246603 | 70 | ok |
-| qcode-jit | block-ir | nsichneu | 597.1 | 0 | 773121 | 652 | ok |
-| qcode-jit | block-ir | picojpeg | 297.6 | 0 | 515129 | 323 | ok |
-| qcode-jit | block-ir | qrduino | 524.8 | 0 | 567451 | 510 | ok |
-| qcode-jit | block-ir | sglib-combined | 239.7 | 0 | 819979 | 279 | ok |
-| qcode-jit | block-ir | statemate | 75.5 | 0 | 336637 | 75 | ok |
-| qcode-jit | block-ir | tarfind | 52.5 | 0 | 331253 | 47 | ok |
-| qcode-jit | block-ir | ud | 94.5 | 0 | 748654 | 66 | ok |
-| qcode-jit | block-ir | xgboost | 109.5 | 0 | 1317252 | 36 | ok |
+| qcode-jit | block-ir | aha-mont64 | 103.8 | 0 | 428535 | 43 | ok |
+| qcode-jit | block-ir | crc32 | 36.6 | 0 | 350902 | 19 | ok |
+| qcode-jit | block-ir | depthconv | 41.3 | 0 | 635575 | 31 | ok |
+| qcode-jit | block-ir | edn | 92.7 | 0 | 817048 | 79 | ok |
+| qcode-jit | block-ir | huffbench | 121.4 | 0 | 797622 | 149 | ok |
+| qcode-jit | block-ir | matmult-int | 66.9 | 0 | 1200608 | 48 | ok |
+| qcode-jit | block-ir | md5sum | 76.8 | 0 | 586384 | 76 | ok |
+| qcode-jit | block-ir | nettle-aes | 112.0 | 0 | 115772 | 71 | ok |
+| qcode-jit | block-ir | nettle-sha256 | 685.6 | 0 | 246603 | 70 | ok |
+| qcode-jit | block-ir | nsichneu | 476.3 | 0 | 773121 | 652 | ok |
+| qcode-jit | block-ir | picojpeg | 239.9 | 0 | 515129 | 323 | ok |
+| qcode-jit | block-ir | qrduino | 530.2 | 0 | 567451 | 510 | ok |
+| qcode-jit | block-ir | sglib-combined | 207.9 | 0 | 819979 | 279 | ok |
+| qcode-jit | block-ir | statemate | 68.4 | 0 | 336637 | 75 | ok |
+| qcode-jit | block-ir | tarfind | 49.3 | 0 | 331253 | 47 | ok |
+| qcode-jit | block-ir | ud | 91.0 | 0 | 748654 | 66 | ok |
+| qcode-jit | block-ir | xgboost | 114.4 | 0 | 1317252 | 36 | ok |
+| qcode-jit | block-ram | aha-mont64 | 81.2 | 0 | 428535 | 43 | ok |
+| qcode-jit | block-ram | crc32 | 39.2 | 0 | 350902 | 19 | ok |
+| qcode-jit | block-ram | depthconv | 46.3 | 0 | 635575 | 31 | ok |
+| qcode-jit | block-ram | edn | 104.3 | 0 | 817048 | 79 | ok |
+| qcode-jit | block-ram | huffbench | 161.4 | 0 | 797622 | 149 | ok |
+| qcode-jit | block-ram | matmult-int | 77.2 | 0 | 1200608 | 48 | ok |
+| qcode-jit | block-ram | md5sum | 89.8 | 0 | 586384 | 76 | ok |
+| qcode-jit | block-ram | nettle-aes | 119.6 | 0 | 115772 | 71 | ok |
+| qcode-jit | block-ram | nettle-sha256 | 710.9 | 0 | 246603 | 70 | ok |
+| qcode-jit | block-ram | nsichneu | 620.0 | 0 | 773121 | 652 | ok |
+| qcode-jit | block-ram | picojpeg | 331.9 | 0 | 515129 | 323 | ok |
+| qcode-jit | block-ram | qrduino | 548.4 | 0 | 567451 | 510 | ok |
+| qcode-jit | block-ram | sglib-combined | 260.2 | 0 | 819979 | 279 | ok |
+| qcode-jit | block-ram | statemate | 80.0 | 0 | 336637 | 75 | ok |
+| qcode-jit | block-ram | tarfind | 56.4 | 0 | 331253 | 47 | ok |
+| qcode-jit | block-ram | ud | 102.1 | 0 | 748654 | 66 | ok |
+| qcode-jit | block-ram | xgboost | 112.2 | 0 | 1317252 | 36 | ok |
 | qcode-jit | cmp-cb | aha-mont64 | 307.6 | 67261 | 67261 | 2241 | Error("value 0 is too large to represent |
 | qcode-jit | cmp-cb | crc32 | 136.9 | 163904 | 163904 | 303 | Error("value 0 is too large to represent |
 | qcode-jit | cmp-cb | depthconv | 53.2 | 9189 | 9189 | 277 | Error("value 0 is too large to represent |
@@ -321,23 +342,40 @@
 | qcode-jit | insn-cb | tarfind | 753.4 | 1942280 | 1942280 | 0 | ok |
 | qcode-jit | insn-cb | ud | 1223.2 | 2994568 | 2994568 | 0 | ok |
 | qcode-jit | insn-cb | xgboost | 1470.3 | 3936130 | 3936130 | 0 | ok |
-| qcode-jit | insn-ir | aha-mont64 | 99.2 | 0 | 2428485 | 496 | ok |
-| qcode-jit | insn-ir | crc32 | 44.7 | 0 | 2278822 | 108 | ok |
-| qcode-jit | insn-ir | depthconv | 55.3 | 0 | 2998976 | 104 | ok |
-| qcode-jit | insn-ir | edn | 136.4 | 0 | 4109614 | 692 | ok |
-| qcode-jit | insn-ir | huffbench | 187.7 | 0 | 2795647 | 734 | ok |
-| qcode-jit | insn-ir | matmult-int | 87.1 | 0 | 4072595 | 283 | ok |
-| qcode-jit | insn-ir | md5sum | 111.0 | 0 | 2398400 | 447 | ok |
-| qcode-jit | insn-ir | nettle-aes | 192.2 | 0 | 2621639 | 1068 | ok |
-| qcode-jit | insn-ir | nettle-sha256 | 1280.4 | 0 | 4475405 | 2845 | ok |
-| qcode-jit | insn-ir | nsichneu | 728.5 | 0 | 2167728 | 1858 | ok |
-| qcode-jit | insn-ir | picojpeg | 416.4 | 0 | 3298380 | 1928 | ok |
-| qcode-jit | insn-ir | qrduino | 735.3 | 0 | 3670529 | 3633 | ok |
-| qcode-jit | insn-ir | sglib-combined | 306.8 | 0 | 2797078 | 1165 | ok |
-| qcode-jit | insn-ir | statemate | 107.9 | 0 | 2235589 | 468 | ok |
-| qcode-jit | insn-ir | tarfind | 64.7 | 0 | 1942280 | 234 | ok |
-| qcode-jit | insn-ir | ud | 118.8 | 0 | 2994568 | 436 | ok |
-| qcode-jit | insn-ir | xgboost | 123.6 | 0 | 3936130 | 187 | ok |
+| qcode-jit | insn-ir | aha-mont64 | 76.1 | 0 | 2428485 | 496 | ok |
+| qcode-jit | insn-ir | crc32 | 38.3 | 0 | 2278822 | 108 | ok |
+| qcode-jit | insn-ir | depthconv | 45.4 | 0 | 2998976 | 104 | ok |
+| qcode-jit | insn-ir | edn | 99.5 | 0 | 4109614 | 692 | ok |
+| qcode-jit | insn-ir | huffbench | 132.3 | 0 | 2795647 | 734 | ok |
+| qcode-jit | insn-ir | matmult-int | 74.4 | 0 | 4072595 | 283 | ok |
+| qcode-jit | insn-ir | md5sum | 81.1 | 0 | 2398400 | 447 | ok |
+| qcode-jit | insn-ir | nettle-aes | 134.2 | 0 | 2621639 | 1068 | ok |
+| qcode-jit | insn-ir | nettle-sha256 | 1232.5 | 0 | 4475405 | 2845 | ok |
+| qcode-jit | insn-ir | nsichneu | 507.3 | 0 | 2167728 | 1858 | ok |
+| qcode-jit | insn-ir | picojpeg | 257.7 | 0 | 3298380 | 1928 | ok |
+| qcode-jit | insn-ir | qrduino | 485.8 | 0 | 3670529 | 3633 | ok |
+| qcode-jit | insn-ir | sglib-combined | 218.4 | 0 | 2797078 | 1165 | ok |
+| qcode-jit | insn-ir | statemate | 68.0 | 0 | 2235589 | 468 | ok |
+| qcode-jit | insn-ir | tarfind | 47.5 | 0 | 1942280 | 234 | ok |
+| qcode-jit | insn-ir | ud | 88.2 | 0 | 2994568 | 436 | ok |
+| qcode-jit | insn-ir | xgboost | 112.2 | 0 | 3936130 | 187 | ok |
+| qcode-jit | insn-ram | aha-mont64 | 106.3 | 0 | 2428485 | 496 | ok |
+| qcode-jit | insn-ram | crc32 | 45.2 | 0 | 2278822 | 108 | ok |
+| qcode-jit | insn-ram | depthconv | 58.3 | 0 | 2998976 | 104 | ok |
+| qcode-jit | insn-ram | edn | 143.8 | 0 | 4109614 | 692 | ok |
+| qcode-jit | insn-ram | huffbench | 186.3 | 0 | 2795647 | 734 | ok |
+| qcode-jit | insn-ram | matmult-int | 90.8 | 0 | 4072595 | 283 | ok |
+| qcode-jit | insn-ram | md5sum | 113.9 | 0 | 2398400 | 447 | ok |
+| qcode-jit | insn-ram | nettle-aes | 196.9 | 0 | 2621639 | 1068 | ok |
+| qcode-jit | insn-ram | nettle-sha256 | 1340.4 | 0 | 4475405 | 2845 | ok |
+| qcode-jit | insn-ram | nsichneu | 734.6 | 0 | 2167728 | 1858 | ok |
+| qcode-jit | insn-ram | picojpeg | 425.4 | 0 | 3298380 | 1928 | ok |
+| qcode-jit | insn-ram | qrduino | 804.9 | 0 | 3670529 | 3633 | ok |
+| qcode-jit | insn-ram | sglib-combined | 322.3 | 0 | 2797078 | 1165 | ok |
+| qcode-jit | insn-ram | statemate | 112.4 | 0 | 2235589 | 468 | ok |
+| qcode-jit | insn-ram | tarfind | 69.1 | 0 | 1942280 | 234 | ok |
+| qcode-jit | insn-ram | ud | 128.9 | 0 | 2994568 | 436 | ok |
+| qcode-jit | insn-ram | xgboost | 131.5 | 0 | 3936130 | 187 | ok |
 | qcode-jit | none | aha-mont64 | 59.2 | 0 | 0 | 0 | ok |
 | qcode-jit | none | crc32 | 32.2 | 0 | 0 | 0 | ok |
 | qcode-jit | none | depthconv | 37.1 | 0 | 0 | 0 | ok |

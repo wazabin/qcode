@@ -28,13 +28,17 @@ pub const WATCH_LEN: u64 = 32;
 pub enum Instr {
     /// No instrumentation.
     None,
-    /// A block counter kept in guest memory, as IR at every block entry.
+    /// A block counter in a flat hook space, as IR at every block entry.
     BlockIr,
+    /// The same counter kept in guest RAM, through the MMU.
+    BlockRam,
     /// A host callback at every block entry.
     BlockCb,
-    /// An instruction counter kept in guest memory, as IR before every
+    /// An instruction counter in a flat hook space, as IR before every
     /// guest instruction.
     InsnIr,
+    /// The same counter kept in guest RAM, through the MMU.
+    InsnRam,
     /// A host callback before every guest instruction.
     InsnCb,
     /// An AFL-style edge map in guest memory, as IR at every block entry.
@@ -53,11 +57,13 @@ pub enum Instr {
 }
 
 impl Instr {
-    pub const ALL: [Instr; 10] = [
+    pub const ALL: [Instr; 12] = [
         Instr::None,
         Instr::BlockIr,
+        Instr::BlockRam,
         Instr::BlockCb,
         Instr::InsnIr,
+        Instr::InsnRam,
         Instr::InsnCb,
         Instr::EdgeIr,
         Instr::WatchIr,
@@ -69,8 +75,10 @@ impl Instr {
         match self {
             Instr::None => "none",
             Instr::BlockIr => "block-ir",
+            Instr::BlockRam => "block-ram",
             Instr::BlockCb => "block-cb",
             Instr::InsnIr => "insn-ir",
+            Instr::InsnRam => "insn-ram",
             Instr::InsnCb => "insn-cb",
             Instr::EdgeIr => "edge-ir",
             Instr::WatchIr => "watch-ir",
