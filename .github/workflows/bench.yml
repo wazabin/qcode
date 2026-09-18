@@ -35,6 +35,18 @@ jobs:
           ref: ${{ github.event.pull_request.base.sha }}
           path: base
 
+      - name: Cache the base's build
+        if: github.event_name == 'pull_request'
+        # The base is the same commit for every push to a pull request, so
+        # its build is a cache hit after the first: keyed on its sha, and
+        # keeping the workspace's own crates, which the action drops by
+        # default since they change on every commit.
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: base -> target
+          key: base-${{ github.event.pull_request.base.sha }}
+          cache-workspace-crates: true
+
       - name: Bench the base
         id: base
         # The base has the bench only once it is on main; a pull request that
