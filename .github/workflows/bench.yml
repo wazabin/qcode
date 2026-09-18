@@ -39,13 +39,19 @@ jobs:
         # adds it is benched on its own.
         if: github.event_name == 'pull_request' && hashFiles('base/sleigh/benches/lift.rs') != ''
         working-directory: base
+        # The base builds in its own target directory: shared with the head's,
+        # cargo reused the base's artifacts for the head and compared the base
+        # with itself. Only Criterion's store is shared, so the head's run
+        # finds the baseline.
         env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          CRITERION_HOME: ${{ github.workspace }}/target/criterion
         run: |
           cargo bench -p wazabin-qcode-sleigh --bench lift -- --noplot --save-baseline base
           echo "compare=--baseline base" >> "$GITHUB_OUTPUT"
 
       - name: Bench
+        env:
+          CRITERION_HOME: ${{ github.workspace }}/target/criterion
         run: |
           cargo bench -p wazabin-qcode-sleigh --bench lift -- --noplot ${{ steps.base.outputs.compare }} \
             | tee bench.txt
