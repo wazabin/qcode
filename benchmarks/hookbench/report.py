@@ -1,20 +1,37 @@
 #!/usr/bin/env python3
 """Turns the sweep's JSON and native results into Markdown tables.
 
-Usage: report.py <results dir>   (the OUT of run-all.sh)
+Usage: report.py <results dir> [<label>=<dir> ...]   (the OUT of run-all.sh,
+then later runs of part of the sweep, oldest first; each replaces the rows
+it re-measured and keeps a column in the progress table)
 """
 import glob, json, os, sys
 from collections import defaultdict
 
 out = sys.argv[1] if len(sys.argv) > 1 else "target/results"
-rows = []
-for path in glob.glob(os.path.join(out, "*.json")):
-    rows += json.load(open(path))
+runs = [("first sweep", out)] + [a.split("=", 1) for a in sys.argv[2:]]
 
-# (engine, instr) -> image -> row
-by = defaultdict(dict)
-for r in rows:
-    by[(r["engine"], r["instr"])][r["image"]] = r
+def load_rows(d):
+    rows = []
+    for path in glob.glob(os.path.join(d, "*.json")):
+        rows += json.load(open(path))
+    return rows
+
+def index(rows):
+    by = defaultdict(dict)
+    for r in rows:
+        by[(r["engine"], r["instr"])][r["image"]] = r
+    return by
+
+run_by = [(label, d, index(load_rows(d))) for label, d in runs]
+seen = {}
+for _, _, b in reversed(run_by):
+    for key, imgs in b.items():
+        for img, r in imgs.items():
+            seen.setdefault((key, img), r)
+rows = list(seen.values())
+# (engine, instr) -> image -> row, the latest word on each
+by = index(rows)
 native = defaultdict(dict)  # variant -> image -> (ns, verified, events)
 if os.path.exists(os.path.join(out, "native.txt")):
     for line in open(os.path.join(out, "native.txt")):
@@ -113,7 +130,31 @@ for k in ["block-ir", "block-ram", "insn-ir", "insn-ram"]:
         print(f"| {k} | {statistics.median(costs):.1f} | {statistics.median(evs):.0f} | {statistics.median(sites):.0f} |")
 print()
 
-# 5. Failures.
+# 5. Progress: the qcode-jit column of every run.
+if len(run_by) > 1:
+    print("## How the qcode-jit numbers moved (oldest first)\n")
+    print("| instrumentation | " + " | ".join(label for label, _, _ in run_by) + " |")
+    print("|---|" + "---:|" * len(run_by))
+    for k in kinds:
+        cells = []
+        for _, _, b in run_by:
+            ratios = []
+            fails_ = 0
+            for img in images:
+                a, c = b[("qcode-jit", "none")].get(img), b[("qcode-jit", k)].get(img)
+                if a and c and a["verified"] and c["verified"]:
+                    ratios.append(c["elapsed_ns"] / a["elapsed_ns"])
+                elif c and not c["verified"]:
+                    fails_ += 1
+            cells.append((f"{geomean(ratios):.2f}× (n={len(ratios)})" if ratios else "") + (f" {fails_} ✗" if fails_ else ""))
+        print(f"| {k} | " + " | ".join(cells) + " |")
+    print()
+    for label, d, b in run_by:
+        notes = open(os.path.join(d, "notes.txt")).read().strip() if os.path.exists(os.path.join(d, "notes.txt")) else ""
+        print(f"- {label}: {notes}" if notes else f"- {label}")
+    print()
+
+# 6. Failures.
 fails = [r for r in rows if not r["verified"]]
 if fails:
     print("## Runs that did not verify\n")
@@ -125,7 +166,7 @@ for v in native:
     if bad:
         print(f"- native {v} did not verify: {', '.join(bad)}")
 
-# 6. Full table.
+# 7. Full table.
 print("\n## Every run\n")
 print("| engine | instr | image | ms | host calls | events | sites | ok |")
 print("|---|---|---|---:|---:|---:|---:|---|")

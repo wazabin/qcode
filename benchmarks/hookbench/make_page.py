@@ -1,17 +1,45 @@
 #!/usr/bin/env python3
 """Builds the results page (HTML) from the sweep's JSON, native.txt and
-unicorn-py.txt. Usage: make_page.py <results dir> <out.html>"""
+unicorn-py.txt.
+
+Usage: make_page.py <results dir> <out.html> [<label>=<dir> ...]
+
+Each extra directory is a later run of part of the sweep, in order. Its
+rows replace the earlier ones for the same (engine, instrumentation,
+image) in the charts and tables, and every run keeps a column in the
+progress section, so the page shows how the numbers moved as well as
+where they stand. A run directory holds a `notes.txt` saying what changed
+before it, and `load.txt` from run-all.sh."""
 import glob, json, math, os, statistics, sys, html
 from collections import defaultdict
 
 res = sys.argv[1]
 out = sys.argv[2]
+runs = [("first sweep", res)] + [a.split("=", 1) for a in sys.argv[3:]]
+
+def load_rows(d):
+    rows = []
+    for p in glob.glob(os.path.join(d, "*.json")):
+        rows += json.load(open(p))
+    return rows
+
+def index(rows):
+    by = defaultdict(dict)
+    for r in rows:
+        by[(r["engine"], r["instr"])][r["image"]] = r
+    return by
+
+# Every run on its own, and the latest word on each row.
+run_by = [(label, d, index(load_rows(d))) for label, d in runs]
 rows = []
-for p in glob.glob(os.path.join(res, "*.json")):
-    rows += json.load(open(p))
-by = defaultdict(dict)
-for r in rows:
-    by[(r["engine"], r["instr"])][r["image"]] = r
+seen = {}
+for _, _, b in reversed(run_by):
+    for key, imgs in b.items():
+        for i, r in imgs.items():
+            if (key, i) not in seen:
+                seen[(key, i)] = r
+rows = list(seen.values())
+by = index(rows)
 native = defaultdict(dict)
 np_ = os.path.join(res, "native.txt")
 if os.path.exists(np_):
@@ -39,7 +67,7 @@ def gm(xs):
     xs = [x for x in xs if x and x > 0]
     return math.exp(sum(map(math.log, xs)) / len(xs)) if xs else None
 
-def slow(engine, k):
+def slow(engine, k, by=by):
     if engine == "native":
         nk = {"block-ir": "block", "block-cb": "block", "edge-ir": "edge", "cmp-ir": "cmp", "cmp-cb": "cmp", "watch-ir": "watch", "watch-cb": "watch"}.get(k)
         if not nk: return None, 0
@@ -61,7 +89,7 @@ def slow(engine, k):
             xs.append(b["elapsed_ns"] / a["elapsed_ns"])
     return gm(xs), len(xs)
 
-def per_call(engine, k):
+def per_call(engine, k, by=by):
     cs = []
     if engine == "unicorn-py":
         kk = {"block-cb": "block-cb", "insn-cb": "insn-cb", "watch-cb": "watch-cb", "watch-ir": "watch-cb"}.get(k)
@@ -150,6 +178,37 @@ for i in images:
     base_rows.append(c)
 
 fails = [r for r in rows if not r["verified"]]
+
+# ---- progress: the QCode JIT columns of every run, side by side
+def run_meta(d):
+    notes = open(os.path.join(d, "notes.txt")).read().strip() if os.path.exists(os.path.join(d, "notes.txt")) else ""
+    lines = open(os.path.join(d, "load.txt")).read().strip().splitlines() if os.path.exists(os.path.join(d, "load.txt")) else []
+    loads = [l.split("load average:")[1].strip().split(",")[0] for l in lines if "load average:" in l]
+    return notes, loads
+
+progress_head = ["instrumentation"] + [label for label, _, _ in run_by]
+progress_rows = []
+for k in KINDS:
+    cells = [LABEL.get(k, k)]
+    for _, _, b in run_by:
+        if ("qcode-jit", k) not in b:
+            cells.append("")
+            continue
+        v, n = slow("qcode-jit", k, b)
+        fail = sum(1 for r in b[("qcode-jit", k)].values() if not r["verified"])
+        cells.append((fmt_x(v) if v else "—") + (f" ({fail} ✗)" if fail else ""))
+    progress_rows.append(cells)
+for k in ["block-cb", "insn-cb", "watch-cb", "cmp-cb"]:
+    cells = [LABEL.get(k, k) + ", ns per callback"]
+    for _, _, b in run_by:
+        v, n = per_call("qcode-jit", k, b) if ("qcode-jit", k) in b else (None, 0)
+        cells.append(f"{v:.0f}" if v else "")
+    progress_rows.append(cells)
+progress_notes = []
+for label, d, b in run_by:
+    notes, loads = run_meta(d)
+    n_rows = sum(len(imgs) for imgs in b.values())
+    progress_notes.append(f"<li><b>{html.escape(label)}</b> — {n_rows} runs" + (f", load {html.escape(' → '.join(loads))}" if loads else "") + (f". {html.escape(notes)}" if notes else "") + "</li>")
 
 def table(head, body, cls="num"):
     t = ['<div class="scroll"><table class="' + cls + '"><thead><tr>' + "".join(f"<th>{html.escape(h)}</th>" for h in head) + "</tr></thead><tbody>"]
@@ -250,9 +309,14 @@ code {{ font-family: "IBM Plex Mono", monospace; font-size: .9em; }}
 <li><b>Sites are not the same across engines.</b> QCode's block is the lifted block after absorption, which is the guest's basic block; its comparison site is every integer comparison in the p-code, which on x86 includes every flag computation, so <code>cmp-*</code> instruments an order of magnitude more sites than Unicorn's <code>cmp</code>-instruction hook. Counts are in the full table.</li>
 <li><b>The write watch</b> covers 32 bytes at the start of each image's writable segment; the number of hits varies from none to hundreds of thousands per image, and the per-hit cost is what the second chart isolates.</li>
 <li><b>Why the callback is expensive under QCode.</b> A callback is a machine stop: compiled code exits, the interpreter describes the interrupt, the table dispatches, the machine resumes and compiled code is re-entered. Three accidental costs in that path were removed while building this benchmark (a diagnostic string rendered per stop, an O(n) walk to find the position, a rebuilt instruction list per block); what remains is the design. Under icicle the callback is a native call from JIT code; under Unicorn a C call from TCG code.</li>
-<li><b>Two limitations found on the way.</b> Re-entering compiled code in the middle of an instruction's p-code, which a store hook needs, produced wrong state on two images; the VM now finishes such a block in the interpreter, which is why <code>watch-cb</code> is the slow QCode column. An interrupt before every comparison (<code>cmp-cb</code>) still fails on crc32 with an interpreter value error and is reported as a failure below.</li>
+<li><b>Two limitations found on the way, and what they were.</b> In the first sweep, re-entering compiled code in the middle of an instruction's p-code, which a store hook needs, produced wrong state on two images, so the VM finished such a block in the interpreter and <code>watch-cb</code> was the slow QCode column; and an interrupt before every comparison (<code>cmp-cb</code>) failed on every image with an interpreter value error. Both had one cause: the JIT validated its cache of compiled blocks by block id and instruction count, and a block the VM empties and lifts again from the same bytes has as many instructions as before under new ids, so the cache went on serving code whose imports read the interpreter's value table at slots nothing had written since the block's previous life. Blocks now carry a revision stamp that every edit moves, the cache is keyed on it, and compiled code is resumed from anywhere in a block. The progress table below has the columns before and after.</li>
 <li><b>The native comparison is a floor, not a peer.</b> The compiler instruments from source; the emulators instrument a binary. Patching a binary to get the same counters — finding sites, making room, preserving flags and registers — is the work the hook layer does away with, and the point of the compiled column is that it does so at a cost in the same order as the compiler's own.</li>
 </ul>
+
+<h2>How the numbers moved</h2>
+<p>The QCode JIT column of each sweep, oldest first. Earlier runs are kept as they were measured; the charts and tables above use the latest run of each row.</p>
+{table(progress_head, progress_rows)}
+<ul>{"".join(progress_notes)}</ul>
 
 <h2>Runs that did not verify</h2>
 {("<ul>" + "".join(f"<li class='bad'>{html.escape(r['engine'])} · {html.escape(r['instr'])} · {html.escape(r['image'])}: <code>{html.escape(r['exit'][:120])}</code></li>" for r in fails) + "</ul>") if fails else "<p>Every run verified.</p>"}

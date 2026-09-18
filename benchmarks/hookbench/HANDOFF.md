@@ -125,15 +125,28 @@ includes translation. The page says so; the article should too.
 - Unicorn's `until` needs the sentinel page mapped; icicle reports the
   sentinel as an ExecViolation; QCode as `Unlifted` at the sentinel.
 
+## Done since: the JIT cache (2026-09-18, later)
+
+Steps 1 and 2 below had one cause, found by tracing the store callbacks
+under both engines (`HOOKBENCH_TRACE=1`) to the first divergence: the JIT
+validated its block cache by block id and instruction count, and a block
+the VM empties and lifts again from the same bytes has as many
+instructions as before under new ids. The cached code imported the stack
+pointer from the block's previous life. Commit `c83141b`: every function
+body stamps a block with a fresh revision on any edit to its instructions
+(`BasicBlock::revision`, bumped by the link verbs and the operand
+replacers in `core/src/value/function.rs`), the JIT keys both caches on
+it, and `Vm::resume` offers the executor the rest of the block from
+anywhere. `watch-cb` and `cmp-cb` verify on all 17 images under the JIT;
+edn's `watch-cb` run went from 2.1 s to 0.56 s. The re-measured QCode JIT
+rows are in `target/results-fix1` (with a `notes.txt`); `make_page.py`
+and `report.py` take later runs as `label=dir` arguments and show every
+run side by side in a progress section, so the page keeps its history.
+
 ## Potential next steps
 
-1. **Fix the JIT's mid-instruction re-entry** (`jit/src/compile.rs`
-   `translate_body` with `start > 0`, and `jit/src/jit.rs` imports). Then drop
-   the boundary rule in `Vm::resume` and re-measure `watch-cb`, which is
-   currently the interpreter's cost.
-2. **Diagnose `cmp-cb`.** Start from the interpreter's `ValueError(0)` sites
-   in `emulator/src/concrete.rs` (array-typed loads) and the IR dump
-   (`HOOKBENCH_DUMP=file`).
+1. ~~Fix the JIT's mid-instruction re-entry~~ — done, see above.
+2. ~~Diagnose `cmp-cb`~~ — same bug, done.
 3. **Dynamic offsets into flat spaces in the JIT**, bounds-checked, so the
    edge map and the compare log can leave guest RAM. Icicle's trace store does
    this; it would bring `edge-ir` from 1.55× toward 1.1×.
