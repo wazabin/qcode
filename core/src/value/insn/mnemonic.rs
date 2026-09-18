@@ -761,6 +761,16 @@ impl Mnemonic {
         visit_operands!(self, f, mut);
     }
 
+    /// This mnemonic with every operand replaced by `f` of it, in canonical
+    /// order. For a mnemonic being rebuilt in another body — a cached
+    /// instruction replayed with its operands renumbered — which is why it
+    /// takes the mnemonic by value: an installed instruction's operands are
+    /// mirrored by use edges, and only its body may change those.
+    pub fn map_operands(mut self, mut f: impl FnMut(LocalValueId) -> LocalValueId) -> Self {
+        self.for_each_operand_mut(|operand| *operand = f(*operand));
+        self
+    }
+
     /// How many operands this mnemonic has.
     pub fn operand_count(&self) -> usize {
         let mut count = 0;

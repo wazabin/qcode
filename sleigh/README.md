@@ -4,6 +4,14 @@ High-performance adapter from decoded `wazabin-sleigh` instructions to QCode.
 
 It consumes `Instruction::pcode_ops()`—the flat, Ghidra-style p-code sequence—rather than the SLEIGH source AST. `SleighLifter` caches the specification-derived QCode context (spaces, registers, and user operations); reuse its indexed lifting API and one `AddressIndex` for a full lifting session.
 
+## Memoized lifting
+
+`cache::LiftCache` remembers what each encoding lowered to and replays it at
+any address; scratch sessions serve a hit without decoding or lowering. The
+module documentation explains how exactness is measured, and
+`examples/lift-throughput.rs` measures a binary's `.text` with and without
+it (`--cache`, `--validate`).
+
 ## Binit/Aegis differential tests
 
 `tests/binit.rs` replays Binit's Aegis-generated x86-64 input/output states through the embedded x86-64 specification from `sleigh-precompile`, this lifter, and `qcode_emulator`. Database tests are ignored unless explicitly requested:
