@@ -19,8 +19,10 @@ import sys
 ID_LINE = re.compile(r"^(?P<id>[^\s/]+/\S+)\s*(?:time:\s*\[(?P<time>[^\]]*)\])?$")
 TIME_LINE = re.compile(r"^\s+time:\s*\[(?P<time>[^\]]*)\]")
 # `change: [−45.623% −44.868% −44.130%] (p = 0.00 < 0.05)`; Criterion writes a
-# Unicode minus.
-CHANGE_LINE = re.compile(r"^\s+change:\s*\[[^\s\]]+\s+(?P<change>[^\s\]]+)\s+[^\s\]]+\]")
+# Unicode minus. A group with a throughput has `change:` on its own line, and
+# the change as a `time:` line under it, next to the throughput's.
+CHANGE_LINE = re.compile(r"^\s+change:\s*\[(?P<change>[^\]]*)\]")
+CHANGE_HEAD = re.compile(r"^\s+change:\s*$")
 VERDICTS = {
     "Performance has improved.": "improved",
     "Performance has regressed.": "regressed",
@@ -32,23 +34,35 @@ VERDICTS = {
 def parse(lines):
     """Yield `(id, time, change, verdict)` per benchmark, in output order."""
     current = None
+    under_change = False
     for line in lines:
         line = line.rstrip("\n")
         if match := ID_LINE.match(line):
             if current:
                 yield current
             current = [match["id"], match["time"], None, None]
+            under_change = False
             continue
         if not current:
             continue
-        if match := TIME_LINE.match(line):
-            current[1] = match["time"]
+        if CHANGE_HEAD.match(line):
+            under_change = True
         elif match := CHANGE_LINE.match(line):
-            current[2] = match["change"].replace("−", "-")
+            current[2] = middle(match["change"])
+        elif match := TIME_LINE.match(line):
+            if under_change:
+                current[2] = middle(match["time"])
+            else:
+                current[1] = match["time"]
         elif (verdict := VERDICTS.get(line.strip())) is not None:
             current[3] = verdict
     if current:
         yield current
+
+
+def middle(change):
+    """The point estimate of `[lower point upper]`, in ASCII."""
+    return change.split()[1].replace("−", "-")
 
 
 def estimate(time):
