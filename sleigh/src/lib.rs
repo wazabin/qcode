@@ -65,7 +65,7 @@ use qcode::{
         BlockId, FunctionBody, FunctionId, InstructionId, QCodeView, Renameable, TempId, Value,
         ValueId,
         insn::{Callee, PCodeOpId},
-        varnode::{Varnode as QcodeVarnode, VarnodeId},
+        varnode::Varnode as QcodeVarnode,
     },
 };
 use rustc_hash::FxHashMap as HashMap;
@@ -260,7 +260,6 @@ pub struct SleighLifter<'spec> {
     /// builds and required of every one it lowers into.
     architecture: ArchitectureId,
     base: Context<'static>,
-    storage: HashMap<Varnode, VarnodeId>,
     unique_space: SpaceId,
     flat_control_flow: bool,
 }
@@ -317,7 +316,6 @@ impl<'spec> SleighLifter<'spec> {
             }
         }
 
-        let mut storage = HashMap::default();
         for register in spec.registers() {
             let id = QcodeVarnode::make(
                 &mut base,
@@ -329,17 +327,12 @@ impl<'spec> SleighLifter<'spec> {
             .expect("SLEIGH register names are unique")
             .id;
             base.shared.registers.insert(register.id, id);
-            storage.insert(
-                Varnode::new(register.space(), register.offset() as u64, register.size()),
-                id,
-            );
         }
 
         Self {
             spec,
             architecture,
             base,
-            storage,
             unique_space,
             flat_control_flow: false,
         }
@@ -554,7 +547,7 @@ impl<'spec> SleighLifter<'spec> {
         Ok(FlatEmitter::new(
             next,
             construction.emitter(),
-            &self.storage,
+            self.spec,
             self.unique_space,
             workspace,
             address,
@@ -746,8 +739,9 @@ struct FlatEmitter<'spec, 'str, 'ctx> {
     /// instruction's blocks and exits at the operations that open and take
     /// them — before `flat` decides what they lower to.
     builder: Emitter<'ctx, 'str>,
-    /// Immutable architectural register locations, shared by every instruction.
-    base_storage: &'spec HashMap<Varnode, VarnodeId>,
+    /// The specification, which names the register a varnode is; the
+    /// context maps that register to its varnode.
+    spec: &'spec CompiledSpec,
     /// SLEIGH's unique space, whose varnodes are instruction-local.
     unique_space: SpaceId,
     /// Per-instruction unique-space locations. Unlike register locations these
@@ -780,7 +774,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
     fn new(
         next: BlockId,
         builder: Emitter<'ctx, 'str>,
-        base_storage: &'spec HashMap<Varnode, VarnodeId>,
+        spec: &'spec CompiledSpec,
         unique_space: SpaceId,
         mut workspace: Workspace,
         address: u64,
@@ -794,7 +788,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         );
         Self {
             builder,
-            base_storage,
+            spec,
             unique_space,
             unique_storage: workspace.unique_storage,
             dirty: workspace.dirty,
@@ -971,10 +965,12 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         Ok(self.builder.ensure_local(value))
     }
 
-    /// Resolves an architectural varnode's QCode location.
+    /// Resolves an architectural varnode's QCode location: the specification
+    /// says which register it is, the context which varnode that register has.
     fn base_storage(&self, varnode: Varnode) -> Result<ValueId, LiftError> {
-        self.base_storage
-            .get(&varnode)
+        self.spec
+            .register_at(varnode)
+            .and_then(|register| self.builder.shr().registers.get(&register))
             .copied()
             .map(ValueId::Varnode)
             .ok_or(LiftError::UnknownVarnode(varnode))

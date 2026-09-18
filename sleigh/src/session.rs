@@ -35,7 +35,7 @@ use qcode::{
         insn::{Callee, Mnemonic},
     },
 };
-use sleigh::{ContextBytes, ContextError, Instruction};
+use sleigh::{CompiledSpec, ContextBytes, ContextError, Instruction, RegisterId, RegisterSlice};
 
 use crate::{FlatPcode, LiftError, SleighLifter, decode::FixedDecoder};
 
@@ -341,6 +341,10 @@ impl<'s, 'l, 'spec, 'b> ScratchLifted<'s, 'l, 'spec, 'b> {
         self.session.store.context()
     }
 
+    fn spec(&self) -> &'spec CompiledSpec {
+        self.session.lifter.spec()
+    }
+
     /// The decoded instruction: its text, operands and effects, without a
     /// second decode.
     pub fn decoded(&self) -> &Instruction<'spec, 'b> {
@@ -365,6 +369,7 @@ impl<'s, 'l, 'spec, 'b> ScratchLifted<'s, 'l, 'spec, 'b> {
             exit,
             site: ScratchInsn {
                 ctx: self.ctx(),
+                spec: self.spec(),
                 id: exit.site(),
             },
         })
@@ -374,6 +379,7 @@ impl<'s, 'l, 'spec, 'b> ScratchLifted<'s, 'l, 'spec, 'b> {
     pub fn entry(&self) -> ScratchBlock<'_> {
         ScratchBlock {
             ctx: self.ctx(),
+            spec: self.spec(),
             id: self.lifted.entry(),
         }
     }
@@ -382,6 +388,7 @@ impl<'s, 'l, 'spec, 'b> ScratchLifted<'s, 'l, 'spec, 'b> {
     pub fn blocks(&self) -> impl Iterator<Item = ScratchBlock<'_>> + '_ {
         self.lifted.blocks().iter().map(|&id| ScratchBlock {
             ctx: self.ctx(),
+            spec: self.spec(),
             id,
         })
     }
@@ -433,6 +440,7 @@ impl ScratchOperand<'_> {
 #[derive(Clone, Copy)]
 pub struct ScratchVarnode<'v> {
     ctx: &'v Context<'static>,
+    spec: &'v CompiledSpec,
     id: VarnodeId,
 }
 
@@ -451,7 +459,7 @@ impl std::fmt::Debug for ScratchVarnode<'_> {
     }
 }
 
-impl ScratchVarnode<'_> {
+impl<'v> ScratchVarnode<'v> {
     /// The id the varnode has in the module — architecture-defined, so it is
     /// the same in every scratch epoch, and usable as a key.
     pub fn id(&self) -> VarnodeId {
@@ -472,6 +480,28 @@ impl ScratchVarnode<'_> {
 
     pub fn name(&self) -> Option<&str> {
         Varnode::from_id(self.ctx, self.id).name()
+    }
+
+    /// The location as SLEIGH names it: space, offset and size.
+    pub fn varnode(&self) -> sleigh::Varnode {
+        let v = Varnode::from_id(self.ctx, self.id);
+        sleigh::Varnode::new(v.space().id, v.address() as u64, v.size())
+    }
+
+    /// This location as a slice of the widest architectural register that
+    /// wholly contains it, keyed by [`RegisterId`] — what the
+    /// specification's generated constants are
+    /// (`sleigh_precompile::x64::regs::RAX`). `None` for a location no
+    /// register contains, which includes every varnode outside a register
+    /// space. See [`CompiledSpec::enclosing_register`].
+    pub fn enclosing_register(&self) -> Option<RegisterSlice> {
+        self.spec.enclosing_register(self.varnode())
+    }
+
+    /// Every architectural register sharing a byte with this location, in
+    /// offset order. See [`CompiledSpec::overlapping_registers`].
+    pub fn overlapping_registers(&self) -> impl Iterator<Item = RegisterId> + 'v {
+        self.spec.overlapping_registers(self.varnode())
     }
 }
 
@@ -506,6 +536,7 @@ impl<'v> ScratchExit<'v> {
 #[derive(Clone, Copy)]
 pub struct ScratchBlock<'v> {
     ctx: &'v Context<'static>,
+    spec: &'v CompiledSpec,
     id: BlockId,
 }
 
@@ -547,11 +578,13 @@ impl<'v> ScratchBlock<'v> {
     /// The block's instructions in order.
     pub fn instructions(&self) -> impl Iterator<Item = ScratchInsn<'v>> + 'v {
         let ctx = self.ctx;
+        let spec = self.spec;
         let func = self.id.func;
         ctx.body(func)
             .insn_ids(self.id.local)
             .map(move |local| ScratchInsn {
                 ctx,
+                spec,
                 id: InstructionId::new(func, local),
             })
     }
@@ -562,6 +595,7 @@ impl<'v> ScratchBlock<'v> {
 #[derive(Clone, Copy)]
 pub struct ScratchInsn<'v> {
     ctx: &'v Context<'static>,
+    spec: &'v CompiledSpec,
     id: InstructionId,
 }
 
@@ -619,11 +653,14 @@ impl<'v> ScratchInsn<'v> {
                     size: self.ctx.shared.types.size_of(literal.type_id),
                 }
             }
-            LocalValueId::Varnode(id) => {
-                ScratchOperand::Varnode(ScratchVarnode { ctx: self.ctx, id })
-            }
+            LocalValueId::Varnode(id) => ScratchOperand::Varnode(ScratchVarnode {
+                ctx: self.ctx,
+                spec: self.spec,
+                id,
+            }),
             LocalValueId::Instruction(local) => ScratchOperand::Result(ScratchInsn {
                 ctx: self.ctx,
+                spec: self.spec,
                 id: InstructionId::new(self.id.func, local),
             }),
             LocalValueId::Temp(temp) => ScratchOperand::Temp(temp),
@@ -639,6 +676,7 @@ impl<'v> ScratchInsn<'v> {
             .expect("a scratch instruction is in a block");
         ScratchBlock {
             ctx: self.ctx,
+            spec: self.spec,
             id: block.id,
         }
     }
@@ -646,6 +684,7 @@ impl<'v> ScratchInsn<'v> {
     fn block_view(&self, local: qcode::value::LocalBlockId) -> ScratchBlock<'v> {
         ScratchBlock {
             ctx: self.ctx,
+            spec: self.spec,
             id: BlockId::new(self.id.func, local),
         }
     }
