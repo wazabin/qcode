@@ -187,6 +187,44 @@ the median image 1.5×), not the store path. The page and `RESULTS.md`
 carry the fix2 column; the chart rows for the hook-space edge map and
 compare log stay empty until a quiet wall-clock run (step 8).
 
+## Done since: the growing-block cost (2026-09-21, later)
+
+Asked why the compiled block counter sat at 1.14× where icicle's is
+1.04×: the geomean was carried by nettle-sha256 at 3.07× (every other
+image 1.02–1.12×). perf showed 56% of that run walking the interpreter's
+instruction list. Straight-line code is discovered an instruction at a
+time, each absorbed into the block being run, and the injectors are
+offered the block after every absorption; sha256's compression is one
+block of ~10k p-code ops, offered ~2,200 times, and each offer (a)
+dropped the interpreter's list unconditionally in `Vm::inject`, so the
+next step walked back to position ~9,900, and (b) had the hook's
+`addresses()`/`stores()`/`compares()` walk the whole block. Both
+quadratic in the block's length. Commit `085e89a`: `inject` reports
+whether the block's revision moved and the list is dropped only then
+(the absorption path lets `resume_after` extend it from the tail);
+`HookInjector` keeps a per-block frontier and offers the block from its
+successor (`BlockView::since`; ids are never reused). Test: a
+65-instruction run offers a hook ≤ 195 sites, where it offered 2,145.
+`HOOKBENCH_DECLINES=1` (`57ad395`) lists what a fresh JIT declines.
+
+`target/results-fix3`: every QCode JIT row, still on a loaded machine
+(load 11 → 4), so read the instruction column:
+
+| kind | fix1, wall (quiet) | fix3, instructions |
+|---|---:|---:|
+| block-ir | 1.14× | 1.03× |
+| insn-ir | 1.20× | 1.05× |
+| edge-ir | (1.52× in RAM) | 1.08× |
+| watch-ir | 1.58× | 1.37× |
+| cmp-ir | (6.39× in RAM) | 1.99× |
+
+The worst image for the counters is now 1.05–1.06×. What is left on
+`cmp-ir` for sha256 (8.6× in instructions) is Cranelift compiling a
+300k-op function — `regalloc2::domtree::merge_sets` — once; a cap on
+compiled block size, or splitting huge blocks, would be the fix, and is
+not a hook-layer matter. The chart rows still await a quiet wall-clock
+run; the load was 3.7 when this was written.
+
 ## Potential next steps
 
 1. ~~Fix the JIT's mid-instruction re-entry~~ — done, see above.
@@ -213,7 +251,7 @@ compare log stay empty until a quiet wall-clock run (step 8).
 
 ## Where things are
 
-- Worktree: `~/dev/vm/qcode-suite` (branch `emulator-suite`, 27 commits over
+- Worktree: `~/dev/vm/qcode-suite` (branch `emulator-suite`, 30 commits over
   main).
 - Harness: `benchmarks/hookbench/`; results in `target/results/`
   (untracked), tables in `RESULTS.md`, page generator `make_page.py`.

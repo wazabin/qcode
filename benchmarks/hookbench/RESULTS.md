@@ -59,25 +59,26 @@
 
 ## How the qcode-jit numbers moved (oldest first)
 
-| instrumentation | first sweep | fix1 | fix2 (CPU time, insns) |
-|---|---:|---:|---:|
-| block-ir | 1.26× (n=17) | 1.14× (n=17) |  |
-| block-ram | 1.41× (n=17) | 1.31× (n=17) |  |
-| block-cb | 5.47× (n=17) | 5.32× (n=17) |  |
-| insn-ir | 1.33× (n=17) | 1.20× (n=17) |  |
-| insn-ram | 1.85× (n=17) | 1.69× (n=17) |  |
-| insn-cb | 14.69× (n=17) | 13.51× (n=17) |  |
-| edge-ir |  |  | 1.12× (n=17) (1.14× insns) |
-| edge-ram | 1.55× (n=17) | 1.52× (n=17) | 1.48× (n=17) (1.35× insns) |
-| watch-ir | 1.71× (n=17) | 1.58× (n=17) |  |
-| watch-cb | 11.33× (n=17) | 3.20× (n=17) |  |
-| cmp-ir |  |  | 2.52× (n=17) (2.14× insns) |
-| cmp-ram | 6.91× (n=17) | 6.39× (n=17) | 4.08× (n=17) (5.01× insns) |
-| cmp-cb | 14.55× (n=1) 16 ✗ | 88.12× (n=17) |  |
+| instrumentation | first sweep | fix1 | fix2 (CPU time, insns) | fix3 (CPU time, insns) |
+|---|---:|---:|---:|---:|
+| block-ir | 1.26× (n=17) | 1.14× (n=17) |  | 1.01× (n=17) (1.03× insns) |
+| block-ram | 1.41× (n=17) | 1.31× (n=17) |  | 1.22× (n=17) (1.14× insns) |
+| block-cb | 5.47× (n=17) | 5.32× (n=17) |  | 5.26× (n=17) (3.60× insns) |
+| insn-ir | 1.33× (n=17) | 1.20× (n=17) |  | 1.07× (n=17) (1.05× insns) |
+| insn-ram | 1.85× (n=17) | 1.69× (n=17) |  | 1.61× (n=17) (1.43× insns) |
+| insn-cb | 14.69× (n=17) | 13.51× (n=17) |  | 15.30× (n=17) (9.71× insns) |
+| edge-ir |  |  | 1.12× (n=17) (1.14× insns) | 1.73× (n=17) (1.08× insns) |
+| edge-ram | 1.55× (n=17) | 1.52× (n=17) | 1.48× (n=17) (1.35× insns) | 2.01× (n=17) (1.29× insns) |
+| watch-ir | 1.71× (n=17) | 1.58× (n=17) |  | 3.07× (n=17) (1.37× insns) |
+| watch-cb | 11.33× (n=17) | 3.20× (n=17) |  | 3.76× (n=17) (2.58× insns) |
+| cmp-ir |  |  | 2.52× (n=17) (2.14× insns) | 2.59× (n=17) (1.99× insns) |
+| cmp-ram | 6.91× (n=17) | 6.39× (n=17) | 4.08× (n=17) (5.01× insns) | 6.75× (n=17) (4.81× insns) |
+| cmp-cb | 14.55× (n=1) 16 ✗ | 88.12× (n=17) |  | 96.10× (n=17) (73.49× insns) |
 
 - first sweep
 - fix1: After the JIT cache fix (commit c83141b): blocks carry a revision stamp, the cache is keyed on it, and compiled code is resumed from anywhere in a block. Only the QCode JIT was re-run; the other engines are unchanged.
 - fix2: After bounded hook spaces (commit c3ad0a6): the edge map and the compare log leave guest RAM for a flat space the JIT indexes by a computed offset, one compare against the bound per access. edge-ir and cmp-ir are the hook-space versions; edge-ram and cmp-ram are what the earlier runs' edge-ir and cmp-ir measured. Only the QCode JIT was re-run, on these kinds and the baseline. The machine was loaded (see the load), so this run is timed by thread CPU time rather than the wall clock and is kept out of the charts; retired user instructions, which the load does not move, are given in parentheses.
+- fix3: After the growing-block fix (commit 085e89a): a block offered to the injectors after each absorbed instruction no longer costs a rebuild of the interpreter's list, nor a walk of the whole block by the hook. Every QCode JIT row re-run, still on a loaded machine: CPU time, with retired user instructions beside it.
 
 ## Runs that did not verify
 
