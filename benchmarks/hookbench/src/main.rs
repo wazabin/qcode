@@ -41,23 +41,28 @@ pub enum Instr {
     InsnRam,
     /// A host callback before every guest instruction.
     InsnCb,
-    /// An AFL-style edge map in guest memory, as IR at every block entry.
+    /// An AFL-style edge map in a bounded hook space, as IR at every block
+    /// entry.
     EdgeIr,
+    /// The same map kept in guest RAM, through the MMU.
+    EdgeRam,
     /// Stores to a 64-byte range: the range check as IR, the host only on a
     /// hit.
     WatchIr,
     /// Stores to a 64-byte range: the host at every store, checking the
     /// range itself.
     WatchCb,
-    /// Every integer comparison's operands logged to a ring buffer in guest
-    /// memory, as IR.
+    /// Every integer comparison's operands logged to a ring buffer in a
+    /// bounded hook space, as IR.
     CmpIr,
+    /// The same log kept in guest RAM, through the MMU.
+    CmpRam,
     /// Every integer comparison's operands handed to the host.
     CmpCb,
 }
 
 impl Instr {
-    pub const ALL: [Instr; 12] = [
+    pub const ALL: [Instr; 14] = [
         Instr::None,
         Instr::BlockIr,
         Instr::BlockRam,
@@ -66,9 +71,11 @@ impl Instr {
         Instr::InsnRam,
         Instr::InsnCb,
         Instr::EdgeIr,
+        Instr::EdgeRam,
         Instr::WatchIr,
         Instr::WatchCb,
         Instr::CmpIr,
+        Instr::CmpRam,
         Instr::CmpCb,
     ];
     pub fn name(self) -> &'static str {
@@ -81,9 +88,11 @@ impl Instr {
             Instr::InsnRam => "insn-ram",
             Instr::InsnCb => "insn-cb",
             Instr::EdgeIr => "edge-ir",
+            Instr::EdgeRam => "edge-ram",
             Instr::WatchIr => "watch-ir",
             Instr::WatchCb => "watch-cb",
             Instr::CmpIr => "cmp-ir",
+            Instr::CmpRam => "cmp-ram",
             Instr::CmpCb => "cmp-cb",
         }
     }

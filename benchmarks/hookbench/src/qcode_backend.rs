@@ -4,7 +4,7 @@
 
 use std::{cell::Cell, rc::Rc};
 
-use qcode::value::insn::IntBinop;
+use qcode::value::{ValueId, insn::IntBinop};
 use qcode_jit::Jit;
 use qcode_userland::bare;
 use qcode_vm::{
@@ -14,7 +14,7 @@ use qcode_vm::{
 
 use crate::{Instr, Outcome, WATCH_LEN, elf};
 
-/// Guest memory the compiled instrumentation keeps its state in.
+/// Guest memory the `-ram` instrumentation keeps its state in.
 const SCRATCH: u64 = 0x7ff0_0000;
 const SCRATCH_SIZE: u64 = 0x30000;
 /// A 64-bit counter.
@@ -29,6 +29,18 @@ const EDGE_MASK: u64 = 0xffff;
 /// 4096 entries of (lhs, rhs).
 const CMP_LOG: u64 = SCRATCH + 0x11000;
 const CMP_MASK: u64 = 0xfff;
+
+/// The `-ir` instrumentation's state lives in flat hook spaces instead: the
+/// counters in the machine's own, and the map and the log in bounded spaces
+/// laid out like the guest-memory ones — a header word, then the table.
+const EDGES: &str = "edges";
+const EDGES_PREV: u64 = 0;
+const EDGES_MAP: u64 = 8;
+const EDGES_LEN: usize = EDGES_MAP as usize + EDGE_MASK as usize + 1;
+const CMPS: &str = "cmps";
+const CMPS_IDX: u64 = 0;
+const CMPS_LOG: u64 = 16;
+const CMPS_LEN: usize = CMPS_LOG as usize + (CMP_MASK as usize + 1) * 16;
 
 /// Interrupt code the raw injector hooks stop with.
 const CODE: u64 = 7;
@@ -87,8 +99,43 @@ impl Hook for CounterIr {
     }
 }
 
+/// Where a hook's state lives, and how it is reached: guest RAM through the
+/// machine's loads and stores, or a flat hook space through its own.
+#[derive(Clone, Copy)]
+enum Store {
+    Ram,
+    Space(&'static str),
+}
+
+impl Store {
+    fn load(self, emit: &mut Emitter<'_>, p: ValueId, size: usize) -> ValueId {
+        match self {
+            Store::Ram => emit.load(p, size),
+            Store::Space(name) => {
+                let space = emit.state_space(name);
+                emit.load_from(space, p, size)
+            }
+        }
+    }
+    fn store(self, emit: &mut Emitter<'_>, value: ValueId, p: ValueId) {
+        match self {
+            Store::Ram => {
+                emit.store(value, p);
+            }
+            Store::Space(name) => {
+                let space = emit.state_space(name);
+                emit.store_to(space, value, p);
+            }
+        }
+    }
+}
+
 /// AFL's edge map: `map[(cur ^ prev) & MASK] += 1; prev = cur >> 1`.
-struct EdgeIr;
+struct EdgeIr {
+    store: Store,
+    prev: u64,
+    map: u64,
+}
 
 impl Hook for EdgeIr {
     fn sites(&mut self, block: &BlockView<'_>) -> Vec<Site> {
@@ -98,20 +145,20 @@ impl Hook for EdgeIr {
         let Site::BlockEntry { address, .. } = site else { return };
         // A block id from its address, spread over the map.
         let cur = ((address >> 4) ^ (address >> 12) ^ (address * 0x9e37_79b9)) & EDGE_MASK;
-        let prev_p = emit.constant(PREV, 8);
-        let prev = emit.load(prev_p, 8);
+        let prev_p = emit.constant(self.prev, 8);
+        let prev = self.store.load(emit, prev_p, 8);
         let cur_v = emit.constant(cur, 8);
         let idx = emit.binop(IntBinop::Xor, prev, cur_v);
         let mask = emit.constant(EDGE_MASK, 8);
         let idx = emit.binop(IntBinop::And, idx, mask);
-        let base = emit.constant(EDGE_MAP, 8);
+        let base = emit.constant(self.map, 8);
         let p = emit.binop(IntBinop::Add, base, idx);
-        let b = emit.load(p, 1);
+        let b = self.store.load(emit, p, 1);
         let one = emit.constant(1, 1);
         let b1 = emit.binop(IntBinop::Add, b, one);
-        emit.store(b1, p);
+        self.store.store(emit, b1, p);
         let next = emit.constant(cur >> 1, 8);
-        emit.store(next, prev_p);
+        self.store.store(emit, next, prev_p);
     }
 }
 
@@ -145,8 +192,12 @@ impl Hook for CmpCb {
     }
 }
 
-/// Every comparison's operands appended to a ring buffer in guest memory.
-struct CmpLogIr;
+/// Every comparison's operands appended to a ring buffer.
+struct CmpLogIr {
+    store: Store,
+    idx: u64,
+    log: u64,
+}
 
 impl Hook for CmpLogIr {
     fn sites(&mut self, block: &BlockView<'_>) -> Vec<Site> {
@@ -156,21 +207,21 @@ impl Hook for CmpLogIr {
         let Some((_, lhs, rhs)) = emit.binop_operands() else { return };
         let lhs = emit.zext(lhs, 8);
         let rhs = emit.zext(rhs, 8);
-        let idx_p = emit.constant(CMP_IDX, 8);
-        let idx = emit.load(idx_p, 8);
+        let idx_p = emit.constant(self.idx, 8);
+        let idx = self.store.load(emit, idx_p, 8);
         let four = emit.constant(4, 8);
         let off = emit.binop(IntBinop::ShiftLeft, idx, four);
-        let base = emit.constant(CMP_LOG, 8);
+        let base = emit.constant(self.log, 8);
         let p = emit.binop(IntBinop::Add, base, off);
-        emit.store(lhs, p);
+        self.store.store(emit, lhs, p);
         let eight = emit.constant(8, 8);
         let p8 = emit.binop(IntBinop::Add, p, eight);
-        emit.store(rhs, p8);
+        self.store.store(emit, rhs, p8);
         let one = emit.constant(1, 8);
         let idx1 = emit.binop(IntBinop::Add, idx, one);
         let mask = emit.constant(CMP_MASK, 8);
         let idx1 = emit.binop(IntBinop::And, idx1, mask);
-        emit.store(idx1, idx_p);
+        self.store.store(emit, idx1, idx_p);
     }
 }
 
@@ -178,6 +229,20 @@ fn read_u64(vm: &Vm<wazabin_qcode_sleigh::vm_source::SleighCodeSource<'static>>,
     let mut b = [0u8; 8];
     vm.memory().mmu.read(at, &mut b).expect("scratch is mapped");
     u64::from_le_bytes(b)
+}
+
+/// `size` bytes at `at` in the hook space `name`.
+fn read_space(
+    vm: &Vm<wazabin_qcode_sleigh::vm_source::SleighCodeSource<'static>>,
+    name: &str,
+    at: u64,
+    size: usize,
+) -> Vec<u8> {
+    let space = vm.context().try_get_space(name).expect("the hook space exists");
+    vm.memory()
+        .flat()
+        .read_bytes(qcode::space::MemorySpaceId::Shared(space), at, size)
+        .expect("the hook space is readable")
 }
 
 pub fn run(image: &[u8], jit: bool, instr: Instr) -> Outcome {
@@ -203,8 +268,16 @@ pub fn run(image: &[u8], jit: bool, instr: Instr) -> Outcome {
         Instr::BlockRam => vm.add_hook(counted(Box::new(CounterIr { per_instruction: false, flat: false }))),
         Instr::InsnIr => vm.add_hook(counted(Box::new(CounterIr { per_instruction: true, flat: true }))),
         Instr::InsnRam => vm.add_hook(counted(Box::new(CounterIr { per_instruction: true, flat: false }))),
-        Instr::EdgeIr => vm.add_hook(counted(Box::new(EdgeIr))),
-        Instr::CmpIr => vm.add_hook(counted(Box::new(CmpLogIr))),
+        Instr::EdgeIr => {
+            vm.state_space(EDGES, EDGES_LEN).expect("the edge space is made");
+            vm.add_hook(counted(Box::new(EdgeIr { store: Store::Space(EDGES), prev: EDGES_PREV, map: EDGES_MAP })));
+        }
+        Instr::EdgeRam => vm.add_hook(counted(Box::new(EdgeIr { store: Store::Ram, prev: PREV, map: EDGE_MAP }))),
+        Instr::CmpIr => {
+            vm.state_space(CMPS, CMPS_LEN).expect("the compare space is made");
+            vm.add_hook(counted(Box::new(CmpLogIr { store: Store::Space(CMPS), idx: CMPS_IDX, log: CMPS_LOG })));
+        }
+        Instr::CmpRam => vm.add_hook(counted(Box::new(CmpLogIr { store: Store::Ram, idx: CMP_IDX, log: CMP_LOG }))),
         Instr::WatchCb => vm.add_hook(counted(Box::new(StoreCb))),
         Instr::CmpCb => vm.add_hook(counted(Box::new(CmpCb))),
         Instr::BlockCb => {
@@ -261,22 +334,19 @@ pub fn run(image: &[u8], jit: bool, instr: Instr) -> Outcome {
     let finished = bare::returned(&exit);
     let verified = finished && bare::register(&mut vm, "EAX") == Some(0);
     match instr {
-        Instr::BlockIr | Instr::InsnIr => {
-            let space = vm.context().try_get_space("hook").expect("the hook space exists");
-            let v = vm
-                .memory_mut()
-                .flat_mut()
-                .read_u128(qcode::space::MemorySpaceId::Shared(space), 0, 8)
-                .unwrap_or(0);
-            events.set(v as u64);
-        }
+        Instr::BlockIr | Instr::InsnIr => events.set(read_space(&vm, "hook", 0, 8)[..8].try_into().map(u64::from_le_bytes).unwrap()),
         Instr::BlockRam | Instr::InsnRam => events.set(read_u64(&vm, COUNTER)),
         Instr::EdgeIr => {
+            let map = read_space(&vm, EDGES, EDGES_MAP, (EDGE_MASK + 1) as usize);
+            events.set(map.iter().filter(|&&b| b != 0).count() as u64);
+        }
+        Instr::EdgeRam => {
             let mut map = vec![0u8; (EDGE_MASK + 1) as usize];
             vm.memory().mmu.read(EDGE_MAP, &mut map).unwrap();
             events.set(map.iter().filter(|&&b| b != 0).count() as u64);
         }
-        Instr::CmpIr => events.set(read_u64(&vm, CMP_IDX)),
+        Instr::CmpIr => events.set(read_space(&vm, CMPS, CMPS_IDX, 8)[..8].try_into().map(u64::from_le_bytes).unwrap()),
+        Instr::CmpRam => events.set(read_u64(&vm, CMP_IDX)),
         _ => {}
     }
     if let Some(path) = std::env::var_os("HOOKBENCH_DUMP") {

@@ -13,7 +13,7 @@ mkdir -p "$OUT"
 uptime > "$OUT/load.txt"
 # One process per (engine, instrumentation, image), each under a timeout, so
 # a run that hangs costs one row rather than the sweep.
-INSTRS="none block-ir block-cb insn-ir insn-cb edge-ir watch-ir watch-cb cmp-ir cmp-cb"
+INSTRS="none block-ir block-ram block-cb insn-ir insn-ram insn-cb edge-ir edge-ram watch-ir watch-cb cmp-ir cmp-ram cmp-cb"
 for engine in qcode-jit unicorn icicle; do
   : > "$OUT/$engine.log"
   for instr in $INSTRS; do

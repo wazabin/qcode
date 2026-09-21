@@ -71,8 +71,8 @@ print()
 
 # 2. Slowdown of each instrumentation relative to the engine's own baseline.
 print("## Slowdown relative to each engine's own baseline (geometric mean over images)\n")
-kinds = ["block-ir", "block-ram", "block-cb", "insn-ir", "insn-ram", "insn-cb", "edge-ir", "watch-ir", "watch-cb", "cmp-ir", "cmp-cb"]
-native_kind = {"block-ir": "block", "block-ram": "block", "block-cb": "block", "edge-ir": "edge", "cmp-ir": "cmp", "cmp-cb": "cmp", "watch-ir": "watch", "watch-cb": "watch"}
+kinds = ["block-ir", "block-ram", "block-cb", "insn-ir", "insn-ram", "insn-cb", "edge-ir", "edge-ram", "watch-ir", "watch-cb", "cmp-ir", "cmp-ram", "cmp-cb"]
+native_kind = {"block-ir": "block", "block-ram": "block", "block-cb": "block", "edge-ir": "edge", "edge-ram": "edge", "cmp-ir": "cmp", "cmp-ram": "cmp", "cmp-cb": "cmp", "watch-ir": "watch", "watch-cb": "watch"}
 print("| instrumentation | native (compiler) | qcode-jit | icicle | unicorn | qcode-interp |")
 print("|---|---:|---:|---:|---:|---:|")
 for k in kinds:

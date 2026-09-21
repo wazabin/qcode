@@ -105,9 +105,9 @@ def per_call(engine, k, by=by):
             cs.append((b["elapsed_ns"] - a["elapsed_ns"]) / b["host_calls"])
     return (statistics.median(cs) if cs else None), len(cs)
 
-KINDS = ["block-ir", "block-ram", "block-cb", "insn-ir", "insn-ram", "insn-cb", "edge-ir", "watch-ir", "watch-cb", "cmp-ir", "cmp-cb"]
+KINDS = ["block-ir", "block-ram", "block-cb", "insn-ir", "insn-ram", "insn-cb", "edge-ir", "edge-ram", "watch-ir", "watch-cb", "cmp-ir", "cmp-ram", "cmp-cb"]
 ENGINES = [("qcode-jit", "QCode JIT", "s1"), ("icicle", "icicle", "s2"), ("unicorn", "Unicorn (C API)", "s3"), ("unicorn-py", "Unicorn (Python)", "s4"), ("afl-qemu", "AFL++ QEMU mode", "s6"), ("native", "Native, compiler-instrumented", "s5")]
-LABEL = {"block-ir": "Block counter, compiled, hook space", "block-ram": "Block counter, compiled, guest RAM", "block-cb": "Block counter, callback", "insn-ir": "Instruction counter, compiled, hook space", "insn-ram": "Instruction counter, compiled, guest RAM", "insn-cb": "Instruction counter, callback", "edge-ir": "AFL edge map, compiled", "watch-ir": "Write watch, range check compiled", "watch-cb": "Write watch, callback per store", "cmp-ir": "Compare log, compiled", "cmp-cb": "Compare log, callback"}
+LABEL = {"block-ir": "Block counter, compiled, hook space", "block-ram": "Block counter, compiled, guest RAM", "block-cb": "Block counter, callback", "insn-ir": "Instruction counter, compiled, hook space", "insn-ram": "Instruction counter, compiled, guest RAM", "insn-cb": "Instruction counter, callback", "edge-ir": "AFL edge map, compiled, hook space", "edge-ram": "AFL edge map, compiled, guest RAM", "watch-ir": "Write watch, range check compiled", "watch-cb": "Write watch, callback per store", "cmp-ir": "Compare log, compiled, hook space", "cmp-ram": "Compare log, compiled, guest RAM", "cmp-cb": "Compare log, callback"}
 
 slowdown = {(e, k): slow(e, k) for e, _, _ in ENGINES for k in KINDS}
 calls = {(e, k): per_call(e, k) for e, _, _ in ENGINES if e not in ("native", "afl-qemu") for k in ["block-cb", "insn-cb", "watch-cb", "cmp-cb"]}
@@ -161,7 +161,7 @@ for i in images:
     base = by[("qcode-jit", "none")].get(i)
     if not base: continue
     cells = [i, ms(base["elapsed_ns"])]
-    for k in ["block-ir", "block-ram", "block-cb", "insn-ir", "insn-ram", "insn-cb", "edge-ir", "watch-ir", "cmp-ir"]:
+    for k in ["block-ir", "block-ram", "block-cb", "insn-ir", "insn-ram", "insn-cb", "edge-ir", "edge-ram", "watch-ir", "cmp-ir", "cmp-ram"]:
         r = by[("qcode-jit", k)].get(i)
         cells.append((f"{r['elapsed_ns']/base['elapsed_ns']:.2f}×" if r["verified"] else "✗") if r else "")
     img_rows.append(cells)
@@ -299,12 +299,12 @@ code {{ font-family: "IBM Plex Mono", monospace; font-size: .9em; }}
 
 <h2>QCode JIT, per image: compiled instrumentation against the callback</h2>
 <p>Slowdown relative to that image's uninstrumented run.</p>
-{table(["image", "base ms", "block-ir", "block-ram", "block-cb", "insn-ir", "insn-ram", "insn-cb", "edge-ir", "watch-ir", "cmp-ir"], img_rows)}
+{table(["image", "base ms", "block-ir", "block-ram", "block-cb", "insn-ir", "insn-ram", "insn-cb", "edge-ir", "edge-ram", "watch-ir", "cmp-ir", "cmp-ram"], img_rows)}
 
 <h2>How to read this</h2>
 <ul>
 <li><b>What "compiled" means per engine.</b> QCode: the hook emits QCode before the site (loads, stores, arithmetic, a conditional detour to an interrupt) and the JIT compiles it with the block. icicle: an injector splices p-code into the lifted block. Unicorn has no compiled form — every hook is a C callback, and Qiling adds Python dispatch on top. Native: <code>gcc -fsanitize-coverage=trace-pc</code> and <code>trace-cmp</code>, plus four hardware watchpoints through <code>perf</code> for the write watch.</li>
-<li><b>Where the hook keeps its state decides most of the compiled cost.</b> A counter in guest RAM goes through the JIT's inline TLB lookup, permission check and initialisation-bit update on every access, because the guest could reach it; the same counter in a flat hook space — a host buffer compiled code addresses by base pointer and constant offset, as it does a register — costs what icicle's trace store costs. The edge map still lives in RAM: compiled code reaches a flat space only at a constant offset, and the map is indexed by a computed one.</li>
+<li><b>Where the hook keeps its state decides most of the compiled cost.</b> A counter in guest RAM goes through the JIT's inline TLB lookup, permission check and initialisation-bit update on every access, because the guest could reach it; the same counter in a flat hook space — a host buffer compiled code addresses by base pointer and constant offset, as it does a register — costs what icicle's trace store costs. A map or a log, indexed by a computed offset, lives in a hook space of fixed length: compiled code checks the offset against the bound (one compare) and accesses off the base pointer, where the RAM version pays the TLB path on each of its two to three accesses per site.</li>
 <li><b>AFL++ QEMU mode</b> is the fuzzing instrumentation people actually run: an edge map updated by TCG ops inlined into every translated block. Its overhead over the same QEMU with instrumentation switched off (<code>AFL_QEMU_INST_RANGES</code> set to an empty range) is within noise, on a base that is itself 5 to 10× slower than native. It is measured on the native binaries under <code>afl-qemu-trace</code>, so it appears on the edge-map row and in the baseline table.</li>
 <li><b>Sites are not the same across engines.</b> QCode's block is the lifted block after absorption, which is the guest's basic block; its comparison site is every integer comparison in the p-code, which on x86 includes every flag computation, so <code>cmp-*</code> instruments an order of magnitude more sites than Unicorn's <code>cmp</code>-instruction hook. Counts are in the full table.</li>
 <li><b>The write watch</b> covers 32 bytes at the start of each image's writable segment; the number of hits varies from none to hundreds of thousands per image, and the per-hit cost is what the second chart isolates.</li>

@@ -17,10 +17,12 @@ whether the benchmark verified its own result.
 | insn-ir | `counter += 1` in a flat hook space before every guest instruction | IR | p-code injector | — | — |
 | insn-ram | the same counter in guest RAM | IR | — | — | — |
 | insn-cb | a host callback before every guest instruction | interrupt | `Op::Hook` | `UC_HOOK_CODE` | — |
-| edge-ir | an AFL-style edge map in guest memory | IR | — | — | trace-pc + map |
+| edge-ir | an AFL-style edge map in a bounded hook space | IR | — | — | trace-pc + map |
+| edge-ram | the same map in guest RAM | IR | — | — | — |
 | watch-ir | stores to 32 bytes: range check as IR, host on a hit | IR + interrupt | MMU hook | `UC_HOOK_MEM_WRITE` | 4 hardware watchpoints |
 | watch-cb | stores to 32 bytes: host at every store | interrupt | (same) | (same) | — |
-| cmp-ir | every integer comparison's operands to a ring buffer | IR | — | — | `-fsanitize-coverage=trace-cmp` |
+| cmp-ir | every integer comparison's operands to a ring buffer in a bounded hook space | IR | — | — | `-fsanitize-coverage=trace-cmp` |
+| cmp-ram | the same log in guest RAM | IR | — | — | — |
 | cmp-cb | every integer comparison's operands to the host | interrupt | — | `UC_HOOK_TCG_OPCODE` (cmp only) | — |
 
 QCode's "block" is the lifted block after absorption, which is the guest's
