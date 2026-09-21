@@ -70,4 +70,5 @@ run counts retired user instructions, which the load does not move. A run
 directory may hold those counts as `instructions.txt` (`engine instr image
 count` per line); the report and the page show such a run in the progress
 table only, with the instruction ratio beside the time ratio, and never in
-place of a wall-clock row.
+place of a wall-clock row. `OUT=target/results-x ./run-qcode-loaded.sh`
+does both for every QCode JIT row (`INSTRS` and `ENGINE` narrow it).
