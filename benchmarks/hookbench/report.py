@@ -12,9 +12,17 @@ out = sys.argv[1] if len(sys.argv) > 1 else "target/results"
 runs = [("first sweep", out)] + [a.split("=", 1) for a in sys.argv[2:]]
 
 def load_rows(d):
+    """A run's rows. A `relabel.txt` in the directory (`old new` per line)
+    renames instrumentation kinds a later harness split: the first runs'
+    `edge-ir` measured what is `edge-ram` now."""
     rows = []
     for path in glob.glob(os.path.join(d, "*.json")):
         rows += json.load(open(path))
+    rp = os.path.join(d, "relabel.txt")
+    if os.path.exists(rp):
+        relabel = dict(line.split() for line in open(rp) if len(line.split()) == 2)
+        for r in rows:
+            r["instr"] = relabel.get(r["instr"], r["instr"])
     return rows
 
 def index(rows):

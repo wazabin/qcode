@@ -143,13 +143,55 @@ rows are in `target/results-fix1` (with a `notes.txt`); `make_page.py`
 and `report.py` take later runs as `label=dir` arguments and show every
 run side by side in a progress section, so the page keeps its history.
 
+## Done since: bounded hook spaces (2026-09-21)
+
+Step 3 below. `Vm::state_space(name, len)` makes a flat hook space of a
+fixed length (`FlatSpace::bound`: allocated whole, growth past it refused
+under interpreter and JIT alike). Given the bound, the JIT compiles a
+load or store at a *computed* address into the space as one unsigned
+compare against `bound - size` and the access off the base pointer; a
+failed check stops the block with `BLOCK_OVERFLOW` before the access and
+the VM reports the interpreter's `AddressOverflow`. A computed address
+into an unbounded space is still declined. Commit `c3ad0a6`, tests in
+`jit/tests/hooks.rs` (map indexed natively, identical under both
+strategies; an overrun stops both alike).
+
+The harness (`1a76249`) moved `edge-ir` and `cmp-ir` into bounded spaces
+and kept the RAM versions as `edge-ram` and `cmp-ram`. The first two
+runs' `edge-ir`/`cmp-ir` measured the RAM layout, so `relabel.txt` in
+`target/results` and `target/results-fix1` renames them to `edge-ram`/
+`cmp-ram` when the report and the page load them (the loaders honour
+that file; it is untracked, like the JSON).
+
+**The machine was loaded (load 15–25 from other jobs) and would not go
+quiet**, so the re-measure was made two ways that survive load
+(`ae4317c`, README): thread CPU time (`HOOKBENCH_CPUTIME=1`, rows carry
+`"clock": "cpu"`) and retired user instructions (`perf stat -e
+instructions:u`, `instructions.txt` in the run dir; deterministic to six
+digits under any load). Such a run stays out of the charts and appears in
+the progress table only. Results in `target/results-fix2` (qcode-jit,
+`none edge-ir edge-ram cmp-ir cmp-ram`, 17 images, all verified):
+
+| kind | CPU time, geomean | instructions, geomean |
+|---|---:|---:|
+| edge-ram (was `edge-ir`) | 1.48× | 1.35× |
+| edge-ir, bounded space | 1.12× | 1.14× |
+| cmp-ram (was `cmp-ir`) | 4.08× | 5.01× |
+| cmp-ir, bounded space | 2.52× | 2.14× |
+
+The edge map went from 1.5× to about 1.1×, which is what step 3
+promised and where icicle's trace store sits. The compare log halved in
+time and is 2.3× fewer instructions; what remains is the site count
+(every flag computation: nettle-sha256 alone is 20× in instructions,
+the median image 1.5×), not the store path. The page and `RESULTS.md`
+carry the fix2 column; the chart rows for the hook-space edge map and
+compare log stay empty until a quiet wall-clock run (step 8).
+
 ## Potential next steps
 
 1. ~~Fix the JIT's mid-instruction re-entry~~ — done, see above.
 2. ~~Diagnose `cmp-cb`~~ — same bug, done.
-3. **Dynamic offsets into flat spaces in the JIT**, bounds-checked, so the
-   edge map and the compare log can leave guest RAM. Icicle's trace store does
-   this; it would bring `edge-ir` from 1.55× toward 1.1×.
+3. ~~Dynamic offsets into flat spaces in the JIT~~ — done, see above.
 4. **Fold hook conditions.** The cleanup passes run at lift time, before
    injection; running `remove_dead_insns` and constant folding after injection
    would simplify a write watch whose store address is constant, and is the
@@ -164,13 +206,15 @@ run side by side in a progress section, so the page keeps its history.
    images, or accept the Python-binding floor as its stand-in (documented).
 8. **Re-run with `--repeat 5` on a quiet machine before publishing**; check
    `target/results/load.txt`. The interpreter was run on four images only.
+   The hook-space `edge-ir` and `cmp-ir` have no wall-clock numbers yet
+   (see above); that run fills the chart rows.
 9. Push the branch (force) and open a PR; the commit messages carry the
    reasoning.
 
 ## Where things are
 
-- Worktree: `~/dev/vm/qcode-suite` (branch `emulator-suite`, 19 commits over
-  main, clean tree).
+- Worktree: `~/dev/vm/qcode-suite` (branch `emulator-suite`, 27 commits over
+  main).
 - Harness: `benchmarks/hookbench/`; results in `target/results/`
   (untracked), tables in `RESULTS.md`, page generator `make_page.py`.
 - Images: `~/dev/vm/qcode/target/embench` (from `benchmarks/embench/build.sh`,

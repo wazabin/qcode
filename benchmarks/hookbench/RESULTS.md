@@ -30,10 +30,12 @@
 | insn-ir |  | 1.20× (n=17) | 1.08× (n=17) |  | 1.20× (n=4) |
 | insn-ram |  | 1.69× (n=17) |  |  |  |
 | insn-cb |  | 13.51× (n=17) | 1.33× (n=17) | 3.71× (n=17) |  |
-| edge-ir | 3.13× | 1.52× (n=17) |  |  | 1.11× (n=4) |
+| edge-ir | 3.13× |  |  |  |  |
+| edge-ram | 3.13× | 1.52× (n=17) |  |  | 1.11× (n=4) |
 | watch-ir | 1.99× | 1.58× (n=17) | 1.11× (n=17) | 1.87× (n=17) | 1.07× (n=4) |
 | watch-cb | 1.99× | 3.20× (n=17) | 1.11× (n=17) | 1.87× (n=17) |  |
-| cmp-ir | 1.96× | 6.39× (n=17) |  |  | 4.53× (n=4) |
+| cmp-ir | 1.96× |  |  |  |  |
+| cmp-ram | 1.96× | 6.39× (n=17) |  |  | 4.53× (n=4) |
 | cmp-cb | 1.96× | 88.12× (n=17) |  | 1.13× (n=17) |  |
 
 ## Cost per host call (ns, median over images with ≥ 10k calls)
@@ -57,22 +59,25 @@
 
 ## How the qcode-jit numbers moved (oldest first)
 
-| instrumentation | first sweep | fix1 |
-|---|---:|---:|
-| block-ir | 1.26× (n=17) | 1.14× (n=17) |
-| block-ram | 1.41× (n=17) | 1.31× (n=17) |
-| block-cb | 5.47× (n=17) | 5.32× (n=17) |
-| insn-ir | 1.33× (n=17) | 1.20× (n=17) |
-| insn-ram | 1.85× (n=17) | 1.69× (n=17) |
-| insn-cb | 14.69× (n=17) | 13.51× (n=17) |
-| edge-ir | 1.55× (n=17) | 1.52× (n=17) |
-| watch-ir | 1.71× (n=17) | 1.58× (n=17) |
-| watch-cb | 11.33× (n=17) | 3.20× (n=17) |
-| cmp-ir | 6.91× (n=17) | 6.39× (n=17) |
-| cmp-cb | 14.55× (n=1) 16 ✗ | 88.12× (n=17) |
+| instrumentation | first sweep | fix1 | fix2 (CPU time, insns) |
+|---|---:|---:|---:|
+| block-ir | 1.26× (n=17) | 1.14× (n=17) |  |
+| block-ram | 1.41× (n=17) | 1.31× (n=17) |  |
+| block-cb | 5.47× (n=17) | 5.32× (n=17) |  |
+| insn-ir | 1.33× (n=17) | 1.20× (n=17) |  |
+| insn-ram | 1.85× (n=17) | 1.69× (n=17) |  |
+| insn-cb | 14.69× (n=17) | 13.51× (n=17) |  |
+| edge-ir |  |  | 1.12× (n=17) (1.14× insns) |
+| edge-ram | 1.55× (n=17) | 1.52× (n=17) | 1.48× (n=17) (1.35× insns) |
+| watch-ir | 1.71× (n=17) | 1.58× (n=17) |  |
+| watch-cb | 11.33× (n=17) | 3.20× (n=17) |  |
+| cmp-ir |  |  | 2.52× (n=17) (2.14× insns) |
+| cmp-ram | 6.91× (n=17) | 6.39× (n=17) | 4.08× (n=17) (5.01× insns) |
+| cmp-cb | 14.55× (n=1) 16 ✗ | 88.12× (n=17) |  |
 
 - first sweep
 - fix1: After the JIT cache fix (commit c83141b): blocks carry a revision stamp, the cache is keyed on it, and compiled code is resumed from anywhere in a block. Only the QCode JIT was re-run; the other engines are unchanged.
+- fix2: After bounded hook spaces (commit c3ad0a6): the edge map and the compare log leave guest RAM for a flat space the JIT indexes by a computed offset, one compare against the bound per access. edge-ir and cmp-ir are the hook-space versions; edge-ram and cmp-ram are what the earlier runs' edge-ir and cmp-ir measured. Only the QCode JIT was re-run, on these kinds and the baseline. The machine was loaded (see the load), so this run is timed by thread CPU time rather than the wall clock and is kept out of the charts; retired user instructions, which the load does not move, are given in parentheses.
 
 ## Runs that did not verify
 
@@ -206,14 +211,14 @@
 | qcode-interp | block-ir | depthconv | 5575.4 | 0 | 635575 | 31 | ok |
 | qcode-interp | block-ir | matmult-int | 6243.2 | 0 | 1200608 | 48 | ok |
 | qcode-interp | block-ir | tarfind | 3222.9 | 0 | 331253 | 47 | ok |
-| qcode-interp | cmp-ir | crc32 | 38188.0 | 0 | 1092 | 324 | ok |
-| qcode-interp | cmp-ir | depthconv | 22439.4 | 0 | 464 | 327 | ok |
-| qcode-interp | cmp-ir | matmult-int | 16891.8 | 0 | 615 | 625 | ok |
-| qcode-interp | cmp-ir | tarfind | 16320.1 | 0 | 302 | 578 | ok |
-| qcode-interp | edge-ir | crc32 | 6146.4 | 0 | 21 | 19 | ok |
-| qcode-interp | edge-ir | depthconv | 5736.4 | 0 | 34 | 31 | ok |
-| qcode-interp | edge-ir | matmult-int | 7016.3 | 0 | 62 | 48 | ok |
-| qcode-interp | edge-ir | tarfind | 3421.2 | 0 | 57 | 47 | ok |
+| qcode-interp | cmp-ram | crc32 | 38188.0 | 0 | 1092 | 324 | ok |
+| qcode-interp | cmp-ram | depthconv | 22439.4 | 0 | 464 | 327 | ok |
+| qcode-interp | cmp-ram | matmult-int | 16891.8 | 0 | 615 | 625 | ok |
+| qcode-interp | cmp-ram | tarfind | 16320.1 | 0 | 302 | 578 | ok |
+| qcode-interp | edge-ram | crc32 | 6146.4 | 0 | 21 | 19 | ok |
+| qcode-interp | edge-ram | depthconv | 5736.4 | 0 | 34 | 31 | ok |
+| qcode-interp | edge-ram | matmult-int | 7016.3 | 0 | 62 | 48 | ok |
+| qcode-interp | edge-ram | tarfind | 3421.2 | 0 | 57 | 47 | ok |
 | qcode-interp | insn-ir | crc32 | 6746.6 | 0 | 2278822 | 108 | ok |
 | qcode-interp | insn-ir | depthconv | 6455.5 | 0 | 2998976 | 104 | ok |
 | qcode-interp | insn-ir | matmult-int | 7274.4 | 0 | 4072595 | 283 | ok |
@@ -294,40 +299,40 @@
 | qcode-jit | cmp-cb | tarfind | 7009.7 | 11600174 | 11600174 | 578 | ok |
 | qcode-jit | cmp-cb | ud | 5582.1 | 7773549 | 7773549 | 1050 | ok |
 | qcode-jit | cmp-cb | xgboost | 3958.0 | 6559787 | 6559787 | 455 | ok |
-| qcode-jit | cmp-ir | aha-mont64 | 666.7 | 0 | 1829 | 2450 | ok |
-| qcode-jit | cmp-ir | crc32 | 306.5 | 0 | 1092 | 324 | ok |
-| qcode-jit | cmp-ir | depthconv | 241.8 | 0 | 464 | 327 | ok |
-| qcode-jit | cmp-ir | edn | 560.1 | 0 | 248 | 2241 | ok |
-| qcode-jit | cmp-ir | huffbench | 469.6 | 0 | 903 | 1807 | ok |
-| qcode-jit | cmp-ir | matmult-int | 200.6 | 0 | 615 | 625 | ok |
-| qcode-jit | cmp-ir | md5sum | 269.2 | 0 | 1495 | 806 | ok |
-| qcode-jit | cmp-ir | nettle-aes | 2236.0 | 0 | 226 | 9115 | ok |
-| qcode-jit | cmp-ir | nettle-sha256 | 10688.2 | 0 | 315 | 23640 | ok |
-| qcode-jit | cmp-ir | nsichneu | 1789.8 | 0 | 3376 | 5301 | ok |
-| qcode-jit | cmp-ir | picojpeg | 1943.1 | 0 | 1588 | 8189 | ok |
-| qcode-jit | cmp-ir | qrduino | 3645.9 | 0 | 2905 | 18417 | ok |
-| qcode-jit | cmp-ir | sglib-combined | 688.0 | 0 | 124 | 2777 | ok |
-| qcode-jit | cmp-ir | statemate | 154.2 | 0 | 1498 | 443 | ok |
-| qcode-jit | cmp-ir | tarfind | 234.8 | 0 | 302 | 578 | ok |
-| qcode-jit | cmp-ir | ud | 265.0 | 0 | 3437 | 1050 | ok |
-| qcode-jit | cmp-ir | xgboost | 191.5 | 0 | 2091 | 455 | ok |
-| qcode-jit | edge-ir | aha-mont64 | 77.6 | 0 | 58 | 43 | ok |
-| qcode-jit | edge-ir | crc32 | 39.5 | 0 | 21 | 19 | ok |
-| qcode-jit | edge-ir | depthconv | 50.5 | 0 | 34 | 31 | ok |
-| qcode-jit | edge-ir | edn | 109.9 | 0 | 106 | 79 | ok |
-| qcode-jit | edge-ir | huffbench | 168.3 | 0 | 208 | 149 | ok |
-| qcode-jit | edge-ir | matmult-int | 80.8 | 0 | 62 | 48 | ok |
-| qcode-jit | edge-ir | md5sum | 95.8 | 0 | 89 | 76 | ok |
-| qcode-jit | edge-ir | nettle-aes | 125.9 | 0 | 94 | 71 | ok |
-| qcode-jit | edge-ir | nettle-sha256 | 679.2 | 0 | 91 | 70 | ok |
-| qcode-jit | edge-ir | nsichneu | 721.3 | 0 | 650 | 652 | ok |
-| qcode-jit | edge-ir | picojpeg | 360.1 | 0 | 455 | 323 | ok |
-| qcode-jit | edge-ir | qrduino | 605.6 | 0 | 746 | 510 | ok |
-| qcode-jit | edge-ir | sglib-combined | 292.3 | 0 | 396 | 279 | ok |
-| qcode-jit | edge-ir | statemate | 89.3 | 0 | 82 | 75 | ok |
-| qcode-jit | edge-ir | tarfind | 60.5 | 0 | 57 | 47 | ok |
-| qcode-jit | edge-ir | ud | 108.9 | 0 | 91 | 66 | ok |
-| qcode-jit | edge-ir | xgboost | 132.6 | 0 | 40 | 36 | ok |
+| qcode-jit | cmp-ram | aha-mont64 | 666.7 | 0 | 1829 | 2450 | ok |
+| qcode-jit | cmp-ram | crc32 | 306.5 | 0 | 1092 | 324 | ok |
+| qcode-jit | cmp-ram | depthconv | 241.8 | 0 | 464 | 327 | ok |
+| qcode-jit | cmp-ram | edn | 560.1 | 0 | 248 | 2241 | ok |
+| qcode-jit | cmp-ram | huffbench | 469.6 | 0 | 903 | 1807 | ok |
+| qcode-jit | cmp-ram | matmult-int | 200.6 | 0 | 615 | 625 | ok |
+| qcode-jit | cmp-ram | md5sum | 269.2 | 0 | 1495 | 806 | ok |
+| qcode-jit | cmp-ram | nettle-aes | 2236.0 | 0 | 226 | 9115 | ok |
+| qcode-jit | cmp-ram | nettle-sha256 | 10688.2 | 0 | 315 | 23640 | ok |
+| qcode-jit | cmp-ram | nsichneu | 1789.8 | 0 | 3376 | 5301 | ok |
+| qcode-jit | cmp-ram | picojpeg | 1943.1 | 0 | 1588 | 8189 | ok |
+| qcode-jit | cmp-ram | qrduino | 3645.9 | 0 | 2905 | 18417 | ok |
+| qcode-jit | cmp-ram | sglib-combined | 688.0 | 0 | 124 | 2777 | ok |
+| qcode-jit | cmp-ram | statemate | 154.2 | 0 | 1498 | 443 | ok |
+| qcode-jit | cmp-ram | tarfind | 234.8 | 0 | 302 | 578 | ok |
+| qcode-jit | cmp-ram | ud | 265.0 | 0 | 3437 | 1050 | ok |
+| qcode-jit | cmp-ram | xgboost | 191.5 | 0 | 2091 | 455 | ok |
+| qcode-jit | edge-ram | aha-mont64 | 77.6 | 0 | 58 | 43 | ok |
+| qcode-jit | edge-ram | crc32 | 39.5 | 0 | 21 | 19 | ok |
+| qcode-jit | edge-ram | depthconv | 50.5 | 0 | 34 | 31 | ok |
+| qcode-jit | edge-ram | edn | 109.9 | 0 | 106 | 79 | ok |
+| qcode-jit | edge-ram | huffbench | 168.3 | 0 | 208 | 149 | ok |
+| qcode-jit | edge-ram | matmult-int | 80.8 | 0 | 62 | 48 | ok |
+| qcode-jit | edge-ram | md5sum | 95.8 | 0 | 89 | 76 | ok |
+| qcode-jit | edge-ram | nettle-aes | 125.9 | 0 | 94 | 71 | ok |
+| qcode-jit | edge-ram | nettle-sha256 | 679.2 | 0 | 91 | 70 | ok |
+| qcode-jit | edge-ram | nsichneu | 721.3 | 0 | 650 | 652 | ok |
+| qcode-jit | edge-ram | picojpeg | 360.1 | 0 | 455 | 323 | ok |
+| qcode-jit | edge-ram | qrduino | 605.6 | 0 | 746 | 510 | ok |
+| qcode-jit | edge-ram | sglib-combined | 292.3 | 0 | 396 | 279 | ok |
+| qcode-jit | edge-ram | statemate | 89.3 | 0 | 82 | 75 | ok |
+| qcode-jit | edge-ram | tarfind | 60.5 | 0 | 57 | 47 | ok |
+| qcode-jit | edge-ram | ud | 108.9 | 0 | 91 | 66 | ok |
+| qcode-jit | edge-ram | xgboost | 132.6 | 0 | 40 | 36 | ok |
 | qcode-jit | insn-cb | aha-mont64 | 1210.5 | 2428485 | 2428485 | 0 | ok |
 | qcode-jit | insn-cb | crc32 | 1019.4 | 2278822 | 2278822 | 0 | ok |
 | qcode-jit | insn-cb | depthconv | 1024.6 | 2998976 | 2998976 | 0 | ok |

@@ -18,9 +18,17 @@ out = sys.argv[2]
 runs = [("first sweep", res)] + [a.split("=", 1) for a in sys.argv[3:]]
 
 def load_rows(d):
+    """A run's rows. A `relabel.txt` in the directory (`old new` per line)
+    renames instrumentation kinds a later harness split: the first runs'
+    `edge-ir` measured what is `edge-ram` now."""
     rows = []
     for p in glob.glob(os.path.join(d, "*.json")):
         rows += json.load(open(p))
+    rp = os.path.join(d, "relabel.txt")
+    if os.path.exists(rp):
+        relabel = dict(line.split() for line in open(rp) if len(line.split()) == 2)
+        for r in rows:
+            r["instr"] = relabel.get(r["instr"], r["instr"])
     return rows
 
 def index(rows):
@@ -71,7 +79,7 @@ def gm(xs):
 
 def slow(engine, k, by=by):
     if engine == "native":
-        nk = {"block-ir": "block", "block-cb": "block", "edge-ir": "edge", "cmp-ir": "cmp", "cmp-cb": "cmp", "watch-ir": "watch", "watch-cb": "watch"}.get(k)
+        nk = {"block-ir": "block", "block-cb": "block", "edge-ir": "edge", "edge-ram": "edge", "cmp-ir": "cmp", "cmp-ram": "cmp", "cmp-cb": "cmp", "watch-ir": "watch", "watch-cb": "watch"}.get(k)
         if not nk: return None, 0
         xs = [native[nk][i][0] / native["plain"][i][0] for i in images if i in native[nk] and i in native["plain"] and native[nk][i][1]]
         return gm(xs), len(xs)
@@ -81,7 +89,7 @@ def slow(engine, k, by=by):
         xs = [upy[kk][i][0] / upy["none"][i][0] for i in images if i in upy.get(kk, {}) and i in upy.get("none", {}) and upy[kk][i][2]]
         return gm(xs), len(xs)
     if engine == "afl-qemu":
-        if k != "edge-ir": return None, 0
+        if k not in ("edge-ir", "edge-ram"): return None, 0
         xs = [afl["afl-inst"][i][0] / afl["afl-none"][i][0] for i in images if i in afl.get("afl-inst", {}) and i in afl.get("afl-none", {}) and afl["afl-inst"][i][1]]
         return gm(xs), len(xs)
     xs = []
@@ -330,7 +338,7 @@ code {{ font-family: "IBM Plex Mono", monospace; font-size: .9em; }}
 <h2>How to read this</h2>
 <ul>
 <li><b>What "compiled" means per engine.</b> QCode: the hook emits QCode before the site (loads, stores, arithmetic, a conditional detour to an interrupt) and the JIT compiles it with the block. icicle: an injector splices p-code into the lifted block. Unicorn has no compiled form — every hook is a C callback, and Qiling adds Python dispatch on top. Native: <code>gcc -fsanitize-coverage=trace-pc</code> and <code>trace-cmp</code>, plus four hardware watchpoints through <code>perf</code> for the write watch.</li>
-<li><b>Where the hook keeps its state decides most of the compiled cost.</b> A counter in guest RAM goes through the JIT's inline TLB lookup, permission check and initialisation-bit update on every access, because the guest could reach it; the same counter in a flat hook space — a host buffer compiled code addresses by base pointer and constant offset, as it does a register — costs what icicle's trace store costs. A map or a log, indexed by a computed offset, lives in a hook space of fixed length: compiled code checks the offset against the bound (one compare) and accesses off the base pointer, where the RAM version pays the TLB path on each of its two to three accesses per site.</li>
+<li><b>Where the hook keeps its state decides most of the compiled cost.</b> A counter in guest RAM goes through the JIT's inline TLB lookup, permission check and initialisation-bit update on every access, because the guest could reach it; the same counter in a flat hook space — a host buffer compiled code addresses by base pointer and constant offset, as it does a register — costs what icicle's trace store costs. A map or a log, indexed by a computed offset, lives in a hook space of fixed length: compiled code checks the offset against the bound (one compare) and accesses off the base pointer, where the RAM version pays the TLB path on each of its two to three accesses per site. The hook-space edge map and compare log have so far been measured only on a loaded machine, so they appear in the progress table below and not in the chart; the chart's edge map and compare log are the guest-RAM versions.</li>
 <li><b>AFL++ QEMU mode</b> is the fuzzing instrumentation people actually run: an edge map updated by TCG ops inlined into every translated block. Its overhead over the same QEMU with instrumentation switched off (<code>AFL_QEMU_INST_RANGES</code> set to an empty range) is within noise, on a base that is itself 5 to 10× slower than native. It is measured on the native binaries under <code>afl-qemu-trace</code>, so it appears on the edge-map row and in the baseline table.</li>
 <li><b>Sites are not the same across engines.</b> QCode's block is the lifted block after absorption, which is the guest's basic block; its comparison site is every integer comparison in the p-code, which on x86 includes every flag computation, so <code>cmp-*</code> instruments an order of magnitude more sites than Unicorn's <code>cmp</code>-instruction hook. Counts are in the full table.</li>
 <li><b>The write watch</b> covers 32 bytes at the start of each image's writable segment; the number of hits varies from none to hundreds of thousands per image, and the per-hit cost is what the second chart isolates.</li>
