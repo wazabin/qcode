@@ -303,7 +303,7 @@ pub fn run(image: &[u8], jit: bool, instr: Instr) -> Outcome {
         }
     }
 
-    let started = std::time::Instant::now();
+    let started = crate::Stopwatch::start();
     let exit = loop {
         let exit = vm.run(1 << 50);
         if std::env::var_os("HOOKBENCH_STATS").is_some() {

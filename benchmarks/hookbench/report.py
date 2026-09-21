@@ -28,7 +28,10 @@ seen = {}
 for _, _, b in reversed(run_by):
     for key, imgs in b.items():
         for img, r in imgs.items():
-            seen.setdefault((key, img), r)
+            # A run timed by CPU time (a loaded machine) keeps its progress
+            # column but does not replace a wall-clock row.
+            if r.get("clock", "wall") == "wall":
+                seen.setdefault((key, img), r)
 rows = list(seen.values())
 # (engine, instr) -> image -> row, the latest word on each
 by = index(rows)
@@ -133,11 +136,24 @@ print()
 # 5. Progress: the qcode-jit column of every run.
 if len(run_by) > 1:
     print("## How the qcode-jit numbers moved (oldest first)\n")
-    print("| instrumentation | " + " | ".join(label for label, _, _ in run_by) + " |")
+    def run_insns(d):
+        """Retired user instructions per (instr, image) from instructions.txt, if kept."""
+        out_ = defaultdict(dict)
+        ip = os.path.join(d, "instructions.txt")
+        if os.path.exists(ip):
+            for line in open(ip):
+                f = line.split()
+                if len(f) == 4 and f[3].isdigit() and f[0] == "qcode-jit":
+                    out_[f[1]][f[2]] = int(f[3])
+        return out_
+    def run_clock(b):
+        clocks = {r.get("clock", "wall") for imgs in b.values() for r in imgs.values()}
+        return "cpu" if clocks == {"cpu"} else "wall"
+    print("| instrumentation | " + " | ".join(label + (" (CPU time, insns)" if run_clock(b) == "cpu" else "") for label, _, b in run_by) + " |")
     print("|---|" + "---:|" * len(run_by))
     for k in kinds:
         cells = []
-        for _, _, b in run_by:
+        for _, d, b in run_by:
             ratios = []
             fails_ = 0
             for img in images:
@@ -146,7 +162,9 @@ if len(run_by) > 1:
                     ratios.append(c["elapsed_ns"] / a["elapsed_ns"])
                 elif c and not c["verified"]:
                     fails_ += 1
-            cells.append((f"{geomean(ratios):.2f}× (n={len(ratios)})" if ratios else "") + (f" {fails_} ✗" if fails_ else ""))
+            insns = run_insns(d)
+            iratios = [insns[k][i] / insns["none"][i] for i in images if i in insns.get(k, {}) and i in insns.get("none", {})]
+            cells.append((f"{geomean(ratios):.2f}× (n={len(ratios)})" if ratios else "") + (f" {fails_} ✗" if fails_ else "") + (f" ({geomean(iratios):.2f}× insns)" if iratios else ""))
         print(f"| {k} | " + " | ".join(cells) + " |")
     print()
     for label, d, b in run_by:

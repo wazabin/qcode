@@ -29,14 +29,16 @@ def index(rows):
         by[(r["engine"], r["instr"])][r["image"]] = r
     return by
 
-# Every run on its own, and the latest word on each row.
+# Every run on its own, and the latest word on each row. A run timed by
+# another clock than the wall (CPU time, on a loaded machine) keeps its
+# column in the progress section but does not replace a wall-clock row.
 run_by = [(label, d, index(load_rows(d))) for label, d in runs]
 rows = []
 seen = {}
 for _, _, b in reversed(run_by):
     for key, imgs in b.items():
         for i, r in imgs.items():
-            if (key, i) not in seen:
+            if (key, i) not in seen and r.get("clock", "wall") == "wall":
                 seen[(key, i)] = r
 rows = list(seen.values())
 by = index(rows)
@@ -186,17 +188,41 @@ def run_meta(d):
     loads = [l.split("load average:")[1].strip().split(",")[0] for l in lines if "load average:" in l]
     return notes, loads
 
-progress_head = ["instrumentation"] + [label for label, _, _ in run_by]
+def run_insns(d):
+    """Retired user instructions per (engine, instr, image), from a run's
+    instructions.txt (perf stat over one run), if it kept them."""
+    out = defaultdict(dict)
+    ip = os.path.join(d, "instructions.txt")
+    if os.path.exists(ip):
+        for line in open(ip):
+            f = line.split()
+            if len(f) == 4 and f[3].isdigit():
+                out[(f[0], f[1])][f[2]] = int(f[3])
+    return out
+
+def insn_ratio(insns, engine, k):
+    xs = [insns[(engine, k)][i] / insns[(engine, "none")][i] for i in images if i in insns.get((engine, k), {}) and i in insns.get((engine, "none"), {})]
+    return gm(xs)
+
+def run_clock(b):
+    clocks = {r.get("clock", "wall") for imgs in b.values() for r in imgs.values()}
+    return "cpu" if clocks == {"cpu"} else "wall"
+
+progress_head = ["instrumentation"] + [label + (" (CPU time, insns)" if run_clock(b) == "cpu" else "") for label, _, b in run_by]
 progress_rows = []
 for k in KINDS:
     cells = [LABEL.get(k, k)]
-    for _, _, b in run_by:
+    for _, d, b in run_by:
         if ("qcode-jit", k) not in b:
             cells.append("")
             continue
         v, n = slow("qcode-jit", k, b)
         fail = sum(1 for r in b[("qcode-jit", k)].values() if not r["verified"])
-        cells.append((fmt_x(v) if v else "—") + (f" ({fail} ✗)" if fail else ""))
+        cell = (fmt_x(v) if v else "—") + (f" ({fail} ✗)" if fail else "")
+        ir = insn_ratio(run_insns(d), "qcode-jit", k)
+        if ir:
+            cell += f" ({ir:.2f}× insns)"
+        cells.append(cell)
     progress_rows.append(cells)
 for k in ["block-cb", "insn-cb", "watch-cb", "cmp-cb"]:
     cells = [LABEL.get(k, k) + ", ns per callback"]
@@ -314,7 +340,7 @@ code {{ font-family: "IBM Plex Mono", monospace; font-size: .9em; }}
 </ul>
 
 <h2>How the numbers moved</h2>
-<p>The QCode JIT column of each sweep, oldest first. Earlier runs are kept as they were measured; the charts and tables above use the latest run of each row.</p>
+<p>The QCode JIT column of each sweep, oldest first. Earlier runs are kept as they were measured; the charts and tables above use the latest wall-clock run of each row. A run made on a loaded machine is timed by thread CPU time instead, stays out of the charts, and gives the ratio of retired user instructions beside it, which the load does not move.</p>
 {table(progress_head, progress_rows)}
 <ul>{"".join(progress_notes)}</ul>
 

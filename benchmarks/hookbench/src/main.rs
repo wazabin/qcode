@@ -109,6 +109,9 @@ pub struct Row {
     pub verified: bool,
     pub exit: String,
     pub elapsed_ns: u128,
+    /// The clock `elapsed_ns` was read from: `wall`, or `cpu` for this
+    /// thread's CPU time (`HOOKBENCH_CPUTIME`).
+    pub clock: &'static str,
     /// Times control left compiled or interpreted guest code for the host on
     /// the hook's behalf.
     pub host_calls: u64,
@@ -117,6 +120,56 @@ pub struct Row {
     pub events: u64,
     /// Sites the hook instrumented (QCode only).
     pub sites: u64,
+}
+
+/// A stopwatch over the run: wall time, or this thread's CPU time when
+/// `HOOKBENCH_CPUTIME` is set.
+///
+/// A run is single-threaded, so the two agree on a quiet machine. On a
+/// loaded one the wall clock counts the other jobs' turns; CPU time counts
+/// only this thread's, and ratios between runs measured the same way hold
+/// within the cache and SMT contention the neighbours add to both.
+pub struct Stopwatch {
+    wall: Option<std::time::Instant>,
+    cpu: Option<Duration>,
+}
+
+impl Stopwatch {
+    pub fn start() -> Self {
+        if std::env::var_os("HOOKBENCH_CPUTIME").is_some() {
+            Self { wall: None, cpu: Some(thread_cpu_time()) }
+        } else {
+            Self { wall: Some(std::time::Instant::now()), cpu: None }
+        }
+    }
+    pub fn elapsed(&self) -> Duration {
+        match (self.wall, self.cpu) {
+            (Some(wall), _) => wall.elapsed(),
+            (None, Some(cpu)) => thread_cpu_time() - cpu,
+            _ => unreachable!(),
+        }
+    }
+    /// Which clock the rows were timed with.
+    pub fn clock() -> &'static str {
+        if std::env::var_os("HOOKBENCH_CPUTIME").is_some() { "cpu" } else { "wall" }
+    }
+}
+
+fn thread_cpu_time() -> Duration {
+    #[repr(C)]
+    struct Timespec {
+        sec: i64,
+        nsec: i64,
+    }
+    unsafe extern "C" {
+        fn clock_gettime(clock: i32, out: *mut Timespec) -> i32;
+    }
+    const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+    let mut ts = Timespec { sec: 0, nsec: 0 };
+    // SAFETY: a valid out-pointer for a clock every Linux has.
+    let rc = unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    assert_eq!(rc, 0, "clock_gettime");
+    Duration::new(ts.sec as u64, ts.nsec as u32)
 }
 
 pub struct Outcome {
@@ -227,6 +280,7 @@ fn main() {
                     verified: o.verified,
                     exit: o.exit,
                     elapsed_ns: o.elapsed.as_nanos(),
+                    clock: Stopwatch::clock(),
                     host_calls: o.host_calls,
                     events: o.events,
                     sites: o.sites,

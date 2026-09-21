@@ -134,7 +134,7 @@ pub fn run(image: &[u8], instr: Instr) -> Option<Outcome> {
         _ => unreachable!(),
     }
 
-    let started = std::time::Instant::now();
+    let started = crate::Stopwatch::start();
     let exit = vm.run();
     let elapsed = started.elapsed();
     let pc = vm.cpu.read_pc();

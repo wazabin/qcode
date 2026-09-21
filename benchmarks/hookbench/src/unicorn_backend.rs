@@ -71,7 +71,7 @@ pub fn run(image: &[u8], instr: Instr) -> Option<Outcome> {
         _ => unreachable!(),
     }
 
-    let started = std::time::Instant::now();
+    let started = crate::Stopwatch::start();
     let result = uc.emu_start(parsed.entry, SENTINEL, 0, 0);
     let elapsed = started.elapsed();
     let rip = uc.reg_read(RegisterX86::RIP).unwrap();
