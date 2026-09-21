@@ -52,8 +52,8 @@ pub use hook::{
 };
 pub use inject::CodeInjector;
 pub use jit_abi::{
-    ACCESS_FAULT, ACCESS_OK, qcode_jit_load, qcode_jit_sdiv128, qcode_jit_srem128, qcode_jit_store,
-    qcode_jit_udiv128, qcode_jit_urem128,
+    ACCESS_FAULT, ACCESS_OK, qcode_jit_load, qcode_jit_overflow, qcode_jit_sdiv128,
+    qcode_jit_srem128, qcode_jit_store, qcode_jit_udiv128, qcode_jit_urem128,
 };
 pub use memory::{MemorySnapshot, VmMemory};
 pub use mmu::{
@@ -65,5 +65,5 @@ pub use table::{HookAction, HookId, InsnAction, MemAccess, TABLE_CODES};
 pub use tlb::{TLB_ENTRIES, TLB_INDEX_BITS, TlbEntry, TranslationCache};
 pub use vm::{
     BlockExecutor, CodeError, CodeSource, Executed, Interrupt, InterruptKind, RestoreError,
-    ResumeError, SnapshotError, Vm, VmExit, VmSnapshot,
+    ResumeError, SnapshotError, StateSpaceError, Vm, VmExit, VmSnapshot,
 };

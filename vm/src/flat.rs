@@ -54,6 +54,8 @@ pub struct FlatSpace {
     /// harness seeded it; a unique is scratch that must be written before it is
     /// read, so reading one that was not is a defect.
     zero_filled: bool,
+    /// The space's fixed length, if it has one; see [`bound`](Self::bound).
+    bound: Option<usize>,
 }
 
 impl FlatSpace {
@@ -62,12 +64,42 @@ impl FlatSpace {
             bytes: Vec::new(),
             written: Vec::new(),
             zero_filled,
+            bound: None,
         }
+    }
+
+    /// Fixes the space's length at `len` bytes, allocated now: an access past
+    /// it is an error rather than growth.
+    ///
+    /// A space grows as it is written, which suits registers and scratch,
+    /// whose addresses are constants of the specification. Code that indexes
+    /// a space by a *computed* address — a coverage map, a log — needs the
+    /// length settled instead, so a compiled access can check the address
+    /// against it and take the base pointer once.
+    ///
+    /// A bound is set once: compiled code checks against the length it was
+    /// compiled with, so a space already bounded to another length is
+    /// refused, with an [`AddressOverflow`](EmulatorErrorKind::AddressOverflow)
+    /// naming that length.
+    pub fn bound(&mut self, len: usize) -> Result<(), EmulatorErrorKind> {
+        if let Some(bound) = self.bound
+            && bound != len
+        {
+            return Err(EmulatorErrorKind::AddressOverflow(bound as u64, len));
+        }
+        self.reserve_to(len)?;
+        self.bound = Some(len);
+        Ok(())
+    }
+
+    /// The fixed length, if [`bound`](Self::bound) set one.
+    pub fn bound_of(&self) -> Option<usize> {
+        self.bound
     }
 
     /// Grows the space so that `end` bytes are addressable.
     fn reserve_to(&mut self, end: usize) -> Result<(), EmulatorErrorKind> {
-        if end > MAX_FLAT_SPACE {
+        if end > MAX_FLAT_SPACE || self.bound.is_some_and(|bound| end > bound) {
             return Err(EmulatorErrorKind::AddressOverflow(end as u64, 0));
         }
         if self.bytes.len() < end {
@@ -78,6 +110,14 @@ impl FlatSpace {
             if !self.zero_filled {
                 self.written.resize(end, false);
             }
+        }
+        Ok(())
+    }
+
+    /// Refuses an access ending at `end` if the space is bounded short of it.
+    fn within_bound(&self, addr: u64, end: usize, size: usize) -> Result<(), EmulatorErrorKind> {
+        if self.bound.is_some_and(|bound| end > bound) {
+            return Err(EmulatorErrorKind::AddressOverflow(addr, size));
         }
         Ok(())
     }
@@ -105,6 +145,7 @@ impl FlatSpace {
         let Some((start, end)) = Self::range(addr, size) else {
             return Err(EmulatorErrorKind::AddressOverflow(addr, size));
         };
+        self.within_bound(addr, end, size)?;
         // Past the end of what has been written: zero-filled spaces read zero,
         // others report the first missing byte.
         if end > self.bytes.len() {
@@ -157,6 +198,7 @@ impl FlatSpace {
         let Some((start, end)) = Self::range(addr, bytes.len()) else {
             return Err(EmulatorErrorKind::AddressOverflow(addr, bytes.len()));
         };
+        self.within_bound(addr, end, bytes.len())?;
         self.reserve_to(end)?;
         self.bytes[start..end].copy_from_slice(bytes);
         if !self.zero_filled {
@@ -176,6 +218,7 @@ impl FlatSpace {
         let Some((start, end)) = Self::range(addr, width) else {
             return Err(EmulatorErrorKind::AddressOverflow(addr, width));
         };
+        self.within_bound(addr, end, width)?;
         self.reserve_to(end)?;
         for index in 0..width {
             self.bytes[start + index] = (bits >> (index * 8)) as u8;
@@ -277,6 +320,16 @@ impl FlatSpaces {
     /// Panics if `slot` did not come from [`slot`](Self::slot) on these spaces.
     pub fn base_ptr_at(&mut self, slot: usize, len: usize) -> Result<*mut u8, EmulatorErrorKind> {
         self.spaces[slot].base_ptr(len)
+    }
+
+    /// Fixes `space`'s length; see [`FlatSpace::bound`].
+    pub fn bound(&mut self, space: MemorySpaceId, len: usize) -> Result<(), EmulatorErrorKind> {
+        self.entry(space).bound(len)
+    }
+
+    /// The fixed length of `space`, if it has one.
+    pub fn bound_of(&self, space: MemorySpaceId) -> Option<usize> {
+        self.get(space).and_then(FlatSpace::bound_of)
     }
 
     fn is_zero_filled(&self, space: MemorySpaceId) -> bool {
@@ -396,6 +449,32 @@ mod tests {
             flat.write_bytes(u64::MAX - 8, &[1; 4]),
             Err(EmulatorErrorKind::AddressOverflow(..))
         ));
+    }
+
+    #[test]
+    fn a_bounded_space_is_allocated_whole_and_refuses_to_grow() {
+        let mut flat = FlatSpace::new(true);
+        flat.bound(16).unwrap();
+        assert_eq!(flat.bytes.len(), 16);
+        flat.write_bytes(12, &[1; 4]).unwrap();
+        assert_eq!(flat.read_bytes(12, 4).unwrap(), vec![1; 4]);
+        assert!(matches!(
+            flat.write_bytes(13, &[1; 4]),
+            Err(EmulatorErrorKind::AddressOverflow(13, 4))
+        ));
+        assert!(matches!(
+            flat.read_bytes(16, 1),
+            Err(EmulatorErrorKind::AddressOverflow(16, 1))
+        ));
+        assert!(matches!(
+            flat.write_u128(15, 2, 0xffff),
+            Err(EmulatorErrorKind::AddressOverflow(15, 2))
+        ));
+        assert!(flat.base_ptr(17).is_err());
+        // Bounded once: the same length again is fine, another is refused.
+        assert!(flat.bound(16).is_ok());
+        assert!(flat.bound(32).is_err());
+        assert_eq!(flat.bound_of(), Some(16));
     }
 
     #[test]

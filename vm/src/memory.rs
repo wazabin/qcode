@@ -46,6 +46,9 @@ pub struct VmMemory {
     /// makes a fault a resumable value rather than an abort. Cleared by
     /// [`take_fault`](Self::take_fault).
     fault: Option<MemFault>,
+    /// The last access past the bound of a flat space, from compiled code:
+    /// its address and width, for the error the run stops with.
+    overflow: Option<(u64, usize)>,
 }
 
 /// A point-in-time copy of a [`VmMemory`]: guest RAM and every flat space.
@@ -113,9 +116,25 @@ impl VmMemory {
         !self.is_ram(space)
     }
 
+    /// The flat spaces.
+    pub fn flat(&self) -> &FlatSpaces {
+        &self.flat
+    }
+
     /// The flat spaces, for a backend that addresses them directly.
     pub fn flat_mut(&mut self) -> &mut FlatSpaces {
         &mut self.flat
+    }
+
+    /// Records an access of `size` bytes at `addr` that a compiled block
+    /// found past the bound of a flat space, and so did not perform.
+    pub fn record_overflow(&mut self, addr: u64, size: usize) {
+        self.overflow = Some((addr, size));
+    }
+
+    /// Returns and clears the overflow recorded by compiled code.
+    pub fn take_overflow(&mut self) -> Option<(u64, usize)> {
+        self.overflow.take()
     }
 
     /// Records `fault` and converts it into the error the interpreter

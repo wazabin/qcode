@@ -305,20 +305,12 @@ impl<'a> Emitter<'a> {
     /// permission and initialisation tracking on every access, since the
     /// guest could reach it; state in a flat space is a host buffer that
     /// compiled code addresses by base pointer and constant offset, like a
-    /// register. A counter belongs here; a map indexed by a computed
-    /// address does not, since compiled code reaches flat spaces only at
-    /// constant addresses.
+    /// register. A counter belongs here. A map indexed by a computed
+    /// address belongs in a *bounded* space, made ahead of the hook with
+    /// [`Vm::state_space`](crate::Vm::state_space) and found here by name:
+    /// compiled code reaches an unbounded space only at constant addresses.
     pub fn state_space(&mut self, name: &str) -> SpaceId {
-        if let Some(id) = self.ctx.try_get_space(name) {
-            return id;
-        }
-        let (word_size, addr_size) = {
-            let default = Space::from_id(self.ctx, self.ctx.shared.default_space);
-            (default.word_size, default.addr_size)
-        };
-        let mut space = Space::new(Some(name), word_size, addr_size);
-        space.ty = SpaceType::Register;
-        self.ctx.add_space(space)
+        state_space(self.ctx, name)
     }
 
     /// Loads `size` bytes at `ptr` in `space`, before the anchor.
@@ -416,6 +408,21 @@ impl<'a> Emitter<'a> {
         self.block = rest;
         interrupt
     }
+}
+
+/// The flat space named `name`, created as a register-like space if the
+/// module has none: zero-filled, and outside the guest's reach.
+pub fn state_space(ctx: &mut Context<'static>, name: &str) -> SpaceId {
+    if let Some(id) = ctx.try_get_space(name) {
+        return id;
+    }
+    let (word_size, addr_size) = {
+        let default = Space::from_id(ctx, ctx.shared.default_space);
+        (default.word_size, default.addr_size)
+    };
+    let mut space = Space::new(Some(name), word_size, addr_size);
+    space.ty = SpaceType::Register;
+    ctx.add_space(space)
 }
 
 /// Runs a [`Hook`] as the machine's [`CodeInjector`], instrumenting each site

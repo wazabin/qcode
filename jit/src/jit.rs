@@ -12,12 +12,14 @@ use qcode::{
 };
 use qcode_emulator::{EmulatorErrorKind, SizedValue, StandaloneEmulator};
 use qcode_vm::{
-    BlockExecutor, Executed, VmMemory, qcode_jit_load, qcode_jit_sdiv128, qcode_jit_srem128,
-    qcode_jit_store, qcode_jit_udiv128, qcode_jit_urem128,
+    BlockExecutor, Executed, VmMemory, flat::FlatSpaces, qcode_jit_load, qcode_jit_overflow,
+    qcode_jit_sdiv128, qcode_jit_srem128, qcode_jit_store, qcode_jit_udiv128, qcode_jit_urem128,
 };
 use rustc_hash::FxHashMap;
 
-use crate::compile::{BLOCK_OK, BlockTranslator, Export, Helpers, SpaceTable, Unsupported};
+use crate::compile::{
+    BLOCK_OK, BLOCK_OVERFLOW, BlockTranslator, Export, Helpers, SpaceTable, Unsupported,
+};
 
 /// What is known about one block: the index of its native code, or the reason
 /// the compiler declined it, together with the block revision that answer
@@ -137,6 +139,7 @@ impl Jit {
         // process's own, so there is no dynamic loading involved.
         builder.symbol("qcode_jit_load", qcode_jit_load as *const u8);
         builder.symbol("qcode_jit_store", qcode_jit_store as *const u8);
+        builder.symbol("qcode_jit_overflow", qcode_jit_overflow as *const u8);
         builder.symbol("qcode_jit_udiv128", qcode_jit_udiv128 as *const u8);
         builder.symbol("qcode_jit_urem128", qcode_jit_urem128 as *const u8);
         builder.symbol("qcode_jit_sdiv128", qcode_jit_sdiv128 as *const u8);
@@ -165,6 +168,15 @@ impl Jit {
             .declare_function("qcode_jit_store", Linkage::Import, &store_sig)
             .expect("the store helper declares once");
 
+        let mut overflow_sig = module.make_signature();
+        // (memory, address, size) -> ()
+        overflow_sig.params.push(AbiParam::new(types::I64));
+        overflow_sig.params.push(AbiParam::new(types::I64));
+        overflow_sig.params.push(AbiParam::new(types::I32));
+        let overflow = module
+            .declare_function("qcode_jit_overflow", Linkage::Import, &overflow_sig)
+            .expect("the overflow helper declares once");
+
         // (a low, a high, b low, b high, out) -> ()
         let mut divide_sig = module.make_signature();
         for _ in 0..5 {
@@ -187,6 +199,7 @@ impl Jit {
             helpers: Helpers {
                 load,
                 store,
+                overflow,
                 divisions,
             },
             compiled: Vec::new(),
@@ -205,6 +218,7 @@ impl Jit {
     fn resolve(
         &mut self,
         ctx: &Context<'_>,
+        flat: &FlatSpaces,
         block: BlockId,
         start: usize,
     ) -> Result<usize, Unsupported> {
@@ -215,7 +229,7 @@ impl Jit {
             {
                 return known.clone();
             }
-            let outcome = self.compile(ctx, block, start);
+            let outcome = self.compile(ctx, flat, block, start);
             match &outcome {
                 Ok(_) => self.stats.compiled += 1,
                 Err(_) => self.stats.declined += 1,
@@ -233,7 +247,7 @@ impl Jit {
             return known.clone();
         }
 
-        let outcome = self.compile(ctx, block, 0);
+        let outcome = self.compile(ctx, flat, block, 0);
         match &outcome {
             Ok(_) => self.stats.compiled += 1,
             Err(_) => self.stats.declined += 1,
@@ -252,6 +266,7 @@ impl Jit {
     fn compile(
         &mut self,
         ctx: &Context<'_>,
+        flat: &FlatSpaces,
         block: BlockId,
         start: usize,
     ) -> Result<usize, Unsupported> {
@@ -278,6 +293,9 @@ impl Jit {
             store: self
                 .module
                 .declare_func_in_func(self.helpers.store, &mut context.func),
+            overflow: self
+                .module
+                .declare_func_in_func(self.helpers.overflow, &mut context.func),
             divisions: self
                 .helpers
                 .divisions
@@ -295,7 +313,7 @@ impl Jit {
             builder.switch_to_block(entry);
             builder.seal_block(entry);
 
-            let mut translator = BlockTranslator::new(ctx, builder, entry, helpers);
+            let mut translator = BlockTranslator::new(ctx, flat, builder, entry, helpers);
             match translator.translate_body(block, start) {
                 Ok(body_len) => {
                     let compiled = (
@@ -349,9 +367,13 @@ impl Jit {
 
     /// Compiles `block` without running it, reporting why if it is declined.
     ///
-    /// For tooling that wants to report coverage over a module.
+    /// For tooling that wants to report coverage over a module. With no
+    /// machine in hand, no flat space is bounded, so a computed address into
+    /// one is declined here where [`run_block`](Self::run_block) may compile
+    /// it.
     pub fn try_compile(&mut self, ctx: &Context<'_>, block: BlockId) -> Result<(), Unsupported> {
-        self.resolve(ctx, block, 0).map(|_| ())
+        self.resolve(ctx, &FlatSpaces::default(), block, 0)
+            .map(|_| ())
     }
 
     /// Runs `block` as native code from body index `start`, if it has any.
@@ -371,7 +393,7 @@ impl Jit {
         let mut from = start;
         let mut retired = 0;
         loop {
-            let Ok(index) = self.resolve(ctx, current, from) else {
+            let Ok(index) = self.resolve(ctx, emu.memory.flat(), current, from) else {
                 // Nothing compiled here. If earlier blocks ran, the machine is
                 // already at `current`'s start and the interpreter takes over
                 // from there; otherwise this call did nothing at all.
@@ -406,7 +428,8 @@ impl Jit {
             } else {
                 None
             };
-            let Some(next) = next.filter(|&next| self.is_compiled(ctx, next)) else {
+            let Some(next) = next.filter(|&next| self.is_compiled(ctx, emu.memory.flat(), next))
+            else {
                 return Ok(Some(Executed {
                     block: current,
                     body,
@@ -423,8 +446,8 @@ impl Jit {
     }
 
     /// Whether `block` has native code from its start, without compiling it.
-    fn is_compiled(&mut self, ctx: &Context<'_>, block: BlockId) -> bool {
-        self.resolve(ctx, block, 0).is_ok()
+    fn is_compiled(&mut self, ctx: &Context<'_>, flat: &FlatSpaces, block: BlockId) -> bool {
+        self.resolve(ctx, flat, block, 0).is_ok()
     }
 
     /// The successor this block's terminator selects, when that is a decision
@@ -550,6 +573,11 @@ impl Jit {
         // left where an interpreted one would be, for the VM to turn into an
         // exit; what goes back from here is only the error the interpreter's
         // own signature can carry.
+        if status == BLOCK_OVERFLOW as i32 {
+            // SAFETY: as above.
+            let (addr, size) = unsafe { (*memory).take_overflow() }.unwrap_or((0, 0));
+            return Err(EmulatorErrorKind::AddressOverflow(addr, size));
+        }
         if status != BLOCK_OK as i32 {
             // SAFETY: as above.
             let fault = unsafe { (*memory).fault() };

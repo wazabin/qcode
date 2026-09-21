@@ -137,6 +137,20 @@ pub unsafe extern "C" fn qcode_jit_store(
     ACCESS_OK
 }
 
+/// Reports an access of `size` bytes at `addr` that compiled code found past
+/// the bound of a flat space, and so did not perform. The block returns
+/// straight after; the VM turns the record into the error the interpreter
+/// would have raised.
+///
+/// # Safety
+///
+/// `memory` must point to a live [`VmMemory`] that nothing else is borrowing.
+pub unsafe extern "C" fn qcode_jit_overflow(memory: *mut VmMemory, addr: u64, size: u32) {
+    // SAFETY: the caller guarantees an exclusive, live pointer.
+    let memory = unsafe { &mut *memory };
+    memory.record_overflow(addr, size as usize);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

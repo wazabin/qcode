@@ -17,6 +17,7 @@
 use qcode::{
     address_index::{AddressIndex, AddressTarget},
     context::Context,
+    space::{MemorySpaceId, SpaceId},
     value::{
         BasicBlock, BlockId, InstructionId, ValueId,
         insn::{Mnemonic, PCodeOpId, VM_INTERRUPT},
@@ -266,6 +267,30 @@ impl std::fmt::Display for RestoreError {
 impl std::error::Error for SnapshotError {}
 impl std::error::Error for RestoreError {}
 
+/// Why [`Vm::state_space`] refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateSpaceError {
+    /// The space is already bounded, at this length.
+    Bounded { name: Box<str>, len: usize },
+    /// Longer than a flat space may be.
+    TooLarge { name: Box<str>, len: usize },
+}
+
+impl std::fmt::Display for StateSpaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bounded { name, len } => {
+                write!(f, "hook space `{name}` is already bounded at {len} bytes")
+            }
+            Self::TooLarge { name, len } => {
+                write!(f, "{len} bytes is too long for hook space `{name}`")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StateSpaceError {}
+
 /// Why [`Vm::resume`] refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeError {
@@ -453,6 +478,45 @@ impl<S: CodeSource> Vm<S> {
     /// its sites and emits through an [`Emitter`](crate::hook::Emitter).
     pub fn add_hook(&mut self, hook: impl crate::hook::Hook + 'static) {
         self.add_injector(Box::new(crate::hook::HookInjector::new(hook)));
+    }
+
+    /// A flat space of `len` bytes for hook state, addressed by computed
+    /// offsets: a coverage map, a log.
+    ///
+    /// The space is created if the module has none by that name, and its
+    /// length fixed: an access past it is an error, under the interpreter
+    /// and compiled code alike, rather than growth. That fixed length is
+    /// what lets compiled code index the space by a value it computed —
+    /// one compare against the bound, then a load or store off the base
+    /// pointer — where an unbounded space (the one
+    /// [`Emitter::state_space`](crate::hook::Emitter::state_space) makes on
+    /// demand) is reached only at constant addresses. A hook finds the space
+    /// by name through `Emitter::state_space`, and the host reads it back
+    /// through [`memory`](Self::memory)'s flat spaces.
+    ///
+    /// Asking again for a space by the same name and length returns it;
+    /// another length is refused, since code compiled against the first
+    /// bound checks against that one.
+    pub fn state_space(&mut self, name: &str, len: usize) -> Result<SpaceId, StateSpaceError> {
+        let id = crate::hook::state_space(&mut self.ctx, name);
+        self.emu.memory.configure_spaces(&self.ctx);
+        let flat = self.emu.memory.flat_mut();
+        let space = MemorySpaceId::Shared(id);
+        match flat.bound_of(space) {
+            Some(bound) if bound != len => {
+                return Err(StateSpaceError::Bounded {
+                    name: name.into(),
+                    len: bound,
+                });
+            }
+            _ => {}
+        }
+        flat.bound(space, len)
+            .map_err(|_| StateSpaceError::TooLarge {
+                name: name.into(),
+                len,
+            })?;
+        Ok(id)
     }
 
     // ---- Unicorn-shaped hooks. See [`crate::table`].

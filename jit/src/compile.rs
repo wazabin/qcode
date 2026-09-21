@@ -12,7 +12,10 @@
 //! The compiler is deliberately partial. It handles integer arithmetic and
 //! accesses to *flat* spaces — registers, uniques, per-function temporaries —
 //! whose addresses are constants known at compile time, so a register access
-//! becomes a load at a fixed offset from a base pointer. Anything else
+//! becomes a load at a fixed offset from a base pointer. A flat space with a
+//! fixed length (a hook's map or log, see [`FlatSpaces::bound`]) may also be
+//! indexed by a computed address: one compare against the bound, then the
+//! access off the base pointer. Anything else
 //! ([`Unsupported`]) is declined, and the caller runs that block on the
 //! interpreter instead. Declining is a normal outcome, not a failure: it is what
 //! lets this be an alternative strategy rather than a replacement.
@@ -73,7 +76,7 @@ use qcode::{
         },
     },
 };
-use qcode_vm::{PAGE_PERM_OFFSET, PAGE_SIZE, TLB_ENTRIES, TlbEntry, perm};
+use qcode_vm::{PAGE_PERM_OFFSET, PAGE_SIZE, TLB_ENTRIES, TlbEntry, flat::FlatSpaces, perm};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Status a compiled block returns: it ran to the end of its body.
@@ -81,6 +84,10 @@ pub const BLOCK_OK: i64 = 0;
 /// Status a compiled block returns: an access faulted and the block stopped
 /// there. The fault itself is on the VM's memory.
 pub const BLOCK_FAULT: i64 = 1;
+/// Status a compiled block returns: a computed address fell past the bound of
+/// a flat space, and the block stopped before the access. The address is on
+/// the VM's memory, as an overflow.
+pub const BLOCK_OVERFLOW: i64 = 2;
 
 /// Which side of memory an access is on, and what it therefore owes.
 #[derive(Clone, Copy)]
@@ -228,6 +235,9 @@ impl SpaceTable {
 /// Translates the body of one block into an already-open Cranelift function.
 pub(crate) struct BlockTranslator<'a, 'ctx> {
     ctx: &'ctx Context<'ctx>,
+    /// The machine's flat spaces, for the bounds of the ones a computed
+    /// address may index.
+    flat: &'ctx FlatSpaces,
     builder: FunctionBuilder<'a>,
     /// Base of the array of space base pointers, the compiled function's first
     /// argument.
@@ -245,6 +255,8 @@ pub(crate) struct BlockTranslator<'a, 'ctx> {
     /// The block that abandons the run and reports a fault, created on the
     /// first access that could take one.
     fault_block: Option<cranelift::prelude::Block>,
+    /// Likewise for an access past a flat space's bound.
+    overflow_block: Option<cranelift::prelude::Block>,
     /// Where the slow-path load leaves its result. One slot serves every
     /// access in the block: only one call is live at a time.
     load_slot: Option<codegen::ir::StackSlot>,
@@ -275,6 +287,7 @@ pub(crate) struct BlockTranslator<'a, 'ctx> {
 pub struct Helpers {
     pub load: FuncId,
     pub store: FuncId,
+    pub overflow: FuncId,
     /// The 128-bit divisions, in `Division` order.
     pub divisions: [FuncId; 4],
 }
@@ -284,6 +297,7 @@ pub struct Helpers {
 pub(crate) struct HelperRefs {
     pub(crate) load: codegen::ir::FuncRef,
     pub(crate) store: codegen::ir::FuncRef,
+    pub(crate) overflow: codegen::ir::FuncRef,
     pub(crate) divisions: [codegen::ir::FuncRef; 4],
 }
 
@@ -300,6 +314,7 @@ pub struct Export {
 impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
     pub(crate) fn new(
         ctx: &'ctx Context<'ctx>,
+        flat: &'ctx FlatSpaces,
         builder: FunctionBuilder<'a>,
         entry: cranelift::prelude::Block,
         helpers: HelperRefs,
@@ -310,6 +325,7 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         let memory_arg = builder.block_params(entry)[3];
         Self {
             ctx,
+            flat,
             builder,
             spaces_arg,
             exports_arg,
@@ -317,6 +333,7 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
             memory_arg,
             helpers,
             fault_block: None,
+            overflow_block: None,
             load_slot: None,
             bases: FxHashMap::default(),
             values: FxHashMap::default(),
@@ -362,6 +379,64 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
             ValueRef::Varnode(varnode) => Some(varnode.address() as u64),
             _ => None,
         }
+    }
+
+    /// Where a `size`-byte access to the flat `space` at `ptr` lands: a host
+    /// address, an offset from it, and the flags the access is made with.
+    ///
+    /// At a constant address the offset is the address itself, off the
+    /// space's base pointer, as for a register, and the access is trusted as
+    /// the specification lays registers out aligned. At a computed one the
+    /// space must be bounded ([`FlatSpaces::bound`]): the address is checked
+    /// against the bound, less the access width, and added to the base. The
+    /// space is grown to its bound before the block is entered, so the sum
+    /// lands inside the storage whenever the check passes; the alignment is
+    /// whatever the hook computed, so the access is not asserted aligned.
+    /// Past the bound the block stops with [`BLOCK_OVERFLOW`], the access
+    /// unperformed.
+    fn flat_access(
+        &mut self,
+        space: MemorySpaceId,
+        ptr: ValueId,
+        size: usize,
+    ) -> Result<(Value, i32, MemFlags), Unsupported> {
+        if let Some(addr) = self.constant_address(ptr) {
+            let slot = self.table.slot(space, addr as usize + size);
+            let base = self.base(slot);
+            let offset =
+                i32::try_from(addr).map_err(|_| Unsupported::Access("address too large"))?;
+            return Ok((base, offset, MemFlags::trusted()));
+        }
+        let Some(bound) = self.flat.bound_of(space) else {
+            return Err(Unsupported::Access(
+                "computed address into an unbounded flat space",
+            ));
+        };
+        let Some(limit) = bound.checked_sub(size) else {
+            return Err(Unsupported::Access("access wider than the space's bound"));
+        };
+        let addr = self.computed_address(ptr)?;
+        let past = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThan, addr, limit as i64);
+        // A cold block of this access's own records what overflowed, then
+        // joins the shared epilogue.
+        let report = self.builder.create_block();
+        self.builder.set_cold_block(report);
+        self.bail_if(past, report);
+        let carry_on = self.builder.current_block().expect("a block is open");
+        self.builder.switch_to_block(report);
+        let width = self.builder.ins().iconst(types::I32, size as i64);
+        self.builder
+            .ins()
+            .call(self.helpers.overflow, &[self.memory_arg, addr, width]);
+        let epilogue = self.overflow_block();
+        self.builder.ins().jump(epilogue, &[]);
+        self.builder.switch_to_block(carry_on);
+        let slot = self.table.slot(space, bound);
+        let base = self.base(slot);
+        Ok((self.builder.ins().iadd(base, addr), 0, Self::guest_flags()))
     }
 
     /// Produces the Cranelift value for a QCode operand.
@@ -600,22 +675,13 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
             &Mnemonic::Load(Load { space, ptr, size }) => {
                 let space = space.qualify(func);
                 if !self.is_flat(space) {
-                    let addr = self.guest_address(ptr.qualify(func))?;
+                    let addr = self.computed_address(ptr.qualify(func))?;
                     let value = self.ram_load(addr, size)?;
                     return self.record(insn_id, Some(value));
                 }
-                let addr = self
-                    .constant_address(ptr.qualify(func))
-                    .ok_or(Unsupported::Access("non-constant address"))?;
                 let ty = int_type(size)?;
-                let slot = self.table.slot(space, addr as usize + size);
-                let base = self.base(slot);
-                Some(self.builder.ins().load(
-                    ty,
-                    MemFlags::trusted(),
-                    base,
-                    i32::try_from(addr).map_err(|_| Unsupported::Access("address too large"))?,
-                ))
+                let (base, offset, flags) = self.flat_access(space, ptr.qualify(func), size)?;
+                Some(self.builder.ins().load(ty, flags, base, offset))
             }
 
             &Mnemonic::Store(Store {
@@ -626,24 +692,15 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
             }) => {
                 let space = space.qualify(func);
                 if !self.is_flat(space) {
-                    let addr = self.guest_address(ptr.qualify(func))?;
+                    let addr = self.computed_address(ptr.qualify(func))?;
                     let value = self.operand(src.qualify(func), size)?;
                     self.ram_store(addr, value, size)?;
                     return Ok(());
                 }
-                let addr = self
-                    .constant_address(ptr.qualify(func))
-                    .ok_or(Unsupported::Access("non-constant address"))?;
                 int_type(size)?;
                 let value = self.operand(src.qualify(func), size)?;
-                let slot = self.table.slot(space, addr as usize + size);
-                let base = self.base(slot);
-                self.builder.ins().store(
-                    MemFlags::trusted(),
-                    value,
-                    base,
-                    i32::try_from(addr).map_err(|_| Unsupported::Access("address too large"))?,
-                );
+                let (base, offset, flags) = self.flat_access(space, ptr.qualify(func), size)?;
+                self.builder.ins().store(flags, value, base, offset);
                 None
             }
 
@@ -849,6 +906,17 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         block
     }
 
+    /// As [`Self::fault_block`], for an access past a flat space's bound.
+    fn overflow_block(&mut self) -> cranelift::prelude::Block {
+        if let Some(block) = self.overflow_block {
+            return block;
+        }
+        let block = self.builder.create_block();
+        self.builder.set_cold_block(block);
+        self.overflow_block = Some(block);
+        block
+    }
+
     /// Continues in a fresh block, taking `target` instead when `cond` is
     /// non-zero.
     fn bail_if(&mut self, cond: Value, target: cranelift::prelude::Block) {
@@ -864,13 +932,14 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         self.builder.switch_to_block(carry_on);
     }
 
-    /// A guest address as a 64-bit value.
+    /// A computed address as a 64-bit value: a literal, or something this
+    /// block worked out.
     ///
-    /// Unlike a flat access, a RAM pointer is a computed guest value: a
-    /// literal, or something this block worked out. A varnode or temp *id*
-    /// reaching here would mean the block is addressing RAM by the storage
-    /// location's own address, which is not what a guest pointer is.
-    fn guest_address(&mut self, ptr: ValueId) -> Result<Value, Unsupported> {
+    /// This is what a RAM pointer always is, and what a flat pointer is when
+    /// it is not a constant. A varnode or temp *id* reaching here would mean
+    /// the block is addressing memory by the storage location's own address,
+    /// which is not what a pointer is.
+    fn computed_address(&mut self, ptr: ValueId) -> Result<Value, Unsupported> {
         let width = self.width_of(ptr)?;
         if width > 8 {
             return Err(Unsupported::Access("address wider than 64 bits"));
@@ -1250,6 +1319,11 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         if let Some(block) = self.fault_block {
             self.builder.switch_to_block(block);
             let status = self.builder.ins().iconst(types::I32, BLOCK_FAULT);
+            self.builder.ins().return_(&[status]);
+        }
+        if let Some(block) = self.overflow_block {
+            self.builder.switch_to_block(block);
+            let status = self.builder.ins().iconst(types::I32, BLOCK_OVERFLOW);
             self.builder.ins().return_(&[status]);
         }
         // The fault block and the continuations every inline check splits off

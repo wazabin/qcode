@@ -322,3 +322,141 @@ fn a_compare_hook_receives_the_operands_the_guest_compared() {
     }
     assert_eq!(results[0], results[1]);
 }
+
+/// AFL's edge map in a bounded hook space: `prev` at offset 0, then `MAP`
+/// one-byte counters indexed by `(prev ^ cur) & (MAP - 1)`, with `cur`
+/// derived from the block's address.
+struct EdgeMap {
+    map: usize,
+    /// Index without masking, so the map is overrun.
+    overrun: bool,
+}
+
+impl EdgeMap {
+    const PREV: u64 = 0;
+    const COUNTERS: u64 = 8;
+}
+
+impl qcode_vm::hook::Hook for EdgeMap {
+    fn sites(&mut self, block: &qcode_vm::hook::BlockView<'_>) -> Vec<qcode_vm::hook::Site> {
+        block.entry().into_iter().collect()
+    }
+
+    fn instrument(&mut self, site: &qcode_vm::hook::Site, emit: &mut qcode_vm::hook::Emitter<'_>) {
+        use qcode::value::insn::IntBinop;
+        let qcode_vm::hook::Site::BlockEntry { address, .. } = site else {
+            return;
+        };
+        let space = emit.state_space("edges");
+        let cur = (address >> 1).wrapping_mul(0x9e37_79b9) & (self.map as u64 - 1);
+        let prev_p = emit.constant(Self::PREV, 8);
+        let prev = emit.load_from(space, prev_p, 8);
+        let cur_v = emit.constant(cur, 8);
+        let mut idx = emit.binop(IntBinop::Xor, prev, cur_v);
+        if !self.overrun {
+            let mask = emit.constant(self.map as u64 - 1, 8);
+            idx = emit.binop(IntBinop::And, idx, mask);
+        }
+        let base = emit.constant(Self::COUNTERS, 8);
+        let p = emit.binop(IntBinop::Add, base, idx);
+        let b = emit.load_from(space, p, 1);
+        let one = emit.constant(1, 1);
+        let b1 = emit.binop(IntBinop::Add, b, one);
+        emit.store_to(space, b1, p);
+        let next = emit.constant(cur >> 1, 8);
+        emit.store_to(space, next, prev_p);
+    }
+}
+
+#[test]
+fn a_map_in_a_bounded_space_is_indexed_natively() {
+    const MAP: usize = 16;
+    let mut maps = Vec::new();
+    for jit in [false, true] {
+        let mut vm = machine(LOOP, false);
+        let shared = Rc::new(RefCell::new(Jit::new()));
+        if jit {
+            vm.set_block_executor(Box::new(SharedJit(shared.clone())));
+        }
+        let space = vm
+            .state_space("edges", EdgeMap::COUNTERS as usize + MAP)
+            .expect("the space is made");
+        vm.add_hook(EdgeMap {
+            map: MAP,
+            overrun: false,
+        });
+        let regs = drive_with(&mut vm, &["EAX"], |_, code, _| {
+            panic!("jit={jit}: nothing stops the machine, but code {code} did")
+        });
+        assert_eq!(
+            regs,
+            vec![Some(42)],
+            "jit={jit}: the program ran to its end"
+        );
+        let map = vm
+            .memory()
+            .flat()
+            .read_bytes(
+                qcode::space::MemorySpaceId::Shared(space),
+                EdgeMap::COUNTERS,
+                MAP,
+            )
+            .unwrap();
+        // Five trips round the loop, and the entry and exit edges, at least:
+        // a block is instrumented as lifted, which can be before absorption
+        // joins it to its neighbours.
+        assert!(
+            map.iter().map(|&b| u64::from(b)).sum::<u64>() >= 7,
+            "jit={jit}: {map:?}"
+        );
+        if jit {
+            let stats = shared.borrow().stats.clone();
+            assert!(
+                stats.native_runs >= 5,
+                "jit: expected the instrumented loop to run natively, got {stats:?}"
+            );
+        }
+        maps.push(map);
+    }
+    assert_eq!(maps[0], maps[1]);
+}
+
+#[test]
+fn an_index_past_the_bound_stops_both_strategies_alike() {
+    const MAP: usize = 16;
+    let mut exits = Vec::new();
+    for jit in [false, true] {
+        let mut vm = machine(LOOP, false);
+        let shared = Rc::new(RefCell::new(Jit::new()));
+        if jit {
+            vm.set_block_executor(Box::new(SharedJit(shared.clone())));
+        }
+        vm.state_space("edges", EdgeMap::COUNTERS as usize + MAP)
+            .expect("the space is made");
+        // Unmasked, the index reaches past the map: the block ids are spread
+        // over 64 bits and xor'd with the previous one.
+        vm.add_hook(EdgeMap {
+            map: 1 << 40,
+            overrun: true,
+        });
+        let exit = vm.run(1_000_000);
+        let VmExit::Error(message) = &exit else {
+            panic!("jit={jit}: expected the overrun to stop the machine, got {exit:?}");
+        };
+        assert!(
+            message.contains("address overflow"),
+            "jit={jit}: unexpected error: {message}"
+        );
+        if jit {
+            let stats = shared.borrow().stats.clone();
+            // A run that errors is not counted as native; the block was
+            // compiled, and nothing declined, so compiled code found it.
+            assert!(
+                stats.compiled >= 1 && stats.declined == 0,
+                "jit: the overrun should be compiled code's to find, got {stats:?}"
+            );
+        }
+        exits.push(message.to_string());
+    }
+    assert_eq!(exits[0], exits[1]);
+}
