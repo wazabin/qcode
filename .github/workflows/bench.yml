@@ -35,7 +35,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         id: toolchain
-      - run: sudo apt-get install -y --no-install-recommends valgrind
+      - name: Install valgrind
+        # The image's package lists lag its mirror; refresh them first.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends valgrind
 
       - name: Pin the runner to the library
         # The runner has to match the `iai-callgrind` crate's version.
@@ -89,7 +93,7 @@ jobs:
           key: iai-${{ github.sha }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.runner.outputs.version }}
 
       - name: Tabulate
-        if: always()
+        if: always() && hashFiles('bench.json') != ''
         run: |
           {
             echo '## Lift bench'
@@ -102,7 +106,7 @@ jobs:
           cat bench.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment
-        if: always() && github.event_name == 'pull_request'
+        if: always() && github.event_name == 'pull_request' && hashFiles('bench.md') != ''
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: lift-bench
