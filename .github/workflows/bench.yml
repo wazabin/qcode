@@ -14,79 +14,99 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Where iai-callgrind keeps its results and baselines, outside `target` so
+  # the base's and the head's builds can each have their own.
+  IAI_CALLGRIND_HOME: ${{ github.workspace }}/iai
+
 jobs:
-  # Times the lifting hot path (sleigh/benches/lift.rs) on every push and pull
-  # request. A pull request is compared against its base: the base is benched
-  # first in the same job, on the same runner, and Criterion reports the change
-  # per instruction. Shared runners are noisy, so the job reports and never
-  # fails on a regression; read the table, in the job summary and in a sticky
-  # comment on the pull request, and rerun locally with
-  # `--save-baseline`/`--baseline` before believing a small difference.
+  # Counts the instructions of the lifting hot path (sleigh/benches/lift.rs)
+  # under callgrind on every push and pull request. The count is exact and
+  # independent of the runner, so a pull request is compared against a
+  # baseline recorded once for its base: a push to main records the baseline
+  # for its own sha and a pull request restores it, keyed on the base's sha
+  # and the toolchain. Only a miss — a base whose push has not run, or an
+  # evicted cache — benches the base in the job. The job reports and never
+  # fails on a regression; the table is in the job summary and in a sticky
+  # comment on the pull request.
   lift:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
+      - name: Install valgrind
+        # The image's package lists lag its mirror; refresh them first.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends valgrind
+
+      - name: Pin the runner to the library
+        # The runner has to match the `iai-callgrind` crate's version.
+        id: runner
+        run: |
+          version=$(cargo pkgid iai-callgrind | cut -d@ -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: iai-callgrind-runner@${{ steps.runner.outputs.version }}
+
+      - name: Restore the base's baseline
+        if: github.event_name == 'pull_request'
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: iai
+          key: iai-${{ github.event.pull_request.base.sha }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.runner.outputs.version }}
 
       - name: Check out the base
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.restore.outputs.cache-hit != 'true'
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: base
 
-      - name: Cache the base's build
-        if: github.event_name == 'pull_request'
-        # The base is the same commit for every push to a pull request, so
-        # its build is a cache hit after the first: keyed on its sha, and
-        # keeping the workspace's own crates, which the action drops by
-        # default since they change on every commit.
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: base -> target
-          key: base-${{ github.event.pull_request.base.sha }}
-          cache-workspace-crates: true
-
       - name: Bench the base
-        id: base
         # The base has the bench only once it is on main; a pull request that
         # adds it is benched on its own.
-        if: github.event_name == 'pull_request' && hashFiles('base/sleigh/benches/lift.rs') != ''
+        if: github.event_name == 'pull_request' && steps.restore.outputs.cache-hit != 'true' && hashFiles('base/sleigh/benches/lift.rs') != ''
         working-directory: base
-        # The base builds in its own target directory: shared with the head's,
-        # cargo reused the base's artifacts for the head and compared the base
-        # with itself. Only Criterion's store is shared, so the head's run
-        # finds the baseline.
-        env:
-          CRITERION_HOME: ${{ github.workspace }}/target/criterion
-        run: |
-          cargo bench -p wazabin-qcode-sleigh --bench lift -- --noplot --save-baseline base
-          echo "compare=--baseline base" >> "$GITHUB_OUTPUT"
+        run: cargo bench -p wazabin-qcode-sleigh --bench lift -- --save-baseline=base
 
       - name: Bench
-        # bash for pipefail, so the tee does not hide a failed bench.
+        # A push to main records the baseline the pull requests against it
+        # restore; a pull request compares against the base's.
         shell: bash
-        env:
-          CRITERION_HOME: ${{ github.workspace }}/target/criterion
         run: |
-          cargo bench -p wazabin-qcode-sleigh --bench lift -- --noplot ${{ steps.base.outputs.compare }} \
-            | tee bench.txt
+          if [ "${{ github.event_name }}" = push ]; then
+            flags=--save-baseline=base
+          elif [ -d iai ]; then
+            flags=--baseline=base
+          fi
+          cargo bench -p wazabin-qcode-sleigh --bench lift -- $flags --output-format=json > bench.json
+
+      - name: Save the baseline
+        if: github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: iai
+          key: iai-${{ github.sha }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.runner.outputs.version }}
 
       - name: Tabulate
-        if: always()
+        if: always() && hashFiles('bench.json') != ''
         run: |
           {
             echo '## Lift bench'
-            if [ -n "${{ steps.base.outputs.compare }}" ]; then
+            if [ "${{ github.event_name }}" = pull_request ]; then
               echo "Head \`${{ github.event.pull_request.head.sha }}\` against base \`${{ github.event.pull_request.base.sha }}\`."
             fi
             echo
-            python3 .github/scripts/bench-table.py < bench.txt
+            python3 .github/scripts/bench-table.py < bench.json
           } > bench.md
           cat bench.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment
-        if: always() && github.event_name == 'pull_request'
+        if: always() && github.event_name == 'pull_request' && hashFiles('bench.md') != ''
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: lift-bench

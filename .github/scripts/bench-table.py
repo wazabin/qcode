@@ -1,99 +1,66 @@
 #!/usr/bin/env python3
-"""Tabulate Criterion's text output as a Markdown table.
+"""Tabulate iai-callgrind's JSON output as a Markdown table.
 
-    cargo bench -p wazabin-qcode-sleigh --bench lift -- --noplot | tee bench.txt
-    python3 .github/scripts/bench-table.py < bench.txt
+    cargo bench -p wazabin-qcode-sleigh --bench lift -- --output-format=json > bench.json
+    python3 .github/scripts/bench-table.py < bench.json
 
-Every benchmark is `group/value`; the values become rows and the groups
-columns, both in the order Criterion printed them. A run against a baseline
-gets a change column per group with Criterion's own verdict: a change is
-marked only when Criterion reports it as an improvement or a regression, so
-the table applies the same significance test and noise threshold as the run.
+One record per benchmark, one per line. The benchmark functions become
+columns and the case ids rows, both in the order they ran. A run against a
+baseline gets a change column per function. The measure is instructions
+retired, which callgrind counts exactly, so every non-zero change is a real
+change in the work done; a change of a percent or more is marked.
 """
 
-import re
+import json
 import sys
 
-# `decode/nop              time:   [203.50 ns 205.25 ns 207.01 ns]`; the id
-# takes the line to itself when it is too long for the column.
-ID_LINE = re.compile(r"^(?P<id>[^\s/]+/\S+)\s*(?:time:\s*\[(?P<time>[^\]]*)\])?$")
-TIME_LINE = re.compile(r"^\s+time:\s*\[(?P<time>[^\]]*)\]")
-# `change: [−45.623% −44.868% −44.130%] (p = 0.00 < 0.05)`; Criterion writes a
-# Unicode minus. A group with a throughput has `change:` on its own line, and
-# the change as a `time:` line under it, next to the throughput's.
-CHANGE_LINE = re.compile(r"^\s+change:\s*\[(?P<change>[^\]]*)\]")
-CHANGE_HEAD = re.compile(r"^\s+change:\s*$")
-VERDICTS = {
-    "Performance has improved.": "improved",
-    "Performance has regressed.": "regressed",
-    "Change within noise threshold.": "noise",
-    "No change in performance detected.": "noise",
-}
+MARK = 1.0
 
 
 def parse(lines):
-    """Yield `(id, time, change, verdict)` per benchmark, in output order."""
-    current = None
-    under_change = False
+    """Yield `(function, id, instructions, change)` per benchmark."""
     for line in lines:
-        line = line.rstrip("\n")
-        if match := ID_LINE.match(line):
-            if current:
-                yield current
-            current = [match["id"], match["time"], None, None]
-            under_change = False
+        if not line.strip():
             continue
-        if not current:
-            continue
-        if CHANGE_HEAD.match(line):
-            under_change = True
-        elif match := CHANGE_LINE.match(line):
-            current[2] = middle(match["change"])
-        elif match := TIME_LINE.match(line):
-            if under_change:
-                current[2] = middle(match["time"])
-            else:
-                current[1] = match["time"]
-        elif (verdict := VERDICTS.get(line.strip())) is not None:
-            current[3] = verdict
-    if current:
-        yield current
+        record = json.loads(line)
+        summary = record["profiles"][0]["summaries"]["total"]["summary"]
+        ir = summary["Callgrind"]["Ir"]
+        metrics = ir["metrics"]
+        # `Both` is `[new, old]` against a baseline; `Left` is a lone run.
+        if "Both" in metrics:
+            new, _ = metrics["Both"]
+            change = float(ir["diffs"]["diff_pct"])
+        else:
+            new = metrics["Left"]
+            change = None
+        yield record["function_name"], record["id"], new["Int"], change
 
 
-def middle(change):
-    """The point estimate of `[lower point upper]`, in ASCII."""
-    return change.split()[1].replace("−", "-")
-
-
-def estimate(time):
-    """The middle of `[lower point upper]`, with its unit."""
-    parts = time.split()
-    return " ".join(parts[2:4]) if len(parts) == 6 else time
-
-
-def cell(change, verdict):
-    if verdict == "improved":
-        return f"**{change}** 🟢"
-    if verdict == "regressed":
-        return f"**{change}** 🔴"
-    return change or ""
+def cell(change):
+    if change is None:
+        return ""
+    text = f"{change:+.2f}%"
+    if change <= -MARK:
+        return f"**{text}** 🟢"
+    if change >= MARK:
+        return f"**{text}** 🔴"
+    return text
 
 
 def main():
     results = {}
     groups, values = [], []
-    for id, time, change, verdict in parse(sys.stdin):
-        group, value = id.split("/", 1)
+    for group, value, instructions, change in parse(sys.stdin):
         if group not in groups:
             groups.append(group)
         if value not in values:
             values.append(value)
-        results[id] = (time, change, verdict)
+        results[group, value] = (instructions, change)
     if not results:
         print("No results.")
         return
 
-    compared = any(change for _, change, _ in results.values())
+    compared = any(change is not None for _, change in results.values())
     header = ["instruction"]
     align = [":--"]
     for group in groups:
@@ -107,21 +74,20 @@ def main():
     for value in values:
         row = [f"`{value}`"]
         for group in groups:
-            time, change, verdict = results.get(f"{group}/{value}", (None, None, None))
-            row.append(estimate(time) if time else "")
+            instructions, change = results.get((group, value), (None, None))
+            row.append(f"{instructions:,}" if instructions is not None else "")
             if compared:
-                row.append(cell(change, verdict))
+                row.append(cell(change))
         print("| " + " | ".join(row) + " |")
+    print()
     if compared:
-        print()
         print(
-            "Criterion's point estimate per iteration and its change against the "
-            "base; 🟢/🔴 mark the changes Criterion reports as an improvement or "
-            "a regression, the others are within its noise threshold."
+            "Instructions retired per run under callgrind, and the change "
+            "against the base. The count is exact, so every non-zero change is "
+            f"a change in the work done; 🟢/🔴 mark those of {MARK:g}% or more."
         )
     else:
-        print()
-        print("Criterion's point estimate per iteration.")
+        print("Instructions retired per run under callgrind.")
 
 
 if __name__ == "__main__":
