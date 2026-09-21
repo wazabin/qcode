@@ -2227,6 +2227,13 @@ impl<'str> FunctionBody<'str> {
         Ok(())
     }
 
+    /// Whether `block`, body-local, is on this body's roster. A block is
+    /// rostered when it is pushed, so the newest is checked first: that is
+    /// the common question, and it costs nothing.
+    pub(crate) fn is_rostered(&self, block: LocalBlockId) -> bool {
+        self.roster.last() == Some(&block) || self.roster.contains(&block)
+    }
+
     /// Drop `block` from this body's ownership roster. Ownership is derived from
     /// the storing arena (`block.func`).
     pub fn unroster_block(&mut self, block: BlockId) {
@@ -3343,10 +3350,10 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
             id.func, self.id,
             "cannot add a block stored in another function arena"
         );
-        let local = id.localize(self.id);
         // Ensure the roster lists it exactly once (a freshly `make`d block is
         // auto-rostered, so this is usually a no-op).
-        if !self.inner().roster.contains(&local) {
+        let local = id.localize(self.id);
+        if !self.inner().is_rostered(local) {
             self.inner_mut().roster.push(local);
         }
     }

@@ -412,20 +412,28 @@ impl LiftCache {
 
     /// Lifts `instruction` into `target` through the cache: a replay when
     /// its shape is known, a real lift — probed and remembered — otherwise.
-    /// `decoder` decoded the instruction and decodes its probes.
+    /// `decoder` decoded the instruction and decodes its probes; `shape` is
+    /// the instruction's, when that decode reported it.
     pub(crate) fn lower(
         &self,
         lifter: &SleighLifter<'_>,
         target: &mut LiftTarget<'_, 'static>,
         instruction: &Decoded<'_, '_>,
+        shape: Option<Shape>,
         decoder: &FixedDecoder<'_>,
         flat: bool,
     ) -> Result<Lifted, LiftError> {
         match self.find(lifter, instruction, decoder, flat)? {
             Lookup::Hit(template, instance) => template.replay(target, &instance),
             Lookup::Uncacheable => lifter.lower(target, instruction, flat),
-            Lookup::Unknown => self.miss(lifter, target, instruction, decoder, flat),
+            Lookup::Unknown => self.miss(lifter, target, instruction, shape, decoder, flat),
         }
+    }
+
+    /// Whether a lookup before decoding can answer: a validating cache
+    /// decodes every instruction to check its hit, so it never does.
+    pub(crate) fn answers_undecoded(&self) -> bool {
+        !self.validating
     }
 
     /// What the cache holds for `instruction`. A hit is counted here, and
@@ -500,12 +508,14 @@ impl LiftCache {
     }
 
     /// Lifts an instruction [`find`](Self::find) did not know into `target`,
-    /// probes its shape, and remembers it.
+    /// probes its shape, and remembers it. `shape` is the instruction's when
+    /// its decode reported one; otherwise it is decoded again for it.
     pub(crate) fn miss(
         &self,
         lifter: &SleighLifter<'_>,
         target: &mut LiftTarget<'_, 'static>,
         instruction: &Decoded<'_, '_>,
+        shape: Option<Shape>,
         decoder: &FixedDecoder<'_>,
         flat: bool,
     ) -> Result<Lifted, LiftError> {
@@ -514,10 +524,15 @@ impl LiftCache {
         let lifted = lifter.lower(target, instruction, flat)?;
         let address = instruction.address();
         let bytes = instruction.bytes();
-        // The shape, from the instruction's own bytes: a decode reading past
-        // them — a delay slot — has no shape the key can hold.
-        let Ok((_, shape)) = decoder.decode_shaped(address, bytes) else {
-            return Ok(lifted);
+        // A decode reading past the instruction's own bytes — a delay slot —
+        // has no shape the key can hold: it overruns, or from the bytes
+        // alone it fails.
+        let shape = match shape {
+            Some(shape) => shape,
+            None => match decoder.decode_shaped(address, bytes) {
+                Ok((_, shape)) => shape,
+                Err(_) => return Ok(lifted),
+            },
         };
         if shape.overruns() || shape.len() != bytes.len() {
             return Ok(lifted);
@@ -1946,7 +1961,9 @@ impl Template {
 
     /// Emits the template's IR into `target` as the instruction at
     /// `instance`.
-    fn replay(
+    /// Lifts the instruction this template is at `instance` into `target`,
+    /// from the record alone.
+    pub(crate) fn replay(
         &self,
         target: &mut LiftTarget<'_, 'static>,
         instance: &Instance,

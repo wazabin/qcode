@@ -1,10 +1,18 @@
 //! Lifting throughput over the whole `.text` of an ELF binary, every byte
-//! offset (the superset) or a linear sweep, single-threaded.
+//! offset (the superset) or a linear sweep, single-threaded. The lift stage
+//! is a [`ScratchSession`], or with `--session` a [`LiftSession`] keeping
+//! every instruction in one function, which is what a cache hit replays into.
 //!
 //! ```sh
-//! cargo run --release -p wazabin-qcode-sleigh --example lift-throughput -- /usr/bin/ls [--linear] [--stage decode|pcode|lift] [--cache] [--validate]
+//! cargo run --release -p wazabin-qcode-sleigh --example lift-throughput -- /usr/bin/ls [--linear] [--stage decode|pcode|lift] [--cache] [--validate] [--session]
 //! cargo run --release -p wazabin-qcode-sleigh --example lift-throughput -- --bytes dec9 --iters 3000 --cache
+//! cargo run --release -p wazabin-qcode-sleigh --example lift-throughput -- xul.dll --offset 0x400 --len 0x24603E1 --linear --stage decode
 //! ```
+//!
+//! `--offset` and `--len` take the code from a slice of any file instead of
+//! an ELF's `.text`, as disas-bench's harnesses do
+//! (<https://github.com/icedland/disas-bench>: xul.dll's `.text`, decoded
+//! linearly, reported in MB/s), so the decode stage compares with its table.
 
 use std::{hint::black_box, sync::Arc, time::Instant};
 
@@ -26,7 +34,11 @@ impl PcodeSink for Tally {
         black_box((opcode, label, condition));
     }
 }
-use wazabin_qcode_sleigh::{SleighLifter, cache::LiftCache, session::ScratchSession};
+use wazabin_qcode_sleigh::{
+    SleighLifter,
+    cache::LiftCache,
+    session::{Host, LiftSession, ScratchSession},
+};
 
 fn text_section(file: &[u8]) -> (u64, Vec<u8>) {
     let u16_at = |o: usize| u16::from_le_bytes(file[o..o + 2].try_into().unwrap()) as usize;
@@ -61,9 +73,16 @@ fn main() {
             .position(|a| a == name)
             .map(|i| args[i + 1].clone())
     };
+    let number = |s: &str| -> usize {
+        match s.strip_prefix("0x") {
+            Some(hex) => usize::from_str_radix(hex, 16).unwrap(),
+            None => s.parse().unwrap(),
+        }
+    };
     let linear = args.iter().any(|a| a == "--linear");
     let use_cache = args.iter().any(|a| a == "--cache");
     let validate = args.iter().any(|a| a == "--validate");
+    let keep = args.iter().any(|a| a == "--session");
     let stage = flag("--stage").unwrap_or_else(|| "all".into());
     let (path, base, text) = if let Some(hex) = flag("--bytes") {
         // One encoding, repeated `--iters` times at consecutive addresses.
@@ -81,7 +100,16 @@ fn main() {
             .expect("path to an ELF")
             .clone();
         let file = std::fs::read(&path).unwrap();
-        let (base, text) = text_section(&file);
+        let (base, text) = match flag("--offset") {
+            Some(offset) => {
+                let offset = number(&offset);
+                let len = flag("--len")
+                    .map(|s| number(&s))
+                    .unwrap_or(file.len() - offset);
+                (0x1000, file[offset..offset + len].to_vec())
+            }
+            None => text_section(&file),
+        };
         (path, base, text)
     };
     eprintln!("{path}: .text {} bytes at {base:#x}", text.len());
@@ -92,8 +120,10 @@ fn main() {
     let lifter = SleighLifter::new(spec).with_flat_control_flow();
     let cache = Arc::new(LiftCache::new(spec).validating(validate));
     let mut session = ScratchSession::new(&lifter);
+    let mut keeping = LiftSession::new(&lifter, Host::Anonymous);
     if use_cache {
         session = session.with_cache(Arc::clone(&cache));
+        keeping = keeping.with_cache(Arc::clone(&cache));
     }
 
     let offsets: Vec<usize> = if linear {
@@ -155,7 +185,17 @@ fn main() {
             }),
         );
     }
-    if stage == "all" || stage == "lift" {
+    if (stage == "all" || stage == "lift") && keep {
+        run(
+            "session",
+            Box::new(|a, b| {
+                keeping
+                    .lift(a, b)
+                    .map(|l| black_box(l.blocks().len()))
+                    .is_ok()
+            }),
+        );
+    } else if stage == "all" || stage == "lift" {
         run(
             "lift",
             Box::new(|a, b| {
