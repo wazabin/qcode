@@ -23,7 +23,7 @@
 
 use sleigh::{
     CompiledSpec, ContextBytes, ContextDatabase, ContextError, DecodeError, Decoder, Instruction,
-    SpecFingerprint,
+    Shape, SpecFingerprint,
 };
 
 /// Decodes any address with one fixed context. See the [module
@@ -72,6 +72,18 @@ impl<'spec> FixedDecoder<'spec> {
         bytes: &'bytes [u8],
     ) -> Result<Instruction<'spec, 'bytes>, DecodeError> {
         self.decoder.decode_one(address, bytes, &self.context)
+    }
+
+    /// [`decode`](Self::decode), also reporting the instruction's
+    /// [`Shape`]: which bits chose its constructors and which fields are its
+    /// parameters. See [`Decoder::decode_one_shaped`].
+    pub fn decode_shaped<'bytes>(
+        &self,
+        address: u64,
+        bytes: &'bytes [u8],
+    ) -> Result<(Instruction<'spec, 'bytes>, Shape), DecodeError> {
+        self.decoder
+            .decode_one_shaped(address, bytes, &self.context)
     }
 }
 

@@ -474,39 +474,15 @@ impl<'spec> SleighLifter<'spec> {
         instruction: &Instruction<'_, '_>,
         flat: bool,
     ) -> Result<Lifted, LiftError> {
-        self.lower_with(target, instruction, flat, false)
-            .map(|(lifted, _)| lifted)
-    }
-
-    /// [`lower`](Self::lower), also returning every constant operand the
-    /// p-code carried, in stream order — what a lift cache compares against
-    /// the same instruction's p-code at another address to tell which
-    /// constants the address made. See [`cache`](crate::cache).
-    pub(crate) fn lower_recording(
-        &self,
-        target: &mut LiftTarget<'_, 'static>,
-        instruction: &Instruction<'_, '_>,
-        flat: bool,
-    ) -> Result<(Lifted, Vec<(u64, usize)>), LiftError> {
-        self.lower_with(target, instruction, flat, true)
-    }
-
-    fn lower_with(
-        &self,
-        target: &mut LiftTarget<'_, 'static>,
-        instruction: &Instruction<'_, '_>,
-        flat: bool,
-        recording: bool,
-    ) -> Result<(Lifted, Vec<(u64, usize)>), LiftError> {
         self.check_instruction(instruction)?;
         self.check_compatible(target.context())?;
         let mut construction = target.begin(instruction.address(), instruction.len())?;
         // The plan carries every fact needed before the builder borrows the
         // function body, so no flat p-code vector is built or re-scanned.
-        let consts = instruction
-            .try_pcode_ops_streamed(|plan| self.emitter(&mut construction, plan, flat, recording))?
+        instruction
+            .try_pcode_ops_streamed(|plan| self.emitter(&mut construction, plan, flat))?
             .finish()?;
-        Ok((construction.commit()?, consts))
+        Ok(construction.commit()?)
     }
 
     /// Resolves the function an instruction at `address` belongs to.
@@ -566,7 +542,6 @@ impl<'spec> SleighLifter<'spec> {
         construction: &'c mut Construction<'_, 'a, 'static>,
         plan: &PcodePlan,
         flat: bool,
-        recording: bool,
     ) -> Result<FlatEmitter<'_, 'static, 'c>, LiftError> {
         let address = construction.address();
         let length = construction.length();
@@ -609,7 +584,6 @@ impl<'spec> SleighLifter<'spec> {
             address,
             plan,
             flat,
-            recording,
         ))
     }
 
@@ -650,8 +624,7 @@ impl<'spec> SleighLifter<'spec> {
         let pcode = flat.ops();
         let plan = Self::plan_from_ops(pcode, self.flat_control_flow)?;
         let mut construction = target.begin(address, length)?;
-        let mut emitter =
-            self.emitter(&mut construction, &plan.plan, self.flat_control_flow, false)?;
+        let mut emitter = self.emitter(&mut construction, &plan.plan, self.flat_control_flow)?;
         for (index, op) in pcode.iter().enumerate() {
             if let Some(&label) = plan.labels.get(&index) {
                 emitter.label(label);
@@ -741,8 +714,6 @@ struct Workspace {
     branches: HashMap<u64, BlockId>,
     calls: HashMap<u64, Callee>,
     labels: Vec<Option<BlockId>>,
-    /// The constant operands the emitter was asked to record.
-    consts: Vec<(u64, usize)>,
 }
 
 impl Workspace {
@@ -752,7 +723,6 @@ impl Workspace {
         self.branches.clear();
         self.calls.clear();
         self.labels.clear();
-        self.consts.clear();
     }
 }
 
@@ -828,10 +798,6 @@ struct FlatEmitter<'spec, 'str, 'ctx> {
     /// A sink cannot fail, so the first failure is latched and the rest of the
     /// instruction is ignored; its caller discards a partial instruction.
     error: Option<LiftError>,
-    /// Every constant operand of the p-code, in stream order, when the
-    /// caller asked for them; see [`SleighLifter::lower_recording`].
-    consts: Vec<(u64, usize)>,
-    recording: bool,
 }
 
 impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
@@ -845,7 +811,6 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         address: u64,
         plan: &PcodePlan,
         flat: bool,
-        recording: bool,
     ) -> Self {
         // A terminal label is the instruction's fall-through, not a block.
         workspace.labels.extend(
@@ -868,16 +833,12 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             fallthrough: 0,
             flat,
             error: None,
-            consts: workspace.consts,
-            recording,
         }
     }
 
     /// Closes the instruction. Running off the end of its p-code is a
     /// fall-through.
-    /// Closes the instruction and hands back the constants it recorded.
-    /// Running off the end of its p-code is a fall-through.
-    fn finish(mut self) -> Result<Vec<(u64, usize)>, LiftError> {
+    fn finish(mut self) -> Result<(), LiftError> {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
@@ -886,7 +847,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             self.builder
                 .exit(site, ExitArm::Unconditional, ExitKind::Fallthrough);
         }
-        Ok(std::mem::take(&mut self.consts))
+        Ok(())
     }
 
     /// Branches to the instruction's fall-through, the target of a local
@@ -1425,40 +1386,7 @@ impl Drop for FlatEmitter<'_, '_, '_> {
             branches: std::mem::take(&mut self.branches),
             calls: std::mem::take(&mut self.calls),
             labels: std::mem::take(&mut self.labels),
-            consts: std::mem::take(&mut self.consts),
         });
-    }
-}
-
-/// Records the constant operands of a p-code stream, in stream order, as
-/// [`FlatEmitter`] records them when asked: a lift cache streams an
-/// instruction's p-code at another address into one and compares.
-#[derive(Default)]
-pub(crate) struct ConstSink {
-    pub(crate) consts: Vec<(u64, usize)>,
-}
-
-/// Appends the constants among `varnodes` to `consts`.
-fn record_consts(consts: &mut Vec<(u64, usize)>, varnodes: &[Varnode]) {
-    consts.extend(
-        varnodes
-            .iter()
-            .filter(|v| v.space == SPACE_CONST)
-            .map(|v| (v.offset, v.size)),
-    );
-}
-
-impl PcodeSink for ConstSink {
-    fn op(&mut self, _opcode: Opcode, _output: Option<Varnode>, inputs: &[Varnode]) {
-        record_consts(&mut self.consts, inputs);
-    }
-
-    fn label(&mut self, _label: LabelId) {}
-
-    fn branch_label(&mut self, _opcode: Opcode, _label: LabelId, condition: Option<Varnode>) {
-        if let Some(condition) = condition {
-            record_consts(&mut self.consts, &[condition]);
-        }
     }
 }
 
@@ -1466,9 +1394,6 @@ impl PcodeSink for FlatEmitter<'_, '_, '_> {
     fn op(&mut self, opcode: Opcode, output: Option<Varnode>, inputs: &[Varnode]) {
         if self.error.is_some() {
             return;
-        }
-        if self.recording {
-            record_consts(&mut self.consts, inputs);
         }
         self.open_continuation();
         self.builder.set_address(self.address);
@@ -1505,11 +1430,6 @@ impl PcodeSink for FlatEmitter<'_, '_, '_> {
     fn branch_label(&mut self, opcode: Opcode, label: LabelId, condition: Option<Varnode>) {
         if self.error.is_some() {
             return;
-        }
-        if self.recording
-            && let Some(condition) = condition
-        {
-            record_consts(&mut self.consts, &[condition]);
         }
         self.open_continuation();
         self.builder.set_address(self.address);

@@ -42,7 +42,7 @@ use sleigh::{CompiledSpec, ContextBytes, ContextError, Instruction, RegisterId, 
 
 use crate::{
     FlatPcode, LiftError, SleighLifter,
-    cache::{LiftCache, Lookup, Template},
+    cache::{Instance, LiftCache, Lookup, Template},
     decode::FixedDecoder,
 };
 
@@ -263,9 +263,6 @@ pub struct ScratchSession<'l, 'spec> {
     decoder: FixedDecoder<'spec>,
     store: ScratchStore,
     cache: Option<Arc<LiftCache>>,
-    /// Per leading byte, the encoding lengths this session has lifted
-    /// through the cache, as a bit set: what a lookup before decoding tries.
-    lengths: Box<[u16; 256]>,
 }
 
 impl<'l, 'spec> ScratchSession<'l, 'spec> {
@@ -280,7 +277,6 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
             decoder: FixedDecoder::new(lifter.spec()),
             store: ScratchStore::new(lifter.new_context()),
             cache: None,
-            lengths: Box::new([0; 256]),
         }
     }
 
@@ -343,33 +339,22 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
     ) -> Result<ScratchLifted<'s, 'l, 'spec, 'b>, LiftError> {
         // A known encoding needs no decode: the views read the template, and
         // the instruction is decoded only if asked for.
-        if let (Some(cache), Some(&first)) = (&self.cache, bytes.first())
-            && let Some((template, length)) = cache.find_undecoded(
-                self.lifter,
-                &self.decoder,
-                true,
-                bytes,
-                self.lengths[usize::from(first)],
-            )?
+        if let Some(cache) = &self.cache
+            && let Some((template, instance)) =
+                cache.find_undecoded(self.lifter, &self.decoder, true, address, bytes)?
         {
-            let lifted = template.lifted_at(address, self.store.function());
-            debug_assert_eq!(lifted.length(), length);
+            let lifted = template.lifted_at(&instance, self.store.function());
             return Ok(ScratchLifted {
                 session: self,
                 instruction: OnceCell::new(),
                 address,
                 bytes: Some(bytes),
                 lifted,
-                template: Some(template),
+                template: Some((template, instance)),
             });
         }
         let instruction = self.decoder.decode(address, bytes)?;
-        let lifted = self.lower(instruction, true)?;
-        if lifted.session.cache.is_some() {
-            let length = lifted.lifted.length();
-            lifted.session.lengths[usize::from(bytes[0])] |= 1 << length.min(15);
-        }
-        Ok(lifted)
+        self.lower(instruction, true)
     }
 
     /// Discards the previous instruction, then lifts one the caller decoded.
@@ -390,17 +375,17 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
             Some(cache) => cache.find(self.lifter, &instruction, &self.decoder, true)?,
             None => Lookup::Uncacheable,
         };
-        if let Lookup::Hit(template) = lookup {
+        if let Lookup::Hit(template, instance) = lookup {
             // Nothing is lowered: the views read the template.
             let address = instruction.address();
-            let lifted = template.lifted_at(address, self.store.function());
+            let lifted = template.lifted_at(&instance, self.store.function());
             return Ok(ScratchLifted {
                 session: self,
                 instruction: OnceCell::from(instruction),
                 address,
                 bytes: None,
                 lifted,
-                template: Some(template),
+                template: Some((template, instance)),
             });
         }
         self.store.reset();
@@ -450,20 +435,21 @@ pub struct ScratchLifted<'s, 'l, 'spec, 'b> {
     /// The stream the instruction starts, kept until it is decoded.
     bytes: Option<&'b [u8]>,
     lifted: Lifted,
-    /// The template the views read when the instruction came from the cache.
-    template: Option<Arc<Template>>,
+    /// The template the views read when the instruction came from the
+    /// cache, and the instance of it the instruction is.
+    template: Option<(Arc<Template>, Instance)>,
 }
 
 /// Where a view reads its instruction from: the store's context, or a
-/// template and the address it is instantiated at. Both keep the context
-/// for the architecture's varnodes.
+/// template and the instance it is read at. Both keep the context for the
+/// architecture's varnodes.
 #[derive(Clone, Copy)]
 enum Source<'v> {
     Store(&'v Context<'static>),
     Template {
         ctx: &'v Context<'static>,
         template: &'v Template,
-        address: u64,
+        instance: &'v Instance,
     },
 }
 
@@ -479,10 +465,10 @@ impl<'s, 'l, 'spec, 'b> ScratchLifted<'s, 'l, 'spec, 'b> {
     fn source(&self) -> Source<'_> {
         let ctx = self.session.store.context();
         match &self.template {
-            Some(template) => Source::Template {
+            Some((template, instance)) => Source::Template {
                 ctx,
                 template,
-                address: self.lifted.address(),
+                instance,
             },
             None => Source::Store(ctx),
         }
@@ -742,8 +728,8 @@ impl<'v> ScratchBlock<'v> {
         match self.source {
             Source::Store(ctx) => ctx.block(self.id).address(),
             Source::Template {
-                template, address, ..
-            } => template.block_address(usize::from(self.id.local), address),
+                template, instance, ..
+            } => template.block_address(usize::from(self.id.local), instance),
         }
     }
 
@@ -861,9 +847,9 @@ impl<'v> ScratchInsn<'v> {
                     }
                 }
                 Source::Template {
-                    template, address, ..
+                    template, instance, ..
                 } => {
-                    let (value, size) = template.literal_at(usize::from(id), address);
+                    let (value, size) = template.literal_at(usize::from(id), instance);
                     ScratchOperand::Const { value, size }
                 }
             },
@@ -941,9 +927,9 @@ impl<'v> ScratchInsn<'v> {
             (
                 Callee::Minted(slot),
                 Source::Template {
-                    template, address, ..
+                    template, instance, ..
                 },
-            ) => template.callee_address(slot as usize, address),
+            ) => template.callee_address(slot as usize, instance),
             _ => None,
         }
     }

@@ -1977,8 +1977,7 @@ dependencies = [
 [[package]]
 name = "wazabin-sleigh"
 version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afd55c25ef8178edc3166e0b67ce87976b638644c49c351b2d4c3499d621b881"
+source = "git+https://github.com/wazabin/sleigh.git?rev=a76acf056a439fc612821507d404c59bff0d812f#a76acf056a439fc612821507d404c59bff0d812f"
 dependencies = [
  "pest",
  "pest_derive",

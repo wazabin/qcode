@@ -82,6 +82,84 @@ const CORPUS: &[(&str, &[u8])] = &[
     ("fxch", b"\xd9\xc9"),
 ];
 
+/// Corpus entries that share a shape with an earlier one — the backward
+/// `jz` and `call` with the forward ones — so they are hits even while
+/// warming.
+const SHAPE_REPEATS: usize = 2;
+
+/// Corpus entries whose shape cannot be parameterized from them, and are
+/// remembered by exact encoding: `jmp` to itself branches to its own entry
+/// block, which no other offset does; `pshufd` masks lane selectors out of
+/// its immediate.
+const EXACT: usize = 2;
+
+/// Pairs of one shape: the second differs from the first only in a
+/// parameter, and is served from the first's template when the flag says
+/// the shape is linear in it — including `ret 8`, whose immediate equals
+/// the pop's width, `add rsp, 8` likewise, and a `jz` whose target lands on
+/// the fall-through. A shape that is not, like `pshufd`'s, is remembered by
+/// exact encoding, so the variant misses once and hits at every other
+/// address.
+const VARIANTS: &[(&str, &[u8], &[u8], bool)] = &[
+    (
+        "mov_rax_rbp_disp8",
+        b"\x48\x8b\x45\xe8",
+        b"\x48\x8b\x45\xe0",
+        true,
+    ),
+    (
+        "add_rsp_imm8",
+        b"\x48\x83\xc4\x10",
+        b"\x48\x83\xc4\x08",
+        true,
+    ),
+    (
+        "sub_rsp_imm32",
+        b"\x48\x81\xec\x00\x01\x00\x00",
+        b"\x48\x81\xec\x08\x00\x00\x00",
+        true,
+    ),
+    ("ret_imm16", b"\xc2\x10\x00", b"\xc2\x08\x00", true),
+    (
+        "pshufd_imm8",
+        b"\x66\x0f\x70\xe4\x1b",
+        b"\x66\x0f\x70\xe4\x00",
+        false,
+    ),
+    ("jz_rel8", b"\x74\x05", b"\x74\x00", true),
+    ("jz_rel8_back", b"\x74\x05", b"\x74\xf0", true),
+    (
+        "call_rel32",
+        b"\xe8\x10\x00\x00\x00",
+        b"\xe8\xf0\xff\xff\xff",
+        true,
+    ),
+    (
+        "mov_rax_rip",
+        b"\x48\x8b\x05\x10\x00\x00\x00",
+        b"\x48\x8b\x05\xf0\xff\xff\xff",
+        true,
+    ),
+    (
+        "shl_rax_imm8",
+        b"\x48\xc1\xe0\x03",
+        b"\x48\xc1\xe0\x21",
+        true,
+    ),
+    (
+        "mov_rax_imm64",
+        b"\x48\xb8\x00\x10\x00\x00\x01\x00\x00\x00",
+        b"\x48\xb8\xff\xff\xff\xff\xff\xff\xff\xff",
+        true,
+    ),
+    (
+        "mov_mem_imm32",
+        b"\x48\xc7\x45\xf8\x01\x00\x00\x00",
+        b"\x48\xc7\x45\xd0\xff\xff\xff\xff",
+        true,
+    ),
+];
+
 /// Addresses on both sides of 4 GiB, none a multiple of another's stride.
 const ADDRESSES: &[u64] = &[
     0x1000,
@@ -223,8 +301,12 @@ fn a_scratch_hit_renders_as_the_uncached_lift() {
         assert_eq!(got.is_err(), expected.is_err(), "{name} (miss)");
     }
     let after_warmup = cache.stats();
-    assert_eq!(after_warmup.hits, 0);
-    assert_eq!(after_warmup.misses as usize, CORPUS.len());
+    assert_eq!(
+        after_warmup.hits as usize, SHAPE_REPEATS,
+        "{after_warmup:?}"
+    );
+    assert_eq!(after_warmup.misses as usize, CORPUS.len() - SHAPE_REPEATS);
+    assert_eq!(after_warmup.exact as usize, EXACT, "{after_warmup:?}");
 
     for &address in &ADDRESSES[1..] {
         for (name, bytes) in CORPUS {
@@ -234,13 +316,71 @@ fn a_scratch_hit_renders_as_the_uncached_lift() {
         }
     }
     let stats = cache.stats();
-    assert_eq!(stats.misses as usize, CORPUS.len());
+    let misses = CORPUS.len() - SHAPE_REPEATS;
+    assert_eq!(stats.misses as usize, misses, "{stats:?}");
     assert_eq!(
         stats.uncacheable, 0,
-        "every encoding of the corpus is cacheable: {stats:?}"
+        "every shape of the corpus is cacheable: {stats:?}"
     );
-    assert_eq!(stats.hits as usize, CORPUS.len() * (ADDRESSES.len() - 1));
-    assert_eq!(stats.entries, CORPUS.len());
+    assert_eq!(stats.exact as usize, EXACT);
+    assert_eq!(stats.hits as usize, CORPUS.len() * ADDRESSES.len() - misses);
+    assert_eq!(stats.entries, misses);
+}
+
+#[test]
+fn a_variant_of_a_shape_is_served_from_the_first_instance() {
+    let lifter = lifter();
+    let cache = Arc::new(LiftCache::new(lifter.spec()));
+    let mut plain = ScratchSession::new(&lifter);
+    let mut cached = ScratchSession::new(&lifter).with_cache(Arc::clone(&cache));
+    let mut hits = 0;
+    for (name, first, variant, linear) in VARIANTS {
+        let expected = render_at(&mut plain, ADDRESSES[0], first).ok();
+        let lifted = cached.lift(ADDRESSES[0], first).unwrap();
+        hits += usize::from(lifted.is_cached());
+        assert_same(
+            &format!("{name} (first)"),
+            &Some(render(&lifted)),
+            &expected,
+        );
+        for (index, &address) in ADDRESSES.iter().enumerate() {
+            let expected = render_at(&mut plain, address, variant).ok();
+            let lifted = cached.lift(address, variant).unwrap();
+            let hit = *linear || index > 0;
+            assert_eq!(lifted.is_cached(), hit, "{name} at {address:#x}");
+            hits += usize::from(hit);
+            assert_same(
+                &format!("{name} at {address:#x}"),
+                &Some(render(&lifted)),
+                &expected,
+            );
+        }
+    }
+    let stats = cache.stats();
+    assert_eq!(stats.hits as usize, hits, "{stats:?}");
+    assert_eq!(stats.uncacheable, 0, "{stats:?}");
+    // Both instances of a shape that is not linear are exact misses.
+    assert_eq!(
+        stats.exact as usize,
+        2 * VARIANTS.iter().filter(|(_, _, _, linear)| !linear).count(),
+        "{stats:?}"
+    );
+
+    // Validation agrees on every variant too, whichever instance is first.
+    let cache = Arc::new(LiftCache::new(lifter.spec()).validating(true));
+    let mut session = ScratchSession::new(&lifter).with_cache(Arc::clone(&cache));
+    for (_, first, variant, _) in VARIANTS {
+        for &address in ADDRESSES {
+            session.lift(address, variant).unwrap();
+            session.lift(address, first).unwrap();
+        }
+    }
+    let stats = cache.stats();
+    assert_eq!(stats.validation_failures, 0, "{stats:?}");
+    assert_eq!(
+        stats.hits as usize,
+        2 * VARIANTS.len() * ADDRESSES.len() - stats.misses as usize
+    );
 }
 
 #[test]
@@ -255,7 +395,12 @@ fn validation_agrees_on_every_hit() {
     }
     let stats = cache.stats();
     assert_eq!(stats.validation_failures, 0, "{stats:?}");
-    assert_eq!(stats.hits as usize, CORPUS.len() * (ADDRESSES.len() - 1));
+    let misses = CORPUS.len() - SHAPE_REPEATS;
+    assert_eq!(
+        stats.hits as usize,
+        CORPUS.len() * ADDRESSES.len() - misses,
+        "{stats:?}"
+    );
 }
 
 /// A straight-line sequence with relative branches into and out of it and a
@@ -373,12 +518,12 @@ fn the_cache_is_shared_across_threads() {
         }
     });
     let stats = cache.stats();
-    assert_eq!(stats.entries, CORPUS.len());
+    assert_eq!(stats.entries, CORPUS.len() - SHAPE_REPEATS);
     assert_eq!(
         stats.hits + stats.misses,
         (4 * CORPUS.len() * ADDRESSES.len()) as u64
     );
-    assert!(stats.misses as usize >= CORPUS.len());
+    assert!(stats.misses as usize >= CORPUS.len() - SHAPE_REPEATS);
 }
 
 #[test]
