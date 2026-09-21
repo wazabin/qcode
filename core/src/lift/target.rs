@@ -316,7 +316,13 @@ impl<'a, 'str> LiftTarget<'a, 'str> {
                 tail
             }
         };
-        FunctionBody::from_id_mut(self.ctx, self.function).add_block(entry);
+        // Every block in the arena is on the roster — `push_block` puts it
+        // there, and only leaving the arena takes it off — so the entry needs
+        // no rostering, and checking would scan the host's every block.
+        debug_assert!(
+            self.ctx.bodies[self.function].is_rostered(entry.local),
+            "the entry block is not on its function's roster"
+        );
         Ok(Construction {
             target: self,
             journal,
