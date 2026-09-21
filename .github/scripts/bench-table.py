@@ -26,11 +26,12 @@ def parse(lines):
         summary = record["profiles"][0]["summaries"]["total"]["summary"]
         ir = summary["Callgrind"]["Ir"]
         metrics = ir["metrics"]
+        # `Both` is `[new, old]` against a baseline; `Left` is a lone run.
         if "Both" in metrics:
             new, _ = metrics["Both"]
             change = float(ir["diffs"]["diff_pct"])
         else:
-            new = metrics["Single"]
+            new = metrics["Left"]
             change = None
         yield record["function_name"], record["id"], new["Int"], change
 
