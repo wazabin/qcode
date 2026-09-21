@@ -38,7 +38,9 @@ use qcode::{
         insn::{Callee, Mnemonic},
     },
 };
-use sleigh::{CompiledSpec, ContextBytes, ContextError, Instruction, RegisterId, RegisterSlice};
+use sleigh::{
+    CompiledSpec, ContextBytes, ContextError, Instruction, RegisterId, RegisterSlice, Shape,
+};
 
 use crate::{
     FlatPcode, LiftError, SleighLifter,
@@ -48,6 +50,24 @@ use crate::{
 
 #[cfg(doc)]
 use crate::decode::LinearDecoder;
+
+/// Decodes for `cache` an instruction its undecoded lookup did not know:
+/// with its shape when the cache answers undecoded, since the decode is
+/// then headed for a miss that keys on the shape, and plainly when the
+/// cache validates and will decode a hit to check it.
+fn decode_for<'spec, 'b>(
+    cache: &LiftCache,
+    decoder: &FixedDecoder<'spec>,
+    address: u64,
+    bytes: &'b [u8],
+) -> Result<(Instruction<'spec, 'b>, Option<Shape>), LiftError> {
+    Ok(if cache.answers_undecoded() {
+        let (instruction, shape) = decoder.decode_shaped(address, bytes)?;
+        (instruction, Some(shape))
+    } else {
+        (decoder.decode(address, bytes)?, None)
+    })
+}
 
 /// Which function a session lifts into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,20 +185,31 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
     }
 
     /// Decodes the instruction at `address` from `bytes` with the session's
-    /// fixed context and lifts it.
+    /// fixed context and lifts it. An encoding the session's cache knows is
+    /// replayed without a decode.
     pub fn lift(&mut self, address: u64, bytes: &[u8]) -> Result<Lifted, LiftError> {
-        let instruction = self.decoder.decode(address, bytes)?;
         let Some(cache) = &self.cache else {
+            let instruction = self.decoder.decode(address, bytes)?;
             return self.lift_decoded(&instruction);
         };
+        let flat = self.lifter.flat_control_flow();
+        if let Some((template, instance)) =
+            cache.find_undecoded(self.lifter, &self.decoder, flat, address, bytes)?
+        {
+            let mut target =
+                LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
+            return template.replay(&mut target, &instance);
+        }
+        let (instruction, shape) = decode_for(cache, &self.decoder, address, bytes)?;
         let mut target =
             LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
         cache.lower(
             self.lifter,
             &mut target,
             &instruction,
+            shape,
             &self.decoder,
-            self.lifter.flat_control_flow(),
+            flat,
         )
     }
 
@@ -353,8 +384,11 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
                 template: Some((template, instance)),
             });
         }
-        let instruction = self.decoder.decode(address, bytes)?;
-        self.lower(instruction, true)
+        let (instruction, shape) = match &self.cache {
+            Some(cache) => decode_for(cache, &self.decoder, address, bytes)?,
+            None => (self.decoder.decode(address, bytes)?, None),
+        };
+        self.lower(instruction, shape, true)
     }
 
     /// Discards the previous instruction, then lifts one the caller decoded.
@@ -362,12 +396,13 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
         &'s mut self,
         instruction: Instruction<'spec, 'b>,
     ) -> Result<ScratchLifted<'s, 'l, 'spec, 'b>, LiftError> {
-        self.lower(instruction, false)
+        self.lower(instruction, None, false)
     }
 
     fn lower<'s, 'b>(
         &'s mut self,
         instruction: Instruction<'spec, 'b>,
+        shape: Option<Shape>,
         cached: bool,
     ) -> Result<ScratchLifted<'s, 'l, 'spec, 'b>, LiftError> {
         let cache = self.cache.as_deref().filter(|_| cached);
@@ -393,9 +428,14 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
         // never printed: its debug names would be minted for nothing.
         let mut target = self.store.target()?.without_debug_names();
         let lifted = match (cache, lookup) {
-            (Some(cache), Lookup::Unknown) => {
-                cache.miss(self.lifter, &mut target, &instruction, &self.decoder, true)?
-            }
+            (Some(cache), Lookup::Unknown) => cache.miss(
+                self.lifter,
+                &mut target,
+                &instruction,
+                shape,
+                &self.decoder,
+                true,
+            )?,
             _ => self.lifter.lower(&mut target, &instruction, true)?,
         };
         Ok(ScratchLifted {
