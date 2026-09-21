@@ -63,12 +63,23 @@ Retired user instructions (`perf stat -e instructions:u`) of
 `.text` of a binary, this tree. `--linear` computes its offsets with a
 decode pass that is inside the count, so linear figures are decode-heavy.
 
-| workload | no cache | cache | shapes (misses) | hits |
-|---|---|---|---|---|
-| `/usr/bin/ls`, every offset | 8.75G | 5.87G | 9 215 | 74 483 |
-| `/usr/bin/ls`, linear | 1.79G | 1.43G | 2 842 | 19 093 |
-| `/usr/bin/bash`, linear | 14.6G | 5.17G | 8 286 | 244 127 |
-| `/usr/bin/bash`, every offset | 95.5G | 23.7G | 35 518 | 931 076 |
+| workload | no cache | cache | shapes (entries) | misses | hits |
+|---|---|---|---|---|---|
+| `/usr/bin/ls`, every offset | 8.75G | 4.35G | 3 937 | 4 361 | 79 337 |
+| `/usr/bin/ls`, linear | 1.79G | 1.01G | 1 018 | 1 075 | 20 860 |
+| `/usr/bin/bash`, linear | 14.6G | 3.66G | 1 797 | 1 983 | 250 430 |
+| `/usr/bin/bash`, every offset | 95.5G | 16.4G | 12 093 | 14 174 | 952 417 |
+
+Since 2026-09-21 (evening) register fields are parameters too (wazabin/sleigh#12
+reports them; see the module docs on registers and coincidences), which is
+what took the shape counts from 2 842 / 8 286 (ls / bash linear) to 1 018 /
+1 797. Misses exceed entries by the shapes that hold several templates,
+one per way their registers coincide. Against disas-bench's xul.dll `.text`
+(38 MB, 10.1 M instructions; `--offset 0x400 --len 0x24603E1`) the cached
+lift runs at 11.1 MB/s cold (13 505 shapes, was 88 052 and 4.2 MB/s) and
+19 MB/s warm (`--warm`, every instruction a hit), against 208 MB/s for iced
+decoding alone and 3.2 MB/s for our decoder alone; peak memory 367 MB,
+was 927 MB.
 
 Exact-encoding keys, for comparison, missed 77 591 times on bash linear
 and reached 10.5G there; shape keys with one probe per parameter reached
@@ -85,6 +96,13 @@ allocation. Slimming the instance to 80 bytes was estimated at ~5 % of a
 decode and not done.
 
 ## 4. Rejected along the way
+
+- A per-session memo of recent encodings (first eight bytes → template)
+  in front of the shared trie: 17–37 % of lookups hit it on xul.dll, but
+  the `Arc` traffic of remembering every trie hit cost more than the walk
+  it saved.
+- Inline storage for `Lifted`'s block and exit lists: kept, but worth
+  only ~2 % of the cached lift.
 
 - Classifying constants on the p-code stream instead of the lifted IR:
   branch targets are RAM-space varnodes, not constants, and value

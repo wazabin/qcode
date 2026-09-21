@@ -26,6 +26,8 @@ pub mod target;
 pub use scratch::ScratchStore;
 pub use target::{Construction, Emitter, LiftTarget, Promotion, TargetError, Transfer};
 
+use smallvec::{SmallVec, smallvec};
+
 use crate::value::{BlockId, InstructionId};
 
 /// Where control lands when a call returns.
@@ -143,8 +145,10 @@ pub struct Lifted {
     address: u64,
     length: usize,
     entry: BlockId,
-    blocks: Vec<BlockId>,
-    exits: Vec<Exit>,
+    // Inline for the common instruction — one block, one exit — so that
+    // a lift, or a cache hit, allocates nothing to say what it made.
+    blocks: SmallVec<[BlockId; 2]>,
+    exits: SmallVec<[Exit; 1]>,
 }
 
 impl Lifted {
@@ -156,16 +160,17 @@ impl Lifted {
         address: u64,
         length: usize,
         entry: BlockId,
-        blocks: Vec<BlockId>,
-        exits: Vec<Exit>,
+        blocks: impl IntoIterator<Item = BlockId>,
+        exits: impl IntoIterator<Item = Exit>,
     ) -> Self {
+        let blocks: SmallVec<[BlockId; 2]> = blocks.into_iter().collect();
         debug_assert_eq!(blocks.first(), Some(&entry));
         Self {
             address,
             length,
             entry,
             blocks,
-            exits,
+            exits: exits.into_iter().collect(),
         }
     }
 
@@ -256,8 +261,8 @@ impl Recorder {
                 address,
                 length,
                 entry,
-                blocks: vec![entry],
-                exits: Vec::new(),
+                blocks: smallvec![entry],
+                exits: SmallVec::new(),
             },
             pending_call: None,
         }

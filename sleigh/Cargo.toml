@@ -18,6 +18,7 @@ qcode.workspace = true
 qcode_vm.workspace = true
 rustc-hash.workspace = true
 sleigh = { package = "wazabin-sleigh", version = "0.1.11" }
+smallvec.workspace = true
 
 [[example]]
 name = "qcode-dump"

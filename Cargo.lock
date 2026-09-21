@@ -2059,6 +2059,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "smallvec",
  "wazabin-jstd",
  "wazabin-qcode",
  "wazabin-qcode-emulator",
@@ -2081,8 +2082,7 @@ dependencies = [
 [[package]]
 name = "wazabin-sleigh"
 version = "0.1.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffa4e9094a8156d756391e810334d7487d89263d4b215066b59385e1cf4dfe13"
+source = "git+https://github.com/wazabin/sleigh.git?rev=e15c9a555c9f9c27012c11ce65689bd62545a0ca#e15c9a555c9f9c27012c11ce65689bd62545a0ca"
 dependencies = [
  "pest",
  "pest_derive",

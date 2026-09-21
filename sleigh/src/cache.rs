@@ -24,6 +24,15 @@
 //! constants resolved once per replay rather than inferred per operation —
 //! so a hit costs the IR and nothing around it.
 //!
+//! Registers are parameters too. `mov rax, [rdi + 8]` and `mov rbx,
+//! [rsi + 8]` are one shape whose register fields — the fields the decoder
+//! read as an index into an `attach variables` table — differ; a
+//! [`RegisterField`](sleigh::RegisterField) is left out of the mask, and
+//! the template holds every varnode an operation names as a slot that is
+//! either fixed or the register some field's value picks from a table, or
+//! a lane of it: the byte at the bottom of it, the low dword. On xul.dll's
+//! ten million instructions that is 13 500 shapes in place of 88 000.
+//!
 //! # Exactness
 //!
 //! SLEIGH is the only source of semantics here; the cache decides nothing
@@ -46,8 +55,21 @@
 //! one thing at a time instead: the address alone, then each parameter
 //! by its lowest free bit and by every free bit. The probe distance is
 //! larger than 4 GiB so that a value the specification truncates to 32
-//! bits fails the comparison instead of matching by accident. [`LiftCache::validating`] lifts every hit for real as well and
-//! compares, for measuring that claim over a corpus.
+//! bits fails the comparison instead of matching by accident.
+//!
+//! The near probe flips a free bit of every register field as well, and a
+//! varnode slot that changed must be the register — or the same lane of
+//! the register — that exactly one field's table binds to its old and new
+//! values. Fields bound to different registers flip different bits, so
+//! that a byte of one register cannot pass for a byte of another; fields
+//! bound to one register flip alike and stay bound alike. Which is the
+//! catch with registers: a lift's structure can turn on two of them
+//! coinciding — `mov eax, eax` lowers to no move at all — so a template
+//! records which of the registers its instance named were one register,
+//! among the fields' and the ones the lift names on its own, and serves
+//! only instances that coincide the same way; a shape holds one template
+//! per way. [`LiftCache::validating`] lifts every hit for real as well and
+//! compares, for measuring these claims over a corpus.
 //!
 //! A value that moves by anything else marks the shape uncacheable, so it is
 //! lifted for real every time and never probed again. Not every shape is
@@ -62,14 +84,16 @@
 //! Entries are keyed by the lowering flag, the decode context and the
 //! shape's masked bytes, and found by walking a trie over the instruction
 //! stream: each node holds, per mask byte some shape applies there, its
-//! children by masked value, and a leaf holds a shape's entry with the
-//! patterns it excludes — the more specific candidates the decoder passed
-//! over, which an encoding of the shape never matches. A lookup needs no
-//! decode: it walks the bytes, tries every mask at a node, and passes over a
-//! leaf whose exclusions reject the stream. A session decoding under
-//! another context or lowering calls differently never sees another's
-//! entries, and the cache is bound to one specification and refuses a
-//! lifter of another.
+//! children by masked value, and a leaf — at the shape's last masked byte,
+//! the rest deciding nothing — holds a shape's entry with the patterns it
+//! excludes: the more specific candidates the decoder passed over, which
+//! an encoding of the shape never matches. A lookup needs no decode: it
+//! walks the bytes, tries every mask at a node, and passes over a leaf
+//! whose exclusions reject the stream. The tries are sharded by the
+//! leading byte under the bits every shape's mask keeps of it, so that
+//! threads mostly lock apart. A session decoding under another context or
+//! lowering calls differently never sees another's entries, and the cache
+//! is bound to one specification and refuses a lifter of another.
 //!
 //! A template records debug names, so a replay into a target that
 //! [names](qcode::lift::LiftTarget::without_debug_names) its values names
@@ -79,8 +103,8 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     sync::{
-        Arc, RwLock,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -96,16 +120,17 @@ use qcode::{
     value::{
         BasicBlock, BlockId, FunctionBody, FunctionId, Instruction, InstructionId, LiteralId,
         LocalBlockId, LocalInsnId, LocalTempId, LocalTempSpaceId, LocalValueId, Temp, TempId,
-        TempRef, TempSpace, TempSpaceId,
+        TempRef, TempSpace, TempSpaceId, Varnode, VarnodeId,
         insn::{Callee, Mnemonic},
         view::ModuleView,
     },
 };
 use rustc_hash::FxHashMap as HashMap;
 use sleigh::{
-    CompiledSpec, ContextBytes, Exclusion, Instruction as Decoded, ParamField, Shape,
+    CompiledSpec, ContextBytes, Exclusion, FieldTableId, Instruction as Decoded, ParamField, Shape,
     SpecFingerprint,
 };
+use smallvec::SmallVec;
 
 use crate::{LiftError, SleighLifter, decode::FixedDecoder};
 
@@ -121,7 +146,10 @@ const MAX_PREFIX: usize = 32;
 /// The most parameters a template carries. A shape with more is not cached.
 pub(crate) const MAX_PARAMS: usize = 8;
 
-/// One shard per leading byte of the instruction.
+/// The most register parameters a template carries.
+pub(crate) const MAX_REGS: usize = 6;
+
+/// One shard per leading byte of the instruction, under the shard mask.
 const SHARDS: usize = 256;
 
 /// Counters of a [`LiftCache`].
@@ -155,46 +183,85 @@ pub struct CacheStats {
 }
 
 enum Kind {
-    Template(Arc<Template>),
+    /// The shape's templates: one per way its registers coincide.
+    Templates(Vec<Arc<Template>>),
     Uncacheable,
 }
+
+/// The most templates a shape holds.
+const MAX_TEMPLATES: usize = 8;
 
 /// What a leaf of the trie holds: a shape's entry and the patterns no
 /// encoding of the shape matches.
 struct Entry {
+    /// The shape's instructions' length: past the leaf's depth, its bytes
+    /// are all unmasked.
+    len: usize,
     exclusions: Box<[Exclusion]>,
     kind: Kind,
 }
 
 impl Entry {
-    /// Whether `bytes`, a stream agreeing with the shape's masked bytes over
-    /// its first `len`, starts an instruction of the shape. An exclusion
-    /// the stream is too short to test does not match, as it would not for
-    /// the decoder reading the same stream.
-    fn admits(&self, bytes: &[u8], len: usize) -> bool {
-        bytes.len() >= len && !self.exclusions.iter().any(|e| e.matches(bytes))
+    /// Whether `bytes`, a stream agreeing with the shape's masked bytes,
+    /// starts an instruction of the shape. An exclusion the stream is too
+    /// short to test does not match, as it would not for the decoder
+    /// reading the same stream.
+    fn admits(&self, bytes: &[u8]) -> bool {
+        bytes.len() >= self.len && !self.exclusions.iter().any(|e| e.matches(bytes))
     }
+}
+
+/// How deep in the trie a shape's leaf sits: past its last masked byte,
+/// the bytes decide nothing. A more specific shape whose masked bytes
+/// reach further is still found, since the shorter shape's exclusions
+/// refuse its instructions and the walk goes on.
+fn keyed(mask: &[u8]) -> usize {
+    mask.iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |i| i + 1)
 }
 
 /// A node of the lookup trie, at one byte of the instruction stream.
 #[derive(Default)]
 struct Node {
     /// Per mask byte some shape applies at this byte, the children by the
-    /// byte's masked value. Almost always one.
-    arms: Vec<(u8, HashMap<u8, Node>)>,
+    /// byte's masked value. Almost always one arm, held in the node.
+    arms: SmallVec<[Arm; 1]>,
     /// The shape whose instructions end here.
     leaf: Option<Entry>,
+}
+
+/// The children of a [`Node`] under one mask: the masked values, sorted
+/// and held with the node for the usual fan-out, apart from the nodes, so
+/// a walk searches one run of bytes rather than hashing or striding over
+/// nodes.
+#[derive(Default)]
+struct Arm {
+    mask: u8,
+    values: SmallVec<[u8; 14]>,
+    children: Vec<Node>,
+}
+
+impl Arm {
+    fn child(&self, value: u8) -> Option<&Node> {
+        let index = if self.values.len() <= 8 {
+            self.values.iter().position(|&v| v == value)?
+        } else {
+            self.values.binary_search(&value).ok()?
+        };
+        Some(&self.children[index])
+    }
 }
 
 impl Node {
     /// The entry of the shape `bytes` starts, searching from `depth`. With
     /// `exact`, `bytes` is one instruction of that length and only a leaf
-    /// at that depth counts; an exclusion reaching past it cannot have
+    /// of that length counts; an exclusion reaching past it cannot have
     /// matched, or the decoder would have taken the longer candidate.
     fn find(&self, bytes: &[u8], depth: usize, exact: Option<usize>) -> Option<&Entry> {
         if let Some(entry) = &self.leaf
-            && exact.is_none_or(|len| len == depth)
-            && entry.admits(bytes, depth)
+            && exact.is_none_or(|len| len == entry.len)
+            && entry.admits(bytes)
         {
             return Some(entry);
         }
@@ -202,8 +269,8 @@ impl Node {
             return None;
         }
         let byte = *bytes.get(depth)?;
-        for (mask, children) in &self.arms {
-            if let Some(child) = children.get(&(byte & mask))
+        for arm in &self.arms {
+            if let Some(child) = arm.child(byte & arm.mask)
                 && let Some(entry) = child.find(bytes, depth + 1, exact)
             {
                 return Some(entry);
@@ -217,14 +284,26 @@ impl Node {
     fn walk_mut(&mut self, mask: &[u8], masked: &[u8]) -> &mut Node {
         let mut node = self;
         for (&mask, &value) in mask.iter().zip(masked) {
-            let arm = match node.arms.iter().position(|(m, _)| *m == mask) {
+            let arm = match node.arms.iter().position(|a| a.mask == mask) {
                 Some(arm) => arm,
                 None => {
-                    node.arms.push((mask, HashMap::default()));
+                    node.arms.push(Arm {
+                        mask,
+                        ..Arm::default()
+                    });
                     node.arms.len() - 1
                 }
             };
-            node = node.arms[arm].1.entry(value).or_default();
+            let arm = &mut node.arms[arm];
+            let index = match arm.values.binary_search(&value) {
+                Ok(index) => index,
+                Err(index) => {
+                    arm.values.insert(index, value);
+                    arm.children.insert(index, Node::default());
+                    index
+                }
+            };
+            node = &mut arm.children[index];
         }
         node
     }
@@ -233,8 +312,9 @@ impl Node {
     fn get_mut(&mut self, mask: &[u8], masked: &[u8]) -> Option<&mut Node> {
         let mut node = self;
         for (&mask, &value) in mask.iter().zip(masked) {
-            let arm = node.arms.iter().position(|(m, _)| *m == mask)?;
-            node = node.arms[arm].1.get_mut(&value)?;
+            let arm = node.arms.iter_mut().find(|a| a.mask == mask)?;
+            let index = arm.values.binary_search(&value).ok()?;
+            node = &mut arm.children[index];
         }
         Some(node)
     }
@@ -254,6 +334,10 @@ pub(crate) enum Lookup {
 /// The tries of one leading byte, by key prefix.
 type Shard = RwLock<HashMap<Box<[u8]>, Node>>;
 
+/// A view of a register table: the `size` bytes at `delta` into each
+/// register it binds.
+type View = (FieldTableId, u64, usize);
+
 /// A cache of lifted instructions keyed by the shape of their encoding. See the [module
 /// documentation](self).
 ///
@@ -263,6 +347,15 @@ type Shard = RwLock<HashMap<Box<[u8]>, Node>>;
 pub struct LiftCache {
     fingerprint: SpecFingerprint,
     shards: Box<[Shard]>,
+    /// Which bits of the leading byte pick the shard: the bits every
+    /// entry's mask keeps, so an entry and every instruction of its shape
+    /// land in one shard. It narrows as shapes with a freer leading byte
+    /// arrive, which empties the cache; on a real specification that
+    /// happens a few times at the start and never again.
+    shard_mask: AtomicU8,
+    /// Per view of an `attach variables` table — a slice of each register
+    /// it binds — the varnodes, once resolved.
+    tables: Mutex<HashMap<View, Arc<[Option<VarnodeId>]>>>,
     capacity: usize,
     entries: AtomicUsize,
     validating: bool,
@@ -296,6 +389,8 @@ impl LiftCache {
             shards: (0..SHARDS)
                 .map(|_| RwLock::new(HashMap::default()))
                 .collect(),
+            shard_mask: AtomicU8::new(0xff),
+            tables: Mutex::new(HashMap::default()),
             capacity: Self::DEFAULT_CAPACITY,
             entries: AtomicUsize::new(0),
             validating: false,
@@ -348,6 +443,79 @@ impl LiftCache {
         self.entries.store(0, Ordering::Relaxed);
     }
 
+    /// The shard of an instruction whose leading byte is `first`.
+    fn shard(&self, first: u8) -> &Shard {
+        &self.shards[usize::from(first & self.shard_mask.load(Ordering::Relaxed))]
+    }
+
+    /// Narrows the shard mask to `mask` — the bits a new entry's leading
+    /// byte keeps — moving every subtree of a leading byte to the shard it
+    /// now belongs in. A lookup racing this may miss; nothing worse.
+    fn narrow_shards(&self, mask: u8) {
+        let mut guards: Vec<_> = self.shards.iter().map(|s| s.write().unwrap()).collect();
+        if self.shard_mask.load(Ordering::Relaxed) == mask {
+            return;
+        }
+        // A root's arm holds, per masked leading byte, that byte's subtree.
+        struct Move {
+            to: usize,
+            prefix: Box<[u8]>,
+            mask: u8,
+            value: u8,
+            node: Node,
+        }
+        let mut moves: Vec<Move> = Vec::new();
+        for (index, shard) in guards.iter_mut().enumerate() {
+            for (prefix, root) in shard.iter_mut() {
+                for arm in &mut root.arms {
+                    let mut i = 0;
+                    while i < arm.values.len() {
+                        let to = usize::from(arm.values[i] & mask);
+                        if to == index {
+                            i += 1;
+                            continue;
+                        }
+                        moves.push(Move {
+                            to,
+                            prefix: prefix.clone(),
+                            mask: arm.mask,
+                            value: arm.values.remove(i),
+                            node: arm.children.remove(i),
+                        });
+                    }
+                }
+            }
+        }
+        for Move {
+            to,
+            prefix,
+            mask,
+            value,
+            node,
+        } in moves
+        {
+            let root = guards[to].entry(prefix).or_default();
+            let arm = match root.arms.iter().position(|a| a.mask == mask) {
+                Some(arm) => arm,
+                None => {
+                    root.arms.push(Arm {
+                        mask,
+                        ..Arm::default()
+                    });
+                    root.arms.len() - 1
+                }
+            };
+            let arm = &mut root.arms[arm];
+            let index = arm
+                .values
+                .binary_search(&value)
+                .expect_err("a subtree lands where none was");
+            arm.values.insert(index, value);
+            arm.children.insert(index, node);
+        }
+        self.shard_mask.store(mask, Ordering::Relaxed);
+    }
+
     fn check(&self, lifter: &SleighLifter<'_>) -> Result<(), LiftError> {
         if lifter.spec().fingerprint() != self.fingerprint {
             return Err(LiftError::IncompatibleSpec);
@@ -365,11 +533,13 @@ impl LiftCache {
         exact: Option<usize>,
     ) -> Option<Found> {
         let first = *bytes.first()?;
-        let shard = self.shards[usize::from(first)].read().unwrap();
+        let shard = self.shard(first).read().unwrap();
         let entry = shard.get(prefix)?.find(bytes, 0, exact)?;
         Some(match &entry.kind {
-            Kind::Template(template) => {
-                let instance = template.instance(address, bytes);
+            Kind::Templates(templates) => {
+                let (template, instance) = templates
+                    .iter()
+                    .find_map(|t| t.instance(address, bytes).map(|i| (t, i)))?;
                 Found::Template(Arc::clone(template), instance)
             }
             Kind::Uncacheable => Found::Uncacheable,
@@ -380,18 +550,43 @@ impl LiftCache {
         if self.entries.load(Ordering::Relaxed) >= self.capacity {
             return;
         }
-        let Some(&first) = masked.first() else {
+        let (Some(&first), Some(&kept)) = (masked.first(), mask.first()) else {
             return;
         };
-        let mut shard = self.shards[usize::from(first)].write().unwrap();
+        let narrowed = self.shard_mask.load(Ordering::Relaxed) & kept;
+        if narrowed != self.shard_mask.load(Ordering::Relaxed) {
+            self.narrow_shards(narrowed);
+        }
+        let depth = keyed(mask);
+        let mut shard = self.shard(first).write().unwrap();
         let leaf = &mut shard
             .entry(Box::from(prefix))
             .or_default()
-            .walk_mut(mask, masked)
+            .walk_mut(&mask[..depth], &masked[..depth])
             .leaf;
-        if leaf.is_none() {
-            *leaf = Some(entry);
-            self.entries.fetch_add(1, Ordering::Relaxed);
+        match leaf {
+            None => {
+                *leaf = Some(entry);
+                self.entries.fetch_add(1, Ordering::Relaxed);
+            }
+            // The shape is known: a new way its registers coincide joins
+            // the entry, once.
+            Some(Entry {
+                kind: Kind::Templates(known),
+                ..
+            }) => {
+                if let Kind::Templates(new) = entry.kind
+                    && let Some(template) = new.into_iter().next()
+                {
+                    let dup = known
+                        .iter()
+                        .any(|k| k.ties == template.ties && k.varnodes == template.varnodes);
+                    if known.len() < MAX_TEMPLATES && !dup {
+                        known.push(template);
+                    }
+                }
+            }
+            Some(_) => {}
         }
     }
 
@@ -400,13 +595,21 @@ impl LiftCache {
         let Some(&first) = keys.masked.first() else {
             return;
         };
-        let mut shard = self.shards[usize::from(first)].write().unwrap();
+        let mut shard = self.shard(first).write().unwrap();
+        let depth = keyed(&keys.mask);
         if let Some(node) = shard
             .get_mut(prefix)
-            .and_then(|root| root.get_mut(&keys.mask, &keys.masked))
-            && node.leaf.take().is_some()
+            .and_then(|root| root.get_mut(&keys.mask[..depth], &keys.masked[..depth]))
+            && let Some(Entry {
+                kind: Kind::Templates(templates),
+                ..
+            }) = &mut node.leaf
         {
-            self.entries.fetch_sub(1, Ordering::Relaxed);
+            templates.retain(|t| !std::ptr::eq(&**t, template));
+            if templates.is_empty() {
+                node.leaf = None;
+                self.entries.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -543,19 +746,32 @@ impl LiftCache {
         };
         let mut masked = vec![0u8; bytes.len()];
         shape.masked(bytes, &mut masked);
-        let attempt = |params: Vec<ParamField>, mask: &[u8], masked: &[u8]| {
+        let attempt = |params: Vec<ParamField>,
+                       regs: Vec<RegParam>,
+                       tables: Vec<RegField>,
+                       mask: &[u8],
+                       masked: &[u8]| {
             let keys = Keys {
                 mask: mask.into(),
                 masked: masked.into(),
                 base_params: params.iter().map(|p| p.value(bytes)).collect(),
                 params: params.into_boxed_slice(),
+                base_regs: regs.iter().map(|r| r.value(bytes)).collect(),
+                regs: regs.into_boxed_slice(),
             };
             let mut template =
                 Template::capture(target.context(), target.addresses(), marks, &lifted, keys)?;
+            template.reg_fields = tables;
+            let registers = Registers {
+                cache: self,
+                spec: lifter.spec(),
+                ctx: target.context(),
+            };
             let probing = Probing {
                 lifter,
                 probes: &self.probes,
                 decoder,
+                registers: &registers,
                 address,
                 bytes,
                 shape: &shape,
@@ -563,22 +779,33 @@ impl LiftCache {
             };
             with_probe_store(lifter, |store| template.measure(&probing, store))?;
             template.dedupe_literals();
+            template.dedupe_varnodes();
+            template.record_ties(&registers);
             Ok(template)
         };
         let captured = parameters(&shape)
-            .and_then(|params| attempt(params, shape.mask(), &masked))
+            .and_then(|params| {
+                let (regs, tables) = register_params(&shape)?;
+                attempt(params, regs, tables, shape.mask(), &masked)
+            })
             .or_else(|refusal| match refusal {
                 Refusal::Parameters(reason) => {
                     debug_uncacheable(instruction, "is remembered exactly", reason);
                     self.exact.fetch_add(1, Ordering::Relaxed);
-                    attempt(Vec::new(), &vec![0xff; bytes.len()], bytes)
+                    attempt(
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        &vec![0xff; bytes.len()],
+                        bytes,
+                    )
                 }
                 other => Err(other),
             });
         let (mask, masked, kind) = match captured {
             Ok(template) => {
                 let (mask, masked) = (template.keys.mask.clone(), template.keys.masked.clone());
-                (mask, masked, Kind::Template(Arc::new(template)))
+                (mask, masked, Kind::Templates(vec![Arc::new(template)]))
             }
             Err(Refusal::Shape(reason) | Refusal::Parameters(reason)) => {
                 debug_uncacheable(instruction, "is uncacheable", reason);
@@ -586,6 +813,7 @@ impl LiftCache {
             }
         };
         let entry = Entry {
+            len: bytes.len(),
             exclusions: shape.exclusions().into(),
             kind,
         };
@@ -662,6 +890,107 @@ pub(crate) struct Instance {
     delta: u64,
     /// Per parameter, the value less the template's.
     params: [i64; MAX_PARAMS],
+    /// Per register parameter, the field's value: the index into its
+    /// tables.
+    regs: [u8; MAX_REGS],
+}
+
+/// A register parameter of a template: a field of the shape read as the
+/// index of a register, by however many tables — the same bits name a
+/// 32-bit register to one constructor and its 64-bit one to another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegParam {
+    bit: u32,
+    width: u8,
+}
+
+impl RegParam {
+    fn end(&self) -> usize {
+        self.bit as usize + usize::from(self.width)
+    }
+
+    /// The field's value in `bytes`, an instruction of the shape.
+    fn value(&self, bytes: &[u8]) -> u8 {
+        (self.bit as usize..self.end())
+            .enumerate()
+            .fold(0u8, |value, (i, bit)| {
+                value | ((bytes[bit / 8] >> (bit % 8)) & 1) << i
+            })
+    }
+}
+
+/// One view a register parameter's value picks: the register of `size`
+/// bytes `delta` into the register that table `table` binds to the value —
+/// the register itself, or a lane of it — as the lifter's varnodes, `None`
+/// where nothing is bound or declared there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegTable {
+    param: u8,
+    table: FieldTableId,
+    delta: u64,
+    size: usize,
+    varnodes: Arc<[Option<VarnodeId>]>,
+}
+
+/// Resolves registers while a template is measured: the specification's
+/// geometry, the context's varnodes.
+#[derive(Clone, Copy)]
+struct Registers<'a> {
+    cache: &'a LiftCache,
+    spec: &'a CompiledSpec,
+    ctx: &'a Context<'static>,
+}
+
+impl Registers<'_> {
+    /// Where a varnode of the context is.
+    fn geometry(&self, varnode: VarnodeId) -> sleigh::Varnode {
+        let varnode = Varnode::from_id(self.ctx, varnode);
+        sleigh::Varnode::new(varnode.space().id, varnode.address() as u64, varnode.size())
+    }
+
+    /// The register table `table` binds to `value`.
+    fn register(&self, table: FieldTableId, value: u8) -> Option<sleigh::RegisterId> {
+        self.spec
+            .attached_registers(table)
+            .get(usize::from(value))
+            .copied()
+            .flatten()
+    }
+
+    /// The varnodes of the `size` bytes `delta` into each register of
+    /// `table`, by value; resolved once per view.
+    fn table(&self, table: FieldTableId, delta: u64, size: usize) -> Arc<[Option<VarnodeId>]> {
+        let mut tables = self.cache.tables.lock().unwrap();
+        Arc::clone(tables.entry((table, delta, size)).or_insert_with(|| {
+            self.spec
+                .attached_registers(table)
+                .iter()
+                .map(|register| {
+                    let whole = self.spec.register_varnode((*register)?)?;
+                    let part = sleigh::Varnode::new(whole.space, whole.offset + delta, size);
+                    let register = self.spec.register_at(part)?;
+                    self.ctx.shared.registers.get(&register).copied()
+                })
+                .collect()
+        }))
+    }
+}
+
+/// A varnode an operation names: the architecture's, or the register a
+/// parameter's value picks from a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VarnodeSlot {
+    Fixed(VarnodeId),
+    /// An index into the template's tables.
+    Register(u32),
+}
+
+/// An operation's debug name: as recorded, or that of the register in one
+/// of its varnode slots, which is how the emitter names a register's load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpName {
+    Fixed(Box<str>),
+    Varnode(u32),
 }
 
 /// A constant of the template: its value at the captured instance, plus
@@ -747,6 +1076,77 @@ fn parameters(shape: &Shape) -> Result<Vec<ParamField>, Refusal> {
     }
     Ok(params)
 }
+
+/// The bits of a run the shape's mask leaves free, lowest first.
+fn free_bits_of(bit: u32, width: u8, mask: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    let start = bit as usize;
+    (start..start + usize::from(width)).filter(move |bit| {
+        mask.get(bit / 8)
+            .is_none_or(|byte| byte & (1 << (bit % 8)) == 0)
+    })
+}
+
+/// The register parameters of `shape` a template carries — each run of
+/// bits with one the mask leaves free, whichever tables it indexes — and,
+/// per table a parameter indexes, which parameter. A field sharing bits
+/// with another field, register or integer, would be perturbed with it,
+/// and is refused.
+fn register_params(shape: &Shape) -> Result<(Vec<RegParam>, Vec<RegField>), Refusal> {
+    let mut params: Vec<RegParam> = Vec::new();
+    let mut tables: Vec<RegField> = Vec::new();
+    let overlaps =
+        |a_bit: usize, a_end: usize, b_bit: usize, b_end: usize| a_bit < b_end && b_bit < a_end;
+    for field in shape.registers() {
+        let param = RegParam {
+            bit: field.bit,
+            width: field.width,
+        };
+        if free_bits_of(param.bit, param.width, shape.mask())
+            .next()
+            .is_none()
+        {
+            continue;
+        }
+        let index = match params.iter().position(|known| *known == param) {
+            Some(index) => index,
+            None => {
+                if params.iter().any(|known| {
+                    overlaps(
+                        param.bit as usize,
+                        param.end(),
+                        known.bit as usize,
+                        known.end(),
+                    )
+                }) || shape.params().iter().any(|int| {
+                    overlaps(
+                        param.bit as usize,
+                        param.end(),
+                        int.bit as usize,
+                        int.bit as usize + usize::from(int.width),
+                    )
+                }) {
+                    return Err(Refusal::Parameters(
+                        "a register field shares bits with another field",
+                    ));
+                }
+                params.push(param);
+                params.len() - 1
+            }
+        };
+        if !tables.contains(&(index as u8, field.table)) {
+            tables.push((index as u8, field.table));
+        }
+    }
+    if params.len() > MAX_REGS {
+        return Err(Refusal::Parameters(
+            "more register parameters than a template carries",
+        ));
+    }
+    Ok((params, tables))
+}
+
+/// A table a register parameter indexes: the parameter, and the table.
+type RegField = (u8, FieldTableId);
 
 /// The lookup key's prefix: the lowering flag and the decode context.
 /// `None` when it does not fit, which no real specification causes.
@@ -909,13 +1309,13 @@ fn base_name(ctx: &Context<'static>, name: &str) -> Box<str> {
 /// `k`th literal, `Instruction(k)` its `k`th operation, `Temp(k)` its `k`th
 /// temporary, `BasicBlock(k)` its `k`th block — the instruction's own blocks
 /// first, then the external ones — and a call's `Callee::Minted(k)` its
-/// `k`th callee. Varnodes are the architecture's and stay as they are.
+/// `k`th callee, and `Varnode(k)` its `k`th [varnode slot](VarnodeSlot).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Op {
     block: u32,
     ty: u32,
     mnemonic: Mnemonic,
-    name: Option<Box<str>>,
+    name: Option<OpName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -955,6 +1355,8 @@ struct Keys {
     masked: Box<[u8]>,
     params: Box<[ParamField]>,
     base_params: Box<[i64]>,
+    regs: Box<[RegParam]>,
+    base_regs: Box<[u8]>,
 }
 
 /// The lowered IR of one shape, relative to the instance it was captured
@@ -985,6 +1387,21 @@ pub struct Template {
     temps: Vec<TempKey>,
     literals: Vec<Literal>,
     types: Vec<TypeKey>,
+    /// Per table a register parameter indexes, the parameter: the views a
+    /// probe may find a varnode following.
+    reg_fields: Vec<RegField>,
+    /// The views the register slots follow.
+    reg_tables: Vec<RegTable>,
+    /// Per pair of registers the lift names — the whole register a field
+    /// binds, through each of its tables, or one a varnode slot names
+    /// outright — whether they were one register at the captured
+    /// instance: a lift's structure can turn on it (a move between one
+    /// register is nothing), so the template serves only instances that
+    /// agree.
+    ties: Vec<(VarnodeSlot, VarnodeSlot, bool)>,
+    /// The varnodes the operations name, one slot per use until
+    /// [`dedupe_varnodes`](Self::dedupe_varnodes).
+    varnodes: Vec<VarnodeSlot>,
     ops: Vec<Op>,
     exits: Vec<ExitRecord>,
 }
@@ -1071,6 +1488,10 @@ impl Template {
             temps: Vec::new(),
             literals: Vec::new(),
             types: Vec::new(),
+            reg_fields: Vec::new(),
+            reg_tables: Vec::new(),
+            ties: Vec::new(),
+            varnodes: Vec::new(),
             ops: Vec::new(),
             exits: Vec::new(),
         };
@@ -1182,6 +1603,7 @@ impl Template {
             let id = InstructionId::new(func, insn);
             let reference = Instruction::from_id(ctx, id);
             let mut failed = None;
+            let first_slot = template.varnodes.len();
             let mut map = |operand: LocalValueId| -> LocalValueId {
                 match operand {
                     // One slot per use: two uses of one value may move
@@ -1221,7 +1643,12 @@ impl Template {
                             operand
                         }
                     },
-                    LocalValueId::Varnode(_) => operand,
+                    // One slot per use, like a constant: a probe tells
+                    // which register field each follows.
+                    LocalValueId::Varnode(varnode) => {
+                        template.varnodes.push(VarnodeSlot::Fixed(varnode));
+                        LocalValueId::Varnode(VarnodeId::from(template.varnodes.len() - 1))
+                    }
                     _ => {
                         failed = Some(Refusal::Shape(
                             "an operand of a kind a template cannot hold",
@@ -1234,6 +1661,23 @@ impl Template {
             if let Some(reason) = failed {
                 return Err(reason);
             }
+            // A load is named after its register; the name then follows
+            // the slot, not the record.
+            let name = reference.name().map(|name| {
+                let base = base_name(ctx, name);
+                let slot = (first_slot..template.varnodes.len()).find(|&slot| {
+                    let VarnodeSlot::Fixed(varnode) = template.varnodes[slot] else {
+                        return false;
+                    };
+                    Varnode::from_id(ctx, varnode)
+                        .name()
+                        .is_some_and(|register| register.to_lowercase() == *base)
+                });
+                match slot {
+                    Some(slot) => OpName::Varnode(slot as u32),
+                    None => OpName::Fixed(base),
+                }
+            });
             let space_index = |space: &mut LocalMemorySpaceId| -> Result<(), Refusal> {
                 if let LocalMemorySpaceId::Temp(local) = space {
                     let raw = usize::from(*local);
@@ -1286,7 +1730,7 @@ impl Template {
                 block,
                 ty,
                 mnemonic,
-                name: reference.name().map(|name| base_name(ctx, name)),
+                name,
             });
         }
 
@@ -1334,8 +1778,9 @@ impl Template {
     }
 
     /// The instance of this template that the instruction at `address`,
-    /// starting `bytes`, is.
-    fn instance(&self, address: u64, bytes: &[u8]) -> Instance {
+    /// starting `bytes`, is; `None` when a register its fields pick has no
+    /// varnode, which a fresh lift refuses too.
+    fn instance(&self, address: u64, bytes: &[u8]) -> Option<Instance> {
         let mut params = [0i64; MAX_PARAMS];
         for ((slot, param), base) in params
             .iter_mut()
@@ -1344,11 +1789,308 @@ impl Template {
         {
             *slot = param.value(bytes).wrapping_sub(*base);
         }
-        Instance {
+        let mut regs = [0u8; MAX_REGS];
+        for (slot, param) in regs.iter_mut().zip(&self.keys.regs) {
+            *slot = param.value(bytes);
+        }
+        if self
+            .varnodes
+            .iter()
+            .any(|&slot| self.varnode_with(slot, &regs).is_none())
+        {
+            return None;
+        }
+        // A register the lifter has no varnode for coincides with nothing
+        // it lifts; the slots above refuse the instance if it matters.
+        if self.ties.iter().any(|&(a, b, tied)| {
+            match (self.varnode_with(a, &regs), self.varnode_with(b, &regs)) {
+                (Some(a), Some(b)) => (a == b) != tied,
+                _ => false,
+            }
+        }) {
+            return None;
+        }
+        Some(Instance {
             address,
             delta: address.wrapping_sub(self.base),
             params,
+            regs,
+        })
+    }
+
+    /// The varnode of `slot` when the register parameters have the values
+    /// `regs`.
+    fn varnode_with(&self, slot: VarnodeSlot, regs: &[u8]) -> Option<VarnodeId> {
+        match slot {
+            VarnodeSlot::Fixed(varnode) => Some(varnode),
+            VarnodeSlot::Register(table) => {
+                let table = &self.reg_tables[table as usize];
+                table
+                    .varnodes
+                    .get(usize::from(regs[usize::from(table.param)]))
+                    .copied()
+                    .flatten()
+            }
         }
+    }
+
+    /// The varnode of the template's `k`th slot at `instance`.
+    pub(crate) fn varnode_at(&self, k: usize, instance: &Instance) -> VarnodeId {
+        self.varnode_with(self.varnodes[k], &instance.regs)
+            .expect("an instance resolves every register")
+    }
+
+    /// Whether every varnode slot of `probed` — the same instruction
+    /// lifted with the register parameters at `regs` — is what this
+    /// template says.
+    fn varnodes_agree(&self, probed: &Self, regs: &[u8]) -> bool {
+        self.varnodes.len() == probed.varnodes.len()
+            && self
+                .varnodes
+                .iter()
+                .zip(&probed.varnodes)
+                .all(|(mine, theirs)| {
+                    let VarnodeSlot::Fixed(theirs) = *theirs else {
+                        return false;
+                    };
+                    self.varnode_with(*mine, regs) == Some(theirs)
+                })
+    }
+
+    /// Marks every fixed varnode slot that `probed` — the same instruction
+    /// lifted with the register parameters at `regs` instead of the base
+    /// values — shows changed as following the one table of a perturbed
+    /// parameter that maps the base value to the slot's varnode and the
+    /// new value to the probe's. A changed slot no table explains, or that
+    /// two explain alike, is a mismatch.
+    fn classify_varnodes(
+        &mut self,
+        probed: &Self,
+        regs: &[u8],
+        registers: &Registers<'_>,
+    ) -> Result<(), Mismatch> {
+        if self.varnodes.len() != probed.varnodes.len() {
+            return Err(Mismatch::Structure(
+                "the two lifts differ in their varnodes",
+            ));
+        }
+        for k in 0..self.varnodes.len() {
+            let VarnodeSlot::Fixed(theirs) = probed.varnodes[k] else {
+                return Err(Mismatch::Structure("a probe was classified"));
+            };
+            let mine = self.varnodes[k];
+            if self.varnode_with(mine, regs) == Some(theirs) {
+                continue;
+            }
+            let VarnodeSlot::Fixed(was) = mine else {
+                return Err(Mismatch::Value(
+                    "a register operand does not follow its field",
+                ));
+            };
+            let index = self.view_of(was, theirs, regs, registers)?;
+            let table = &self.reg_tables[index];
+            let at = |value: u8| table.varnodes.get(usize::from(value)).copied().flatten();
+            if at(self.keys.base_regs[usize::from(table.param)]) != Some(was)
+                || at(regs[usize::from(table.param)]) != Some(theirs)
+            {
+                return Err(Mismatch::Value(
+                    "a register operand does not follow its view",
+                ));
+            }
+            self.varnodes[k] = VarnodeSlot::Register(index as u32);
+        }
+        Ok(())
+    }
+
+    /// The view — made if new — of a perturbed register field under which
+    /// a slot that named `was` at the base values names `theirs` at `regs`:
+    /// `was` lies at some offset in the register the field bound before,
+    /// and `theirs` at the same offset in the one it binds now.
+    fn view_of(
+        &mut self,
+        was: VarnodeId,
+        theirs: VarnodeId,
+        regs: &[u8],
+        registers: &Registers<'_>,
+    ) -> Result<usize, Mismatch> {
+        let (g_was, g_theirs) = (registers.geometry(was), registers.geometry(theirs));
+        if g_was.size != g_theirs.size || g_was.space != g_theirs.space {
+            return Err(Mismatch::Value(
+                "a register operand does not follow a register field",
+            ));
+        }
+        let size = g_was.size;
+        let mut found: Option<(u8, FieldTableId, u64)> = None;
+        for &(param, table) in &self.reg_fields {
+            let p = usize::from(param);
+            let base = self.keys.base_regs[p];
+            if regs[p] == base {
+                continue;
+            }
+            let whole = |value: u8| {
+                registers
+                    .register(table, value)
+                    .and_then(|r| registers.spec.register_varnode(r))
+            };
+            let (Some(before), Some(after)) = (whole(base), whole(regs[p])) else {
+                continue;
+            };
+            if before.space != g_was.space
+                || g_was.offset < before.offset
+                || g_was.offset + size as u64 > before.offset + before.size as u64
+            {
+                continue;
+            }
+            let delta = g_was.offset - before.offset;
+            if after.space != g_theirs.space
+                || after.offset + delta != g_theirs.offset
+                || (delta as usize) + size > after.size
+            {
+                continue;
+            }
+            // Two fields bound to one register at the base values explain
+            // a slot alike, and the template serves only instances where
+            // they still are; two bound to different registers do not.
+            match found {
+                Some((known, _, _))
+                    if !self.tied_fields(usize::from(known), usize::from(param), registers) =>
+                {
+                    return Err(Mismatch::Ambiguous);
+                }
+                Some(_) => {}
+                None => found = Some((param, table, delta)),
+            }
+        }
+        let Some((param, table, delta)) = found else {
+            return Err(Mismatch::Value(
+                "a register operand does not follow a register field",
+            ));
+        };
+        let known = self.reg_tables.iter().position(|t| {
+            t.param == param && t.table == table && t.delta == delta && t.size == size
+        });
+        Ok(known.unwrap_or_else(|| {
+            self.reg_tables.push(RegTable {
+                param,
+                table,
+                delta,
+                size,
+                varnodes: registers.table(table, delta, size),
+            });
+            self.reg_tables.len() - 1
+        }))
+    }
+
+    /// Which registers the fields bind at `values` coincide — with each
+    /// other, and with the registers the lift names on its own — as a
+    /// probe must keep it: a lift can turn on the coincidence.
+    fn reg_pattern(&self, values: &[u8], registers: &Registers<'_>) -> Vec<bool> {
+        let bound: Vec<Option<sleigh::RegisterId>> = self
+            .reg_fields
+            .iter()
+            .map(|&(param, table)| registers.register(table, values[usize::from(param)]))
+            .collect();
+        let at_base: Vec<Option<sleigh::RegisterId>> = self
+            .reg_fields
+            .iter()
+            .map(|&(param, table)| {
+                registers.register(table, self.keys.base_regs[usize::from(param)])
+            })
+            .collect();
+        let implicit: Vec<sleigh::RegisterId> = self
+            .varnodes
+            .iter()
+            .filter_map(|slot| match slot {
+                VarnodeSlot::Fixed(varnode) => {
+                    registers.spec.register_at(registers.geometry(*varnode))
+                }
+                VarnodeSlot::Register(_) => None,
+            })
+            .filter(|register| !at_base.contains(&Some(*register)))
+            .collect();
+        let mut pattern = Vec::new();
+        for i in 0..bound.len() {
+            for j in i + 1..bound.len() {
+                pattern.push(bound[i] == bound[j]);
+            }
+            pattern.push(bound[i].is_some_and(|r| implicit.contains(&r)));
+        }
+        pattern
+    }
+
+    /// The coincidences at the base values, for
+    /// [`instance`](Self::instance) to hold instances to: among the whole
+    /// registers the fields bind, and between those and the registers the
+    /// slots name outright.
+    fn record_ties(&mut self, registers: &Registers<'_>) {
+        let mut views: Vec<VarnodeSlot> = Vec::new();
+        for index in 0..self.reg_fields.len() {
+            let (param, table) = self.reg_fields[index];
+            let Some(size) = registers
+                .spec
+                .attached_registers(table)
+                .iter()
+                .find_map(|r| registers.spec.register_varnode((*r)?))
+                .map(|whole| whole.size)
+            else {
+                continue;
+            };
+            let view = self
+                .reg_tables
+                .iter()
+                .position(|t| {
+                    t.param == param && t.table == table && t.delta == 0 && t.size == size
+                })
+                .unwrap_or_else(|| {
+                    self.reg_tables.push(RegTable {
+                        param,
+                        table,
+                        delta: 0,
+                        size,
+                        varnodes: registers.table(table, 0, size),
+                    });
+                    self.reg_tables.len() - 1
+                });
+            views.push(VarnodeSlot::Register(view as u32));
+        }
+        let fields = views.len();
+        for slot in &self.varnodes {
+            if matches!(slot, VarnodeSlot::Fixed(_)) && !views.contains(slot) {
+                views.push(*slot);
+            }
+        }
+        // Only pairs that can coincide at some instance are worth holding
+        // instances to: a field never binds a flag.
+        let could_coincide = |a: VarnodeSlot, b: VarnodeSlot| match (a, b) {
+            (VarnodeSlot::Register(a), VarnodeSlot::Register(b)) => {
+                let (a, b) = (&self.reg_tables[a as usize], &self.reg_tables[b as usize]);
+                a.varnodes
+                    .iter()
+                    .flatten()
+                    .any(|v| b.varnodes.contains(&Some(*v)))
+            }
+            (VarnodeSlot::Register(a), VarnodeSlot::Fixed(v))
+            | (VarnodeSlot::Fixed(v), VarnodeSlot::Register(a)) => {
+                self.reg_tables[a as usize].varnodes.contains(&Some(v))
+            }
+            (VarnodeSlot::Fixed(_), VarnodeSlot::Fixed(_)) => false,
+        };
+        let base = &self.keys.base_regs;
+        let mut ties = Vec::new();
+        for i in 0..fields {
+            for j in i + 1..views.len() {
+                let (Some(a), Some(b)) = (
+                    self.varnode_with(views[i], base),
+                    self.varnode_with(views[j], base),
+                ) else {
+                    continue;
+                };
+                if could_coincide(views[i], views[j]) {
+                    ties.push((views[i], views[j], a == b));
+                }
+            }
+        }
+        self.ties = ties;
     }
 
     /// A result naming the template's own keys, for views over the template
@@ -1357,22 +2099,18 @@ impl Template {
     /// its `k`th operation.
     pub(crate) fn lifted_at(&self, instance: &Instance, func: FunctionId) -> Lifted {
         let block = |k: usize| BlockId::new(func, LocalBlockId::from(k));
-        let blocks: Vec<BlockId> = (0..=self.blocks.len()).map(block).collect();
-        let exits = self
-            .exits
-            .iter()
-            .map(|exit| {
-                let continuation = |c: Option<u32>| match c {
-                    None => Continuation::Next,
-                    Some(k) => Continuation::Block(block(k as usize)),
-                };
-                Exit::new(
-                    InstructionId::new(func, LocalInsnId::from(exit.site as usize)),
-                    exit.arm,
-                    exit.target.kind(instance, continuation),
-                )
-            })
-            .collect();
+        let blocks = (0..=self.blocks.len()).map(block);
+        let exits = self.exits.iter().map(|exit| {
+            let continuation = |c: Option<u32>| match c {
+                None => Continuation::Next,
+                Some(k) => Continuation::Block(block(k as usize)),
+            };
+            Exit::new(
+                InstructionId::new(func, LocalInsnId::from(exit.site as usize)),
+                exit.arm,
+                exit.target.kind(instance, continuation),
+            )
+        });
         Lifted::new(instance.address, self.length, block(0), blocks, exits)
     }
 
@@ -1492,6 +2230,9 @@ impl Template {
         if self.types != other.types {
             return Err("the two lifts differ in their types");
         }
+        if self.varnodes.len() != other.varnodes.len() {
+            return Err("the two lifts differ in their varnodes");
+        }
         if self.literals.len() != other.literals.len()
             || !self
                 .literals
@@ -1533,6 +2274,9 @@ impl Template {
         if let Err(reason) = self.same_structure(other) {
             return Some(reason);
         }
+        if self.varnodes != other.varnodes {
+            return Some("the two lifts differ in a register");
+        }
         self.affines()
             .zip(other.affines())
             .any(|(a, b)| a != b)
@@ -1553,6 +2297,7 @@ impl Template {
             lifter,
             probes,
             decoder,
+            registers,
             address,
             bytes,
             shape,
@@ -1601,6 +2346,7 @@ impl Template {
             probe: &probe,
             flip: &flip,
             decoder,
+            registers,
             shape,
         };
         if self.measure_together(store, &perturbing)? {
@@ -1636,7 +2382,7 @@ impl Template {
                         break;
                     }
                     Err(Mismatch::Structure(_)) => {}
-                    Err(Mismatch::Value(reason)) => return Err(Refusal::Parameters(reason)),
+                    Err(mismatch) => return Err(Refusal::Parameters(mismatch.reason())),
                 }
             }
             let Some(first) = first else {
@@ -1664,7 +2410,7 @@ impl Template {
                         break;
                     }
                     Err(Mismatch::Structure(_)) => {}
-                    Err(Mismatch::Value(reason)) => return Err(Refusal::Parameters(reason)),
+                    Err(mismatch) => return Err(Refusal::Parameters(mismatch.reason())),
                 }
             }
             if !verified {
@@ -1673,7 +2419,118 @@ impl Template {
                 ));
             }
         }
+
+        // Each register field on its own — with the fields bound to the
+        // same register as it, so they stay so: the first perturbation the
+        // shape admits that lifts to the same structure says which slots
+        // follow it. Another value of the field is another register of the
+        // same size, so one suffices.
+        let regs = self.keys.regs.clone();
+        let mut done = vec![false; regs.len()];
+        for index in 0..regs.len() {
+            if done[index] {
+                continue;
+            }
+            let group: Vec<usize> = (0..regs.len())
+                .filter(|&other| other == index || self.tied_fields(index, other, registers))
+                .collect();
+            let mut classified = false;
+            for k in 0..8 {
+                let Some(bits) = self.register_bits_at(&regs, &group, k, &[], &perturbing) else {
+                    continue;
+                };
+                let perturbed = flip(&bits);
+                let Some(decoded) = decode_alike(decoder, shape, bytes.len(), address, &perturbed)
+                else {
+                    continue;
+                };
+                let probed = probe(store, &decoded)?;
+                let values: Vec<u8> = regs.iter().map(|param| param.value(&perturbed)).collect();
+                match self.classify_varnodes(&probed, &values, registers) {
+                    Ok(()) => {
+                        classified = true;
+                        break;
+                    }
+                    Err(Mismatch::Structure(_)) => {}
+                    Err(mismatch) => return Err(Refusal::Parameters(mismatch.reason())),
+                }
+            }
+            if !classified {
+                return Err(Refusal::Parameters(
+                    "no perturbation of a register field lifts to the same structure",
+                ));
+            }
+            for &member in &group {
+                done[member] = true;
+            }
+        }
         Ok(())
+    }
+
+    /// Whether register fields `a` and `b` bind one register at the base
+    /// values through some of their views.
+    fn tied_fields(&self, a: usize, b: usize, registers: &Registers<'_>) -> bool {
+        let bound = |param: usize| {
+            self.reg_fields
+                .iter()
+                .filter(move |(p, _)| usize::from(*p) == param)
+                .filter_map(move |&(_, table)| {
+                    registers.register(table, self.keys.base_regs[param])
+                })
+        };
+        bound(a).any(|r| bound(b).any(|q| q == r))
+    }
+
+    /// `base`, plus a free bit of each register field in `group` — the
+    /// `k`th, round robin — when the shape admits the flip and it keeps the
+    /// registers coinciding as at the base values.
+    fn register_bits_at(
+        &self,
+        regs: &[RegParam],
+        group: &[usize],
+        k: usize,
+        base: &[usize],
+        perturbing: &Perturbing<'_, '_>,
+    ) -> Option<Vec<usize>> {
+        // Fields bound to one register move alike, to stay so; fields
+        // bound to different ones move differently, so that a slot inside
+        // one register cannot pass for inside another.
+        let mut classes: Vec<usize> = Vec::new();
+        let mut bits = base.to_vec();
+        for &i in group {
+            let class = match group
+                .iter()
+                .take_while(|&&j| j != i)
+                .position(|&j| self.tied_fields(i, j, perturbing.registers))
+            {
+                Some(index) => classes[index],
+                None => classes.iter().max().map_or(0, |c| c + 1),
+            };
+            classes.push(class);
+            let free: Vec<usize> =
+                free_bits_of(regs[i].bit, regs[i].width, perturbing.shape.mask()).collect();
+            bits.push(free[(k + class) % free.len()]);
+        }
+        let flipped = (perturbing.flip)(&bits);
+        if !perturbing.shape.admits(&flipped) {
+            return None;
+        }
+        let values: Vec<u8> = regs.iter().map(|param| param.value(&flipped)).collect();
+        (self.reg_pattern(&values, perturbing.registers)
+            == self.reg_pattern(&self.keys.base_regs, perturbing.registers))
+        .then_some(bits)
+    }
+
+    /// [`register_bits_at`](Self::register_bits_at) in the first round
+    /// that works.
+    fn register_bits(
+        &self,
+        regs: &[RegParam],
+        group: Vec<usize>,
+        base: &[usize],
+        perturbing: &Perturbing<'_, '_>,
+    ) -> Option<Vec<usize>> {
+        (0..8).find_map(|k| self.register_bits_at(regs, &group, k, base, perturbing))
     }
 
     /// [`measure`](Self::measure) in two probes instead of two per
@@ -1699,16 +2556,28 @@ impl Template {
             probe,
             flip,
             decoder,
+            registers,
             shape,
         } = *perturbing;
         // Parameter `i` in its `i`th free bit, so two parameters' deltas
         // differ — two lowest bits both move by one, and a slot moving by
         // one could belong to either.
-        let near_bits: Vec<usize> = free
+        let mut near_bits: Vec<usize> = free
             .iter()
             .enumerate()
             .map(|(i, f)| f[i.min(f.len() - 1)])
             .collect();
+        // Every register field too, each in a free bit, such that the
+        // shape admits the result and the registers coincide as before.
+        let regs = self.keys.regs.clone();
+        if !regs.is_empty() {
+            let Some(bits) =
+                self.register_bits(&regs, (0..regs.len()).collect(), &near_bits, perturbing)
+            else {
+                return Ok(false);
+            };
+            near_bits = bits;
+        }
         let near = flip(&near_bits);
         let Some(decoded) = decode_alike(
             decoder,
@@ -1722,6 +2591,12 @@ impl Template {
         let probed = probe(store, &decoded)?;
         if self.same_structure(&probed).is_err() {
             return Ok(false);
+        }
+        let near_regs: Vec<u8> = regs.iter().map(|param| param.value(&near)).collect();
+        match self.classify_varnodes(&probed, &near_regs, registers) {
+            Ok(()) => {}
+            Err(Mismatch::Structure(_) | Mismatch::Ambiguous) => return Ok(false),
+            Err(Mismatch::Value(reason)) => return Err(Refusal::Parameters(reason)),
         }
         // Source 0 is the address; source `i + 1` is parameter `i`.
         let mut deltas = [0u64; MAX_PARAMS + 1];
@@ -1769,7 +2644,9 @@ impl Template {
                 return Ok(false);
             };
             let probed = probe(store, &decoded)?;
-            if self.same_structure(&probed).is_err() {
+            if self.same_structure(&probed).is_err()
+                || !self.varnodes_agree(&probed, &self.keys.base_regs)
+            {
                 return Ok(false);
             }
             for (i, param) in params.iter().enumerate() {
@@ -1800,6 +2677,9 @@ impl Template {
     /// exactly `delta` in its width, and no other value moved.
     fn verify(&self, probed: &Self, delta: u64, index: usize) -> Result<(), Mismatch> {
         self.same_structure(probed).map_err(Mismatch::Structure)?;
+        if !self.varnodes_agree(probed, &self.keys.base_regs) {
+            return Err(Mismatch::Value("a register operand moved with a parameter"));
+        }
         for (mine, theirs) in self.affines().zip(probed.affines()) {
             let mask = Affine::mask(mine.size);
             let expected = if mine.params & (1 << index) != 0 {
@@ -1825,6 +2705,9 @@ impl Template {
         moved: impl Fn(&mut Affine),
     ) -> Result<(), Mismatch> {
         self.same_structure(probed).map_err(Mismatch::Structure)?;
+        if !self.varnodes_agree(probed, &self.keys.base_regs) {
+            return Err(Mismatch::Value("a register operand moved with a probe"));
+        }
         for (mine, theirs) in self.affines_mut().zip(probed.affines()) {
             let mask = Affine::mask(mine.size);
             if theirs.value == mine.value {
@@ -1872,6 +2755,35 @@ impl Template {
         self.literals = unique;
     }
 
+    /// Merges varnode slots that name the same varnode, following the same
+    /// field, and renumbers the operations.
+    fn dedupe_varnodes(&mut self) {
+        let mut unique: Vec<VarnodeSlot> = Vec::with_capacity(self.varnodes.len());
+        let remap: Vec<usize> = self
+            .varnodes
+            .iter()
+            .map(|slot| match unique.iter().position(|u| u == slot) {
+                Some(index) => index,
+                None => {
+                    unique.push(*slot);
+                    unique.len() - 1
+                }
+            })
+            .collect();
+        for op in &mut self.ops {
+            op.mnemonic = op.mnemonic.clone().map_operands(|operand| match operand {
+                LocalValueId::Varnode(k) => {
+                    LocalValueId::Varnode(VarnodeId::from(remap[usize::from(k)]))
+                }
+                other => other,
+            });
+            if let Some(OpName::Varnode(k)) = &mut op.name {
+                *k = remap[*k as usize] as u32;
+            }
+        }
+        self.varnodes = unique;
+    }
+
     /// This template with its values as they are at `instance`, in
     /// canonical form.
     fn instantiate(&self, instance: &Instance) -> Self {
@@ -1881,6 +2793,13 @@ impl Template {
         for affine in resolved.affines_mut() {
             *affine = affine.resolved(instance);
         }
+        for slot in &mut resolved.varnodes {
+            *slot = VarnodeSlot::Fixed(
+                self.varnode_with(*slot, &instance.regs)
+                    .expect("an instance resolves every register"),
+            );
+        }
+        resolved.reg_tables.clear();
         resolved.canonicalize();
         resolved
     }
@@ -1892,6 +2811,7 @@ impl Template {
     /// block is the entry — and the operations renumbered to match.
     fn canonicalize(&mut self) {
         self.dedupe_literals();
+        self.dedupe_varnodes();
         let internal = 1 + self.blocks.len();
         let mut addresses: Vec<u64> = self
             .externals
@@ -2001,6 +2921,20 @@ impl Template {
 
         let ctx = construction.context();
         let types: Vec<TypeId> = self.types.iter().map(|key| key.resolve(ctx)).collect();
+        let varnodes: Vec<VarnodeId> = (0..self.varnodes.len())
+            .map(|k| self.varnode_at(k, instance))
+            .collect();
+        let names: Vec<Option<String>> = self
+            .ops
+            .iter()
+            .map(|op| match &op.name {
+                Some(OpName::Fixed(name)) => Some(name.to_string()),
+                Some(OpName::Varnode(k)) => Varnode::from_id(ctx, varnodes[*k as usize])
+                    .name()
+                    .map(str::to_lowercase),
+                None => None,
+            })
+            .collect();
         let literals: Vec<LocalValueId> = self
             .literals
             .iter()
@@ -2050,7 +2984,7 @@ impl Template {
 
         let mut insns: Vec<InstructionId> = Vec::with_capacity(self.ops.len());
         let mut current = 0u32;
-        for op in &self.ops {
+        for (op, name) in self.ops.iter().zip(names) {
             if op.block != current {
                 current = op.block;
                 emitter.switch_to_block(blocks[current as usize]);
@@ -2061,6 +2995,7 @@ impl Template {
                     LocalValueId::Instruction(insns[usize::from(index)].local)
                 }
                 LocalValueId::Temp(index) => LocalValueId::Temp(temps[usize::from(index)]),
+                LocalValueId::Varnode(index) => LocalValueId::Varnode(varnodes[usize::from(index)]),
                 other => other,
             });
             match &mut mnemonic {
@@ -2089,9 +3024,12 @@ impl Template {
                 }
                 _ => {}
             }
-            let name = op.name.as_deref().map(|name| Cow::Owned(name.to_owned()));
             let id = emitter
-                .push_mnemonic_with_type_named(mnemonic, types[op.ty as usize], name)
+                .push_mnemonic_with_type_named(
+                    mnemonic,
+                    types[op.ty as usize],
+                    name.map(Cow::Owned),
+                )
                 .id;
             insns.push(id);
         }
@@ -2118,6 +3056,7 @@ struct Probing<'a, 'spec> {
     lifter: &'a SleighLifter<'spec>,
     probes: &'a AtomicU64,
     decoder: &'a FixedDecoder<'spec>,
+    registers: &'a Registers<'a>,
     address: u64,
     bytes: &'a [u8],
     shape: &'a Shape,
@@ -2160,11 +3099,15 @@ struct Perturbing<'a, 'spec> {
     /// The instruction with those bits flipped.
     flip: &'a dyn Fn(&[usize]) -> Vec<u8>,
     decoder: &'a FixedDecoder<'spec>,
+    registers: &'a Registers<'a>,
     shape: &'a Shape,
 }
 
 /// How a probe's lift differs from the captured one.
 enum Mismatch {
+    /// A probe moved two things a slot could follow either of; one at a
+    /// time tells.
+    Ambiguous,
     /// In its structure: the probe is not an instance of the same template.
     Structure(&'static str),
     /// In a value that moved by something other than the probe's delta.
@@ -2174,6 +3117,7 @@ enum Mismatch {
 impl Mismatch {
     fn reason(&self) -> &'static str {
         match self {
+            Self::Ambiguous => "a probe moved two things a value could follow",
             Self::Structure(reason) | Self::Value(reason) => reason,
         }
     }

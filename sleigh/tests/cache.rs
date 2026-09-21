@@ -209,9 +209,15 @@ fn render(lifted: &ScratchLifted<'_, '_, '_, '_>) -> String {
                     other => format!("{other:?}"),
                 })
                 .collect();
+            // Literal, block and varnode ids in a raw mnemonic are the
+            // template's keys, not the store's: the resolved operands say
+            // what they are.
             let mnemonic = blank(
-                &blank(&format!("{:?}", insn.mnemonic()), "LiteralId("),
-                "LocalBlockId(",
+                &blank(
+                    &blank(&format!("{:?}", insn.mnemonic()), "LiteralId("),
+                    "LocalBlockId(",
+                ),
+                "VarnodeId(",
             );
             let targets = match (insn.branch_target(), insn.cbranch_targets()) {
                 (Some(target), _) => format!(" -> @{:?}", target.address()),
