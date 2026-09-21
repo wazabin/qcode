@@ -17,7 +17,7 @@ jstd.workspace = true
 qcode.workspace = true
 qcode_vm.workspace = true
 rustc-hash.workspace = true
-sleigh = { package = "wazabin-sleigh", version = "0.1.11" }
+sleigh = { package = "wazabin-sleigh", version = "0.1.12" }
 smallvec.workspace = true
 
 [[example]]
@@ -44,10 +44,10 @@ criterion.workspace = true
 iai-callgrind.workspace = true
 # The coverage test names the constructors the corpus never reaches, which
 # needs read-only access to the specification's symbolic structures.
-sleigh = { package = "wazabin-sleigh", version = "0.1.11", features = ["unstable-introspect"] }
+sleigh = { package = "wazabin-sleigh", version = "0.1.12", features = ["unstable-introspect"] }
 qcode_emulator.workspace = true
 qcode_passes.workspace = true
-sleigh-precompile = { package = "wazabin-sleigh-precompile", version = "0.1.11" }
+sleigh-precompile = { package = "wazabin-sleigh-precompile", version = "0.1.12" }
 serde.workspace = true
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }

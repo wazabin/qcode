@@ -48,6 +48,3 @@ toml = "1"
 # not recorded in published packages and never reaches downstream consumers.
 [patch.crates-io]
 rustc_apfloat = { git = "https://github.com/Garfield1002/rustc_apfloat.git", rev = "9a4a688bc8f2741c5bd43df79c7061ef63142122" }
-# `Shape::registers` (see sleigh/src/cache.rs) is in wazabin/sleigh pull
-# request #12, unreleased. Drop once wazabin-sleigh ships it.
-wazabin-sleigh = { git = "https://github.com/wazabin/sleigh.git", rev = "e15c9a555c9f9c27012c11ce65689bd62545a0ca" }

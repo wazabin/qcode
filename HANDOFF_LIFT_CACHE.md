@@ -11,10 +11,9 @@ truth; this file is the state of the work, the numbers and the follow-ups.
   `origin/main` at `da90043`. Three commits:
   the exact-encoding cache, the shape keying with combined probes, and the
   cheaper capture.
-- Depends on wazabin-sleigh 0.1.11, which ships `Decoder::decode_one_shaped`
-  and the constructor maps as small vectors (wazabin/sleigh pull request
-  #10, released 2026-09-21). `sleigh/Cargo.toml` names that version; the
-  git-revision patch the branch carried while #10 was unreleased is gone.
+- Depends on wazabin-sleigh 0.1.12, which ships `Decoder::decode_one_shaped`
+  (wazabin/sleigh#10) and `Shape::registers` (#12), both released
+  2026-09-21. `sleigh/Cargo.toml` names that version.
 - Do not touch `~/dev/juju` or `~/dev/binary`: other agents work there.
 
 Checks that pass as of this handoff (CI's commands):
