@@ -8,17 +8,13 @@ truth; this file is the state of the work, the numbers and the follow-ups.
 ## 1. State of the tree
 
 - Repository `~/dev/nochurn/qcode`, branch `encoding-cache`, rebased on
-  `origin/main` at `da90043` (wazabin-sleigh 0.1.10). Three commits:
+  `origin/main` at `da90043`. Three commits:
   the exact-encoding cache, the shape keying with combined probes, and the
   cheaper capture.
-- **Depends on unreleased wazabin-sleigh.** `Decoder::decode_one_shaped`
-  is in wazabin/sleigh pull request #10 (branch `shaped-decode`, also the
-  constructor maps as small vectors). `Cargo.toml` patches
-  `wazabin-sleigh` to that branch by git revision so CI can build. To
-  merge: land #10, release wazabin-sleigh 0.1.11, bump `sleigh/Cargo.toml`
-  to it and drop the patch.
-- The sibling checkout `~/dev/nochurn/wazabin-sleigh` holds that branch;
-  the path patch it used to be reached through is gone.
+- Depends on wazabin-sleigh 0.1.11, which ships `Decoder::decode_one_shaped`
+  and the constructor maps as small vectors (wazabin/sleigh pull request
+  #10, released 2026-09-21). `sleigh/Cargo.toml` names that version; the
+  git-revision patch the branch carried while #10 was unreleased is gone.
 - Do not touch `~/dev/juju` or `~/dev/binary`: other agents work there.
 
 Checks that pass as of this handoff (CI's commands):
