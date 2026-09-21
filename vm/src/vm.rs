@@ -725,20 +725,31 @@ impl<S: CodeSource> Vm<S> {
         None
     }
 
-    /// Runs the injectors over `block` unless the current set already has.
+    /// Runs the injectors over `block` unless the current set already has,
+    /// and says whether any of them changed it.
     ///
     /// Only over lifted code: an empty block carrying an address is a request
     /// to lift it, and its instructions arrive — and get rewritten — once it
     /// is discovered.
-    fn inject(&mut self, block: BlockId) {
+    ///
+    /// The interpreter may hold this block's instruction list, which a
+    /// change makes stale; what to do about it is the caller's, since it
+    /// knows where the machine stands. A block is offered again each time it
+    /// grows, which for straight-line code is once per guest instruction, so
+    /// an unchanged block must cost the interpreter nothing: dropping its
+    /// list regardless made the walk back to the machine's position, and
+    /// the rebuild, once per instruction of the block — quadratic in its
+    /// length.
+    fn inject(&mut self, block: BlockId) -> bool {
         if self.injectors.is_empty()
             || self.injected.get(&block) == Some(&self.generation)
             || !BasicBlock::from_id(&self.ctx, block).is_terminated()
         {
-            return;
+            return false;
         }
         // Moved out for the duration, so the injectors can be handed the
         // module without borrowing the machine twice.
+        let revision = self.ctx.block(block).revision();
         let mut injectors = std::mem::take(&mut self.injectors);
         for injector in &mut injectors {
             injector.inject(&mut self.ctx, block);
@@ -750,9 +761,7 @@ impl<S: CodeSource> Vm<S> {
         // space first touched by compiled code would otherwise be created
         // unconfigured, and read as unwritten by the interpreter afterwards.
         qcode_emulator::EmulatorMemory::configure_spaces(&mut self.emu.memory, &self.ctx);
-        // The interpreter may hold this block's instruction list, and it has
-        // changed.
-        self.emu.invalidate_block_cache();
+        self.ctx.block(block).revision() != revision
     }
 
     /// Executes one instruction, lifting code on demand if control leaves the
@@ -805,7 +814,9 @@ impl<S: CodeSource> Vm<S> {
             if self.emu.idx == 0 {
                 let block = self.emu.block;
                 self.clean_before_entering(block);
-                self.inject(block);
+                if self.inject(block) {
+                    self.emu.invalidate_block_cache();
+                }
             }
 
             // At a block's first instruction — or just past an interrupt it
@@ -1533,7 +1544,10 @@ impl<S: CodeSource> Vm<S> {
         if self.emu.block == filled {
             // The absorbed instructions have not run, and the injectors have
             // not seen them: rewrite now, so a hook on the instruction about
-            // to execute is not missed the first time.
+            // to execute is not missed the first time. What they emit goes
+            // with those instructions, after `last_executed`, which is the
+            // tail `resume_after` reads afresh; the list it keeps is the part
+            // before, and it checks that part still ends where it should.
             self.inject(head);
             self.emu.resume_after(&self.ctx, head, last_executed);
         }

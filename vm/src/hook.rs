@@ -33,7 +33,7 @@ use qcode::{
         insn::{Binop, IntBinop, Mnemonic, Store, VM_INTERRUPT},
     },
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::inject::CodeInjector;
 
@@ -64,15 +64,34 @@ impl Site {
 }
 
 /// A read-only look at a block, for choosing sites.
+///
+/// A block is offered again each time it grows — for straight-line code,
+/// once per guest instruction discovered — so an offer may name the first
+/// instruction that is new since the last one, and the site lists start
+/// there. Walking the whole block on every offer made instrumenting a long
+/// run quadratic in its length.
 pub struct BlockView<'a> {
     pub ctx: &'a Context<'static>,
     pub block: BlockId,
+    /// The first instruction not offered before; `None` offers the whole
+    /// block.
+    pub since: Option<InstructionId>,
 }
 
-impl BlockView<'_> {
+impl<'a> BlockView<'a> {
     /// The block's guest address, if it starts at one.
     pub fn address(&self) -> Option<u64> {
         BasicBlock::from_id(self.ctx, self.block).address()
+    }
+
+    /// The block's instructions from the offer's start, in order.
+    fn instructions(&self) -> impl Iterator<Item = qcode::value::InstructionRef<'static, 'a>> {
+        let ctx = self.ctx;
+        let first = match self.since {
+            Some(since) => Some(since),
+            None => BasicBlock::from_id(ctx, self.block).first_instruction(),
+        };
+        std::iter::successors(first.map(|id| ctx.get_insn(id)), |insn| insn.next())
     }
 
     /// The site at the block's entry, if the block starts at a guest address.
@@ -102,13 +121,20 @@ impl BlockView<'_> {
     /// last address; they are a continuation, not a start, and get no site.
     pub fn addresses(&self) -> Vec<Site> {
         let block = BasicBlock::from_id(self.ctx, self.block);
-        let continued = if block.address().is_none() {
+        // Starting part-way through, the run in progress is the nearest
+        // addressed instruction before the start; the hook's own code
+        // carries no address and is stepped over.
+        let mut seen = self.since.and_then(|since| {
+            std::iter::successors(self.ctx.get_insn(since).prev(), |insn| insn.prev())
+                .find_map(|insn| insn.address())
+        });
+        let continued = if seen.is_none() && block.address().is_none() {
             block
                 .predecessors()
                 .filter_map(|(_, pred)| {
                     BasicBlock::from_id(self.ctx, pred)
                         .instructions()
-                        .last()
+                        .next_back()
                         .and_then(|insn| insn.address())
                 })
                 .collect::<Vec<u64>>()
@@ -116,8 +142,7 @@ impl BlockView<'_> {
             Vec::new()
         };
         let mut sites = Vec::new();
-        let mut seen = None;
-        for insn in block.instructions() {
+        for insn in self.instructions() {
             // An interrupt a hook placed carries the site's address so the
             // stop reports it, but it is the hook's instruction, not the
             // guest's: never the start of a run, never an anchor.
@@ -155,8 +180,7 @@ impl BlockView<'_> {
 
     /// Every store to guest memory, in order.
     pub fn stores(&self) -> Vec<Site> {
-        BasicBlock::from_id(self.ctx, self.block)
-            .instructions()
+        self.instructions()
             .filter(|insn| matches!(insn.mnemonic(), Mnemonic::Store(store) if self.is_ram(store.space)))
             .map(|insn| Site::Store { insn: insn.id })
             .collect()
@@ -164,8 +188,7 @@ impl BlockView<'_> {
 
     /// Every load from guest memory, in order.
     pub fn loads(&self) -> Vec<Site> {
-        BasicBlock::from_id(self.ctx, self.block)
-            .instructions()
+        self.instructions()
             .filter(
                 |insn| matches!(insn.mnemonic(), Mnemonic::Load(load) if self.is_ram(load.space)),
             )
@@ -175,8 +198,7 @@ impl BlockView<'_> {
 
     /// Every integer comparison, in order.
     pub fn compares(&self) -> Vec<Site> {
-        BasicBlock::from_id(self.ctx, self.block)
-            .instructions()
+        self.instructions()
             .filter(|insn| {
                 matches!(insn.mnemonic(), Mnemonic::Binop(binary) if binary.op.is_comparison()
                     && matches!(binary.op, Binop::Int(_)))
@@ -430,6 +452,11 @@ pub fn state_space(ctx: &mut Context<'static>, name: &str) -> SpaceId {
 pub struct HookInjector<H> {
     pub hook: H,
     done: FxHashSet<InstructionId>,
+    /// Per block, the last instruction before its terminator when the hook
+    /// last saw it. A block grows by absorbing instructions after that one,
+    /// so the next offer starts at its successor; instruction ids are never
+    /// reused, so an id still in the block is the instruction it was.
+    frontier: FxHashMap<BlockId, InstructionId>,
 }
 
 impl<H: Hook> HookInjector<H> {
@@ -437,13 +464,29 @@ impl<H: Hook> HookInjector<H> {
         Self {
             hook,
             done: FxHashSet::default(),
+            frontier: FxHashMap::default(),
         }
+    }
+
+    /// Where this offer of `block` starts: after the frontier, when the
+    /// frontier is still in the block; from the top otherwise.
+    fn since(&self, ctx: &Context<'static>, block: BlockId) -> Option<InstructionId> {
+        let frontier = *self.frontier.get(&block)?;
+        if !ctx.contains_instruction(frontier) {
+            return None;
+        }
+        let insn = ctx.get_insn(frontier);
+        if insn.parent().map(|parent| parent.id) != Some(block) {
+            return None;
+        }
+        insn.next().map(|next| next.id)
     }
 }
 
 impl<H: Hook> CodeInjector for HookInjector<H> {
     fn inject(&mut self, ctx: &mut Context<'static>, block: BlockId) {
-        let sites = self.hook.sites(&BlockView { ctx, block });
+        let since = self.since(ctx, block);
+        let sites = self.hook.sites(&BlockView { ctx, block, since });
         for site in sites {
             if !self.done.insert(site.anchor()) {
                 continue;
@@ -452,6 +495,20 @@ impl<H: Hook> CodeInjector for HookInjector<H> {
             // split may have moved this one.
             let mut emit = Emitter::new(ctx, &site);
             self.hook.instrument(&site, &mut emit);
+        }
+        // A split leaves `block` ending in the branch to the detour; the
+        // rest is a block of its own, offered on its own entry.
+        let last = BasicBlock::from_id(ctx, block)
+            .instructions()
+            .next_back()
+            .and_then(|terminator| terminator.prev().map(|insn| insn.id));
+        match last {
+            Some(last) => {
+                self.frontier.insert(block, last);
+            }
+            None => {
+                self.frontier.remove(&block);
+            }
         }
     }
 }

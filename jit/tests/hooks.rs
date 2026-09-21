@@ -2,7 +2,7 @@
 //! the interpreter and under the JIT, and the JIT must keep running natively
 //! around them.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use qcode::{context::Context, value::BlockId};
@@ -459,4 +459,37 @@ fn an_index_past_the_bound_stops_both_strategies_alike() {
         exits.push(message.to_string());
     }
     assert_eq!(exits[0], exits[1]);
+}
+
+/// Counts the address sites it is offered, instrumenting none.
+struct OfferCounter(Rc<Cell<usize>>);
+
+impl qcode_vm::hook::Hook for OfferCounter {
+    fn sites(&mut self, block: &qcode_vm::hook::BlockView<'_>) -> Vec<qcode_vm::hook::Site> {
+        self.0.set(self.0.get() + block.addresses().len());
+        Vec::new()
+    }
+
+    fn instrument(&mut self, _: &qcode_vm::hook::Site, _: &mut qcode_vm::hook::Emitter<'_>) {}
+}
+
+#[test]
+fn a_growing_block_offers_a_hook_only_what_is_new() {
+    // Sixty-four `inc eax`, then `mov ebx, 42`: one straight-line run,
+    // discovered an instruction at a time and absorbed into one block.
+    let mut code = vec![0xff, 0xc0].repeat(64);
+    code.extend_from_slice(&[0xbb, 0x2a, 0x00, 0x00, 0x00]);
+    let offered = Rc::new(Cell::new(0));
+    let mut vm = machine(&code, false);
+    vm.add_hook(OfferCounter(offered.clone()));
+    let regs = drive_with(&mut vm, &["EAX", "EBX"], |_, _, _| {});
+    assert_eq!(regs, vec![Some(64), Some(42)]);
+    // Each instruction is offered once as the block grows past it, plus the
+    // block itself once more as a whole; offering the whole block on every
+    // growth would be sixty-five offers of up to sixty-five sites.
+    assert!(
+        offered.get() <= 65 * 3,
+        "the hook was offered {} address sites over a 65-instruction run",
+        offered.get()
+    );
 }
