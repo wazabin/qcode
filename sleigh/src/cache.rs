@@ -136,7 +136,7 @@ pub struct CacheStats {
     /// with the address moved and every parameter's lowest free bit
     /// flipped, one with every free bit flipped when a parameter has more
     /// than one, and — when a probe is ambiguous or changes the lift's
-    /// structure — one at a time as [measured](Template::measure).
+    /// structure — one at a time.
     pub probes: u64,
     /// Lifts of a shape the probe found uncacheable; each was lifted for
     /// real. Counted per lift, not per shape.
@@ -994,10 +994,32 @@ impl Marks {
 /// Assigns template indices to the ids of one lift, in first-seen order.
 #[derive(Default)]
 struct Numbering {
-    insns: HashMap<LocalInsnId, u32>,
-    temps: HashMap<LocalTempId, u32>,
-    blocks: HashMap<LocalBlockId, u32>,
-    types: HashMap<TypeId, u32>,
+    /// The instruction's operations by id, ascending; an operation's
+    /// position is its index.
+    insns: Vec<LocalInsnId>,
+    /// The first temporary the lift made; those after it are numbered from
+    /// there.
+    temps_from: usize,
+    temps: usize,
+    blocks: Vec<(LocalBlockId, u32)>,
+    types: Vec<TypeId>,
+}
+
+impl Numbering {
+    fn insn(&self, id: LocalInsnId) -> Option<u32> {
+        self.insns.binary_search(&id).ok().map(|i| i as u32)
+    }
+
+    fn temp(&self, id: LocalTempId) -> Option<u32> {
+        let raw = usize::from(id);
+        (self.temps_from..self.temps_from + self.temps)
+            .contains(&raw)
+            .then(|| (raw - self.temps_from) as u32)
+    }
+
+    fn block(&self, id: LocalBlockId) -> Option<u32> {
+        self.blocks.iter().find(|(b, _)| *b == id).map(|(_, i)| *i)
+    }
 }
 
 impl Template {
@@ -1015,7 +1037,13 @@ impl Template {
         let func = lifted.entry().func;
         let body = ctx.body(func);
         let view = ModuleView::new(ctx);
-        let mut numbering = Numbering::default();
+        let mut numbering = Numbering {
+            insns: Vec::new(),
+            temps_from: marks.temps,
+            temps: 0,
+            blocks: Vec::new(),
+            types: Vec::new(),
+        };
         let mut template = Self {
             base,
             length: lifted.length(),
@@ -1035,7 +1063,7 @@ impl Template {
         // The instruction's blocks, in the order they were opened; the entry
         // is block 0 and needs no name of its own.
         for (index, &block) in lifted.blocks().iter().enumerate() {
-            numbering.blocks.insert(block.local, index as u32);
+            numbering.blocks.push((block.local, index as u32));
             if index > 0 {
                 let name = BasicBlock::from_id(ctx, block).name();
                 template.blocks.push(BlockName::parse(name, base));
@@ -1051,9 +1079,7 @@ impl Template {
             }
         }
         order.sort_unstable_by_key(|(insn, _)| usize::from(*insn));
-        for (position, (insn, _)) in order.iter().enumerate() {
-            numbering.insns.insert(*insn, position as u32);
-        }
+        numbering.insns = order.iter().map(|(insn, _)| *insn).collect();
 
         // The temporary spaces and temporaries the lift appended, in order.
         for space in marks.temp_spaces..body.temp_space_count() {
@@ -1068,7 +1094,7 @@ impl Template {
         }
         for temp in marks.temps..body.temp_count() {
             let local = LocalTempId::from(temp);
-            numbering.temps.insert(local, (temp - marks.temps) as u32);
+            numbering.temps += 1;
             let temp = TempRef::new(view, TempId::new(func, local));
             if temp.name().is_some() || temp.label().is_some() {
                 return Err(Refusal::Shape("a named or labeled temporary"));
@@ -1091,7 +1117,7 @@ impl Template {
         // the shape lists them in, so probes pair up slot by slot.
         let mut external_blocks: Vec<LocalBlockId> = Vec::new();
         let mut external = |block: LocalBlockId| {
-            if !numbering.blocks.contains_key(&block) && !external_blocks.contains(&block) {
+            if numbering.block(block).is_none() && !external_blocks.contains(&block) {
                 external_blocks.push(block);
             }
         };
@@ -1126,7 +1152,7 @@ impl Template {
                     "a block of another instruction has no address",
                 ))?;
             template.externals.push(Affine::fixed(address, 8));
-            numbering.blocks.insert(block, internal + index as u32);
+            numbering.blocks.push((block, internal + index as u32));
         }
         let mut creation: Vec<(LocalBlockId, u32)> = external_blocks
             .iter()
@@ -1136,7 +1162,8 @@ impl Template {
         creation.sort_unstable_by_key(|(block, _)| usize::from(*block));
         template.external_order = creation.iter().map(|(_, index)| *index).collect();
 
-        for (insn, block) in order {
+        for (position, (insn, block)) in order.into_iter().enumerate() {
+            let position = position as u32;
             let id = InstructionId::new(func, insn);
             let reference = Instruction::from_id(ctx, id);
             let mut failed = None;
@@ -1160,9 +1187,9 @@ impl Template {
                         });
                         LocalValueId::Literal(LiteralId::from(template.literals.len() - 1))
                     }
-                    LocalValueId::Instruction(other) => match numbering.insns.get(&other) {
+                    LocalValueId::Instruction(other) => match numbering.insn(other) {
                         // A use may only name an operation issued before it.
-                        Some(&index) if index < numbering.insns[&insn] => {
+                        Some(index) if index < position => {
                             LocalValueId::Instruction(LocalInsnId::from(index as usize))
                         }
                         _ => {
@@ -1170,8 +1197,8 @@ impl Template {
                             operand
                         }
                     },
-                    LocalValueId::Temp(temp) => match numbering.temps.get(&temp) {
-                        Some(&index) => LocalValueId::Temp(LocalTempId::from(index as usize)),
+                    LocalValueId::Temp(temp) => match numbering.temp(temp) {
+                        Some(index) => LocalValueId::Temp(LocalTempId::from(index as usize)),
                         None => {
                             failed = Some(Refusal::Shape(
                                 "an operand names an earlier instruction's temporary",
@@ -1210,8 +1237,11 @@ impl Template {
                 _ => {}
             }
             // Block targets are not operands; a call's callee is not either.
-            let block_index =
-                |target: LocalBlockId| LocalBlockId::from(numbering.blocks[&target] as usize);
+            let block_index = |target: LocalBlockId| {
+                LocalBlockId::from(
+                    numbering.block(target).expect("a target block of the lift") as usize
+                )
+            };
             match &mut mnemonic {
                 Mnemonic::Branch(branch) => branch.target = block_index(branch.target),
                 Mnemonic::CBranch(cbranch) => {
@@ -1226,14 +1256,14 @@ impl Template {
             }
             let type_id = reference.type_id();
             let next = numbering.types.len() as u32;
-            let ty = match numbering.types.get(&type_id) {
-                Some(&index) => index,
+            let ty = match numbering.types.iter().position(|&t| t == type_id) {
+                Some(index) => index as u32,
                 None => {
                     template.types.push(
                         TypeKey::of(ctx, type_id)
                             .ok_or(Refusal::Shape("a type a template cannot hold"))?,
                     );
-                    numbering.types.insert(type_id, next);
+                    numbering.types.push(type_id);
                     next
                 }
             };
@@ -1246,17 +1276,14 @@ impl Template {
         }
 
         for exit in lifted.exits() {
-            let site = *numbering
-                .insns
-                .get(&exit.site().local)
+            let site = numbering
+                .insn(exit.site().local)
                 .ok_or(Refusal::Shape("an exit site outside the instruction"))?;
             let continuation = |continuation: Continuation| -> Result<Option<u32>, Refusal> {
                 match continuation {
                     Continuation::Next => Ok(None),
                     Continuation::Block(block) => numbering
-                        .blocks
-                        .get(&block.local)
-                        .copied()
+                        .block(block.local)
                         .map(Some)
                         .ok_or(Refusal::Shape("a continuation outside the instruction")),
                 }
@@ -1516,11 +1543,8 @@ impl Template {
             shape,
             flat,
         } = *probing;
-        let probe = |store: &mut ScratchStore, address: u64, bytes: &[u8]| {
+        let probe = |store: &mut ScratchStore, decoded: &Decoded<'_, '_>| {
             probes.fetch_add(1, Ordering::Relaxed);
-            let decoded = decoder
-                .decode(address, bytes)
-                .map_err(|_| Refusal::Shape("a probe did not decode"))?;
             store.reset();
             // Debug names are not compared, and minting them costs.
             let mut target = store
@@ -1529,7 +1553,7 @@ impl Template {
                 .without_debug_names();
             let marks = Marks::of(&target);
             let lifted = lifter
-                .lower(&mut target, &decoded, flat)
+                .lower(&mut target, decoded, flat)
                 .map_err(|_| Refusal::Shape("a probe did not lift"))?;
             Template::capture(
                 target.context(),
@@ -1547,12 +1571,6 @@ impl Template {
             }
             perturbed
         };
-        let lifts_alike = |perturbed: &[u8]| {
-            shape.admits(perturbed)
-                && decoder
-                    .decode(address, perturbed)
-                    .is_ok_and(|candidate| candidate.len() == bytes.len())
-        };
         let params = self.keys.params.clone();
         let free: Vec<Vec<usize>> = params
             .iter()
@@ -1567,14 +1585,18 @@ impl Template {
             free: &free,
             probe: &probe,
             flip: &flip,
-            lifts_alike: &lifts_alike,
+            decoder,
+            shape,
         };
         if self.measure_together(store, &perturbing)? {
             return Ok(());
         }
 
         // One thing at a time.
-        let probed = probe(store, address.wrapping_add(PROBE_DISTANCE), bytes)?;
+        let decoded = decoder
+            .decode(address.wrapping_add(PROBE_DISTANCE), bytes)
+            .map_err(|_| Refusal::Shape("a probe did not decode"))?;
+        let probed = probe(store, &decoded)?;
         self.compare(&probed, PROBE_DISTANCE, |affine| affine.relative = true)
             .map_err(|mismatch| Refusal::Shape(mismatch.reason()))?;
 
@@ -1587,10 +1609,11 @@ impl Template {
             let mut first = None;
             for &bit in free {
                 let perturbed = flip(&[bit]);
-                if !lifts_alike(&perturbed) {
+                let Some(decoded) = decode_alike(decoder, shape, bytes.len(), address, &perturbed)
+                else {
                     continue;
-                }
-                let probed = probe(store, address, &perturbed)?;
+                };
+                let probed = probe(store, &decoded)?;
                 let delta = param.value(&perturbed).wrapping_sub(base) as u64;
                 match self.compare(&probed, delta, |affine| affine.params |= 1 << index) {
                     Ok(()) => {
@@ -1614,10 +1637,11 @@ impl Template {
             let far = [flip(free), flip(&free[free.len() - 1..])];
             let mut verified = free.len() < 2;
             for perturbed in far.iter().filter(|p| **p != first) {
-                if !lifts_alike(perturbed) {
+                let Some(decoded) = decode_alike(decoder, shape, bytes.len(), address, perturbed)
+                else {
                     continue;
-                }
-                let probed = probe(store, address, perturbed)?;
+                };
+                let probed = probe(store, &decoded)?;
                 let delta = param.value(perturbed).wrapping_sub(base) as u64;
                 match self.verify(&probed, delta, index) {
                     Ok(()) => {
@@ -1650,7 +1674,7 @@ impl Template {
     fn measure_together(
         &mut self,
         store: &mut ScratchStore,
-        perturbing: &Perturbing<'_>,
+        perturbing: &Perturbing<'_, '_>,
     ) -> Result<bool, Refusal> {
         let Perturbing {
             address,
@@ -1659,7 +1683,8 @@ impl Template {
             free,
             probe,
             flip,
-            lifts_alike,
+            decoder,
+            shape,
         } = *perturbing;
         // Parameter `i` in its `i`th free bit, so two parameters' deltas
         // differ — two lowest bits both move by one, and a slot moving by
@@ -1670,10 +1695,16 @@ impl Template {
             .map(|(i, f)| f[i.min(f.len() - 1)])
             .collect();
         let near = flip(&near_bits);
-        if !params.is_empty() && !lifts_alike(&near) {
+        let Some(decoded) = decode_alike(
+            decoder,
+            shape,
+            bytes.len(),
+            address.wrapping_add(PROBE_DISTANCE),
+            &near,
+        ) else {
             return Ok(false);
-        }
-        let probed = probe(store, address.wrapping_add(PROBE_DISTANCE), &near)?;
+        };
+        let probed = probe(store, &decoded)?;
         if self.same_structure(&probed).is_err() {
             return Ok(false);
         }
@@ -1710,18 +1741,24 @@ impl Template {
             // Every free bit, or the highest of each, as `measure` tries.
             let all: Vec<usize> = free.iter().flatten().copied().collect();
             let highest: Vec<usize> = free.iter().map(|f| f[f.len() - 1]).collect();
-            let Some(far) = [flip(&all), flip(&highest)]
-                .into_iter()
-                .find(|far| *far != near && lifts_alike(far))
+            let candidates = [flip(&all), flip(&highest)];
+            let Some((far, decoded)) =
+                candidates
+                    .iter()
+                    .filter(|far| **far != near)
+                    .find_map(|far| {
+                        decode_alike(decoder, shape, bytes.len(), address, far)
+                            .map(|decoded| (far, decoded))
+                    })
             else {
                 return Ok(false);
             };
-            let probed = probe(store, address, &far)?;
+            let probed = probe(store, &decoded)?;
             if self.same_structure(&probed).is_err() {
                 return Ok(false);
             }
             for (i, param) in params.iter().enumerate() {
-                deltas[i + 1] = param.value(&far).wrapping_sub(param.value(bytes)) as u64;
+                deltas[i + 1] = param.value(far).wrapping_sub(param.value(bytes)) as u64;
             }
             for ((mine, theirs), &(_, moving)) in self.affines().zip(probed.affines()).zip(&marks) {
                 let expected = (0..params.len())
@@ -2070,13 +2107,32 @@ struct Probing<'a, 'spec> {
     flat: bool,
 }
 
-/// Lifts bytes at an address into a store and captures them.
-type Probe<'a> = dyn Fn(&mut ScratchStore, u64, &[u8]) -> Result<Template, Refusal> + 'a;
+/// Lifts a decoded instruction into a store and captures it.
+type Probe<'a> = dyn Fn(&mut ScratchStore, &Decoded<'_, '_>) -> Result<Template, Refusal> + 'a;
+
+/// A perturbation of an instruction of `shape`, `len` bytes long, decoded
+/// at `at` — where it will be lifted — when the shape admits it and it
+/// decodes to the same length.
+fn decode_alike<'spec, 'b>(
+    decoder: &FixedDecoder<'spec>,
+    shape: &Shape,
+    len: usize,
+    at: u64,
+    perturbed: &'b [u8],
+) -> Option<Decoded<'spec, 'b>> {
+    if !shape.admits(perturbed) {
+        return None;
+    }
+    decoder
+        .decode(at, perturbed)
+        .ok()
+        .filter(|candidate| candidate.len() == len)
+}
 
 /// A miss's instruction and the ways [`measure`](Template::measure)
 /// perturbs it.
 #[derive(Clone, Copy)]
-struct Perturbing<'a> {
+struct Perturbing<'a, 'spec> {
     address: u64,
     bytes: &'a [u8],
     params: &'a [ParamField],
@@ -2086,8 +2142,8 @@ struct Perturbing<'a> {
     probe: &'a Probe<'a>,
     /// The instruction with those bits flipped.
     flip: &'a dyn Fn(&[usize]) -> Vec<u8>,
-    /// Whether a perturbation decodes to the shape, at the same length.
-    lifts_alike: &'a dyn Fn(&[u8]) -> bool,
+    decoder: &'a FixedDecoder<'spec>,
+    shape: &'a Shape,
 }
 
 /// How a probe's lift differs from the captured one.
