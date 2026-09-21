@@ -352,6 +352,23 @@ pub fn run(image: &[u8], jit: bool, instr: Instr) -> Outcome {
     if let Some(path) = std::env::var_os("HOOKBENCH_DUMP") {
         std::fs::write(path, format!("{}", vm.context())).unwrap();
     }
+    if std::env::var_os("HOOKBENCH_DECLINES").is_some() {
+        // Which blocks a fresh JIT declines, and why: a block the executor
+        // runs on the interpreter is the usual reason a compiled hook costs
+        // more than its instructions.
+        let ctx = vm.context().clone();
+        let mut probe = Jit::new();
+        for func in ctx.function_ids() {
+            for block in qcode::value::FunctionBody::from_id(&ctx, func).block_ids() {
+                if let Err(reason) = probe.try_compile(&ctx, block)
+                    && ctx.block(block).has_insns()
+                {
+                    let b = qcode::value::BasicBlock::from_id(&ctx, block);
+                    eprintln!("declined {:?} at {:x?} ({} insns): {reason}", block, b.address(), b.len());
+                }
+            }
+        }
+    }
     if std::env::var_os("HOOKBENCH_STATS").is_some() {
         eprintln!(
             "stats {:?}: steps={} lifts={} absorbed={} native_bodies={} evicted={}",
