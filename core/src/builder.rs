@@ -47,7 +47,7 @@ use crate::{
     types::{AggregateField, TypeId},
     value::{
         BodyView, FunctionBody, Instruction, LocalBlockId, LocalValueId, Temp, TempId, TempSpace,
-        ValueId, ValueRef,
+        TempSpaceId, ValueId, ValueRef,
         block::{BasicBlock, BlockId},
         block_param::{BlockParam, BlockParamId},
         function::FunctionId,
@@ -223,6 +223,19 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 
     /// Creates a body-local temporary identified by a SLEIGH local label.
+    /// Appends a temporary space to the body, as
+    /// [`FunctionBody::push_temp_space`] does; for reproducing temporaries
+    /// recorded from another lift of the same instruction.
+    pub fn push_temp_space(&mut self, space: TempSpace) -> TempSpaceId {
+        self.body.push_temp_space(space)
+    }
+
+    /// Appends a temporary to the body, as [`FunctionBody::push_temp`] does.
+    /// Its space must be one of this body's.
+    pub fn push_temp(&mut self, temp: Temp<'str>) -> TempId {
+        self.body.push_temp(temp)
+    }
+
     pub fn make_temp_labeled(&mut self, label: u32, size: usize) -> TempId {
         let space = self.fresh_temp_space(None);
         let mut temp = Temp::new(0, size, space.local);
@@ -603,6 +616,29 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         type_id: TypeId,
     ) -> InstructionRef<'str, '_, BodyView<'_, 'str>> {
         let local = self.store_insn_with_type(mnemonic, type_id);
+        self.insn_ref(local)
+    }
+
+    /// [`push_mnemonic_with_type`](Self::push_mnemonic_with_type), naming the
+    /// result `name` — made unique in the body, as a register load's name
+    /// is — when the builder [names](Self::naming) things, and leaving it
+    /// unnamed otherwise. For replaying an instruction recorded with its
+    /// names.
+    #[track_caller]
+    pub fn push_mnemonic_with_type_named(
+        &mut self,
+        mnemonic: Mnemonic,
+        type_id: TypeId,
+        name: Option<Cow<'str, str>>,
+    ) -> InstructionRef<'str, '_, BodyView<'_, 'str>> {
+        let local = self.store_insn_with_type(mnemonic, type_id);
+        if let Some(name) = name
+            && self.naming()
+        {
+            let unique = self.body.names.unique(name);
+            self.rename_insn_local(local, unique)
+                .expect("the name was deduplicated");
+        }
         self.insn_ref(local)
     }
 

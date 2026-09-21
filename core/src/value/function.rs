@@ -1140,6 +1140,19 @@ impl<'str> FunctionBody<'str> {
         &self.temp_spaces[id.local]
     }
 
+    /// How many temporary spaces this body owns. Temporary spaces and
+    /// temporaries are appended and never removed, so a count taken before
+    /// some construction marks where its additions start.
+    pub fn temp_space_count(&self) -> usize {
+        self.temp_spaces.len()
+    }
+
+    /// How many temporaries this body owns; see
+    /// [`temp_space_count`](Self::temp_space_count).
+    pub fn temp_count(&self) -> usize {
+        self.temps.len()
+    }
+
     /// Iterates over every temporary space owned by this body, in id order.
     pub fn temp_spaces(&self) -> impl Iterator<Item = (TempSpaceId, &TempSpace)> + '_ {
         let func = self.id();

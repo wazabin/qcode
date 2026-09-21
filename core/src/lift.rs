@@ -109,6 +109,12 @@ pub struct Exit {
 }
 
 impl Exit {
+    /// An exit at `site` taking `arm` to `kind`, for a result assembled
+    /// from a record rather than emitted.
+    pub fn new(site: InstructionId, arm: ExitArm, kind: ExitKind) -> Self {
+        Self { site, arm, kind }
+    }
+
     /// The emitted operation the exit leaves from: a terminator, or a
     /// structured call that the rest of the instruction continues after.
     pub fn site(&self) -> InstructionId {
@@ -142,6 +148,27 @@ pub struct Lifted {
 }
 
 impl Lifted {
+    /// A result assembled from a record of an instruction — a cached
+    /// template — rather than from an emission. `blocks` starts with
+    /// `entry`; the ids are the record's keys and name whatever the record
+    /// says they do.
+    pub fn new(
+        address: u64,
+        length: usize,
+        entry: BlockId,
+        blocks: Vec<BlockId>,
+        exits: Vec<Exit>,
+    ) -> Self {
+        debug_assert_eq!(blocks.first(), Some(&entry));
+        Self {
+            address,
+            length,
+            entry,
+            blocks,
+            exits,
+        }
+    }
+
     /// The machine address the instruction was lifted at.
     pub fn address(&self) -> u64 {
         self.address

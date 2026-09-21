@@ -38,6 +38,30 @@
 //! println!("{ctx}");
 //! ```
 //!
+//! # Memoized lifting
+//!
+//! Machine code repeats, and lowering the busiest x86-64 forms costs
+//! hundreds of microseconds each. A [`cache::LiftCache`] shared by the
+//! sessions of a lifter remembers what every encoding lowered to and
+//! replays it at any other address, exactly — see the [`cache`] module for
+//! how that is measured rather than assumed. A scratch session serves a hit
+//! without decoding or lowering anything:
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use sleigh_precompile::x64;
+//! use wazabin_qcode_sleigh::{SleighLifter, cache::LiftCache, session::ScratchSession};
+//!
+//! let lifter = SleighLifter::new(x64::spec()).with_flat_control_flow();
+//! let cache = Arc::new(LiftCache::new(lifter.spec()));
+//! let mut session = ScratchSession::new(&lifter).with_cache(Arc::clone(&cache));
+//! for address in [0x1000, 0x2000] {
+//!     let lifted = session.lift(address, &[0xde, 0xc9]).expect("FMULP lifts");
+//!     println!("{} blocks, cached: {}", lifted.blocks().count(), lifted.is_cached());
+//! }
+//! println!("{:?}", cache.stats());
+//! ```
+//!
 //! The `qcode-dump` example prints every stage — disassembly text, SLEIGH AST,
 //! flat p-code, and the resulting QCode:
 //!
@@ -45,6 +69,7 @@
 //! cargo run --example qcode-dump -- 4889d8
 //! ```
 
+pub mod cache;
 pub mod decode;
 pub mod session;
 pub mod vm_source;
@@ -341,6 +366,12 @@ impl<'spec> SleighLifter<'spec> {
     /// Returns the compiled SLEIGH specification used by this lifter.
     pub fn spec(&self) -> &'spec CompiledSpec {
         self.spec
+    }
+
+    /// Whether the guest's calls and returns are lowered as jumps; see
+    /// [`with_flat_control_flow`](Self::with_flat_control_flow).
+    pub fn flat_control_flow(&self) -> bool {
+        self.flat_control_flow
     }
 
     /// Creates a QCode module initialized for this specification.

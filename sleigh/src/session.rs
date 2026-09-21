@@ -24,20 +24,27 @@
 //! recovery; a scratch session recovers by itself, since discarding the
 //! instruction discards the damage.
 
+use std::{cell::OnceCell, sync::Arc};
+
 use qcode::{
     address_index::AddressIndex,
     context::Context,
     lift::{Exit, ExitArm, ExitKind, LiftTarget, Lifted, ScratchStore, TargetError},
     space::SpaceId,
     value::{
-        BlockId, FunctionBody, FunctionId, InstructionId, LocalTempId, LocalValueId, Varnode,
-        VarnodeId,
+        BlockId, FunctionBody, FunctionId, InstructionId, LocalBlockId, LocalInsnId, LocalTempId,
+        LocalValueId, Varnode, VarnodeId,
+        function::InsnIds,
         insn::{Callee, Mnemonic},
     },
 };
 use sleigh::{CompiledSpec, ContextBytes, ContextError, Instruction, RegisterId, RegisterSlice};
 
-use crate::{FlatPcode, LiftError, SleighLifter, decode::FixedDecoder};
+use crate::{
+    FlatPcode, LiftError, SleighLifter,
+    cache::{Instance, LiftCache, Lookup, Template},
+    decode::FixedDecoder,
+};
 
 #[cfg(doc)]
 use crate::decode::LinearDecoder;
@@ -61,6 +68,7 @@ pub struct LiftSession<'l, 'spec> {
     ctx: Context<'static>,
     addresses: AddressIndex,
     function: FunctionId,
+    cache: Option<Arc<LiftCache>>,
 }
 
 impl<'l, 'spec> LiftSession<'l, 'spec> {
@@ -75,6 +83,7 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
             ctx,
             addresses,
             function,
+            cache: None,
         }
     }
 
@@ -98,6 +107,7 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
             ctx,
             addresses,
             function,
+            cache: None,
         })
     }
 
@@ -115,6 +125,15 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
     pub fn with_decode_context(mut self, context: ContextBytes) -> Result<Self, ContextError> {
         self.decoder = FixedDecoder::with_context(self.lifter.spec(), context)?;
         Ok(self)
+    }
+
+    /// Lifts through `cache`: an encoding seen before is replayed from its
+    /// template instead of lowered again. Only [`lift`](Self::lift) uses it —
+    /// the key needs the decode context, which the session's decoder has and
+    /// a caller-decoded instruction does not carry. See [`LiftCache`].
+    pub fn with_cache(mut self, cache: Arc<LiftCache>) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     pub fn lifter(&self) -> &'l SleighLifter<'spec> {
@@ -149,7 +168,18 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
     /// fixed context and lifts it.
     pub fn lift(&mut self, address: u64, bytes: &[u8]) -> Result<Lifted, LiftError> {
         let instruction = self.decoder.decode(address, bytes)?;
-        self.lift_decoded(&instruction)
+        let Some(cache) = &self.cache else {
+            return self.lift_decoded(&instruction);
+        };
+        let mut target =
+            LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
+        cache.lower(
+            self.lifter,
+            &mut target,
+            &instruction,
+            &self.decoder,
+            self.lifter.flat_control_flow(),
+        )
     }
 
     /// Lifts an instruction the caller decoded, with whatever context it
@@ -232,6 +262,7 @@ pub struct ScratchSession<'l, 'spec> {
     lifter: &'l SleighLifter<'spec>,
     decoder: FixedDecoder<'spec>,
     store: ScratchStore,
+    cache: Option<Arc<LiftCache>>,
 }
 
 impl<'l, 'spec> ScratchSession<'l, 'spec> {
@@ -245,7 +276,17 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
             lifter,
             decoder: FixedDecoder::new(lifter.spec()),
             store: ScratchStore::new(lifter.new_context()),
+            cache: None,
         }
+    }
+
+    /// Lifts through `cache`: an encoding seen before is replayed from its
+    /// template instead of lowered again. Only [`lift`](Self::lift) uses it —
+    /// the key needs the decode context, which the session's decoder has and
+    /// a caller-decoded instruction does not carry. See [`LiftCache`].
+    pub fn with_cache(mut self, cache: Arc<LiftCache>) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     /// Decodes every address with `context` instead of the specification's
@@ -296,8 +337,24 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
         address: u64,
         bytes: &'b [u8],
     ) -> Result<ScratchLifted<'s, 'l, 'spec, 'b>, LiftError> {
+        // A known encoding needs no decode: the views read the template, and
+        // the instruction is decoded only if asked for.
+        if let Some(cache) = &self.cache
+            && let Some((template, instance)) =
+                cache.find_undecoded(self.lifter, &self.decoder, true, address, bytes)?
+        {
+            let lifted = template.lifted_at(&instance, self.store.function());
+            return Ok(ScratchLifted {
+                session: self,
+                instruction: OnceCell::new(),
+                address,
+                bytes: Some(bytes),
+                lifted,
+                template: Some((template, instance)),
+            });
+        }
         let instruction = self.decoder.decode(address, bytes)?;
-        self.lift_decoded(instruction)
+        self.lower(instruction, true)
     }
 
     /// Discards the previous instruction, then lifts one the caller decoded.
@@ -305,15 +362,49 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
         &'s mut self,
         instruction: Instruction<'spec, 'b>,
     ) -> Result<ScratchLifted<'s, 'l, 'spec, 'b>, LiftError> {
+        self.lower(instruction, false)
+    }
+
+    fn lower<'s, 'b>(
+        &'s mut self,
+        instruction: Instruction<'spec, 'b>,
+        cached: bool,
+    ) -> Result<ScratchLifted<'s, 'l, 'spec, 'b>, LiftError> {
+        let cache = self.cache.as_deref().filter(|_| cached);
+        let lookup = match cache {
+            Some(cache) => cache.find(self.lifter, &instruction, &self.decoder, true)?,
+            None => Lookup::Uncacheable,
+        };
+        if let Lookup::Hit(template, instance) = lookup {
+            // Nothing is lowered: the views read the template.
+            let address = instruction.address();
+            let lifted = template.lifted_at(&instance, self.store.function());
+            return Ok(ScratchLifted {
+                session: self,
+                instruction: OnceCell::from(instruction),
+                address,
+                bytes: None,
+                lifted,
+                template: Some((template, instance)),
+            });
+        }
         self.store.reset();
         // The instruction is read through the session's views and discarded,
         // never printed: its debug names would be minted for nothing.
         let mut target = self.store.target()?.without_debug_names();
-        let lifted = self.lifter.lower(&mut target, &instruction, true)?;
+        let lifted = match (cache, lookup) {
+            (Some(cache), Lookup::Unknown) => {
+                cache.miss(self.lifter, &mut target, &instruction, &self.decoder, true)?
+            }
+            _ => self.lifter.lower(&mut target, &instruction, true)?,
+        };
         Ok(ScratchLifted {
             session: self,
-            instruction,
+            address: instruction.address(),
+            instruction: OnceCell::from(instruction),
+            bytes: None,
             lifted,
+            template: None,
         })
     }
 }
@@ -330,30 +421,90 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
 /// [`LocalValueId`]s still appear in [`ScratchInsn::mnemonic`] and as
 /// [`ScratchInsn::result`]; they are keys for the caller's own tables while
 /// the instruction is live, and nothing more.
+///
+/// An instruction the session's [cache](ScratchSession::with_cache) knows
+/// is not lowered into the store at all: its views read the cached template
+/// directly, with the same keys-not-handles contract. The store then still
+/// holds the last instruction that was lowered.
 pub struct ScratchLifted<'s, 'l, 'spec, 'b> {
     session: &'s mut ScratchSession<'l, 'spec>,
-    instruction: Instruction<'spec, 'b>,
+    /// Decoded when the instruction was lowered or asked for; a cached
+    /// instruction found by its bytes is not decoded until then.
+    instruction: OnceCell<Instruction<'spec, 'b>>,
+    address: u64,
+    /// The stream the instruction starts, kept until it is decoded.
+    bytes: Option<&'b [u8]>,
     lifted: Lifted,
+    /// The template the views read when the instruction came from the
+    /// cache, and the instance of it the instruction is.
+    template: Option<(Arc<Template>, Instance)>,
+}
+
+/// Where a view reads its instruction from: the store's context, or a
+/// template and the instance it is read at. Both keep the context for the
+/// architecture's varnodes.
+#[derive(Clone, Copy)]
+enum Source<'v> {
+    Store(&'v Context<'static>),
+    Template {
+        ctx: &'v Context<'static>,
+        template: &'v Template,
+        instance: &'v Instance,
+    },
+}
+
+impl<'v> Source<'v> {
+    fn ctx(self) -> &'v Context<'static> {
+        match self {
+            Self::Store(ctx) | Self::Template { ctx, .. } => ctx,
+        }
+    }
 }
 
 impl<'s, 'l, 'spec, 'b> ScratchLifted<'s, 'l, 'spec, 'b> {
-    fn ctx(&self) -> &Context<'static> {
-        self.session.store.context()
+    fn source(&self) -> Source<'_> {
+        let ctx = self.session.store.context();
+        match &self.template {
+            Some((template, instance)) => Source::Template {
+                ctx,
+                template,
+                instance,
+            },
+            None => Source::Store(ctx),
+        }
     }
 
     fn spec(&self) -> &'spec CompiledSpec {
         self.session.lifter.spec()
     }
 
-    /// The decoded instruction: its text, operands and effects, without a
-    /// second decode.
+    /// The decoded instruction: its text, operands and effects. Decoded at
+    /// most once; a cached instruction is decoded here, on first request.
     pub fn decoded(&self) -> &Instruction<'spec, 'b> {
-        &self.instruction
+        self.instruction.get_or_init(|| {
+            let bytes = self
+                .bytes
+                .expect("an undecoded instruction keeps its bytes");
+            self.session
+                .decoder
+                .decode(self.address, bytes)
+                .expect("the bytes decoded when the cache learned them")
+        })
     }
 
     /// The instruction's own bytes.
     pub fn bytes(&self) -> &[u8] {
-        self.instruction.bytes()
+        match (self.instruction.get(), self.bytes) {
+            (Some(instruction), _) => instruction.bytes(),
+            (None, Some(bytes)) => &bytes[..self.lifted.length()],
+            (None, None) => unreachable!("an instruction is decoded or keeps its bytes"),
+        }
+    }
+
+    /// Whether the instruction was read from the session's cache rather
+    /// than lowered.
+    pub fn is_cached(&self) -> bool {
+        self.template.is_some()
     }
 
     /// The plain result: address, length, exits and how control leaves. The
@@ -365,10 +516,11 @@ impl<'s, 'l, 'spec, 'b> ScratchLifted<'s, 'l, 'spec, 'b> {
 
     /// Every place control leaves the instruction, in emission order.
     pub fn exits(&self) -> impl Iterator<Item = ScratchExit<'_>> + '_ {
-        self.lifted.exits().iter().map(|exit| ScratchExit {
+        let source = self.source();
+        self.lifted.exits().iter().map(move |exit| ScratchExit {
             exit,
             site: ScratchInsn {
-                ctx: self.ctx(),
+                source,
                 spec: self.spec(),
                 id: exit.site(),
             },
@@ -378,7 +530,7 @@ impl<'s, 'l, 'spec, 'b> ScratchLifted<'s, 'l, 'spec, 'b> {
     /// The block control enters the instruction through.
     pub fn entry(&self) -> ScratchBlock<'_> {
         ScratchBlock {
-            ctx: self.ctx(),
+            source: self.source(),
             spec: self.spec(),
             id: self.lifted.entry(),
         }
@@ -386,11 +538,12 @@ impl<'s, 'l, 'spec, 'b> ScratchLifted<'s, 'l, 'spec, 'b> {
 
     /// The instruction's blocks, the entry first.
     pub fn blocks(&self) -> impl Iterator<Item = ScratchBlock<'_>> + '_ {
-        self.lifted.blocks().iter().map(|&id| ScratchBlock {
-            ctx: self.ctx(),
-            spec: self.spec(),
-            id,
-        })
+        let source = self.source();
+        let spec = self.spec();
+        self.lifted
+            .blocks()
+            .iter()
+            .map(move |&id| ScratchBlock { source, spec, id })
     }
 }
 
@@ -535,14 +688,14 @@ impl<'v> ScratchExit<'v> {
 /// name a block across sessions.
 #[derive(Clone, Copy)]
 pub struct ScratchBlock<'v> {
-    ctx: &'v Context<'static>,
+    source: Source<'v>,
     spec: &'v CompiledSpec,
     id: BlockId,
 }
 
 impl PartialEq for ScratchBlock<'_> {
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self.ctx, other.ctx) && self.id == other.id
+        std::ptr::eq(self.source.ctx(), other.source.ctx()) && self.id == other.id
     }
 }
 
@@ -550,7 +703,7 @@ impl Eq for ScratchBlock<'_> {}
 
 impl std::hash::Hash for ScratchBlock<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::ptr::hash(self.ctx, state);
+        std::ptr::hash(self.source.ctx(), state);
         self.id.hash(state);
     }
 }
@@ -561,32 +714,68 @@ impl std::fmt::Debug for ScratchBlock<'_> {
     }
 }
 
+/// The instructions of a block, from either source.
+enum BlockInsns<'v> {
+    Store(InsnIds<'v, 'static>),
+    Template(std::ops::Range<usize>),
+}
+
 impl<'v> ScratchBlock<'v> {
     /// The machine address this block stands at: the instruction's own for
     /// its entry, another instruction's for a block an exit leads to, none
     /// for a block internal to the instruction.
     pub fn address(&self) -> Option<u64> {
-        self.ctx.block(self.id).address()
+        match self.source {
+            Source::Store(ctx) => ctx.block(self.id).address(),
+            Source::Template {
+                template, instance, ..
+            } => template.block_address(usize::from(self.id.local), instance),
+        }
     }
 
     /// Whether the block holds any instruction. A block an exit leads to is
     /// a placeholder, and empty.
     pub fn has_insns(&self) -> bool {
-        self.ctx.block(self.id).has_insns()
+        match self.source {
+            Source::Store(ctx) => ctx.block(self.id).has_insns(),
+            Source::Template { template, .. } => template.block_has_ops(usize::from(self.id.local)),
+        }
     }
 
     /// The block's instructions in order.
     pub fn instructions(&self) -> impl Iterator<Item = ScratchInsn<'v>> + 'v {
-        let ctx = self.ctx;
+        let source = self.source;
         let spec = self.spec;
         let func = self.id.func;
-        ctx.body(func)
-            .insn_ids(self.id.local)
-            .map(move |local| ScratchInsn {
-                ctx,
+        let block = usize::from(self.id.local);
+        let ids = match source {
+            Source::Store(ctx) => BlockInsns::Store(ctx.body(func).insn_ids(self.id.local)),
+            Source::Template { template, .. } => BlockInsns::Template(template.ops_of(block)),
+        };
+        let template = match source {
+            Source::Template { template, .. } => Some(template),
+            Source::Store(_) => None,
+        };
+        let mut ids = ids;
+        std::iter::from_fn(move || {
+            let local = match &mut ids {
+                BlockInsns::Store(ids) => ids.next()?,
+                BlockInsns::Template(range) => {
+                    let template = template.expect("a template source");
+                    loop {
+                        let k = range.next()?;
+                        if template.op_block(k) == block {
+                            break LocalInsnId::from(k);
+                        }
+                    }
+                }
+            };
+            Some(ScratchInsn {
+                source,
                 spec,
                 id: InstructionId::new(func, local),
             })
+        })
     }
 }
 
@@ -594,14 +783,14 @@ impl<'v> ScratchBlock<'v> {
 /// same instruction of the same session, as for [`ScratchBlock`].
 #[derive(Clone, Copy)]
 pub struct ScratchInsn<'v> {
-    ctx: &'v Context<'static>,
+    source: Source<'v>,
     spec: &'v CompiledSpec,
     id: InstructionId,
 }
 
 impl PartialEq for ScratchInsn<'_> {
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self.ctx, other.ctx) && self.id == other.id
+        std::ptr::eq(self.source.ctx(), other.source.ctx()) && self.id == other.id
     }
 }
 
@@ -618,7 +807,10 @@ impl<'v> ScratchInsn<'v> {
     /// facade resolves none of them, and they must not be carried to another
     /// instruction. [`operands`](Self::operands) resolves them.
     pub fn mnemonic(&self) -> &'v Mnemonic {
-        self.ctx.instruction(self.id).mnemonic()
+        match self.source {
+            Source::Store(ctx) => ctx.instruction(self.id).mnemonic(),
+            Source::Template { template, .. } => template.op_mnemonic(usize::from(self.id.local)),
+        }
     }
 
     /// The operand other instructions name this one's result by.
@@ -637,7 +829,7 @@ impl<'v> ScratchInsn<'v> {
 
     /// The mnemonic's opcode name.
     pub fn opcode(&self) -> &'static str {
-        qcode::value::Instruction::from_id(self.ctx, self.id).opcode()
+        self.mnemonic().opcode()
     }
 
     /// Resolves an operand *of this instruction*. Private on purpose: every
@@ -646,20 +838,28 @@ impl<'v> ScratchInsn<'v> {
     /// interner through here.
     fn resolve(&self, v: LocalValueId) -> ScratchOperand<'v> {
         match v {
-            LocalValueId::Literal(id) => {
-                let literal = &self.ctx.shared.values.literals[id];
-                ScratchOperand::Const {
-                    value: self.ctx.get_literal_value(id),
-                    size: self.ctx.shared.types.size_of(literal.type_id),
+            LocalValueId::Literal(id) => match self.source {
+                Source::Store(ctx) => {
+                    let literal = &ctx.shared.values.literals[id];
+                    ScratchOperand::Const {
+                        value: ctx.get_literal_value(id),
+                        size: ctx.shared.types.size_of(literal.type_id),
+                    }
                 }
-            }
+                Source::Template {
+                    template, instance, ..
+                } => {
+                    let (value, size) = template.literal_at(usize::from(id), instance);
+                    ScratchOperand::Const { value, size }
+                }
+            },
             LocalValueId::Varnode(id) => ScratchOperand::Varnode(ScratchVarnode {
-                ctx: self.ctx,
+                ctx: self.source.ctx(),
                 spec: self.spec,
                 id,
             }),
             LocalValueId::Instruction(local) => ScratchOperand::Result(ScratchInsn {
-                ctx: self.ctx,
+                source: self.source,
                 spec: self.spec,
                 id: InstructionId::new(self.id.func, local),
             }),
@@ -671,19 +871,24 @@ impl<'v> ScratchInsn<'v> {
 
     /// The instruction's block.
     pub fn block(&self) -> ScratchBlock<'v> {
-        let block = qcode::value::Instruction::from_id(self.ctx, self.id)
-            .parent()
-            .expect("a scratch instruction is in a block");
-        ScratchBlock {
-            ctx: self.ctx,
-            spec: self.spec,
-            id: block.id,
-        }
+        let local = match self.source {
+            Source::Store(ctx) => {
+                qcode::value::Instruction::from_id(ctx, self.id)
+                    .parent()
+                    .expect("a scratch instruction is in a block")
+                    .id
+                    .local
+            }
+            Source::Template { template, .. } => {
+                LocalBlockId::from(template.op_block(usize::from(self.id.local)))
+            }
+        };
+        self.block_view(local)
     }
 
     fn block_view(&self, local: qcode::value::LocalBlockId) -> ScratchBlock<'v> {
         ScratchBlock {
-            ctx: self.ctx,
+            source: self.source,
             spec: self.spec,
             id: BlockId::new(self.id.func, local),
         }
@@ -715,9 +920,17 @@ impl<'v> ScratchInsn<'v> {
             Mnemonic::TailCall(call) => call.target,
             _ => return None,
         };
-        match callee {
-            Callee::Real(function) => FunctionBody::from_id(self.ctx, function).address(),
-            Callee::Minted(_) => None,
+        match (callee, self.source) {
+            (Callee::Real(function), Source::Store(ctx)) => {
+                FunctionBody::from_id(ctx, function).address()
+            }
+            (
+                Callee::Minted(slot),
+                Source::Template {
+                    template, instance, ..
+                },
+            ) => template.callee_address(slot as usize, instance),
+            _ => None,
         }
     }
 }

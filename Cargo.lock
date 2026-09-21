@@ -2080,9 +2080,9 @@ dependencies = [
 
 [[package]]
 name = "wazabin-sleigh"
-version = "0.1.10"
+version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afd55c25ef8178edc3166e0b67ce87976b638644c49c351b2d4c3499d621b881"
+checksum = "ffa4e9094a8156d756391e810334d7487d89263d4b215066b59385e1cf4dfe13"
 dependencies = [
  "pest",
  "pest_derive",
@@ -2094,9 +2094,9 @@ dependencies = [
 
 [[package]]
 name = "wazabin-sleigh-precompile"
-version = "0.1.10"
+version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "294cd5956e20c97ca28741ac085b8cd1c1e6cb6a9fd26c2eae8f5968e975b010"
+checksum = "95984f1d3f2e9ec7b032a0b196c897a5f4357e173f3f242c7cc23f578ca321fc"
 dependencies = [
  "bincode 2.0.1",
  "serde",
