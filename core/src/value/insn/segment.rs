@@ -1031,7 +1031,7 @@ mod tests {
             builder.finalize(target);
             (dead, user)
         };
-        ctx.body_mut(dead.func).remove_instruction(dead);
+        ctx.bodies[dead.func].remove_instruction(dead);
 
         let text = Instruction::from_id(&ctx, user).as_statement().to_string();
         assert!(text.contains("%dead-tmp"), "{text}");

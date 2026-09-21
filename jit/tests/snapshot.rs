@@ -147,6 +147,11 @@ fn a_snapshot_can_be_restored_repeatedly() {
     let mut vm = machine(LCG, true);
     vm.add_breakpoint(END);
     let snapshot = vm.snapshot().unwrap();
+    // A budget is exact to the operation under the interpreter but to the
+    // block under an executor, and the loop's block is still being shaped on
+    // the first pass. Settling the code first is what makes two runs of the
+    // same budget stop at the same place, which is the comparison below.
+    assert!(matches!(vm.run(100_000_000), VmExit::Breakpoint(END)));
     let mut results = Vec::new();
     for budget in [100, 5000, 100_000_000, 5000] {
         vm.restore(&snapshot).unwrap();

@@ -1081,6 +1081,18 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         self.ctx.bodies[self.id.func].touch_shape();
     }
 
+    /// Stops this block covering the addresses it absorbed, returning them;
+    /// its own address stays. The module's shape revision counts it, and an
+    /// index the caller keeps must [forget]
+    /// (crate::address_index::AddressIndex::forget) each one.
+    pub fn uncover_absorbed(&mut self) -> Vec<u64> {
+        let absorbed = std::mem::take(&mut self.inner_mut().extra_addresses);
+        if !absorbed.is_empty() {
+            self.ctx.bodies[self.id.func].touch_shape();
+        }
+        absorbed
+    }
+
     /// Assigns an address through a caller-owned construction index.
     pub fn set_address_indexed(
         &mut self,
@@ -1216,7 +1228,7 @@ mod tests {
             "
         );
         let mut seen = vec![BasicBlock::from_id(&ctx, block).revision()];
-        let mut expect_moved = |ctx: &Context<'_>, seen: &mut Vec<u64>, what: &str| {
+        let expect_moved = |ctx: &Context<'_>, seen: &mut Vec<u64>, what: &str| {
             let now = BasicBlock::from_id(ctx, block).revision();
             assert!(!seen.contains(&now), "{what} reissued revision {now}");
             seen.push(now);
@@ -1224,10 +1236,10 @@ mod tests {
 
         // The same instructions, in the same order, are still a new revision:
         // a block emptied and refilled has been rebuilt, whatever it holds.
-        let ids: Vec<LocalInsnId> = ctx.body_mut(block.func).take_insns(block.local);
+        let ids: Vec<LocalInsnId> = ctx.bodies[block.func].take_insns(block.local);
         expect_moved(&ctx, &mut seen, "take_insns");
         for &id in &ids {
-            ctx.body_mut(block.func).link_last(block.local, id);
+            ctx.bodies[block.func].link_last(block.local, id);
             expect_moved(&ctx, &mut seen, "link_last");
         }
         assert_eq!(BasicBlock::from_id(&ctx, block).len(), 4);
@@ -1236,16 +1248,15 @@ mod tests {
         let sum = InstructionId::new(block.func, ids[2]);
         let x = ValueId::Instruction(InstructionId::new(block.func, ids[0]));
         let y = ValueId::Instruction(InstructionId::new(block.func, ids[1]));
-        ctx.body_mut(block.func).replace_operand(sum, 1, x);
+        ctx.bodies[block.func].replace_operand(sum, 1, x);
         expect_moved(&ctx, &mut seen, "replace_operand");
-        ctx.body_mut(block.func).replace_all_uses_with(x, y);
+        ctx.bodies[block.func].replace_all_uses_with(x, y);
         expect_moved(&ctx, &mut seen, "replace_all_uses_with");
         let mnemonic = ctx.get_insn(sum).mnemonic().clone();
-        ctx.body_mut(block.func)
-            .replace_instruction_mnemonic(sum, mnemonic);
+        ctx.bodies[block.func].replace_instruction_mnemonic(sum, mnemonic);
         expect_moved(&ctx, &mut seen, "replace_instruction_mnemonic");
 
-        ctx.body_mut(block.func).unlink(ids[2]);
+        ctx.bodies[block.func].unlink(ids[2]);
         expect_moved(&ctx, &mut seen, "unlink");
     }
 

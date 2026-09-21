@@ -541,6 +541,7 @@ impl<'str> Clone for FunctionBody<'str> {
             insns: self.insns.clone(),
             blocks: self.blocks.clone(),
             roster: self.roster.clone(),
+            revisions: self.revisions,
             params: self.params.clone(),
             edges: self.edges.clone(),
             temp_spaces: self.temp_spaces.clone(),

@@ -19,7 +19,7 @@ use qcode::{
     context::Context,
     space::{MemorySpaceId, SpaceId},
     value::{
-        BasicBlock, BlockId, InstructionId, ValueId,
+        BasicBlock, BlockId, InstructionId, QCodeMut, ValueId,
         insn::{Mnemonic, PCodeOpId, VM_INTERRUPT},
     },
 };
@@ -980,7 +980,6 @@ impl<S: CodeSource> Vm<S> {
     /// what it is stopped at.
     fn interrupt_at_position(&mut self) -> Option<Interrupt> {
         let block = self.emu.block;
-        let idx = self.emu.idx;
         if !self.ctx.contains_block(block) {
             return None;
         }
@@ -1131,12 +1130,15 @@ impl<S: CodeSource> Vm<S> {
             .emu
             .take_address_index()
             .unwrap_or_else(|| AddressIndex::analyze(&self.ctx));
+        // Every address-bearing change below is applied to the index by
+        // hand, so an index that was current stays current across them.
+        let current = index.is_current(&self.ctx);
         let mut evicted = 0u64;
         for block in self.ctx.block_ids() {
             let covered = {
                 let block = self.ctx.block(block);
-                block.address.is_some_and(in_written)
-                    || block.extra_addresses.iter().copied().any(in_written)
+                block.address().is_some_and(in_written)
+                    || block.extra_addresses().iter().copied().any(in_written)
             };
             if !covered || BasicBlock::from_id(&self.ctx, block).is_empty() {
                 continue;
@@ -1144,18 +1146,19 @@ impl<S: CodeSource> Vm<S> {
             // Its own address stays indexed: an empty block at an address is
             // this module's request to lift it. Whatever it absorbed is no
             // longer anyone's, until lifting settles which block covers it.
-            let absorbed = std::mem::take(&mut self.ctx.block_mut(block).extra_addresses);
+            let absorbed = BasicBlock::from_id_mut(&mut self.ctx, block).uncover_absorbed();
             for addr in absorbed {
                 index.forget(addr);
             }
-            self.ctx
-                .body_mut(block.func)
-                .clear_block_instructions(block);
+            self.ctx.clear_block_instructions(block);
             self.injected.remove(&block);
             if self.dirty == Some(block) {
                 self.dirty = None;
             }
             evicted += 1;
+        }
+        if current {
+            index.mark_current(&self.ctx);
         }
         self.emu.set_address_index(index);
         self.stats.evicted += evicted;
@@ -1189,7 +1192,7 @@ impl<S: CodeSource> Vm<S> {
         // The op here carries a different address from the op before it, or
         // is the first of a block that starts at an address of its own.
         match (idx, ids.get(idx)) {
-            (0, _) => self.ctx.block(block).address,
+            (0, _) => self.ctx.block(block).address(),
             (_, Some(&id)) => address_of(id).filter(|&addr| address_of(ids[idx - 1]) != Some(addr)),
             _ => None,
         }
@@ -1299,7 +1302,7 @@ impl<S: CodeSource> Vm<S> {
         let covering = |vm: &mut Self| {
             vm.emu
                 .block_at_address(&vm.ctx, pc)
-                .filter(|&b| vm.ctx.block(b).address == Some(pc))
+                .filter(|&b| vm.ctx.block(b).address() == Some(pc))
         };
         if covering(self).is_none()
             && let Some(VmExit::Unlifted { addr, error }) = self.discover(pc)

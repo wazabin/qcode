@@ -6,19 +6,36 @@
 //! returned into the wrong function). The cache has to go by the block's
 //! revision, not its length.
 
-use qcode::{address_index::AddressIndex, context::Context, value::BlockId};
+use qcode::{
+    address_index::AddressIndex,
+    context::Context,
+    value::{BlockId, QCodeMut},
+};
 use qcode_jit::Jit;
 use wazabin_qcode_sleigh::SleighLifter;
 
-/// Lifts `add eax, ebx` at 0x1000 and returns its block.
-fn lift() -> (Context<'static>, BlockId) {
+/// `add eax, ebx`.
+const ADD: &[u8] = &[0x01, 0xd8];
+
+fn lifter() -> &'static SleighLifter<'static> {
     static LIFTER: std::sync::OnceLock<SleighLifter<'static>> = std::sync::OnceLock::new();
-    let lifter = LIFTER.get_or_init(|| SleighLifter::new(sleigh_precompile::x64::spec()));
-    let mut ctx = lifter.new_context();
-    let mut index = AddressIndex::analyze(&ctx);
-    let block = lifter
-        .decode_and_lift_indexed(&mut ctx, &mut index, 0x1000, &[0x01, 0xd8], None)
-        .expect("the instruction decodes and lifts");
+    LIFTER.get_or_init(|| SleighLifter::new(sleigh_precompile::x64::spec()))
+}
+
+/// Lifts `ADD` at 0x1000 into `ctx`, returning its block: the block already
+/// at that address when there is one.
+fn lift_at_0x1000(ctx: &mut Context<'static>) -> BlockId {
+    let mut index = AddressIndex::analyze(ctx);
+    lifter()
+        .decode_and_lift_indexed(ctx, &mut index, 0x1000, ADD, None)
+        .expect("the instruction decodes and lifts")
+        .entry()
+}
+
+/// Lifts `ADD` at 0x1000 and returns its block.
+fn lift() -> (Context<'static>, BlockId) {
+    let mut ctx = lifter().new_context();
+    let block = lift_at_0x1000(&mut ctx);
     (ctx, block)
 }
 
@@ -26,17 +43,24 @@ fn lift() -> (Context<'static>, BlockId) {
 fn a_block_rebuilt_to_the_same_length_is_compiled_again() {
     let (mut ctx, block) = lift();
     let mut jit = Jit::new();
-    jit.try_compile(&ctx, block).expect("plain arithmetic compiles");
+    jit.try_compile(&ctx, block)
+        .expect("plain arithmetic compiles");
     jit.try_compile(&ctx, block).expect("still compiles");
-    assert_eq!(jit.stats.compiled, 1, "an unchanged block is served from the cache");
+    assert_eq!(
+        jit.stats.compiled, 1,
+        "an unchanged block is served from the cache"
+    );
 
-    // The same instructions relinked in the same order: the block is as long
-    // as it was, and is not the block the code was compiled from.
+    // The same instruction lifted again into the emptied block, as the VM
+    // does after the guest writes over it: the block is as long as it was,
+    // and is not the block the code was compiled from.
     let before = ctx.block(block).insn_count();
-    let ids = ctx.body_mut(block.func).take_insns(block.local);
-    for id in ids {
-        ctx.body_mut(block.func).link_last(block.local, id);
-    }
+    ctx.clear_block_instructions(block);
+    assert_eq!(
+        lift_at_0x1000(&mut ctx),
+        block,
+        "an empty block at an address is refilled"
+    );
     assert_eq!(ctx.block(block).insn_count(), before);
 
     jit.try_compile(&ctx, block).expect("compiles again");

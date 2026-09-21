@@ -227,6 +227,13 @@ pub trait QCodeMut<'str>: sealed::Storage<'str> {
             .remove_block_instructions(block, dead);
     }
 
+    /// Empties `block` of code, keeping the block itself and the edges into
+    /// it; see [`FunctionBody::clear_block_instructions`].
+    fn clear_block_instructions(&mut self, block: BlockId) {
+        self.function_mut(block.func)
+            .clear_block_instructions(block);
+    }
+
     /// Rehome `remove`'s outgoing CFG edges onto `keep`. The direct edge and
     /// `keep`'s forwarding terminator have already been removed by the caller.
     fn rehome_outgoing_edges(&mut self, keep: BlockId, remove: BlockId) {

@@ -642,7 +642,10 @@ pub trait Interpreter {
 #[cfg(test)]
 mod error_tests {
     use super::*;
-    use qcode::value::insn::{Binop, IntBinop};
+    use qcode::value::{
+        QCodeMut,
+        insn::{Binop, IntBinop},
+    };
 
     /// Two instructions, the second using the first, in a block at 0x1000.
     fn module() -> (Context<'static>, InstructionId, InstructionId) {
@@ -665,7 +668,7 @@ mod error_tests {
     #[test]
     fn an_error_at_a_dead_instruction_formats() {
         let (mut ctx, first, _) = module();
-        ctx.body_mut(first.func).remove_instruction(first);
+        ctx.remove_instruction(first);
         let insn = qcode::value::Instruction::from_id(&ctx, first);
         let error = EmulatorError::new(EmulatorErrorKind::PoisonRead, &insn);
         let text = error.to_string();
@@ -676,7 +679,7 @@ mod error_tests {
     #[test]
     fn an_error_at_an_instruction_with_a_dead_operand_formats() {
         let (mut ctx, first, second) = module();
-        ctx.body_mut(first.func).remove_instruction(first);
+        ctx.remove_instruction(first);
         let insn = qcode::value::Instruction::from_id(&ctx, second);
         let error = EmulatorError::new(EmulatorErrorKind::PoisonRead, &insn);
         let text = error.to_string();
@@ -692,7 +695,7 @@ mod error_tests {
             .expect("the instruction is in a block")
             .id;
         // Emptying purges the instructions; the references are now stale.
-        ctx.body_mut(block.func).clear_block_instructions(block);
+        ctx.clear_block_instructions(block);
         for id in [first, second] {
             let insn = qcode::value::Instruction::from_id(&ctx, id);
             let _ = EmulatorError::new(EmulatorErrorKind::PoisonRead, &insn).to_string();
