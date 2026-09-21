@@ -62,3 +62,12 @@ AFL++ checkout with `qemu_mode` built, instrumented and with
 
 `HOOKBENCH_STATS=1` prints the VM's counters after each QCode run and
 `HOOKBENCH_DUMP=file` writes the instrumented IR.
+
+On a machine that will not go quiet, `HOOKBENCH_CPUTIME=1` times each run
+by the thread's CPU clock instead of the wall clock (the rows say
+`"clock": "cpu"`), and `perf stat -e instructions:u` over a `--repeat 1`
+run counts retired user instructions, which the load does not move. A run
+directory may hold those counts as `instructions.txt` (`engine instr image
+count` per line); the report and the page show such a run in the progress
+table only, with the instruction ratio beside the time ratio, and never in
+place of a wall-clock row.
