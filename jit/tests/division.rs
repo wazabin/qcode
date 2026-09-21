@@ -81,6 +81,8 @@ fn state(emu: &mut StandaloneEmulator<VmMemory>, ctx: &Context<'_>) -> Vec<Optio
 fn agree_on(code: &[u8], what: &str, seeds: &[(u64, u64, u64)]) {
     let (ctx, block) = lift(code);
     let mut jit = Jit::new();
+    // Driven block by block here: compile on first sight.
+    jit.set_warm_up(1);
     let mut compiled_any = false;
     let mut interpreted = machine(block, &ctx, seeds[0]);
     let mut jitted = machine(block, &ctx, seeds[0]);

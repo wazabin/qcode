@@ -65,6 +65,7 @@ impl BlockExecutor for Probe {
                 Unsupported::Terminator(t) => format!("terminator {t}"),
                 Unsupported::Operand(o) => format!("operand {o}"),
                 Unsupported::Escapes(e) => format!("escapes {e}"),
+                Unsupported::Cold => "cold".to_string(),
             };
             *tally.declined.entry(key).or_default() += 1;
         }

@@ -5,6 +5,14 @@ use qcode_jit::Jit;
 use qcode_vm::{Vm, VmMemory, perm};
 use wazabin_qcode_sleigh::vm_source::SleighCodeSource;
 
+/// A JIT that compiles on first sight: the programs here run once, and the
+/// point is that their blocks ran natively.
+fn eager() -> Jit {
+    let mut jit = Jit::new();
+    jit.set_warm_up(1);
+    jit
+}
+
 fn machine(code: &[u8]) -> Vm<SleighCodeSource<'static>> {
     let source = SleighCodeSource::new(sleigh_precompile::x64::spec());
     let ctx = source.new_context();
@@ -29,7 +37,7 @@ const WATCHED: [&str; 11] = [
 fn run(code: &[u8], jit: bool, budget: u64) -> (Vec<Option<u64>>, u64) {
     let mut vm = machine(code);
     if jit {
-        vm.set_block_executor(Box::new(Jit::new()));
+        vm.set_block_executor(Box::new(eager()));
     }
     vm.run(budget);
     let ctx = vm.context().clone();
@@ -126,7 +134,7 @@ fn jit_throughput() {
     for jit in [false, true] {
         let mut vm = machine(code);
         if jit {
-            vm.set_block_executor(Box::new(Jit::new()));
+            vm.set_block_executor(Box::new(eager()));
         }
         let start = std::time::Instant::now();
         vm.run(u64::MAX);
@@ -165,7 +173,7 @@ fn an_intrinsic_interrupt_stops_the_jit_at_the_same_place_as_the_interpreter() {
     for jit in [false, true] {
         let mut vm = machine(code);
         if jit {
-            vm.set_block_executor(Box::new(Jit::new()));
+            vm.set_block_executor(Box::new(eager()));
         }
         let exit = vm.run(10_000);
         let VmExit::Interrupt(interrupt) = exit else {
@@ -225,7 +233,7 @@ fn an_intrinsic_interrupt_stops_the_jit_at_the_same_place_as_the_interpreter() {
 fn the_budget_stops_a_loop_that_stays_in_compiled_code() {
     // `l: dec ecx; jmp l`
     let mut vm = machine(&[0xff, 0xc9, 0xeb, 0xfc]);
-    vm.set_block_executor(Box::new(Jit::new()));
+    vm.set_block_executor(Box::new(eager()));
     let exit = vm.run(10_000);
     assert!(
         matches!(exit, qcode_vm::VmExit::InstructionLimit),
@@ -260,7 +268,7 @@ fn a_chain_follows_returns_and_indirect_calls() {
     vm.emulator()
         .set_varnode_by_name(&ctx, "RSP", 0x21000)
         .unwrap();
-    vm.set_block_executor(Box::new(Jit::new()));
+    vm.set_block_executor(Box::new(eager()));
     let exit = vm.run(u64::MAX);
     assert!(
         matches!(exit, qcode_vm::VmExit::Unlifted { addr: 0x2000, .. }),
@@ -283,7 +291,7 @@ fn a_chain_follows_returns_and_indirect_calls() {
 fn a_step_never_chains_past_the_block_it_starts() {
     // `l: dec ecx; jmp l`
     let mut vm = machine(&[0xff, 0xc9, 0xeb, 0xfc]);
-    vm.set_block_executor(Box::new(Jit::new()));
+    vm.set_block_executor(Box::new(eager()));
     for _ in 0..100 {
         assert!(vm.step().is_none());
     }

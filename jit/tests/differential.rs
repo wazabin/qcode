@@ -75,6 +75,8 @@ fn agree(code: &[u8]) -> bool {
 
     let mut jitted = machine(block, &ctx);
     let mut jit = Jit::new();
+    // Driven block by block here: compile on first sight.
+    jit.set_warm_up(1);
     let ran = jit
         .run_block(&ctx, &mut jitted, block, 0, 0)
         .expect("running compiled code does not fault")
@@ -130,6 +132,8 @@ fn a_declined_block_is_reported_rather_than_miscompiled() {
     let (ctx, block) = lift(&[0xd8, 0xc1]); // fadd st, st(1)
     let mut emu = machine(block, &ctx);
     let mut jit = Jit::new();
+    // Driven block by block here: compile on first sight.
+    jit.set_warm_up(1);
     let ran = jit
         .run_block(&ctx, &mut emu, block, 0, 0)
         .expect("declining is not an error")

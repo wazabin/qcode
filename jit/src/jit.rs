@@ -21,10 +21,19 @@ use crate::compile::{
     BLOCK_OK, BLOCK_OVERFLOW, BlockTranslator, Export, Helpers, SpaceTable, Unsupported,
 };
 
-/// What is known about one block: the index of its native code, or the reason
-/// the compiler declined it, together with the block revision that answer
-/// was reached for.
-type CacheEntry = Option<(u64, Result<usize, Unsupported>)>;
+/// What is known about one block, together with the block revision it was
+/// learnt for.
+type CacheEntry = Option<(u64, Known)>;
+
+/// What the JIT knows about a block at a revision.
+#[derive(Debug, Clone)]
+enum Known {
+    /// Entered this many times without being compiled; see
+    /// [`Jit::set_warm_up`].
+    Warming(u32),
+    /// The index of its native code, or the reason the compiler declined it.
+    Settled(Result<usize, Unsupported>),
+}
 
 /// A block that has been compiled to native code.
 struct Compiled {
@@ -104,6 +113,9 @@ pub struct Jit {
     /// Likewise for the export buffer compiled code writes its terminator
     /// operands into.
     exports: Vec<u64>,
+    /// The entry at which a block is compiled; see [`set_warm_up`]
+    /// (Self::set_warm_up).
+    warm_up: u32,
     pub stats: JitStats,
 }
 
@@ -207,11 +219,31 @@ impl Jit {
             partial: FxHashMap::default(),
             scratch: Vec::new(),
             exports: Vec::new(),
+            warm_up: 2,
             stats: JitStats::default(),
         }
     }
 
-    /// Whether `block` has native code, compiling it on first sight.
+    /// Compiles a block on its `entries`th entry, running it on the
+    /// interpreter until then; `1` compiles on first sight, `0` is `1`.
+    ///
+    /// The default is 2. A block is compiled from the shape it has when it
+    /// is entered, and a VM that lifts on demand grows a block by absorbing
+    /// the instructions it discovers after it, each absorption a new
+    /// revision that has to be compiled again: on straight-line code most
+    /// blocks are compiled at least twice, and code that runs once — setup,
+    /// most of a program's text — is compiled for nothing, at a cost of tens
+    /// of microseconds per block against the microsecond of interpreting it.
+    /// Waiting for the second entry compiles a block once it has been run
+    /// through, and only when something comes back to it; on the Embench
+    /// images that is a quarter to a third off the whole run.
+    pub fn set_warm_up(&mut self, entries: u32) {
+        self.warm_up = entries.max(1);
+    }
+
+    /// Whether `block` has native code, on one more entry to it: compiled
+    /// once the entries reach the [warm-up](Self::set_warm_up), declined
+    /// with [`Unsupported::Cold`] before that.
     ///
     /// A decline is remembered, so an unsupported block costs one compilation
     /// attempt over the life of the machine rather than one per execution.
@@ -224,6 +256,8 @@ impl Jit {
     ) -> Result<usize, Unsupported> {
         let revision = ctx.block(block).revision();
         if start != 0 {
+            // A continuation is compiled at once: the block is one that is
+            // running, and the interpreter has just been through part of it.
             if let Some((cached_revision, known)) = self.partial.get(&(block, start))
                 && *cached_revision == revision
             {
@@ -238,20 +272,47 @@ impl Jit {
                 .insert((block, start), (revision, outcome.clone()));
             return outcome;
         }
-        let func: usize = block.func.into();
-        let local: usize = block.local.into();
-        if let Some(Some((cached_revision, known))) =
-            self.cache.get(func).and_then(|slots| slots.get(local))
-            && *cached_revision == revision
-        {
-            return known.clone();
+        let entries = match self.slot(block) {
+            Some((cached_revision, known)) if *cached_revision == revision => match known {
+                Known::Settled(known) => return known.clone(),
+                Known::Warming(entries) => *entries + 1,
+            },
+            _ => 1,
+        };
+        if entries < self.warm_up {
+            *self.slot_mut(block) = Some((revision, Known::Warming(entries)));
+            return Err(Unsupported::Cold);
         }
+        self.settle(ctx, flat, block, revision)
+    }
 
+    /// Compiles `block` at `revision` from its start, whatever its entries,
+    /// and remembers the outcome.
+    fn settle(
+        &mut self,
+        ctx: &Context<'_>,
+        flat: &FlatSpaces,
+        block: BlockId,
+        revision: u64,
+    ) -> Result<usize, Unsupported> {
         let outcome = self.compile(ctx, flat, block, 0);
         match &outcome {
             Ok(_) => self.stats.compiled += 1,
             Err(_) => self.stats.declined += 1,
         }
+        *self.slot_mut(block) = Some((revision, Known::Settled(outcome.clone())));
+        outcome
+    }
+
+    fn slot(&self, block: BlockId) -> Option<&(u64, Known)> {
+        let func: usize = block.func.into();
+        let local: usize = block.local.into();
+        self.cache.get(func)?.get(local)?.as_ref()
+    }
+
+    fn slot_mut(&mut self, block: BlockId) -> &mut CacheEntry {
+        let func: usize = block.func.into();
+        let local: usize = block.local.into();
         if func >= self.cache.len() {
             self.cache.resize_with(func + 1, Vec::new);
         }
@@ -259,8 +320,7 @@ impl Jit {
         if local >= slots.len() {
             slots.resize(local + 1, None);
         }
-        slots[local] = Some((revision, outcome.clone()));
-        outcome
+        &mut slots[local]
     }
 
     fn compile(
@@ -372,8 +432,15 @@ impl Jit {
     /// one is declined here where [`run_block`](Self::run_block) may compile
     /// it.
     pub fn try_compile(&mut self, ctx: &Context<'_>, block: BlockId) -> Result<(), Unsupported> {
-        self.resolve(ctx, &FlatSpaces::default(), block, 0)
-            .map(|_| ())
+        let revision = ctx.block(block).revision();
+        match self.slot(block) {
+            Some((cached_revision, Known::Settled(known))) if *cached_revision == revision => {
+                known.clone().map(|_| ())
+            }
+            _ => self
+                .settle(ctx, &FlatSpaces::default(), block, revision)
+                .map(|_| ()),
+        }
     }
 
     /// Runs `block` as native code from body index `start`, if it has any.
@@ -428,8 +495,7 @@ impl Jit {
             } else {
                 None
             };
-            let Some(next) = next.filter(|&next| self.is_compiled(ctx, emu.memory.flat(), next))
-            else {
+            let Some(next) = next.filter(|&next| self.is_compiled(ctx, next)) else {
                 return Ok(Some(Executed {
                     block: current,
                     body,
@@ -445,9 +511,14 @@ impl Jit {
         }
     }
 
-    /// Whether `block` has native code from its start, without compiling it.
-    fn is_compiled(&mut self, ctx: &Context<'_>, flat: &FlatSpaces, block: BlockId) -> bool {
-        self.resolve(ctx, flat, block, 0).is_ok()
+    /// Whether `block` has native code from its start, without compiling it
+    /// or counting an entry: a block still warming is the interpreter's to
+    /// enter, and that entry is what [`resolve`](Self::resolve) counts.
+    fn is_compiled(&self, ctx: &Context<'_>, block: BlockId) -> bool {
+        matches!(
+            self.slot(block),
+            Some((revision, Known::Settled(Ok(_)))) if *revision == ctx.block(block).revision()
+        )
     }
 
     /// The successor this block's terminator selects, when that is a decision

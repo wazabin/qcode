@@ -129,6 +129,9 @@ pub enum Unsupported {
     Operand(&'static str),
     /// A value defined in this block and read from outside it.
     Escapes(&'static str),
+    /// Not compiled yet: the block has not been entered as often as the
+    /// JIT's [warm-up](crate::Jit::set_warm_up) asks before it is.
+    Cold,
 }
 
 impl std::fmt::Display for Unsupported {
@@ -140,6 +143,7 @@ impl std::fmt::Display for Unsupported {
             Self::Terminator(what) => write!(f, "unsupported terminator `{what}`"),
             Self::Operand(what) => write!(f, "unsupported operand: {what}"),
             Self::Escapes(what) => write!(f, "value escapes the block: {what}"),
+            Self::Cold => f.write_str("not entered often enough to compile yet"),
         }
     }
 }

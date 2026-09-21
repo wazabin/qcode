@@ -17,6 +17,14 @@ use wazabin_qcode_sleigh::vm_source::SleighCodeSource;
 const ENTRY: u64 = 0x1000;
 
 /// A JIT the test keeps a handle on, to read its counters after the run.
+/// A JIT that compiles on first sight: the loops here run a few times and
+/// the assertions count what compiled code did in them.
+fn eager() -> Jit {
+    let mut jit = Jit::new();
+    jit.set_warm_up(1);
+    jit
+}
+
 struct SharedJit(Rc<RefCell<Jit>>);
 
 impl BlockExecutor for SharedJit {
@@ -42,7 +50,7 @@ fn machine(code: &[u8], jit: bool) -> Vm<SleighCodeSource<'static>> {
     memory.mmu.map(0x20000, 0x2000, perm::RW_INIT).unwrap();
     let mut vm = Vm::at_address(ctx, ENTRY, source, memory).expect("the entry decodes");
     if jit {
-        vm.set_block_executor(Box::new(Jit::new()));
+        vm.set_block_executor(Box::new(eager()));
     }
     vm
 }
@@ -235,7 +243,7 @@ const WRITES: &[u8] = &[
 fn a_write_watch_only_leaves_the_vm_for_writes_in_its_range() {
     for jit in [false, true] {
         let mut vm = machine(WRITES, false);
-        let shared = Rc::new(RefCell::new(Jit::new()));
+        let shared = Rc::new(RefCell::new(eager()));
         if jit {
             vm.set_block_executor(Box::new(SharedJit(shared.clone())));
         }
@@ -374,7 +382,7 @@ fn a_map_in_a_bounded_space_is_indexed_natively() {
     let mut maps = Vec::new();
     for jit in [false, true] {
         let mut vm = machine(LOOP, false);
-        let shared = Rc::new(RefCell::new(Jit::new()));
+        let shared = Rc::new(RefCell::new(eager()));
         if jit {
             vm.set_block_executor(Box::new(SharedJit(shared.clone())));
         }
@@ -427,7 +435,7 @@ fn an_index_past_the_bound_stops_both_strategies_alike() {
     let mut exits = Vec::new();
     for jit in [false, true] {
         let mut vm = machine(LOOP, false);
-        let shared = Rc::new(RefCell::new(Jit::new()));
+        let shared = Rc::new(RefCell::new(eager()));
         if jit {
             vm.set_block_executor(Box::new(SharedJit(shared.clone())));
         }

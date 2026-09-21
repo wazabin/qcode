@@ -36,6 +36,8 @@ fn a_value_read_from_another_block_is_exported_and_imported() {
     let b = InstructionId::new(escapes, ctx.block(next).first_insn().unwrap());
 
     let mut jit = Jit::new();
+    // Driven block by block here: compile on first sight.
+    jit.set_warm_up(1);
     assert_eq!(
         jit.try_compile(&ctx, entry),
         Ok(()),

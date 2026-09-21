@@ -18,10 +18,10 @@ fn machine(code: &[u8]) -> Vm<SleighCodeSource<'static>> {
 /// A loop that bumps the immediate of its own `mov ebx, imm` each pass, so
 /// `eax` sums 1 + 2 + 3 only if every pass runs the freshly written bytes.
 ///
-/// The patch is a store from inside the loop body into the same page, and
-/// on the third pass the body has been entered at its start twice already,
-/// which is when a JIT compiles it — so the store that must be seen is one
-/// compiled code performs.
+/// The patch is a store from inside the loop body into the same page, so
+/// under a JIT that compiles on first sight the store that must be seen is
+/// one compiled code performs. (The default warm-up would never compile
+/// it: the body is a new block revision on every pass.)
 const PATCHER: &[u8] = &[
     0xb9, 0x03, 0x00, 0x00, 0x00, // 1000: mov ecx, 3
     0xbb, 0x01, 0x00, 0x00, 0x00, // 1005: mov ebx, 1         (imm at 1006)
@@ -37,7 +37,9 @@ const PATCHER: &[u8] = &[
 fn run(jit: bool) -> (Option<u64>, u64, u64) {
     let mut vm = machine(PATCHER);
     if jit {
-        vm.set_block_executor(Box::new(Jit::new()));
+        let mut jit = Jit::new();
+        jit.set_warm_up(1);
+        vm.set_block_executor(Box::new(jit));
     }
     vm.add_breakpoint(0x1017);
     let exit = vm.run(2000);

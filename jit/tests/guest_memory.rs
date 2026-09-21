@@ -103,6 +103,8 @@ fn agree(code: &[u8], pointer: u64) {
     let expected = state(&mut interpreted, &ctx);
 
     let mut jit = Jit::new();
+    // Driven block by block here: compile on first sight.
+    jit.set_warm_up(1);
     let mut jitted = machine(block, &ctx, pointer);
     for pass in 0..2 {
         seed(&mut jitted, &ctx, block, pointer);
@@ -165,6 +167,8 @@ fn an_access_straddling_two_pages_still_agrees() {
 fn fault_from(code: &[u8], pointer: u64, prepare: impl Fn(&mut VmMemory)) -> Option<FaultKind> {
     let (ctx, block) = lift(code);
     let mut jit = Jit::new();
+    // Driven block by block here: compile on first sight.
+    jit.set_warm_up(1);
     let mut emu = machine(block, &ctx, pointer);
     prepare(&mut emu.memory);
     let mut faulted = None;
@@ -203,6 +207,8 @@ fn a_permission_refusal_survives_a_warm_translation() {
     // write.
     let (ctx, block) = lift(&[0x48, 0x89, 0x03]); // mov [rbx], rax
     let mut jit = Jit::new();
+    // Driven block by block here: compile on first sight.
+    jit.set_warm_up(1);
     let mut emu = machine(block, &ctx, DATA);
     emu.memory
         .mmu
@@ -238,6 +244,8 @@ fn a_store_through_compiled_code_marks_its_bytes_initialized() {
     // `check_uninit` run reported a byte the guest had plainly written.
     let (ctx, block) = lift(&[0x48, 0x89, 0x03]); // mov [rbx], rax
     let mut jit = Jit::new();
+    // Driven block by block here: compile on first sight.
+    jit.set_warm_up(1);
     let mut emu = machine(block, &ctx, DATA + 8);
     // Start from bytes that are mapped and writable but undefined.
     emu.memory
