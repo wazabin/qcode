@@ -8,13 +8,16 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 IMAGES=${IMAGES:-$HERE/../../target/embench}
 OUT=${OUT:-$HERE/target/results}
 REPEAT=${REPEAT:-5}
+# ENGINES narrows the sweep; REFERENCES=0 skips the native, AFL++, Python and
+# interpreter references, for a re-run of one engine's rows.
+ENGINES=${ENGINES:-"qcode-jit unicorn icicle"}
 BIN=$HERE/target/release/hookbench
 mkdir -p "$OUT"
 uptime > "$OUT/load.txt"
 # One process per (engine, instrumentation, image), each under a timeout, so
 # a run that hangs costs one row rather than the sweep.
 INSTRS="none block-ir block-ram block-cb insn-ir insn-ram insn-cb edge-ir edge-ram watch-ir watch-cb cmp-ir cmp-ram cmp-cb"
-for engine in qcode-jit unicorn icicle; do
+for engine in $ENGINES; do
   : > "$OUT/$engine.log"
   for instr in $INSTRS; do
     for img in $(ls "$IMAGES"/*.elf | xargs -n1 basename | sed 's/\.elf$//'); do
@@ -24,6 +27,7 @@ for engine in qcode-jit unicorn icicle; do
     done
   done
 done
+if [ "${REFERENCES:-1}" = 0 ]; then uptime >> "$OUT/load.txt"; echo done >> "$OUT/load.txt"; exit 0; fi
 (cd "$HERE/target/native" && for b in $(ls *.plain | sed 's/\.plain$//'); do
   for v in plain block edge cmp watch; do "./$b.$v" 30 "$b" "$v"; done
 done) > "$OUT/native.txt" 2>&1
