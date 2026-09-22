@@ -485,7 +485,7 @@ impl qcode_vm::hook::Hook for OfferCounter {
 fn a_growing_block_offers_a_hook_only_what_is_new() {
     // Sixty-four `inc eax`, then `mov ebx, 42`: one straight-line run,
     // discovered an instruction at a time and absorbed into one block.
-    let mut code = vec![0xff, 0xc0].repeat(64);
+    let mut code = [0xff, 0xc0].repeat(64);
     code.extend_from_slice(&[0xbb, 0x2a, 0x00, 0x00, 0x00]);
     let offered = Rc::new(Cell::new(0));
     let mut vm = machine(&code, false);
