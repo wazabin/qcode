@@ -667,7 +667,10 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 
     /// Appends a prototype run — a recorded instruction's operations — in
-    /// one pass; see [`FunctionBody::append_prototype`]. The operations go
+    /// one pass, with nothing resolved twice: the body copies each
+    /// mnemonic, points its operands into itself, pushes and links it,
+    /// records its use edges, connects its branches and names its result.
+    /// The operations go
     /// at the end of their own blocks, at the builder's address, named
     /// when the builder [names](Self::naming) things; the builder is left
     /// on the run's last block. The ids are pushed onto `out` in order.
