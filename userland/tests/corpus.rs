@@ -163,6 +163,29 @@ fn mmap_mprotect_munmap() {
 }
 
 #[test]
+fn memfd_ftruncate_and_shared_mappings() {
+    check("memfd", false, &[], &[], None, "memfd ok\n", 0);
+}
+
+#[test]
+fn shared_anonymous_memory_survives_a_fork() {
+    check("shared", false, &[], &[], None, "shared ok\n", 0);
+}
+
+#[test]
+fn a_nanomite_is_steered_by_its_tracer() {
+    check(
+        "nanomite",
+        false,
+        &[],
+        &[],
+        None,
+        "stage 1\nstage 2\nstage 3\ntraced ok\n",
+        7,
+    );
+}
+
+#[test]
 fn files_under_a_sandbox_root() {
     let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("root");
     std::fs::create_dir_all(root.join("data")).unwrap();

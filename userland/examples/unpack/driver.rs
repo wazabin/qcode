@@ -36,6 +36,8 @@ pub struct Options {
     /// Arguments after the program name; the program name itself is always
     /// `argv[0]`.
     pub args: Vec<String>,
+    /// What the guest reads on its standard input.
+    pub stdin: Option<Vec<u8>>,
 }
 
 impl Default for Options {
@@ -46,6 +48,7 @@ impl Default for Options {
             hooks: true,
             edges: false,
             args: Vec::new(),
+            stdin: None,
         }
     }
 }
@@ -122,6 +125,9 @@ pub fn run_keeping(path: &str, options: &Options) -> Result<(Process, Outcome), 
     };
     let mut process =
         Process::new(&image, config).map_err(|e| format!("cannot load {path}: {e}"))?;
+    if let Some(stdin) = &options.stdin {
+        process.files_mut().set_stdin(stdin.clone());
+    }
 
     let loaded = process.image();
     let image_lo = loaded

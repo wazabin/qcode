@@ -3,13 +3,14 @@
 //! The example's module tree is pulled in here rather than duplicated, so the
 //! tests drive exactly the code the command line drives.
 //!
-//! Four layers, from the cheapest to the most expensive: the layout is
+//! Five layers, from the cheapest to the most expensive: the layout is
 //! consistent (no guest at all); `selfdecrypt` runs to its exit and the
 //! harvest names both of its generations, byte for byte, on either strategy;
 //! a static glibc `hello` built at test time runs under the hooks and
-//! generates nothing; and, where one is installed, a BusyBox applet runs
-//! under them too — a real libc, a real filesystem, and a few million
-//! operations of it.
+//! generates nothing; the same `hello` packed with UPX unpacks to one
+//! region, the first real packer; and, where one is installed, a BusyBox
+//! applet runs under them too — a real libc, a real filesystem, and a few
+//! million operations of it.
 
 #[path = "../examples/unpack/lib.rs"]
 mod unpack;
@@ -526,6 +527,143 @@ fn a_static_glibc_hello_runs_under_the_hooks() {
     assert!(summary.regions.is_empty(), "{:?}", summary.regions);
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// The first real packer: a static glibc `hello` packed with UPX (the
+/// fixture's README says how). The stub decompresses the whole program into
+/// a `MAP_SHARED` mapping of a memfd at the image base and maps the file back
+/// over it executable, so the harvest sees one generation-1 region — the
+/// unpacked program, byte for byte where the loader would have put it —
+/// written by the stub's decompressor, and nothing deeper.
+///
+/// JIT only: the same run takes half a minute under the interpreter, and the
+/// two strategies lift one loop head of the stub's fold differently, so
+/// they do not write byte-identical graphs for this program (a node and a
+/// site more under the interpreter; the regions and generations agree).
+#[test]
+fn a_upx_packed_hello_unpacks_to_one_region() {
+    let Some(path) = fixture("hello.upx") else {
+        return;
+    };
+    let path = path.to_str().expect("the fixture path is UTF-8").to_owned();
+    let dir = out_dir("upx-hello");
+
+    let options = Options {
+        jit: true,
+        edges: true,
+        ..Options::default()
+    };
+    let (mut process, outcome) =
+        driver::run_keeping(&path, &options).expect("hello.upx loads and runs");
+    assert!(!outcome.crashed, "{}", outcome.stop_reason);
+    assert_eq!(outcome.stop_reason, "exit");
+    assert_eq!(outcome.exit_status, Some(0));
+    assert_eq!(outcome.stdout, b"hello\n");
+    assert!(outcome.stderr.is_empty());
+    assert!(!outcome.recorder.blocks_saturated, "the log filled up");
+    assert!(!outcome.recorder.sites_saturated, "the site ids saturated");
+
+    let summary = artifact::write(&dir, &mut process, &outcome).expect("the artifact is written");
+    let graph = read_graph(&dir);
+
+    // One region, one generation deep, the unpacked program inside the image
+    // window at the image base: half a megabyte the stub wrote.
+    let image = outcome.layout.image_window();
+    let regions = graph["regions"].as_array().expect("regions is a list");
+    assert_eq!(regions.len(), 1, "{regions:?}");
+    let region = &regions[0];
+    assert_eq!(region["generation"].as_u64(), Some(1));
+    let start = hex(&region["start"]);
+    let len = region["bytes_len"].as_u64().expect("a region length");
+    assert!(len > 400_000, "the region is {len} bytes");
+    assert!(
+        start >= image.start && start + len <= image.end(),
+        "the region {start:#x}+{len:#x} leaves the image window"
+    );
+    assert_eq!(summary.regions.len(), 1);
+
+    // Every generated node is generation 1 and lies in that region: the
+    // program the stub unpacked runs no unpacker of its own.
+    let generated: Vec<&serde_json::Value> = graph["nodes"]
+        .as_array()
+        .expect("nodes is a list")
+        .iter()
+        .filter(|node| node["generated"] == true)
+        .collect();
+    assert!(
+        generated.len() > 1000,
+        "{} generated nodes",
+        generated.len()
+    );
+    for node in &generated {
+        let (lo, hi) = range(node);
+        assert_eq!(
+            node["generation"].as_u64(),
+            Some(1),
+            "the generated node at {lo:#x} is not generation 1"
+        );
+        assert!(
+            start <= lo && hi <= start + len,
+            "the generated node at {lo:#x}..{hi:#x} is outside the region"
+        );
+    }
+    assert!(of_generation(&graph, 2).is_empty(), "a second generation");
+
+    // The region's bytes are the file the loader would have mapped: they
+    // start with the unpacked program's code, not with the packed stub's.
+    let bytes = fs::read(dir.join(format!("regions/{:#x}-g1.bin", start)))
+        .expect("the region's bytes were written");
+    assert_eq!(bytes.len() as u64, len);
+
+    // Byte-exact: the region is the unpacked program's `R E` segment from
+    // eight bytes past its base (the ELF magic the packed file already had)
+    // to the segment's end, followed by the stub's exit trampoline
+    // (`endbr64; syscall; pop rdx; pop rax; jmp rax`), which it writes just
+    // past the text and leaves through. The digest is that of bytes
+    // `0x8..0x7adfd` of the unpacked `hello` the fixture was packed from
+    // (see the fixture README).
+    const TEXT_END: u64 = 0x47adfd;
+    const TEXT_SHA256: &str = "9400e9e66d468ef4af501831d7cca8a21e3db2440a715c7f99d9abb9767d87bc";
+    const TRAMPOLINE: [u8; 11] = [
+        0xf3, 0x0f, 0x1e, 0xfa, 0x0f, 0x05, 0x5a, 0x58, 0x3e, 0xff, 0xe0,
+    ];
+    assert_eq!(
+        start, 0x400008,
+        "the region does not start at the image base"
+    );
+    let text = &bytes[..(TEXT_END - start) as usize];
+    assert_eq!(
+        sha256_hex(text),
+        TEXT_SHA256,
+        "the unpacked text differs from the original binary"
+    );
+    assert_eq!(
+        &bytes[text.len()..],
+        &TRAMPOLINE,
+        "past the text is not the stub's trampoline"
+    );
+
+    // And the IR round-trips, packed program and stub in the one context.
+    let encoded = fs::read(dir.join("context.bin")).expect("context.bin was written");
+    let (decoded, _) = bincode::serde::decode_from_slice::<qcode::context::Context<'static>, _>(
+        &encoded,
+        bincode::config::standard(),
+    )
+    .expect("context.bin decodes");
+    assert_eq!(
+        decoded.blocks().count(),
+        process.vm().context().blocks().count()
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// The BusyBox binary to test with, if one is installed.

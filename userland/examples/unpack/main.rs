@@ -46,6 +46,9 @@ struct Cli {
     /// Record the observed control-flow edge into each block as well
     #[arg(long)]
     edges: bool,
+    /// A file the guest reads as its standard input
+    #[arg(long, value_name = "FILE")]
+    stdin: Option<PathBuf>,
     /// Arguments handed to the guest after its own name
     #[arg(trailing_var_arg = true)]
     args: Vec<String>,
@@ -59,6 +62,12 @@ fn main() {
         hooks: !cli.no_hooks,
         edges: cli.edges,
         args: cli.args.clone(),
+        stdin: cli.stdin.as_ref().map(|path| {
+            std::fs::read(path).unwrap_or_else(|e| {
+                eprintln!("error: cannot read {}: {e}", path.display());
+                process::exit(1);
+            })
+        }),
     };
 
     let started = Instant::now();

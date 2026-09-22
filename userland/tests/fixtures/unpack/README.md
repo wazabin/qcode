@@ -79,3 +79,59 @@ Sources:
 Toolchain: `gcc`, `objcopy`, `strip`, `python3` (the XOR step). Built with GCC
 16.2.1 / binutils on Fedora; any recent GNU toolchain reproduces the same
 bytes given the same compiler and linker versions.
+
+# `hello.upx` — a UPX-packed static glibc `hello`
+
+The first real packer. `hello.c` is a static glibc program that writes
+`hello\n` with the `write` system call and exits 0; `hello.upx` is that
+program packed with UPX. The stub's fold decompresses the whole first
+`PT_LOAD` into a `MAP_SHARED` mapping of a `memfd` at the image base, then
+maps the file back over it read-only and executable, so the unpacked program
+sits byte for byte where the loader would have put it (`0x400000`) and every
+byte of it was written by the decompressor's stores.
+
+## Building
+
+```
+gcc -static -O2 -o hello hello.c        # GCC 16.2.1, glibc-static 2.43 (Fedora 44)
+cp hello hello.upx && upx -q hello.upx  # upx 5.2.1-devel.15+git-6dbfb688, defaults
+```
+
+sha256 of the committed `hello.upx`:
+`3abd35b48512a57ddc44f4240a3a11381bd130883986015516714f0e8ca28c09`.
+
+The program uses `write`, not `puts`: with this UPX the `puts` build traps in
+the stub *natively* (`Trace/breakpoint trap`, exit 133) before any of our
+code is involved, so it is no fixture. The `write` build runs natively and
+under `userland` alike.
+
+## What the stub needs from `userland`
+
+`memfd_create` (319), `ftruncate` (77), `msync` (26), and `MAP_SHARED` file
+mappings whose stores reach the file — `userland` maps files as snapshots and
+carries a shared mapping's bytes back at `msync`, at `munmap`, and before the
+file is mapped again. Without them the stub falls back to `/dev/shm`, then
+`hlt`s.
+
+## Expected
+
+```
+$ ./hello.upx; echo $?
+hello
+0
+```
+
+Under the hooks: one generation-1 region of 503,296 bytes at `0x400008`, no
+second generation.
+
+### Byte-exact oracle
+
+`unpack.rs` checks the harvested region against the binary that was packed:
+bytes `0x8..0x7adfd` of the unpacked `hello` (its whole `R E` segment past
+the ELF magic) have sha256
+`9400e9e66d468ef4af501831d7cca8a21e3db2440a715c7f99d9abb9767d87bc`, and the
+region continues with the stub's 11-byte exit trampoline
+(`f3 0f 1e fa 0f 05 5a 58 3e ff e0`). Recompute with
+`python3 -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()[8:0x7adfd]).hexdigest())" hello`
+after rebuilding `hello` from `hello.c`; a different toolchain gives a
+different segment and a different digest, so re-pack and update both.
