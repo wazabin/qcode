@@ -200,13 +200,10 @@ where the 8 300 go, from callgrind on one repeated encoding — a `nop`
   index entry ~750, the undecoded key walk ~560, `begin`/`commit` ~300,
   the replay's prologue ~360, allocator ~200.
 
-The next moves, in order, and what they are worth: a `reserve` on
-jstd's `StableArena` and `RecyclingArena` (a jstd release; the growth
-memcpy and capacity checks are ~100 per operation), boxing the large
-`Mnemonic` variants to shrink an instruction to ~80 bytes, and a leaner
-`Construction` for a run that promises nothing. Below ~5 000 per
-instruction the fall-through block plumbing dominates, and that is the
-IR the flat lowering is defined to produce.
+`HANDOFF_LIFT_FAST.md` is the handoff for carrying this on: how to
+measure on a loaded machine, what the next moves are worth, and what has
+already been measured and rejected — including a `reserve` on jstd's
+arenas, which is a small loss rather than the gain it looked like.
 
 ## 4. Rejected along the way
 
