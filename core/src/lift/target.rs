@@ -679,7 +679,23 @@ impl<'t, 'a, 'str> Construction<'t, 'a, 'str> {
             }
         }
         let reported = |local: LocalInsnId| reported.get(&local).copied();
-        for raw in self.journal.insns..body.insns.issued_len() {
+        // An instruction that promised nothing and reports no call cannot
+        // hold a minted slot it would be wrong about, so its operations are
+        // not scanned: that scan was most of committing a lift's commonest
+        // instruction.
+        let may_hold_minted = !self.journal.minted.is_empty()
+            || self
+                .record
+                .lifted()
+                .exits()
+                .iter()
+                .any(|exit| exit.kind().is_call());
+        let scanned = if may_hold_minted {
+            self.journal.insns..body.insns.issued_len()
+        } else {
+            0..0
+        };
+        for raw in scanned {
             let local = raw.into();
             if !body.insns.contains(local) {
                 continue;

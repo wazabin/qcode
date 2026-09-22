@@ -348,7 +348,7 @@ fn a_cloned_block_keeps_the_order() {
         "
     );
     let target = ctx.anon_function();
-    let mut value_map = FxHashMap::default();
+    let mut value_map = rustc_hash::FxHashMap::default();
     let cloned = BasicBlock::clone_block_into(&mut ctx, entry, target, &mut value_map);
     let opcodes = |ctx: &Context<'_>, block: BlockId| -> Vec<String> {
         BasicBlock::from_id(ctx, block)

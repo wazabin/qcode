@@ -51,6 +51,7 @@ use crate::{
         block::{BasicBlock, BlockId},
         block_param::{BlockParam, BlockParamId},
         function::FunctionId,
+        function::{ProtoMap, ProtoOp},
         insn::{
             Apply, Assert, Binary, Binop, Branch, BranchInd, CBranch, Call, CallInd, Callee, Carry,
             Extract, FloatBinop, FloatToFloat, FloatToInt, Gep, InstructionId, InstructionRef,
@@ -663,6 +664,25 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         }
         let local = self.body.append_insn(self.block, insn, base);
         self.insn_ref(local)
+    }
+
+    /// Appends a prototype run — a recorded instruction's operations — in
+    /// one pass; see [`FunctionBody::append_prototype`]. The operations go
+    /// at the end of their own blocks, at the builder's address, named
+    /// when the builder [names](Self::naming) things; the builder is left
+    /// on the run's last block. The ids are pushed onto `out` in order.
+    pub fn append_prototype(
+        &mut self,
+        ops: &[ProtoOp],
+        map: &ProtoMap<'_>,
+        out: &mut Vec<LocalInsnId>,
+    ) {
+        self.body
+            .append_prototype(ops, map, self.address, self.naming, out);
+        if let Some(last) = ops.last() {
+            self.block = map.blocks[last.block as usize];
+            self.is_terminated = last.mnemonic.is_terminator();
+        }
     }
 
     /// Body-local instruction-storage core: mint an `Int(size)`-typed

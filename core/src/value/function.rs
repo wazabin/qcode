@@ -3,7 +3,7 @@ use jstd::{
     registry::{Identified, Registry},
     stable_arena::StableArena,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use std::{
     borrow::Cow,
     collections::BTreeSet,
@@ -14,6 +14,8 @@ use std::{
 mod footprint;
 #[cfg(test)]
 mod insn_order;
+mod prototype;
+pub use prototype::{ProtoMap, ProtoOp};
 #[cfg(test)]
 mod use_edges;
 pub use footprint::{Footprint, RamBase, RamField, RamLocations, RamObject, RamRegion};
@@ -34,7 +36,7 @@ use crate::{
         block_param::{BlockParam, BlockParamId, LocalParamId},
         insn::{LocalInsnId, Mnemonic},
         name::{BaseId, LocalNames, Name, hex_name},
-        uses::{Use, UseArena, UseId, WithUsers},
+        uses::{SharedHeads, Use, UseArena, UseId, WithUsers},
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable, update_context_name},
@@ -516,7 +518,7 @@ pub struct FunctionBody<'str> {
     /// use tracking is per body, and bodies are mutated independently. Sparse:
     /// a value with no use in this body has no entry.
     #[serde(skip)]
-    pub(crate) shared_first_use: FxHashMap<LocalValueId, UseId>,
+    pub(crate) shared_first_use: SharedHeads,
 
     /// The module's shape clock (see
     /// [`Context::revision`](crate::context::Context::revision)), ticked by
@@ -808,7 +810,7 @@ impl<'str> FunctionBody<'str> {
             instruction_addrs: BTreeSet::new(),
             names: LocalNames::default(),
             uses: UseArena::default(),
-            shared_first_use: FxHashMap::default(),
+            shared_first_use: SharedHeads::default(),
             clock: crate::context::ShapeClock::default(),
         }
     }
@@ -834,7 +836,7 @@ impl<'str> FunctionBody<'str> {
             instruction_addrs: BTreeSet::new(),
             names: LocalNames::default(),
             uses: UseArena::default(),
-            shared_first_use: FxHashMap::default(),
+            shared_first_use: SharedHeads::default(),
             clock: crate::context::ShapeClock::default(),
         }
     }
@@ -1973,7 +1975,7 @@ impl<'str> FunctionBody<'str> {
             | LocalValueId::Bytes(_)
             | LocalValueId::Varnode(_)
             | LocalValueId::Function(_)
-            | LocalValueId::Poison(_) => self.shared_first_use.get(&value).copied(),
+            | LocalValueId::Poison(_) => self.shared_first_use.get(value),
         }
     }
 
@@ -1989,14 +1991,7 @@ impl<'str> FunctionBody<'str> {
             | LocalValueId::Bytes(_)
             | LocalValueId::Varnode(_)
             | LocalValueId::Function(_)
-            | LocalValueId::Poison(_) => match head {
-                Some(head) => {
-                    self.shared_first_use.insert(value, head);
-                }
-                None => {
-                    self.shared_first_use.remove(&value);
-                }
-            },
+            | LocalValueId::Poison(_) => self.shared_first_use.set(value, head),
         }
     }
 
@@ -2007,6 +2002,7 @@ impl<'str> FunctionBody<'str> {
     /// `value`: the operand is dangling, which the integrity check reports,
     /// and which a clone into another function's arenas leaves behind until
     /// the caller remaps the operands and rebuilds the edges.
+    #[inline]
     pub(crate) fn add_use(
         &mut self,
         value: LocalValueId,
@@ -2025,44 +2021,55 @@ impl<'str> FunctionBody<'str> {
             shared_first_use,
             ..
         } = self;
-        let holder: &mut dyn WithUsers = match value {
-            LocalValueId::Instruction(id) => insns.get_mut(id)?.inner,
-            LocalValueId::BlockParam(id) => params.get_mut(id)?.inner,
-            LocalValueId::BasicBlock(id) => blocks.get_mut(id)?.inner,
+        let mut edge = Use {
+            value,
+            user,
+            operand_index,
+            next: None,
+        };
+        match value {
+            LocalValueId::Instruction(id) => {
+                let holder = insns.get_mut(id)?.inner;
+                edge.next = holder.first_use.get();
+                let edge = uses.push(edge);
+                holder.first_use.set(Some(edge));
+                Some(edge)
+            }
+            LocalValueId::BlockParam(id) => {
+                let holder = params.get_mut(id)?.inner;
+                edge.next = holder.first_use;
+                let edge = uses.push(edge);
+                holder.first_use = Some(edge);
+                Some(edge)
+            }
+            LocalValueId::BasicBlock(id) => {
+                let holder = blocks.get_mut(id)?.inner;
+                edge.next = holder.first_use();
+                let edge = uses.push(edge);
+                holder.set_first_use(Some(edge));
+                Some(edge)
+            }
             LocalValueId::Temp(id) => {
                 if usize::from(id) >= temps.len() {
                     return None;
                 }
-                &mut temps[id]
+                let holder = &mut temps[id];
+                edge.next = holder.first_use;
+                let edge = uses.push(edge);
+                holder.first_use = Some(edge);
+                Some(edge)
             }
             LocalValueId::Literal(_)
             | LocalValueId::Bytes(_)
             | LocalValueId::Varnode(_)
             | LocalValueId::Function(_)
             | LocalValueId::Poison(_) => {
-                let head = shared_first_use.entry(value);
-                let next = match &head {
-                    std::collections::hash_map::Entry::Occupied(head) => Some(*head.get()),
-                    std::collections::hash_map::Entry::Vacant(_) => None,
-                };
-                let edge = uses.push(Use {
-                    value,
-                    user,
-                    operand_index,
-                    next,
-                });
-                *head.or_insert(edge) = edge;
-                return Some(edge);
+                edge.next = shared_first_use.get(value);
+                let edge = uses.push(edge);
+                shared_first_use.set(value, Some(edge));
+                Some(edge)
             }
-        };
-        let edge = uses.push(Use {
-            value,
-            user,
-            operand_index,
-            next: holder.first_use(),
-        });
-        holder.set_first_use(Some(edge));
-        Some(edge)
+        }
     }
 
     /// Finds the edge recording that `user`'s operand `operand_index` names
@@ -2168,7 +2175,9 @@ impl<'str> FunctionBody<'str> {
     /// Records a use edge for each operand of `insn`: on creation, and after
     /// its mnemonic is swapped.
     fn add_operand_uses(&mut self, insn: LocalInsnId) {
-        // Inline for up to two operands, which covers most instructions.
+        // The mnemonic is borrowed from the arena the edges' heads live in,
+        // so the operands are read out first: inline for up to two, which
+        // covers most instructions.
         let operands = self.insns[insn].mnemonic().args();
         for (index, &value) in operands.iter().enumerate() {
             self.add_use(value, insn, index);

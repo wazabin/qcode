@@ -538,7 +538,7 @@ fn verify_use_edges(
     for temp in body.temps.iter() {
         walk(LocalValueId::Temp(temp.id), out);
     }
-    for &value in body.shared_first_use.keys() {
+    for value in body.shared_first_use.values() {
         if matches!(
             value,
             LocalValueId::Instruction(_)

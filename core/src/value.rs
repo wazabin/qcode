@@ -98,9 +98,9 @@ pub use function::{
     ArgMemKind, BodyArenaKindStats, BodyArenaStats, DerivedOutput, ExternArg, ExternArgmem,
     ExternInterface, ExternSlot, Footprint, FunctionBody, FunctionEffects, FunctionId,
     FunctionKind, FunctionMutRef, FunctionRef, InterfaceSlot, MemoryChannelState,
-    MemoryInterfaceMap, ParamAttrs, RamBase, RamField, RamLocations, RamObject, RamRegion,
-    RegisterChannelState, RegisterEffectSets, RegisterInterfaceMap, SlotBase, WrittenSpaces,
-    WrittenSpacesState,
+    MemoryInterfaceMap, ParamAttrs, ProtoMap, ProtoOp, RamBase, RamField, RamLocations, RamObject,
+    RamRegion, RegisterChannelState, RegisterEffectSets, RegisterInterfaceMap, SlotBase,
+    WrittenSpaces, WrittenSpacesState,
 };
 pub use insn::LocalInsnId;
 pub use insn::{Instruction, InstructionId, InstructionRef};

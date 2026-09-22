@@ -746,6 +746,7 @@ impl Mnemonic {
 
     /// Calls `f` on each operand, in canonical order. Allocation-free; the
     /// operand's position in this order is its *operand index*.
+    #[inline]
     pub fn for_each_operand(&self, mut f: impl FnMut(LocalValueId)) {
         let mut visit = |operand: &LocalValueId| f(*operand);
         visit_operands!(self, visit);
@@ -757,6 +758,7 @@ impl Mnemonic {
     /// Crate-private: an installed instruction's operands are mirrored by its
     /// body's use edges, which only the body's use-maintaining verbs may
     /// desynchronize and repair. A detached mnemonic is free to change.
+    #[inline]
     pub(crate) fn for_each_operand_mut(&mut self, mut f: impl FnMut(&mut LocalValueId)) {
         visit_operands!(self, f, mut);
     }

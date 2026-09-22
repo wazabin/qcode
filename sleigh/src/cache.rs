@@ -110,17 +110,17 @@ use std::{
 
 use qcode::{
     address_index::AddressIndex,
-    context::Context,
+    context::{Context, Shared},
     lift::{
-        CallTarget, Construction, Continuation, Exit, ExitArm, ExitKind, LiftTarget, Lifted,
-        ScratchStore,
+        CallTarget, Construction, Continuation, Emitter, Exit, ExitArm, ExitKind, LiftTarget,
+        Lifted, ScratchStore,
     },
     space::{LocalMemorySpaceId, MemorySpaceId},
     types::{TypeId, TypeRepr},
     value::{
         BaseId, BasicBlock, BlockId, FunctionBody, FunctionId, Instruction, InstructionId,
-        LiteralId, LocalBlockId, LocalInsnId, LocalTempId, LocalTempSpaceId, LocalValueId, Temp,
-        TempId, TempRef, TempSpace, TempSpaceId, Varnode, VarnodeId,
+        LiteralId, LocalBlockId, LocalInsnId, LocalTempId, LocalTempSpaceId, LocalValueId,
+        ProtoMap, ProtoOp, Temp, TempId, TempRef, TempSpace, TempSpaceId, Varnode, VarnodeId,
         insn::{Callee, Mnemonic},
         view::ModuleView,
     },
@@ -1242,8 +1242,8 @@ impl TypeKey {
         })
     }
 
-    fn resolve(self, ctx: &Context<'_>) -> TypeId {
-        let types = &ctx.shared.types;
+    fn resolve_in(self, shared: &Shared<'_>) -> TypeId {
+        let types = &shared.types;
         match self {
             Self::Int(size) => types.get_or_make_int(size),
             Self::Bool => types.get_or_make_bool(),
@@ -1266,11 +1266,11 @@ impl Literal {
         !self.affine.relative && self.affine.params == 0
     }
 
-    /// The literal at `instance`, interned in `ctx`.
-    fn resolve(&self, ctx: &Context<'static>, instance: &Instance) -> LocalValueId {
-        LocalValueId::Literal(ctx.shared.values.get_or_make_typed_literal(
+    /// The literal at `instance`, interned in `shared`, as type `ty`.
+    fn resolve(&self, shared: &Shared<'static>, ty: TypeId, instance: &Instance) -> LocalValueId {
+        LocalValueId::Literal(shared.values.get_or_make_typed_literal(
             self.affine.at(instance),
-            self.ty.resolve(ctx),
+            ty,
             self.affine.size,
         ))
     }
@@ -1443,20 +1443,87 @@ pub struct Template {
     exits: Vec<ExitRecord>,
 }
 
-/// What a template's context-independent keys resolve to in one session's
-/// context: its types, and its constants that are the same at every
-/// instance, which are most of them. Interned values never move, so the
-/// ids hold for the context's life.
+/// A template as one session's body appends it: its operations as a
+/// prototype run with the session's type ids and name bases, and what its
+/// context-independent keys resolve to in the session's context — the
+/// constants that are the same at every instance, which are most of them.
+/// Interned values never move, so the ids hold for the context's life.
 #[derive(Debug)]
 struct Resolved {
     /// Keeps the template alive, so its address is not reused for another.
     _template: Arc<Template>,
-    types: Box<[TypeId]>,
-    /// Per literal, its id when the literal is fixed.
-    literals: Box<[Option<LocalValueId>]>,
-    /// Per operation with a fixed name, the name's base in the session's
-    /// body, once interned there.
-    bases: Box<[Option<BaseId>]>,
+    ops: Box<[ProtoOp]>,
+    /// The operations named after a register a parameter picks, with the
+    /// table the register comes from: their base is set per instance.
+    register_named: Box<[(u32, u32)]>,
+    /// Per register table, per register, the base of a load's name, once
+    /// interned.
+    reg_bases: Box<[Box<[Option<BaseId>]>]>,
+    /// Per literal, its type in the session's context, and its id when the
+    /// literal is fixed.
+    literals: Box<[(TypeId, Option<LocalValueId>)]>,
+}
+
+impl Resolved {
+    fn new(
+        template: &Arc<Template>,
+        emitter: &mut Emitter<'_, 'static>,
+        instance: &Instance,
+    ) -> Self {
+        let shared = emitter.shr();
+        let types: Vec<TypeId> = template
+            .types
+            .iter()
+            .map(|key| key.resolve_in(shared))
+            .collect();
+        let literals = template
+            .literals
+            .iter()
+            .map(|literal| {
+                let ty = literal.ty.resolve_in(shared);
+                let fixed = literal
+                    .is_fixed()
+                    .then(|| literal.resolve(shared, ty, instance));
+                (ty, fixed)
+            })
+            .collect();
+        let mut register_named = Vec::new();
+        let ops = template
+            .ops
+            .iter()
+            .enumerate()
+            .map(|(k, op)| {
+                let base = match &op.name {
+                    None => None,
+                    Some(OpName::Fixed(name)) => Some(emitter.intern_base(name)),
+                    Some(OpName::Varnode(slot)) => {
+                        if let VarnodeSlot::Register(table) = template.varnodes[*slot as usize] {
+                            register_named.push((k as u32, table));
+                        }
+                        None
+                    }
+                };
+                ProtoOp {
+                    block: op.block,
+                    type_id: types[op.ty as usize],
+                    base,
+                    mnemonic: op.mnemonic.clone(),
+                }
+            })
+            .collect();
+        let reg_bases = template
+            .reg_tables
+            .iter()
+            .map(|table| vec![None; table.view.names.len()].into_boxed_slice())
+            .collect();
+        Self {
+            _template: Arc::clone(template),
+            ops,
+            register_named: register_named.into_boxed_slice(),
+            reg_bases,
+            literals,
+        }
+    }
 }
 
 /// Where a lift's additions to its body start.
@@ -2956,26 +3023,6 @@ impl Template {
         Ok(construction.commit()?)
     }
 
-    /// The debug name of the `k`th operation at `instance`: as recorded,
-    /// or that of the register in its varnode slot, which
-    /// [`bake_names`](Self::bake_names) resolved when the slot is fixed.
-    fn name_at(&self, k: usize, instance: &Instance) -> Option<&str> {
-        match self.ops[k].name.as_ref()? {
-            OpName::Fixed(name) => Some(name),
-            OpName::Varnode(slot) => match self.varnodes[*slot as usize] {
-                VarnodeSlot::Register(table) => {
-                    let table = &self.reg_tables[table as usize];
-                    table.view.names[usize::from(instance.regs[usize::from(table.param)])]
-                        .as_deref()
-                }
-                VarnodeSlot::Fixed(_) => {
-                    debug_assert!(false, "a fixed slot's name was not baked");
-                    None
-                }
-            },
-        }
-    }
-
     /// Resolves the name of every operation named after a fixed varnode
     /// slot, once the probes have settled which slots are fixed, so a
     /// replay does not look the register up and lowercase it every time.
@@ -3002,7 +3049,6 @@ impl Template {
             blocks,
             externals,
             callees,
-            types,
             resolved,
             varnodes,
             literals,
@@ -3013,7 +3059,6 @@ impl Template {
         blocks.clear();
         externals.clear();
         callees.clear();
-        types.clear();
         varnodes.clear();
         literals.clear();
         spaces.clear();
@@ -3022,7 +3067,7 @@ impl Template {
         // Everything the construction resolves against the module comes
         // before the emitter borrows it: the blocks of other instructions and
         // the callees, exactly as the emitter resolves its plan.
-        blocks.push(construction.entry());
+        blocks.push(construction.entry().local);
         externals.resize(self.externals.len(), None);
         for &index in &self.external_order {
             let external = self.externals[index as usize].at(instance);
@@ -3031,43 +3076,46 @@ impl Template {
         for affine in &self.callees {
             callees.push(construction.callee_at(affine.at(instance))?);
         }
-
-        let ctx = construction.context();
-        let resolved = resolved
-            .entry(Arc::as_ptr(self) as usize)
-            .or_insert_with(|| Resolved {
-                _template: Arc::clone(self),
-                types: self.types.iter().map(|key| key.resolve(ctx)).collect(),
-                literals: self
-                    .literals
-                    .iter()
-                    .map(|literal| literal.is_fixed().then(|| literal.resolve(ctx, instance)))
-                    .collect(),
-                bases: vec![None; self.ops.len()].into_boxed_slice(),
-            });
-        types.extend_from_slice(&resolved.types);
-        literals.extend(
-            self.literals
-                .iter()
-                .zip(&resolved.literals)
-                .map(|(literal, fixed)| fixed.unwrap_or_else(|| literal.resolve(ctx, instance))),
-        );
         varnodes.extend((0..self.varnodes.len()).map(|k| self.varnode_at(k, instance)));
 
         let mut emitter = construction.emitter();
         emitter.set_address(address);
+        let resolved = resolved
+            .entry(Arc::as_ptr(self) as usize)
+            .or_insert_with(|| Resolved::new(self, &mut emitter, instance));
+        literals.extend(self.literals.iter().zip(&resolved.literals).map(
+            |(literal, &(ty, fixed))| {
+                fixed.unwrap_or_else(|| literal.resolve(emitter.shr(), ty, instance))
+            },
+        ));
+        for &(k, table) in &resolved.register_named {
+            let reg_table = &self.reg_tables[table as usize];
+            let value = usize::from(instance.regs[usize::from(reg_table.param)]);
+            let base = match resolved.reg_bases[table as usize][value] {
+                Some(base) => Some(base),
+                None => {
+                    let base = reg_table.view.names[value]
+                        .as_deref()
+                        .map(|name| emitter.intern_base(name));
+                    resolved.reg_bases[table as usize][value] = base;
+                    base
+                }
+            };
+            resolved.ops[k as usize].base = base;
+        }
+
         for name in &self.blocks {
             let block = match name.render(address) {
                 Some(name) if emitter.naming() => emitter.get_or_make_local_label(Cow::Owned(name)),
                 _ => emitter.push_anonymous_block(),
             };
             emitter.block(block);
-            blocks.push(block);
+            blocks.push(block.local);
         }
         blocks.extend(
             externals
                 .iter()
-                .map(|b| b.expect("every external is ordered")),
+                .map(|b| b.expect("every external is ordered").local),
         );
         for space in &self.temp_spaces {
             spaces.push(
@@ -3088,74 +3136,24 @@ impl Template {
             );
         }
 
-        let mut current = 0u32;
-        for (k, op) in self.ops.iter().enumerate() {
-            if op.block != current {
-                current = op.block;
-                emitter.switch_to_block(blocks[current as usize]);
-            }
-            let mut mnemonic = op.mnemonic.clone().map_operands(|operand| match operand {
-                LocalValueId::Literal(index) => literals[usize::from(index)],
-                LocalValueId::Instruction(index) => {
-                    LocalValueId::Instruction(insns[usize::from(index)].local)
-                }
-                LocalValueId::Temp(index) => LocalValueId::Temp(temps[usize::from(index)]),
-                LocalValueId::Varnode(index) => LocalValueId::Varnode(varnodes[usize::from(index)]),
-                other => other,
-            });
-            match &mut mnemonic {
-                Mnemonic::Load(load) => {
-                    if let LocalMemorySpaceId::Temp(space) = &mut load.space {
-                        *space = spaces[usize::from(*space)];
-                    }
-                }
-                Mnemonic::Store(store) => {
-                    if let LocalMemorySpaceId::Temp(space) = &mut store.space {
-                        *space = spaces[usize::from(*space)];
-                    }
-                }
-                Mnemonic::Branch(branch) => {
-                    branch.target = blocks[usize::from(branch.target)].local
-                }
-                Mnemonic::CBranch(cbranch) => {
-                    cbranch.success_block = blocks[usize::from(cbranch.success_block)].local;
-                    cbranch.failure_block = blocks[usize::from(cbranch.failure_block)].local;
-                }
-                Mnemonic::Call(call) => {
-                    call.target = callees[call.target.minted().unwrap() as usize]
-                }
-                Mnemonic::TailCall(call) => {
-                    call.target = callees[call.target.minted().unwrap() as usize]
-                }
-                _ => {}
-            }
-            let base = match &op.name {
-                None => None,
-                Some(OpName::Fixed(name)) => Some(match resolved.bases[k] {
-                    Some(base) => base,
-                    None => {
-                        let base = emitter.intern_base(name);
-                        resolved.bases[k] = Some(base);
-                        base
-                    }
-                }),
-                Some(OpName::Varnode(_)) => self
-                    .name_at(k, instance)
-                    .map(|name| emitter.intern_base(name)),
-            };
-            let id = emitter
-                .push_mnemonic_with_type_based(mnemonic, types[op.ty as usize], base)
-                .id;
-            insns.push(id);
-        }
+        let map = ProtoMap {
+            literals,
+            varnodes,
+            temps,
+            spaces,
+            blocks,
+            callees,
+        };
+        emitter.append_prototype(&resolved.ops, &map, insns);
 
+        let function = emitter.current_block().func;
         for exit in &self.exits {
             let continuation = |c: Option<u32>| match c {
                 None => Continuation::Next,
-                Some(block) => Continuation::Block(blocks[block as usize]),
+                Some(block) => Continuation::Block(BlockId::new(function, blocks[block as usize])),
             };
             emitter.exit(
-                insns[exit.site as usize],
+                InstructionId::new(function, insns[exit.site as usize]),
                 exit.arm,
                 exit.target.kind(instance, continuation),
             );
@@ -3169,18 +3167,17 @@ impl Template {
 #[derive(Debug, Default)]
 pub struct ReplayScratch {
     /// The entry, the instruction's own blocks, then the externals.
-    blocks: Vec<BlockId>,
+    blocks: Vec<LocalBlockId>,
     externals: Vec<Option<BlockId>>,
     callees: Vec<Callee>,
-    types: Vec<TypeId>,
-    /// Per template replayed, by address, what its keys resolve to in the
-    /// session's context.
+    /// Per template replayed, by address, its prototype run in the
+    /// session's body.
     resolved: HashMap<usize, Resolved>,
     varnodes: Vec<VarnodeId>,
     literals: Vec<LocalValueId>,
     spaces: Vec<LocalTempSpaceId>,
     temps: Vec<LocalTempId>,
-    insns: Vec<InstructionId>,
+    insns: Vec<LocalInsnId>,
 }
 
 /// What a miss probes: the instruction, how it is decoded and lifted, and

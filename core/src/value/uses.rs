@@ -15,8 +15,9 @@
 //! and [`UseId`] never leaves the crate.
 
 use jstd::{Identifier, recycling_arena::RecyclingArena};
+use rustc_hash::FxHashMap;
 
-use crate::value::{LocalValueId, insn::LocalInsnId};
+use crate::value::{LocalValueId, insn::LocalInsnId, link::Link};
 
 /// Index into a body's [`UseArena`]. Crate-private: an edge is only ever
 /// reached through a value's use list.
@@ -37,6 +38,92 @@ pub(crate) struct Use {
 pub(crate) trait WithUsers {
     fn first_use(&self) -> Option<UseId>;
     fn set_first_use(&mut self, head: Option<UseId>);
+}
+
+/// The use-list heads of the shared values a body uses — literals, bytes,
+/// varnodes, functions, poison — which cannot carry a head themselves: use
+/// tracking is per body, and bodies are mutated independently.
+///
+/// Literals and varnodes, which every instruction of a lift names, are
+/// dense by id: the head of a literal is a slot in a vector, not a hash
+/// probe. The rest are sparse.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SharedHeads {
+    literals: Vec<Link<UseId>>,
+    varnodes: Vec<Link<UseId>>,
+    other: FxHashMap<LocalValueId, UseId>,
+}
+
+impl SharedHeads {
+    #[inline]
+    pub(crate) fn get(&self, value: LocalValueId) -> Option<UseId> {
+        match value {
+            LocalValueId::Literal(id) => self.literals.get(usize::from(id))?.get(),
+            LocalValueId::Varnode(id) => self.varnodes.get(usize::from(id))?.get(),
+            _ => self.other.get(&value).copied(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set(&mut self, value: LocalValueId, head: Option<UseId>) {
+        let dense = match value {
+            LocalValueId::Literal(id) => (&mut self.literals, usize::from(id)),
+            LocalValueId::Varnode(id) => (&mut self.varnodes, usize::from(id)),
+            _ => {
+                match head {
+                    Some(head) => {
+                        self.other.insert(value, head);
+                    }
+                    None => {
+                        self.other.remove(&value);
+                    }
+                }
+                return;
+            }
+        };
+        let (heads, at) = dense;
+        if at >= heads.len() {
+            if head.is_none() {
+                return;
+            }
+            heads.resize(at + 1, Link::none());
+        }
+        heads[at].set(head);
+    }
+
+    /// Every shared value with a use, in no particular order.
+    pub(crate) fn values(&self) -> impl Iterator<Item = LocalValueId> + '_ {
+        let literals = self
+            .literals
+            .iter()
+            .enumerate()
+            .filter(|(_, head)| head.get().is_some())
+            .map(|(id, _)| LocalValueId::Literal(crate::value::LiteralId::from(id)));
+        let varnodes = self
+            .varnodes
+            .iter()
+            .enumerate()
+            .filter(|(_, head)| head.get().is_some())
+            .map(|(id, _)| LocalValueId::Varnode(crate::value::VarnodeId::from(id)));
+        literals.chain(varnodes).chain(self.other.keys().copied())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.values().next().is_none()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.literals.clear();
+        self.varnodes.clear();
+        self.other.clear();
+    }
+
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.literals.shrink_to_fit();
+        self.varnodes.shrink_to_fit();
+        self.other.shrink_to_fit();
+    }
 }
 
 /// Body-local slab storage for use edges. Removed slots are reused; `UseId`
