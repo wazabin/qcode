@@ -48,7 +48,7 @@ pub mod vm;
 
 pub use hook::{
     AddressHook, BlockEntryHook, BlockView, CompareHook, Emitter, Hook, HookInjector, Site,
-    WriteWatch,
+    WriteWatch, split_tail_address,
 };
 pub use inject::CodeInjector;
 pub use jit_abi::{

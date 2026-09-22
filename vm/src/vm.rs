@@ -967,6 +967,57 @@ impl<S: CodeSource> Vm<S> {
         self.emu.set_address_index(index);
     }
 
+    /// Settles the index after `block` absorbed everything past the
+    /// `covered` addresses it answered for before.
+    ///
+    /// Which way round depends on whether a branch to one of those addresses
+    /// may enter `block`: see [`reindex_absorbed`](Self::reindex_absorbed)
+    /// and [`drop_absorbed_from_index`](Self::drop_absorbed_from_index).
+    fn settle_absorbed(&mut self, block: BlockId, covered: usize) {
+        if self.ctx.block(block).address().is_some() {
+            self.reindex_absorbed(block);
+        } else {
+            self.drop_absorbed_from_index(block, covered);
+        }
+    }
+
+    /// Drops the addresses a *hook's split tail* has just absorbed from the
+    /// index, rather than pointing them at it.
+    ///
+    /// `covered` is what the tail already answered for; everything absorption
+    /// appended after it is what this drops.
+    ///
+    /// The tail of an [`interrupt_if`](crate::Emitter::interrupt_if) split
+    /// holds guest code like any other block, but it has no address of its
+    /// own: it is reached only by falling through the hook's detour, and a
+    /// split — which re-establishes an interior address as a block start by
+    /// emptying the block and lifting it afresh from its own address — has
+    /// nothing to lift it from. So the run it holds stays private to that
+    /// path. An address in it answers to nothing, and a branch there,
+    /// discovered later, is lifted a second time into a block of its own:
+    /// the same guest instruction reached two ways, lifted two ways. What
+    /// the index must not do is name the tail, which would send the branch
+    /// to the *start* of the run — the caller's code, not the callee's.
+    ///
+    /// Vouching for the index afterwards is deliberate. It is complete for
+    /// what it is used for — resolving a branch to a block it may enter —
+    /// and its omission is exactly the second lift this wants.
+    fn drop_absorbed_from_index(&mut self, block: BlockId, covered: usize) {
+        let absorbed = match self.ctx.block(block).extra_addresses().get(covered..) {
+            Some(absorbed) if !absorbed.is_empty() => absorbed.to_vec(),
+            _ => return,
+        };
+        let mut index = self
+            .emu
+            .take_address_index()
+            .unwrap_or_else(|| AddressIndex::analyze(&self.ctx));
+        for addr in absorbed {
+            index.forget(addr);
+        }
+        index.mark_current(&self.ctx);
+        self.emu.set_address_index(index);
+    }
+
     /// Re-runs the block cleanup over a block that has just grown.
     ///
     /// The cleanup at discovery saw a single guest instruction, where every
@@ -1049,10 +1100,11 @@ impl<S: CodeSource> Vm<S> {
         // a split leaves behind — it re-establishes a block's *start* while
         // everything after it is still lifted — and the shape a back-edge into
         // the middle of a run creates generally.
+        let covered = self.ctx.block(filled).extra_addresses().len();
         let forward = qcode_passes::absorb_straight_line(&mut self.ctx, filled);
         self.stats.absorbed += forward as u64;
         if forward > 0 {
-            self.reindex_absorbed(filled);
+            self.settle_absorbed(filled, covered);
             self.mark_dirty(filled);
         }
 
@@ -1083,14 +1135,29 @@ impl<S: CodeSource> Vm<S> {
         if head == filled {
             return None;
         }
-        // Only into a block that starts at a machine address. Absorbing makes
-        // the head responsible for the absorbed addresses, and a later branch
-        // to one of them splits the head apart again — which works by emptying
-        // it and lifting it afresh. A block with no address of its own (the
-        // fallthrough arm of a branch *inside* one instruction's p-code) has
-        // nowhere to be lifted from, so emptying it leaves a hole nothing can
-        // fill.
-        if self.ctx.block(head).address().is_none() {
+        // Only into a block a branch to one of the absorbed addresses can be
+        // resolved against. Absorbing makes the head answer for those
+        // addresses, and code discovered later may branch to one: a head that
+        // starts at a machine address is split apart again, by emptying it
+        // and lifting it afresh. A block with no address of its own — the
+        // fallthrough arm of a branch *inside* one instruction's p-code —
+        // has nowhere to be lifted from, so emptying it would leave a hole
+        // nothing can fill.
+        //
+        // The tail a conditional hook's split leaves behind is the one
+        // address-less block that holds guest code of its own, beginning at
+        // a guest instruction ([`crate::hook::split_tail_address`]). It is
+        // absorbed into, and never split: the addresses it takes in leave
+        // the index instead of being rehomed onto it
+        // ([`drop_absorbed_from_index`](Self::drop_absorbed_from_index)), so
+        // a branch to one of them lifts a second copy rather than breaking
+        // this one apart. Refusing it would end the guest basic block at
+        // every hook that gates one — every instruction behind the split
+        // would stay a block of its own, and a hook on block entries would
+        // then find, and instrument, an entry per guest instruction.
+        if self.ctx.block(head).address().is_none()
+            && crate::hook::split_tail_address(&self.ctx, head).is_none()
+        {
             return (forward > 0).then_some(filled);
         }
         // What the head has already run: everything it held before the
@@ -1108,6 +1175,7 @@ impl<S: CodeSource> Vm<S> {
                 .prev()
                 .map(|insn| insn.id.local)
         });
+        let covered = self.ctx.block(head).extra_addresses().len();
         if qcode_passes::absorb_straight_line(&mut self.ctx, head) == 0 {
             return (forward > 0).then_some(filled);
         }
@@ -1115,7 +1183,7 @@ impl<S: CodeSource> Vm<S> {
 
         self.mark_dirty(head);
 
-        self.reindex_absorbed(head);
+        self.settle_absorbed(head, covered);
 
         // The machine stopped at the empty placeholder this lift filled, which
         // absorption has just deleted; its instructions are in the head now.

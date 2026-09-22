@@ -20,6 +20,11 @@
 //! such as the address and datum of a store — which the exit reports as the
 //! interrupt's arguments.
 //!
+//! Hooks also read and write guest memory inline:
+//! [`Emitter::load`] and [`Emitter::store`] emit an ordinary RAM load or store
+//! before the site, so a hook can keep a counter, a shadow byte or a visited
+//! bitmap in the guest's own address space without ever leaving compiled code.
+//!
 //! [`HookInjector`] adapts a hook to the [`CodeInjector`] the machine runs,
 //! and handles idempotence: a site is instrumented once, remembered by its
 //! anchor instruction, which survives absorption and disappears with a
@@ -29,7 +34,7 @@ use qcode::{
     context::Context,
     space::MemorySpaceId,
     value::{
-        BasicBlock, BlockId, InstructionId, ValueId,
+        BasicBlock, BlockId, InstructionId, Value, ValueId,
         insn::{Binop, IntBinop, Mnemonic, Store, VM_INTERRUPT},
     },
 };
@@ -306,6 +311,36 @@ impl<'a> Emitter<'a> {
         builder.push_zext(value, size).id()
     }
 
+    /// Loads `size` bytes of guest RAM at `ptr` before the anchor.
+    ///
+    /// Like [`binop`](Self::binop), the load carries no guest address: it is
+    /// the hook's instruction, not the guest's.
+    pub fn load(&mut self, ptr: ValueId, size: usize) -> ValueId {
+        let (block, anchor) = (self.block, self.anchor);
+        let space = self.ctx.shared.default_space;
+        let mut builder = self.ctx.builder(block);
+        builder.set_insert_point_before(anchor);
+        builder.push_load::<true>(ptr, size, space).id()
+    }
+
+    /// Stores `value`, at its own width, to guest RAM at `ptr` before the
+    /// anchor.
+    ///
+    /// Like [`binop`](Self::binop), the store carries no guest address: it is
+    /// the hook's instruction, not the guest's, and a store to the default
+    /// space that looked like the start of a guest instruction would be
+    /// offered as a site to the next hook.
+    pub fn store(&mut self, ptr: ValueId, value: ValueId) {
+        let (block, anchor) = (self.block, self.anchor);
+        let space = self.ctx.shared.default_space;
+        let mut builder = self.ctx.builder(block);
+        builder.set_insert_point_before(anchor);
+        // A varnode pointer names a register, not an address in RAM; take its
+        // value, as the load side does with `CHECK_LOCAL`.
+        let ptr = builder.ensure_local(ptr);
+        builder.push_store(value, ptr, space);
+    }
+
     /// `value - begin < end - begin + 1`, as a one-byte condition: whether a
     /// 64-bit `value` lies in `begin..=end`.
     pub fn in_range(&mut self, value: ValueId, begin: u64, end: u64) -> ValueId {
@@ -352,6 +387,73 @@ impl<'a> Emitter<'a> {
         self.block = rest;
         interrupt
     }
+}
+
+/// The guest address the fall-through tail of an [`Emitter::interrupt_if`]
+/// split opens with, if `block` is one.
+///
+/// The split leaves exactly this shape: the block it was cut from keeps the
+/// address and ends in `cbranch cond -> hook, tail`, and `hook` holds the
+/// interrupt and falls through to `tail`. Neither the branch nor the tail is
+/// stamped with a guest address — a tail that looked like the start of a
+/// guest instruction would be offered as a site to the next hook choosing
+/// them — but the detour's own instructions are, and that address is the
+/// guest instruction the tail opens with.
+///
+/// That is what makes such a tail a place the machine may go on folding a
+/// guest basic block into, though it carries no address: what it holds is
+/// the guest's code from `address` on, and nothing else. A hook anchored
+/// *inside* an instruction's p-code — on a store, a load, a comparison —
+/// splits in the middle of one, and its tail opens with a continuation
+/// instead; the block it was cut from still holding instructions of that
+/// same address is how that case is told apart.
+pub fn split_tail_address(ctx: &Context<'static>, block: BlockId) -> Option<u64> {
+    let view = BasicBlock::from_id(ctx, block);
+    if view.address().is_some() {
+        return None;
+    }
+    let mut address: Option<u64> = None;
+    let mut origin: Option<BlockId> = None;
+    for (_, pred) in view.predecessors() {
+        let terminator = BasicBlock::from_id(ctx, pred).last_instruction()?;
+        match ctx.instruction(terminator).mnemonic() {
+            // The arm that chose between the two: the block the tail was cut
+            // from. There is one, and a second would mean something else
+            // branches here — which nothing can, the tail having no address
+            // to be found by.
+            Mnemonic::CBranch(_) if origin.replace(pred).is_none() => {}
+            // The interrupt's block, stamped with the site's address.
+            Mnemonic::Branch(_)
+                if BasicBlock::from_id(ctx, pred)
+                    .instructions()
+                    .any(|insn| is_interrupt_op(ctx, insn.id)) =>
+            {
+                let at = qcode::value::Instruction::from_id(ctx, terminator).address()?;
+                if address.replace(at).is_some_and(|earlier| earlier != at) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    let (address, origin) = (address?, origin?);
+    // The tail opens the guest instruction at `address`, so the block it was
+    // cut from holds none of it — and anything of it left behind would sit at
+    // the very end, where the cut was made. So walk back from there to the
+    // first instruction the guest addressed, rather than over a block that
+    // may hold a whole run: the hook's own instructions carry no address, and
+    // an interrupt an earlier hook placed carries the site's without being
+    // its code.
+    let mut at = BasicBlock::from_id(ctx, origin).last_instruction();
+    while let Some(insn) = at.map(|id| qcode::value::Instruction::from_id(ctx, id)) {
+        if !is_interrupt_op(ctx, insn.id)
+            && let Some(stamped) = insn.address()
+        {
+            return (stamped != address).then_some(address);
+        }
+        at = insn.prev().map(|previous| previous.id);
+    }
+    Some(address)
 }
 
 /// Runs a [`Hook`] as the machine's [`CodeInjector`], instrumenting each site
@@ -507,5 +609,73 @@ impl Hook for CompareHook {
             return;
         };
         emit.interrupt(self.code, &[lhs, rhs]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qcode::value::{FunctionBody, insn::CBranch};
+
+    /// A module holding one block of two instructions at `0x1000`, an `add`
+    /// and a comparison of its result, branching to a block at `0x1004`.
+    fn module() -> (Context<'static>, BlockId) {
+        let mut ctx = Context::new();
+        let function = FunctionBody::make_at_addr(&mut ctx, 0x1000, None).id;
+        let block = BasicBlock::make(&mut ctx, function).with_address(0x1000).id;
+        let next = BasicBlock::make(&mut ctx, function).with_address(0x1004).id;
+        let one = ctx.shared.get_const(1, 4);
+        let mut builder = ctx.builder(block);
+        builder.set_address(0x1000);
+        let sum = builder.push_binop(Binop::Int(IntBinop::Add), one, one).id();
+        builder.push_binop(Binop::Int(IntBinop::Equal), sum, one);
+        builder.finalize(next);
+        (ctx, block)
+    }
+
+    /// The block the split left behind, read off the `cbranch` it ends in.
+    fn tail_of(ctx: &Context<'static>, block: BlockId) -> BlockId {
+        let terminator = BasicBlock::from_id(ctx, block)
+            .last_instruction()
+            .expect("the block is terminated");
+        let Mnemonic::CBranch(CBranch { failure_block, .. }) =
+            ctx.instruction(terminator).mnemonic()
+        else {
+            panic!("a conditional hook ends the block it splits in a cbranch");
+        };
+        BlockId::new(block.func, *failure_block)
+    }
+
+    #[test]
+    fn the_tail_of_a_split_at_a_site_opens_the_site_s_instruction() {
+        let (mut ctx, block) = module();
+        let site = BlockView { ctx: &ctx, block }
+            .entry()
+            .expect("the block starts at a guest address");
+        let mut emit = Emitter::new(&mut ctx, &site);
+        let cond = emit.constant(1, 1);
+        emit.interrupt_if(cond, 7, &[]);
+
+        let tail = tail_of(&ctx, block);
+        assert_eq!(split_tail_address(&ctx, tail), Some(0x1000));
+        // The block the tail was cut from keeps its address, and is not one.
+        assert_eq!(split_tail_address(&ctx, block), None);
+    }
+
+    #[test]
+    fn the_tail_of_a_split_inside_an_instruction_is_not_one() {
+        let (mut ctx, block) = module();
+        // A comparison is not the start of the guest instruction it belongs
+        // to, so the tail opens with the rest of that instruction — which no
+        // lift of its address would reproduce on its own.
+        let site = BlockView { ctx: &ctx, block }
+            .compares()
+            .pop()
+            .expect("the block compares");
+        let mut emit = Emitter::new(&mut ctx, &site);
+        let cond = emit.constant(1, 1);
+        emit.interrupt_if(cond, 7, &[]);
+
+        assert_eq!(split_tail_address(&ctx, tail_of(&ctx, block)), None);
     }
 }
