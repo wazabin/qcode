@@ -64,6 +64,6 @@ pub use stats::Stats;
 pub use table::{HookAction, HookId, InsnAction, MemAccess, TABLE_CODES};
 pub use tlb::{TLB_ENTRIES, TLB_INDEX_BITS, TlbEntry, TranslationCache};
 pub use vm::{
-    BlockExecutor, CodeError, CodeSource, Executed, Interrupt, InterruptKind, RestoreError,
+    BlockExecutor, CodeError, CodeSource, Executed, Interrupt, InterruptKind, Parked, RestoreError,
     ResumeError, SnapshotError, StateSpaceError, Vm, VmExit, VmSnapshot,
 };

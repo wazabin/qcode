@@ -236,6 +236,55 @@ pub enum SnapshotError {
     Interrupted,
 }
 
+/// Where a task stands on the machine, taken off it by [`Vm::park`] so
+/// another task's memory can be installed, and put back by [`Vm::unpark`].
+///
+/// Only the position and the interrupt the task is stopped at: memory and
+/// registers are the environment's to save and restore around it, which is
+/// what lets several tasks share one machine, one module of lifted code and
+/// one set of hooks.
+#[derive(Clone)]
+pub struct Parked {
+    /// The block the task was in, if it was on the machine when parked.
+    block: Option<BlockId>,
+    /// The op at that position — its id and guest address — so it can be
+    /// found again after its block changes shape.
+    op: Option<(InstructionId, Option<u64>)>,
+    /// The guest instruction the position starts, if it starts one: where
+    /// the task can be put by lifting alone.
+    boundary: Option<u64>,
+    /// Values produced before the position that the rest of the block reads.
+    live: Vec<(InstructionId, SizedValue)>,
+    /// The interrupt the task was stopped at, not yet resumed.
+    pending: Option<Interrupt>,
+}
+
+impl Parked {
+    /// A task about to start the instruction at `addr`, with nothing else
+    /// on the machine: a fork child at the instruction after the `fork`, a
+    /// fresh image at its entry point.
+    pub fn at_address(addr: u64) -> Self {
+        Self {
+            block: None,
+            op: None,
+            boundary: Some(addr),
+            live: Vec::new(),
+            pending: None,
+        }
+    }
+
+    /// The guest address of the instruction the task is in or about to
+    /// start, when the position records one.
+    pub fn address(&self) -> Option<u64> {
+        self.op.and_then(|(_, addr)| addr).or(self.boundary)
+    }
+
+    /// The interrupt the task was stopped at when it was parked.
+    pub fn pending(&self) -> Option<&Interrupt> {
+        self.pending.as_ref()
+    }
+}
+
 /// Why [`Vm::restore`] could not put the machine back where it was. Memory
 /// and registers are restored either way.
 #[derive(Debug, Clone)]
@@ -1212,11 +1261,35 @@ impl<S: CodeSource> Vm<S> {
         if self.pending.is_some() {
             return Err(SnapshotError::Interrupted);
         }
+        let Parked {
+            block,
+            op,
+            boundary,
+            live,
+            ..
+        } = self.position();
+        Ok(VmSnapshot {
+            memory: self.emu.memory.snapshot(),
+            block: block.expect("the machine is always in a block"),
+            op,
+            boundary,
+            live,
+        })
+    }
+
+    /// Where the machine is, in the terms a snapshot or a parked task
+    /// records it: the block, the op there by identity, the instruction
+    /// boundary if it is at one, and the block-local values still needed.
+    fn position(&self) -> Parked {
         let block = self.emu.block;
         let idx = self.emu.idx;
-        let ids: Vec<InstructionId> = BasicBlock::from_id(&self.ctx, block)
-            .iter_instruction_ids()
-            .collect();
+        let ids: Vec<InstructionId> = if self.ctx.contains_block(block) {
+            BasicBlock::from_id(&self.ctx, block)
+                .iter_instruction_ids()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let address_of = |id: InstructionId| self.ctx.get_insn(id).address();
         let op = ids.get(idx).map(|&id| (id, address_of(id)));
         let boundary = self.instruction_boundary();
@@ -1240,13 +1313,13 @@ impl<S: CodeSource> Vm<S> {
                 }
             }
         }
-        Ok(VmSnapshot {
-            memory: self.emu.memory.snapshot(),
-            block,
+        Parked {
+            block: Some(block),
             op,
             boundary,
             live,
-        })
+            pending: None,
+        }
     }
 
     /// Puts the machine back where [`snapshot`](Self::snapshot) found it.
@@ -1271,24 +1344,7 @@ impl<S: CodeSource> Vm<S> {
             self.evict_pages(&pages);
         }
 
-        let block = snapshot.block;
-        let position = if !self.ctx.contains_block(block) {
-            None
-        } else {
-            let ids: Vec<InstructionId> = BasicBlock::from_id(&self.ctx, block)
-                .iter_instruction_ids()
-                .collect();
-            match snapshot.op {
-                // The same op, wherever a cleanup ahead of it has moved it.
-                Some((id, addr)) => ids
-                    .iter()
-                    .position(|&l| l == id)
-                    .filter(|_| self.ctx.get_insn(id).address() == addr),
-                // An empty placeholder: still the same one if it has no code.
-                None => ids.is_empty().then_some(0),
-            }
-        };
-        if let Some(idx) = position {
+        if let Some((block, idx)) = self.locate_op(snapshot.block, snapshot.op) {
             self.emu.block = block;
             self.emu.idx = idx;
             for &(id, value) in &snapshot.live {
@@ -1296,9 +1352,48 @@ impl<S: CodeSource> Vm<S> {
             }
             return Ok(());
         }
-        let Some(pc) = snapshot.boundary else {
-            return Err(RestoreError::PositionLost);
-        };
+        let pc = snapshot.boundary.ok_or(RestoreError::PositionLost)?;
+        self.seek(pc)
+    }
+
+    /// Where the op a snapshot or a parked task named is now: the block that
+    /// holds it and its index there, wherever a split or a cleanup has moved
+    /// it since. `None` once the op is gone. The op is found through the
+    /// instruction that owns it, not the block that used to — while a task
+    /// is parked another may split its block, giving the op a new block id.
+    fn locate_op(
+        &self,
+        block: BlockId,
+        op: Option<(InstructionId, Option<u64>)>,
+    ) -> Option<(BlockId, usize)> {
+        match op {
+            Some((id, addr)) => {
+                if !self.ctx.contains_instruction(id) || self.ctx.get_insn(id).address() != addr {
+                    return None;
+                }
+                let block = self.ctx.get_insn(id).parent()?.id;
+                let idx = BasicBlock::from_id(&self.ctx, block)
+                    .iter_instruction_ids()
+                    .position(|l| l == id)?;
+                Some((block, idx))
+            }
+            // An empty placeholder: still the same one if its block is there
+            // and holds no code.
+            None => {
+                let empty = self.ctx.contains_block(block)
+                    && BasicBlock::from_id(&self.ctx, block)
+                        .iter_instruction_ids()
+                        .next()
+                        .is_none();
+                empty.then_some((block, 0))
+            }
+        }
+    }
+
+    /// Puts the machine at the start of the instruction at `pc`, lifting it
+    /// if nothing covers it and splitting whatever covers it part-way, so
+    /// that a block starts exactly there.
+    fn seek(&mut self, pc: u64) -> Result<(), RestoreError> {
         let covering = |vm: &mut Self| {
             vm.emu
                 .block_at_address(&vm.ctx, pc)
@@ -1313,7 +1408,102 @@ impl<S: CodeSource> Vm<S> {
         let block = covering(self).ok_or(RestoreError::PositionLost)?;
         self.emu.block = block;
         self.emu.idx = 0;
+        self.emu.invalidate_block_cache();
         Ok(())
+    }
+
+    // ---- Tasks.
+
+    /// Takes the task that is running off the machine: where it is, and the
+    /// interrupt it is stopped at if it has not been resumed.
+    ///
+    /// Memory and registers stay on the machine for the caller to save; the
+    /// caller then installs another task's and hands that task back with
+    /// [`unpark`](Self::unpark). Nothing of this task is left latched on the
+    /// machine: a write it made into lifted code under its last instruction
+    /// is settled here rather than under whichever task runs next.
+    pub fn park(&mut self) -> Parked {
+        if let Some(VmExit::Unlifted { addr, .. }) = self.evict_written_code() {
+            // The instruction the task was about to run could not be lifted
+            // again after its page was written; name it by address and lift
+            // it once more when the task is put back.
+            self.reset_run_state();
+            return Parked::at_address(addr);
+        }
+        // A task with nothing pending is stepped to a guest-instruction
+        // boundary before it is captured, so it can be put back by lifting
+        // alone if a split in another task moves the op it stopped on. A
+        // task stopped at an interrupt keeps it: it is already at the
+        // boundary of the instruction that raised it, and re-raises it when
+        // it runs again.
+        if self.pending.is_none() {
+            while self.instruction_boundary().is_none() {
+                match self.step() {
+                    // An interrupt or an unliftable branch at the boundary:
+                    // capture where it is and let the next run raise it.
+                    Some(_) => break,
+                    None => continue,
+                }
+            }
+        }
+        let mut parked = self.position();
+        parked.pending = self.pending.take();
+        self.reset_run_state();
+        parked
+    }
+
+    /// Clears the flags that describe where the machine was, before another
+    /// task's position is installed.
+    fn reset_run_state(&mut self) {
+        self.offer_rest = false;
+        self.absorbed_into = None;
+        self.code_written_at = None;
+        self.emu.invalidate_block_cache();
+    }
+
+    /// Puts a parked task back on the machine, whose memory and registers
+    /// the caller has already installed.
+    ///
+    /// Lifted code over any page the memory now installed disagrees about is
+    /// thrown away first (the MMU reports it through
+    /// [`take_code_writes`](crate::Mmu::take_code_writes)), so a task never
+    /// runs code lifted from another task's bytes. The position is found
+    /// again the way [`restore`](Self::restore) finds a snapshot's: by the
+    /// op's identity while its block survives, and otherwise at the start
+    /// of the instruction it was in, lifted again. A task put back that way
+    /// re-raises the interrupt it was stopped at when it runs the op again,
+    /// with the same effect as having kept it pending.
+    pub fn unpark(&mut self, parked: Parked) -> Result<(), RestoreError> {
+        self.pending = None;
+        self.offer_rest = false;
+        self.absorbed_into = None;
+        self.code_written_at = None;
+        self.emu.invalidate_block_cache();
+        if let Some(pages) = self.emu.memory.mmu.take_code_writes() {
+            self.evict_pages(&pages);
+        }
+        if let Some(from) = parked.block
+            && let Some((block, idx)) = self.locate_op(from, parked.op)
+        {
+            self.emu.block = block;
+            self.emu.idx = idx;
+            for &(id, value) in &parked.live {
+                self.emu.insn_values.insert(id, value);
+            }
+            self.pending = parked.pending;
+            return Ok(());
+        }
+        let pc = parked.boundary.ok_or(RestoreError::PositionLost)?;
+        self.seek(pc)
+    }
+
+    /// Positions the machine at the start of the instruction at `addr`,
+    /// lifting it if need be. Whatever the machine was doing is dropped: a
+    /// pending interrupt, values computed part-way through a block. For a
+    /// tracer moving a tracee, or an environment starting a task at a fresh
+    /// image's entry point.
+    pub fn position_at(&mut self, addr: u64) -> Result<(), RestoreError> {
+        self.unpark(Parked::at_address(addr))
     }
 
     /// Points the emulator at whatever block now covers `addr`, reusing the

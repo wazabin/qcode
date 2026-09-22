@@ -249,7 +249,9 @@ pub struct Mmu {
 ///
 /// A cached entry names a host address inside *this* MMU's pages, which the
 /// clone does not own. Copying one across would hand compiled code running on
-/// the clone a pointer into the original's memory.
+/// the clone a pointer into the original's memory. The source's own entries
+/// are as unsafe once its pages are shared: use [`Mmu::fork`], which empties
+/// them, or flush the source after cloning.
 impl Clone for Mmu {
     fn clone(&self) -> Self {
         Self {
@@ -647,6 +649,44 @@ impl Mmu {
         self.pages.clone_from(&snapshot.pages);
         self.baseline = snapshot.generation;
         self.dirty.clear();
+    }
+
+    /// Replaces the address space with `other`'s, as `execve` does, keeping
+    /// this MMU's record of which pages hold lifted code: every such page
+    /// whose bytes are not the same allocation in `other` is reported
+    /// through [`take_code_writes`](Mmu::take_code_writes), so code lifted
+    /// from the old image is thrown away before the new one runs.
+    pub fn adopt(&mut self, other: Mmu) {
+        self.tlb.flush();
+        for &index in &self.code_pages {
+            let same = match (self.pages.get(&index), other.pages.get(&index)) {
+                (Some(live), Some(new)) => Arc::ptr_eq(&live.inner, &new.inner),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same {
+                self.code_written.insert(index);
+            }
+        }
+        self.pages = other.pages;
+        // A number no snapshot holds: the next restore replaces the whole
+        // page table rather than trusting a dirty set kept against another
+        // address space.
+        self.generation += 1;
+        self.baseline = self.generation;
+        self.dirty.clear();
+    }
+
+    /// A copy of the address space for a second machine, as a `fork` needs,
+    /// sharing every page copy-on-write with this one.
+    ///
+    /// Prefer this to `clone`: compiled code running on this MMU may hold a
+    /// translation into a page the copy now shares, and would write through
+    /// it into both. The translation cache is emptied here; `clone`, which
+    /// cannot touch its source, leaves that to its caller.
+    pub fn fork(&mut self) -> Self {
+        self.tlb.flush();
+        self.clone()
     }
 
     /// Pages touched since the last snapshot or restore. Telemetry and tests.

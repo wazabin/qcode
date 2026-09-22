@@ -1076,6 +1076,17 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
     fn leave_block(&mut self, continues: bool) {
         if continues || self.has_local_blocks {
             self.spill();
+        } else {
+            // The p-code after this transfer is reached only by a fresh
+            // entry, never by falling through or a local label, so the
+            // uniques written before it are dead: drop them rather than
+            // spill into a block already terminated. (A flat-mode call is
+            // the case — its continuation carries none of them.)
+            for varnode in self.dirty.drain(..) {
+                if let Some(slot) = self.unique_storage.get_mut(&varnode) {
+                    slot.dirty = false;
+                }
+            }
         }
     }
 
