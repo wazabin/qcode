@@ -34,6 +34,7 @@ impl PcodeSink for Tally {
         black_box((opcode, label, condition));
     }
 }
+use qcode::value::FunctionBody;
 use wazabin_qcode_sleigh::{
     SleighLifter,
     cache::LiftCache,
@@ -123,11 +124,18 @@ fn main() {
     let lifter = SleighLifter::new(spec).with_flat_control_flow();
     let cache = Arc::new(LiftCache::new(spec).validating(validate));
     let mut session = ScratchSession::new(&lifter);
-    let mut keeping = LiftSession::new(&lifter, Host::Anonymous);
     if use_cache {
         session = session.with_cache(Arc::clone(&cache));
-        keeping = keeping.with_cache(Arc::clone(&cache));
     }
+    // A keeping session cannot lift an address twice, so a warm pass runs in
+    // a session of its own and the timed pass in a fresh one.
+    let keeping = || {
+        let session = LiftSession::new(&lifter, Host::Anonymous);
+        match use_cache {
+            true => session.with_cache(Arc::clone(&cache)),
+            false => session,
+        }
+    };
 
     let offsets: Vec<usize> = if linear {
         let mut v = Vec::new();
@@ -194,15 +202,33 @@ fn main() {
         );
     }
     if (stage == "all" || stage == "lift") && keep {
+        let mut sessions = vec![keeping()];
+        if warm {
+            sessions.push(keeping());
+        }
+        let mut lifted = 0usize;
         run(
             "session",
             Box::new(|a, b| {
-                keeping
+                let pass = lifted / n;
+                lifted += 1;
+                sessions[pass]
                     .lift(a, b)
                     .map(|l| black_box(l.blocks().len()))
                     .is_ok()
             }),
         );
+        let last = sessions.pop().unwrap();
+        let ctx = last.context();
+        let (mut blocks, mut insns, mut named) = (0usize, 0usize, 0usize);
+        for block in FunctionBody::from_id(ctx, last.function()).blocks() {
+            blocks += 1;
+            for insn in block.instructions() {
+                insns += 1;
+                named += insn.name().is_some() as usize;
+            }
+        }
+        println!("body: {blocks} blocks, {insns} instructions, {named} named");
     } else if stage == "all" || stage == "lift" {
         run(
             "lift",

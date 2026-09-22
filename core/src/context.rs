@@ -2630,45 +2630,134 @@ impl<'str> Context<'str> {
 /// lock and no cross-function collisions. Two functions may each name a block
 /// `loop` — they render correctly because a value's own `name` field is the
 /// source of truth; this table only enforces uniqueness and resolves by name.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+///
+/// # Three tiers
+///
+/// Nearly every name a lift registers is one of two derived kinds: the
+/// `base_<n>` that [`unique`](Self::unique) mints for a load named after its
+/// register, a hundred thousand times per base, and the hex address a block
+/// is labelled with. Those are kept as what they derive from — per base, a
+/// vector indexed by suffix; per label, its value — so minting, registering
+/// and resolving them never hash or store the string, and growing the table
+/// never re-reads a hundred thousand strings. Every other name (a bare
+/// `rax`, a `tmp_007` whose digits are not canonical) lives in an ordinary
+/// map, as does a suffixed name so far past its vector's end that extending
+/// it would waste more than a map entry. Which tier a name is in is a
+/// function of the name alone, so a lookup goes straight to it.
+#[derive(Clone)]
 pub struct NameTable<'str, Id = ValueId> {
-    /// name → the value that holds it.
+    /// The names of neither derived kind, plus the far suffixed ones (see
+    /// [`Suffixes::far`]).
     map: HashMap<Cow<'str, str>, Id>,
-    /// Per-base "next suffix to try" lower-bound hints for [`unique`](Self::unique),
-    /// so probing resumes instead of rescanning from `0`. A derived cache: rides
-    /// through `clone` but is not serialized (see [`Context::get_unique_name`]).
-    #[serde(skip)]
-    suffix_hint: HashMap<String, u32>,
+    /// Per base, the `base_<n>` names, by suffix.
+    suffixed: HashMap<Cow<'str, str>, Suffixes<Id>>,
+    /// The canonical hex names, by value: a block's label at its address.
+    labels: HashMap<u64, Id>,
 }
+
+/// The `base_<n>` names of one base.
+#[derive(Clone)]
+struct Suffixes<Id> {
+    /// The value holding `base_<n>`, at index `n`.
+    taken: Vec<Option<Id>>,
+    /// A lower bound on the first free suffix, so [`NameTable::unique`]
+    /// resumes instead of rescanning from `1`; lowered when a suffix is freed.
+    hint: u32,
+    /// Whether the bare base is taken — cached, so minting a suffix does not
+    /// look it up.
+    bare: bool,
+    /// How many `base_<n>` are in the map instead of `taken`, because their
+    /// `n` was far past its end when they were registered. Nonzero, and
+    /// minting checks the map for each candidate.
+    far: u32,
+}
+
+/// How far past its end a suffix may extend a base's vector, rather than go
+/// to the map.
+const NEAR: usize = 4096;
 
 impl<Id> Default for NameTable<'_, Id> {
     fn default() -> Self {
         Self {
             map: HashMap::default(),
-            suffix_hint: HashMap::default(),
+            suffixed: HashMap::default(),
+            labels: HashMap::default(),
         }
     }
 }
 
 impl<'str, Id: Copy + Eq> NameTable<'str, Id> {
-    pub(crate) fn entries(&self) -> impl Iterator<Item = (&str, Id)> + '_ {
-        self.map.iter().map(|(name, &value)| (name.as_ref(), value))
+    /// Every name and the value holding it, in no particular order.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (Cow<'_, str>, Id)> + '_ {
+        let plain = self
+            .map
+            .iter()
+            .map(|(name, &value)| (Cow::Borrowed(name.as_ref()), value));
+        let suffixed = self.suffixed.iter().flat_map(|(base, suffixes)| {
+            suffixes
+                .taken
+                .iter()
+                .enumerate()
+                .filter_map(move |(n, id)| {
+                    id.map(|id| (Cow::Owned(suffixed_name(base, n as u32)), id))
+                })
+        });
+        let labels = self
+            .labels
+            .iter()
+            .map(|(&value, &id)| (Cow::Owned(hex_name(value)), id));
+        plain.chain(suffixed).chain(labels)
     }
 
     /// The value currently holding `name`, if any.
     pub fn get(&self, name: &str) -> Option<Id> {
+        if let Some((base, n)) = split_generated_suffix(name) {
+            if let Some(suffixes) = self.suffixed.get(base)
+                && let Some(Some(id)) = suffixes.taken.get(n as usize)
+            {
+                return Some(*id);
+            }
+        } else if let Some(value) = hex_value(name) {
+            return self.labels.get(&value).copied();
+        }
         self.map.get(name).copied()
     }
 
     /// Whether `name` is taken.
     pub fn contains(&self, name: &str) -> bool {
-        self.map.contains_key(name)
+        self.get(name).is_some()
     }
 
     /// Forgets every name, keeping the table's capacity.
     pub(crate) fn clear(&mut self) {
         self.map.clear();
-        self.suffix_hint.clear();
+        self.suffixed.clear();
+        self.labels.clear();
+    }
+
+    /// Whether the bare name `name` — one with no canonical suffix — is
+    /// taken, without going through its suffixes.
+    fn bare_taken(&self, name: &str) -> bool {
+        match hex_value(name) {
+            Some(value) => self.labels.contains_key(&value),
+            None => self.map.contains_key(name),
+        }
+    }
+
+    /// Registers the bare name `name` for `id`: in its tier, and as taken
+    /// in the suffixes of its base, if there are any.
+    fn register_bare(&mut self, name: Cow<'str, str>, id: Id) -> Result<()> {
+        if let Some(suffixes) = self.suffixed.get_mut(name.as_ref()) {
+            suffixes.bare = true;
+        }
+        let taken = match hex_value(&name) {
+            Some(value) => insert_free(&mut self.labels, value, id),
+            None => insert_free(&mut self.map, name.clone(), id),
+        };
+        if taken {
+            return Err(Error::spanless(ErrorTy::DuplicateName(name.to_string())));
+        }
+        Ok(())
     }
 
     /// Register `name` for `id`, forgetting `old_name` first. Errors if `name`
@@ -2678,21 +2767,92 @@ impl<'str, Id: Copy + Eq> NameTable<'str, Id> {
         if let Some(old_name) = old_name {
             self.forget(old_name);
         }
-        match self.map.insert(name.clone(), id) {
-            Some(_) => Err(Error::spanless(ErrorTy::DuplicateName(name.to_string()))),
-            None => Ok(()),
+        let Some((base, n)) = split_generated_suffix(&name) else {
+            return self.register_bare(name, id);
+        };
+        let n = n as usize;
+        let suffixes = suffixes_of(&self.map, &self.labels, &mut self.suffixed, base);
+        if n < suffixes.taken.len() + NEAR {
+            if n >= suffixes.taken.len() {
+                suffixes.taken.resize(n + 1, None);
+            }
+            if suffixes.taken[n].is_some() {
+                return Err(Error::spanless(ErrorTy::DuplicateName(name.to_string())));
+            }
+            suffixes.taken[n] = Some(id);
+            return Ok(());
         }
+        if insert_free(&mut self.map, name.clone(), id) {
+            return Err(Error::spanless(ErrorTy::DuplicateName(name.to_string())));
+        }
+        suffixes.far += 1;
+        Ok(())
+    }
+
+    /// Registers `id` under `name` made [unique](Self::unique), and returns
+    /// the name it got: what [`unique`](Self::unique) then
+    /// [`register`](Self::register) do, without hashing the suffixed name
+    /// or keeping a copy of it. For naming what a lift emits, which is
+    /// nearly every name a body holds.
+    pub fn register_unique(&mut self, name: &str, id: Id) -> Cow<'str, str> {
+        let Self {
+            map,
+            suffixed,
+            labels,
+        } = self;
+        // One probe of the base on the common path: its suffixes exist and
+        // the bare name is taken.
+        let suffixes = match suffixed.get_mut(name) {
+            Some(suffixes) if suffixes.bare => suffixes,
+            Some(suffixes) => {
+                suffixes.bare = true;
+                return register_bare_in(map, labels, name, id);
+            }
+            None => {
+                let taken = match hex_value(name) {
+                    Some(value) => labels.contains_key(&value),
+                    None => map.contains_key(name),
+                };
+                if !taken {
+                    return register_bare_in(map, labels, name, id);
+                }
+                suffixes_of(map, labels, suffixed, name)
+            }
+        };
+        let suffix = first_free_suffix(map, suffixes, name);
+        let at = suffix as usize;
+        if at >= suffixes.taken.len() {
+            suffixes.taken.resize(at + 1, None);
+        }
+        suffixes.taken[at] = Some(id);
+        suffixes.hint = suffix + 1;
+        Cow::Owned(suffixed_name(name, suffix))
     }
 
     /// Remove `name`, keeping the [`unique`](Self::unique) suffix hint exact: if
     /// `name` is a generated `base_<n>` suffix, lower `base`'s hint so the freed
     /// suffix is reconsidered next time.
     pub fn forget(&mut self, name: &str) {
-        self.map.remove(name);
-        if let Some((base, suffix)) = split_generated_suffix(name)
-            && let Some(hint) = self.suffix_hint.get_mut(base)
-        {
-            *hint = (*hint).min(suffix);
+        if let Some((base, n)) = split_generated_suffix(name) {
+            if let Some(suffixes) = self.suffixed.get_mut(base) {
+                suffixes.hint = suffixes.hint.min(n);
+                if let Some(slot) = suffixes.taken.get_mut(n as usize)
+                    && slot.take().is_some()
+                {
+                    return;
+                }
+                if self.map.remove(name).is_some() {
+                    suffixes.far -= 1;
+                }
+            }
+            return;
+        }
+        match hex_value(name) {
+            Some(value) => self.labels.remove(&value),
+            None => self.map.remove(name),
+        };
+        if let Some(suffixes) = self.suffixed.get_mut(name) {
+            suffixes.bare = false;
         }
     }
 
@@ -2701,34 +2861,221 @@ impl<'str, Id: Copy + Eq> NameTable<'str, Id> {
     /// minting many like-named values stays ~O(1) amortized; the chosen suffix is
     /// identical to a naive first-free scan from `1`.
     pub fn unique(&mut self, name: Cow<'str, str>) -> Cow<'str, str> {
-        use std::fmt::Write as _;
-
-        if !self.map.contains_key(&name) {
+        let taken = match self.suffixed.get(name.as_ref()) {
+            Some(suffixes) => suffixes.bare,
+            None => self.bare_taken(&name),
+        };
+        if !taken {
             return name;
         }
-        let base: &str = &name;
-        let mut suffix = self.suffix_hint.get(base).copied().unwrap_or(1).max(1);
-        let mut unique_name = format!("{base}_{suffix}");
-        while self.map.contains_key(unique_name.as_str()) {
-            suffix += 1;
-            unique_name.clear();
-            let _ = write!(unique_name, "{base}_{suffix}");
+        let suffixes = suffixes_of(&self.map, &self.labels, &mut self.suffixed, &name);
+        let suffix = first_free_suffix(&self.map, suffixes, &name);
+        Cow::Owned(suffixed_name(&name, suffix))
+    }
+}
+
+/// The first free suffix of the taken bare name `name`, whose suffixes are
+/// `suffixes`; the hint is left at it.
+fn first_free_suffix<'str, Id>(
+    map: &HashMap<Cow<'str, str>, Id>,
+    suffixes: &mut Suffixes<Id>,
+    name: &str,
+) -> u32 {
+    suffixes.bare = true;
+    let mut suffix = suffixes.hint.max(1);
+    while suffixes
+        .taken
+        .get(suffix as usize)
+        .is_some_and(Option::is_some)
+        || (suffixes.far > 0 && map.contains_key(suffixed_name(name, suffix).as_str()))
+    {
+        suffix += 1;
+    }
+    suffixes.hint = suffix;
+    suffix
+}
+
+/// Registers the free bare name `name` for `id` in its tier, and returns
+/// it owned.
+fn register_bare_in<'str, Id>(
+    map: &mut HashMap<Cow<'str, str>, Id>,
+    labels: &mut HashMap<u64, Id>,
+    name: &str,
+    id: Id,
+) -> Cow<'str, str> {
+    let name: Cow<'str, str> = Cow::Owned(name.to_owned());
+    match hex_value(&name) {
+        Some(value) => {
+            labels.insert(value, id);
         }
-        self.suffix_hint.insert(base.to_string(), suffix);
-        Cow::Owned(unique_name)
+        None => {
+            map.insert(name.clone(), id);
+        }
+    }
+    name
+}
+
+/// Inserts `id` under `key` unless the key is taken, which it reports.
+fn insert_free<K: std::hash::Hash + Eq, Id>(map: &mut HashMap<K, Id>, key: K, id: Id) -> bool {
+    match map.entry(key) {
+        std::collections::hash_map::Entry::Occupied(_) => true,
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(id);
+            false
+        }
+    }
+}
+
+/// The suffixes of `base` in `suffixed`, made if there are none yet.
+fn suffixes_of<'a, 'str, Id>(
+    map: &HashMap<Cow<'str, str>, Id>,
+    labels: &HashMap<u64, Id>,
+    suffixed: &'a mut HashMap<Cow<'str, str>, Suffixes<Id>>,
+    base: &str,
+) -> &'a mut Suffixes<Id> {
+    // Two probes only the first time a base is seen; `entry` would need the
+    // key owned every time.
+    if suffixed.get(base).is_none() {
+        let bare = match hex_value(base) {
+            Some(value) => labels.contains_key(&value),
+            None => map.contains_key(base),
+        };
+        suffixed.insert(
+            Cow::Owned(base.to_string()),
+            Suffixes {
+                taken: Vec::new(),
+                hint: 1,
+                bare,
+                far: 0,
+            },
+        );
+    }
+    suffixed.get_mut(base).expect("just inserted")
+}
+
+/// `base_<suffix>`, without going through the formatting machinery: this is
+/// most of what naming a lifted operation costs.
+fn suffixed_name(base: &str, suffix: u32) -> String {
+    let mut digits = [0u8; 10];
+    let mut at = digits.len();
+    let mut rest = suffix;
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    let mut name = String::with_capacity(base.len() + 1 + digits.len() - at);
+    name.push_str(base);
+    name.push('_');
+    for &digit in &digits[at..] {
+        name.push(char::from(digit));
+    }
+    name
+}
+
+/// `value` in lowercase hex, as `format!("{value:x}")` renders it: the label
+/// of a block at that address. The inverse of [`hex_value`].
+pub(crate) fn hex_name(value: u64) -> String {
+    let mut digits = [0u8; 16];
+    let mut at = digits.len();
+    let mut rest = value;
+    loop {
+        at -= 1;
+        digits[at] = b"0123456789abcdef"[(rest & 0xf) as usize];
+        rest >>= 4;
+        if rest == 0 {
+            break;
+        }
+    }
+    let mut name = String::with_capacity(digits.len() - at);
+    for &digit in &digits[at..] {
+        name.push(char::from(digit));
+    }
+    name
+}
+
+/// The value `name` is the canonical hex rendering of — lowercase, no
+/// leading zero, at most sixteen digits — if it is one.
+fn hex_value(name: &str) -> Option<u64> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 16 || (bytes.len() > 1 && bytes[0] == b'0') {
+        return None;
+    }
+    bytes.iter().try_fold(0u64, |value, &byte| {
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => return None,
+        };
+        Some((value << 4) | u64::from(digit))
+    })
+}
+
+impl<Id: serde::Serialize> serde::Serialize for NameTable<'_, Id>
+where
+    Id: Copy + Eq,
+{
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq as _;
+        let count = self.map.len()
+            + self.labels.len()
+            + self
+                .suffixed
+                .values()
+                .map(|s| s.taken.iter().filter(|t| t.is_some()).count())
+                .sum::<usize>();
+        let mut seq = serializer.serialize_seq(Some(count))?;
+        for entry in self.entries() {
+            seq.serialize_element(&entry)?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de, 'str, Id: serde::Deserialize<'de> + Copy + Eq> serde::Deserialize<'de>
+    for NameTable<'str, Id>
+{
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let entries: Vec<(String, Id)> = serde::Deserialize::deserialize(deserializer)?;
+        let mut table = Self::default();
+        for (name, id) in entries {
+            table
+                .register(Cow::Owned(name), id, None)
+                .map_err(serde::de::Error::custom)?;
+        }
+        Ok(table)
     }
 }
 
 /// Split a generated unique name into its base and numeric suffix, i.e. the
 /// inverse of the `format!("{base}_{suffix}")` in [`NameTable::unique`]:
 /// `"tmp_7"` → `Some(("tmp", 7))`. Returns `None` for names with no `_<digits>`
-/// tail (a bare base, or a name whose tail is empty/non-numeric/overflows).
+/// tail (a bare base, or a name whose tail is empty/non-numeric/overflows),
+/// and for a tail that is not how the suffix renders (`"tmp_07"`).
 fn split_generated_suffix(name: &str) -> Option<(&str, u32)> {
-    let (base, digits) = name.rsplit_once('_')?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    let bytes = name.as_bytes();
+    let mut at = bytes.len();
+    let mut suffix: u32 = 0;
+    let mut scale: u64 = 1;
+    while at > 0 && bytes[at - 1].is_ascii_digit() {
+        at -= 1;
+        let digit = u32::from(bytes[at] - b'0');
+        suffix = suffix.checked_add(u32::try_from(scale.checked_mul(u64::from(digit))?).ok()?)?;
+        scale = scale.checked_mul(10)?;
+    }
+    let digits = bytes.len() - at;
+    if digits == 0 || at == 0 || bytes[at - 1] != b'_' || (digits > 1 && bytes[at] == b'0') {
         return None;
     }
-    Some((base, digits.parse().ok()?))
+    Some((&name[..at - 1], suffix))
 }
 
 /// Rebind pointer provenance carried by a result/parameter type when its
@@ -4120,6 +4467,57 @@ mod tests {
         assert_eq!(take(&mut ctx, id, "tmp"), "tmp_1");
         // ...then continue past the still-taken suffixes.
         assert_eq!(take(&mut ctx, id, "tmp"), "tmp_4");
+    }
+
+    /// The tiers of a [`NameTable`] agree with one flat map of strings,
+    /// whichever tier a name lands in.
+    #[test]
+    fn name_table_tiers_behave_as_one_map() {
+        let mut table: NameTable<'static, u32> = NameTable::default();
+        let register = |table: &mut NameTable<'static, u32>, name: &str, id: u32| {
+            table.register(Cow::Owned(name.to_string()), id, None)
+        };
+        // A label, a base and its suffixes, a non-canonical suffix, and a
+        // far suffix each resolve, and each is taken once.
+        for (name, id) in [
+            ("2100", 1),
+            ("rax", 2),
+            ("rax_2", 3),
+            ("rax_007", 4),
+            ("rax_9000", 5),
+        ] {
+            register(&mut table, name, id).unwrap();
+            assert!(register(&mut table, name, 99).is_err(), "{name} twice");
+            assert_eq!(table.get(name), Some(id), "{name}");
+        }
+        assert_eq!(table.get("02100"), None);
+        assert_eq!(table.get("rax_7"), None);
+        assert_eq!(table.get("rax_1"), None);
+        // Minting skips every taken suffix, whichever tier holds it.
+        assert_eq!(table.register_unique("rax", 6), "rax_1");
+        assert_eq!(table.register_unique("rax", 7), "rax_3");
+        assert_eq!(table.unique(Cow::Borrowed("rbx")), "rbx");
+        assert_eq!(table.register_unique("2100", 8), "2100_1");
+        assert_eq!(table.get("2100_1"), Some(8));
+        // Freeing lowers the hint; a far suffix is skipped when reached.
+        table.forget("rax_2");
+        assert_eq!(table.get("rax_2"), None);
+        assert_eq!(table.register_unique("rax", 9), "rax_2");
+        for id in 10..9010u32 {
+            let name = table.register_unique("rax", id);
+            assert_ne!(name, "rax_9000", "the far suffix is taken");
+        }
+        assert_eq!(table.get("rax_9000"), Some(5));
+        // Every name registered is listed exactly once.
+        let mut names: Vec<String> = table.entries().map(|(name, _)| name.into_owned()).collect();
+        let listed = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), listed);
+        assert_eq!(listed, 5 + 3 + 9000);
+        // Forgetting the bare name frees it for the next mint.
+        table.forget("rax");
+        assert_eq!(table.register_unique("rax", 1), "rax");
     }
 
     // --- split_function_at (strict-local construction verb, ruling 2) ---
