@@ -355,7 +355,7 @@ pub struct LiftCache {
     shard_mask: AtomicU8,
     /// Per view of an `attach variables` table — a slice of each register
     /// it binds — the varnodes, once resolved.
-    tables: Mutex<HashMap<View, Arc<[Option<VarnodeId>]>>>,
+    tables: Mutex<HashMap<View, Arc<TableView>>>,
     capacity: usize,
     entries: AtomicUsize,
     validating: bool,
@@ -625,9 +625,10 @@ impl LiftCache {
         shape: Option<Shape>,
         decoder: &FixedDecoder<'_>,
         flat: bool,
+        scratch: &mut ReplayScratch,
     ) -> Result<Lifted, LiftError> {
         match self.find(lifter, instruction, decoder, flat)? {
-            Lookup::Hit(template, instance) => template.replay(target, &instance),
+            Lookup::Hit(template, instance) => template.replay(target, &instance, scratch),
             Lookup::Uncacheable => lifter.lower(target, instruction, flat),
             Lookup::Unknown => self.miss(lifter, target, instruction, shape, decoder, flat),
         }
@@ -781,6 +782,7 @@ impl LiftCache {
             template.dedupe_literals();
             template.dedupe_varnodes();
             template.record_ties(&registers);
+            template.bake_names(target.context());
             Ok(template)
         };
         let captured = parameters(&shape)
@@ -929,7 +931,16 @@ struct RegTable {
     table: FieldTableId,
     delta: u64,
     size: usize,
-    varnodes: Arc<[Option<VarnodeId>]>,
+    view: Arc<TableView>,
+}
+
+/// The registers one view of a table binds, by the field's value.
+#[derive(Debug, PartialEq, Eq)]
+struct TableView {
+    varnodes: Box<[Option<VarnodeId>]>,
+    /// Each register's name as a load of it is named: lowercase. Resolved
+    /// once here rather than lowercased at every replay.
+    names: Box<[Option<Box<str>>]>,
 }
 
 /// Resolves registers while a template is measured: the specification's
@@ -958,11 +969,12 @@ impl Registers<'_> {
     }
 
     /// The varnodes of the `size` bytes `delta` into each register of
-    /// `table`, by value; resolved once per view.
-    fn table(&self, table: FieldTableId, delta: u64, size: usize) -> Arc<[Option<VarnodeId>]> {
+    /// `table`, by value, with their names; resolved once per view.
+    fn table(&self, table: FieldTableId, delta: u64, size: usize) -> Arc<TableView> {
         let mut tables = self.cache.tables.lock().unwrap();
         Arc::clone(tables.entry((table, delta, size)).or_insert_with(|| {
-            self.spec
+            let varnodes: Box<[Option<VarnodeId>]> = self
+                .spec
                 .attached_registers(table)
                 .iter()
                 .map(|register| {
@@ -971,7 +983,16 @@ impl Registers<'_> {
                     let register = self.spec.register_at(part)?;
                     self.ctx.shared.registers.get(&register).copied()
                 })
-                .collect()
+                .collect();
+            let names = varnodes
+                .iter()
+                .map(|varnode| {
+                    Varnode::from_id(self.ctx, (*varnode)?)
+                        .name()
+                        .map(|name| name.to_lowercase().into_boxed_str())
+                })
+                .collect();
+            Arc::new(TableView { varnodes, names })
         }))
     }
 }
@@ -1826,6 +1847,7 @@ impl Template {
             VarnodeSlot::Register(table) => {
                 let table = &self.reg_tables[table as usize];
                 table
+                    .view
                     .varnodes
                     .get(usize::from(regs[usize::from(table.param)]))
                     .copied()
@@ -1889,7 +1911,14 @@ impl Template {
             };
             let index = self.view_of(was, theirs, regs, registers)?;
             let table = &self.reg_tables[index];
-            let at = |value: u8| table.varnodes.get(usize::from(value)).copied().flatten();
+            let at = |value: u8| {
+                table
+                    .view
+                    .varnodes
+                    .get(usize::from(value))
+                    .copied()
+                    .flatten()
+            };
             if at(self.keys.base_regs[usize::from(table.param)]) != Some(was)
                 || at(regs[usize::from(table.param)]) != Some(theirs)
             {
@@ -1975,7 +2004,7 @@ impl Template {
                 table,
                 delta,
                 size,
-                varnodes: registers.table(table, delta, size),
+                view: registers.table(table, delta, size),
             });
             self.reg_tables.len() - 1
         }))
@@ -2047,7 +2076,7 @@ impl Template {
                         table,
                         delta: 0,
                         size,
-                        varnodes: registers.table(table, 0, size),
+                        view: registers.table(table, 0, size),
                     });
                     self.reg_tables.len() - 1
                 });
@@ -2064,14 +2093,15 @@ impl Template {
         let could_coincide = |a: VarnodeSlot, b: VarnodeSlot| match (a, b) {
             (VarnodeSlot::Register(a), VarnodeSlot::Register(b)) => {
                 let (a, b) = (&self.reg_tables[a as usize], &self.reg_tables[b as usize]);
-                a.varnodes
+                a.view
+                    .varnodes
                     .iter()
                     .flatten()
-                    .any(|v| b.varnodes.contains(&Some(*v)))
+                    .any(|v| b.view.varnodes.contains(&Some(*v)))
             }
             (VarnodeSlot::Register(a), VarnodeSlot::Fixed(v))
             | (VarnodeSlot::Fixed(v), VarnodeSlot::Register(a)) => {
-                self.reg_tables[a as usize].varnodes.contains(&Some(v))
+                self.reg_tables[a as usize].view.varnodes.contains(&Some(v))
             }
             (VarnodeSlot::Fixed(_), VarnodeSlot::Fixed(_)) => false,
         };
@@ -2879,74 +2909,116 @@ impl Template {
         self.callees = callees.iter().map(|&a| Affine::fixed(a, 8)).collect();
     }
 
-    /// Emits the template's IR into `target` as the instruction at
-    /// `instance`.
     /// Lifts the instruction this template is at `instance` into `target`,
-    /// from the record alone.
+    /// from the record alone. `scratch` is the replay's working memory.
     pub(crate) fn replay(
         &self,
         target: &mut LiftTarget<'_, 'static>,
         instance: &Instance,
+        scratch: &mut ReplayScratch,
     ) -> Result<Lifted, LiftError> {
         let mut construction = target.begin(instance.address, self.length)?;
-        self.emit(&mut construction, instance)?;
+        self.emit(&mut construction, instance, scratch)?;
         Ok(construction.commit()?)
+    }
+
+    /// The debug name of the `k`th operation at `instance`: as recorded,
+    /// or that of the register in its varnode slot, which
+    /// [`bake_names`](Self::bake_names) resolved when the slot is fixed.
+    fn name_at(&self, k: usize, instance: &Instance) -> Option<&str> {
+        match self.ops[k].name.as_ref()? {
+            OpName::Fixed(name) => Some(name),
+            OpName::Varnode(slot) => match self.varnodes[*slot as usize] {
+                VarnodeSlot::Register(table) => {
+                    let table = &self.reg_tables[table as usize];
+                    table.view.names[usize::from(instance.regs[usize::from(table.param)])]
+                        .as_deref()
+                }
+                VarnodeSlot::Fixed(_) => {
+                    debug_assert!(false, "a fixed slot's name was not baked");
+                    None
+                }
+            },
+        }
+    }
+
+    /// Resolves the name of every operation named after a fixed varnode
+    /// slot, once the probes have settled which slots are fixed, so a
+    /// replay does not look the register up and lowercase it every time.
+    fn bake_names(&mut self, ctx: &Context<'static>) {
+        for op in &mut self.ops {
+            if let Some(OpName::Varnode(slot)) = op.name
+                && let VarnodeSlot::Fixed(varnode) = self.varnodes[slot as usize]
+            {
+                op.name = Varnode::from_id(ctx, varnode)
+                    .name()
+                    .map(|name| OpName::Fixed(name.to_lowercase().into_boxed_str()));
+            }
+        }
     }
 
     fn emit(
         &self,
         construction: &mut Construction<'_, '_, 'static>,
         instance: &Instance,
+        scratch: &mut ReplayScratch,
     ) -> Result<(), LiftError> {
         let address = instance.address;
+        let ReplayScratch {
+            blocks,
+            externals,
+            callees,
+            types,
+            type_ids,
+            varnodes,
+            literals,
+            spaces,
+            temps,
+            insns,
+        } = scratch;
+        blocks.clear();
+        externals.clear();
+        callees.clear();
+        types.clear();
+        varnodes.clear();
+        literals.clear();
+        spaces.clear();
+        temps.clear();
+        insns.clear();
         // Everything the construction resolves against the module comes
         // before the emitter borrows it: the blocks of other instructions and
         // the callees, exactly as the emitter resolves its plan.
-        let mut blocks: Vec<BlockId> =
-            Vec::with_capacity(1 + self.blocks.len() + self.externals.len());
         blocks.push(construction.entry());
-        let mut externals: Vec<Option<BlockId>> = vec![None; self.externals.len()];
+        externals.resize(self.externals.len(), None);
         for &index in &self.external_order {
             let external = self.externals[index as usize].at(instance);
             externals[index as usize] = Some(construction.block_at(external)?);
         }
-        let externals: Vec<BlockId> = externals
-            .into_iter()
-            .map(|b| b.expect("every external is ordered"))
-            .collect();
-        let mut callees = Vec::with_capacity(self.callees.len());
         for affine in &self.callees {
             callees.push(construction.callee_at(affine.at(instance))?);
         }
 
         let ctx = construction.context();
-        let types: Vec<TypeId> = self.types.iter().map(|key| key.resolve(ctx)).collect();
-        let varnodes: Vec<VarnodeId> = (0..self.varnodes.len())
-            .map(|k| self.varnode_at(k, instance))
-            .collect();
-        let names: Vec<Option<String>> = self
-            .ops
-            .iter()
-            .map(|op| match &op.name {
-                Some(OpName::Fixed(name)) => Some(name.to_string()),
-                Some(OpName::Varnode(k)) => Varnode::from_id(ctx, varnodes[*k as usize])
-                    .name()
-                    .map(str::to_lowercase),
-                None => None,
-            })
-            .collect();
-        let literals: Vec<LocalValueId> = self
-            .literals
-            .iter()
-            .map(|literal| {
-                let ty = literal.ty.resolve(ctx);
-                LocalValueId::Literal(ctx.shared.values.get_or_make_typed_literal(
-                    literal.affine.at(instance),
-                    ty,
-                    literal.affine.size,
-                ))
-            })
-            .collect();
+        types.extend(self.types.iter().map(|key| {
+            // A session sees a handful of types: a scan beats hashing.
+            match type_ids.iter().find(|(known, _)| known == key) {
+                Some(&(_, id)) => id,
+                None => {
+                    let id = key.resolve(ctx);
+                    type_ids.push((*key, id));
+                    id
+                }
+            }
+        }));
+        varnodes.extend((0..self.varnodes.len()).map(|k| self.varnode_at(k, instance)));
+        literals.extend(self.literals.iter().map(|literal| {
+            let ty = literal.ty.resolve(ctx);
+            LocalValueId::Literal(ctx.shared.values.get_or_make_typed_literal(
+                literal.affine.at(instance),
+                ty,
+                literal.affine.size,
+            ))
+        }));
 
         let mut emitter = construction.emitter();
         emitter.set_address(address);
@@ -2958,33 +3030,32 @@ impl Template {
             emitter.block(block);
             blocks.push(block);
         }
-        blocks.extend(externals);
-        let spaces: Vec<LocalTempSpaceId> = self
-            .temp_spaces
-            .iter()
-            .map(|space| {
+        blocks.extend(
+            externals
+                .iter()
+                .map(|b| b.expect("every external is ordered")),
+        );
+        for space in &self.temp_spaces {
+            spaces.push(
                 emitter
                     .push_temp_space(TempSpace::new(None, space.word_size, space.addr_size))
-                    .local
-            })
-            .collect();
-        let temps: Vec<LocalTempId> = self
-            .temps
-            .iter()
-            .map(|temp| {
+                    .local,
+            );
+        }
+        for temp in &self.temps {
+            temps.push(
                 emitter
                     .push_temp(Temp::new(
                         temp.address,
                         temp.size,
                         spaces[temp.space as usize],
                     ))
-                    .local
-            })
-            .collect();
+                    .local,
+            );
+        }
 
-        let mut insns: Vec<InstructionId> = Vec::with_capacity(self.ops.len());
         let mut current = 0u32;
-        for (op, name) in self.ops.iter().zip(names) {
+        for (k, op) in self.ops.iter().enumerate() {
             if op.block != current {
                 current = op.block;
                 emitter.switch_to_block(blocks[current as usize]);
@@ -3028,7 +3099,7 @@ impl Template {
                 .push_mnemonic_with_type_named(
                     mnemonic,
                     types[op.ty as usize],
-                    name.map(Cow::Owned),
+                    self.name_at(k, instance),
                 )
                 .id;
             insns.push(id);
@@ -3047,6 +3118,25 @@ impl Template {
         }
         Ok(())
     }
+}
+
+/// A replay's working memory: what it resolves before emitting, kept by
+/// the session between hits so a hit allocates none of it.
+#[derive(Debug, Default)]
+pub struct ReplayScratch {
+    /// The entry, the instruction's own blocks, then the externals.
+    blocks: Vec<BlockId>,
+    externals: Vec<Option<BlockId>>,
+    callees: Vec<Callee>,
+    types: Vec<TypeId>,
+    /// The session's context's id for each type a template has named,
+    /// once resolved: the context interns types behind a lock.
+    type_ids: Vec<(TypeKey, TypeId)>,
+    varnodes: Vec<VarnodeId>,
+    literals: Vec<LocalValueId>,
+    spaces: Vec<LocalTempSpaceId>,
+    temps: Vec<LocalTempId>,
+    insns: Vec<InstructionId>,
 }
 
 /// What a miss probes: the instruction, how it is decoded and lifted, and

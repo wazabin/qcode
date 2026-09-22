@@ -54,6 +54,10 @@ pub enum AddressTarget {
 #[derive(Debug, Clone, Default)]
 pub struct AddressIndex {
     targets: FxHashMap<u64, AddressTarget>,
+    /// The last address registered, with its target: what a lift asks for
+    /// next, as an instruction's fall-through placeholder becomes the next
+    /// instruction's entry. Answered without a probe of the map.
+    last: Option<(u64, AddressTarget)>,
     /// Addresses known to start a block because something branches to them.
     ///
     /// Learned, not derived: an address becomes a boundary the first time a
@@ -105,6 +109,7 @@ impl AddressIndex {
 
         Self {
             targets,
+            last: None,
             boundaries: rustc_hash::FxHashSet::default(),
             provenance: Some(ctx.revision()),
         }
@@ -114,6 +119,7 @@ impl AddressIndex {
     /// index then describes no context until it is refreshed or marked.
     pub fn clear(&mut self) {
         self.targets.clear();
+        self.last = None;
         self.boundaries.clear();
         self.provenance = None;
     }
@@ -191,6 +197,7 @@ impl AddressIndex {
     /// the caller [vouches](Self::mark_current) for it or refreshes.
     pub fn rehome_block(&mut self, addr: u64, old: BlockId, new: BlockId) {
         self.provenance = None;
+        self.last = None;
         if self.targets.get(&addr) == Some(&AddressTarget::Block(old)) {
             self.targets.insert(addr, AddressTarget::Block(new));
         }
@@ -201,6 +208,7 @@ impl AddressIndex {
     /// the index's provenance, as [`rehome_block`](Self::rehome_block) does.
     pub fn forget(&mut self, address: u64) {
         self.provenance = None;
+        self.last = None;
         self.targets.remove(&address);
     }
 
@@ -212,6 +220,7 @@ impl AddressIndex {
     /// [`rehome_block`](Self::rehome_block) does.
     pub fn set_block(&mut self, address: u64, block: BlockId) {
         self.provenance = None;
+        self.last = Some((address, AddressTarget::Block(block)));
         self.targets.insert(address, AddressTarget::Block(block));
     }
 
@@ -239,11 +248,17 @@ impl AddressIndex {
         target: AddressTarget,
     ) -> Result<()> {
         self.provenance = None;
-        let Some(existing) = self.targets.get(&address).copied() else {
-            self.targets.insert(address, target);
-            return Ok(());
+        self.last = None;
+        let existing = match self.targets.entry(address) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(target);
+                self.last = Some((address, target));
+                return Ok(());
+            }
+            std::collections::hash_map::Entry::Occupied(slot) => *slot.get(),
         };
         if existing == target {
+            self.last = Some((address, target));
             return Ok(());
         }
 
@@ -269,7 +284,10 @@ impl AddressIndex {
 
     /// Returns the live target registered at `address` in this snapshot.
     pub fn get(&self, address: u64) -> Option<AddressTarget> {
-        self.targets.get(&address).copied()
+        match self.last {
+            Some((last, target)) if last == address => Some(target),
+            _ => self.targets.get(&address).copied(),
+        }
     }
 
     /// Returns the function registered at `address`, if that is the target kind.

@@ -44,7 +44,7 @@ use sleigh::{
 
 use crate::{
     FlatPcode, LiftError, SleighLifter,
-    cache::{Instance, LiftCache, Lookup, Template},
+    cache::{Instance, LiftCache, Lookup, ReplayScratch, Template},
     decode::FixedDecoder,
 };
 
@@ -89,6 +89,7 @@ pub struct LiftSession<'l, 'spec> {
     addresses: AddressIndex,
     function: FunctionId,
     cache: Option<Arc<LiftCache>>,
+    scratch: ReplayScratch,
 }
 
 impl<'l, 'spec> LiftSession<'l, 'spec> {
@@ -104,6 +105,7 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
             addresses,
             function,
             cache: None,
+            scratch: ReplayScratch::default(),
         }
     }
 
@@ -128,6 +130,7 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
             addresses,
             function,
             cache: None,
+            scratch: ReplayScratch::default(),
         })
     }
 
@@ -198,7 +201,7 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
         {
             let mut target =
                 LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
-            return template.replay(&mut target, &instance);
+            return template.replay(&mut target, &instance, &mut self.scratch);
         }
         let (instruction, shape) = decode_for(cache, &self.decoder, address, bytes)?;
         let mut target =
@@ -210,6 +213,7 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
             shape,
             &self.decoder,
             flat,
+            &mut self.scratch,
         )
     }
 

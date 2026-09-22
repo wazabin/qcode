@@ -1069,10 +1069,8 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         registered?;
 
         if self.name().is_none() {
-            let label = self
-                .ctx
-                .get_unique_name_in(self.id.func, Cow::Owned(format!("{addr:x}")));
-            self.rename(label)?;
+            self.ctx.bodies[self.id.func]
+                .name_block_unique(self.id.local, &crate::context::hex_name(addr));
         }
         Ok(())
     }

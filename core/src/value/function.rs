@@ -1237,6 +1237,36 @@ impl<'str> FunctionBody<'str> {
         local
     }
 
+    /// Pushes `insn` into the arena, records its operands' uses, links it
+    /// at the end of `block` and, with `name`, names it `name` made unique:
+    /// what a lift does for every operation it emits, in one pass over the
+    /// instruction. The id-less core of the builder's append.
+    pub(crate) fn append_insn(
+        &mut self,
+        block: LocalBlockId,
+        mut insn: Instruction<'str>,
+        name: Option<&str>,
+    ) -> LocalInsnId {
+        let last = self.blocks[block].instructions.last;
+        insn.parent = Some(block);
+        insn.prev = last;
+        insn.next = None;
+        insn.first_use = None;
+        let local = self.insns.push(insn);
+        self.add_operand_uses(local);
+        match last {
+            Some(last) => self.insns[last].next = Some(local),
+            None => self.blocks[block].instructions.first = Some(local),
+        }
+        let list = &mut self.blocks[block].instructions;
+        list.last = Some(local);
+        list.len += 1;
+        if let Some(name) = name {
+            self.name_insn_unique(local, name);
+        }
+        local
+    }
+
     /// Push a fresh block into this body's arena and onto its ownership roster.
     /// Ownership is derived from the storing arena: the returned id's `func` is
     /// this body's own id.
@@ -1980,18 +2010,55 @@ impl<'str> FunctionBody<'str> {
         user: LocalInsnId,
         operand_index: usize,
     ) -> Option<UseId> {
-        if !self.has_use_home(value) {
-            return None;
-        }
         let operand_index = u16::try_from(operand_index).expect("operand index fits a use edge");
-        let next = self.first_use_of(value);
-        let edge = self.uses.push(Use {
+        // One match, and one lookup of the value: this runs for every
+        // operand of every instruction a lift emits.
+        let Self {
+            insns,
+            params,
+            blocks,
+            temps,
+            uses,
+            shared_first_use,
+            ..
+        } = self;
+        let head: &mut Option<UseId> = match value {
+            LocalValueId::Instruction(id) => insns.get_mut(id)?.inner.first_use_mut(),
+            LocalValueId::BlockParam(id) => params.get_mut(id)?.inner.first_use_mut(),
+            LocalValueId::BasicBlock(id) => blocks.get_mut(id)?.inner.first_use_mut(),
+            LocalValueId::Temp(id) => {
+                if usize::from(id) >= temps.len() {
+                    return None;
+                }
+                temps[id].first_use_mut()
+            }
+            LocalValueId::Literal(_)
+            | LocalValueId::Bytes(_)
+            | LocalValueId::Varnode(_)
+            | LocalValueId::Function(_)
+            | LocalValueId::Poison(_) => {
+                let head = shared_first_use.entry(value);
+                let next = match &head {
+                    std::collections::hash_map::Entry::Occupied(head) => Some(*head.get()),
+                    std::collections::hash_map::Entry::Vacant(_) => None,
+                };
+                let edge = uses.push(Use {
+                    value,
+                    user,
+                    operand_index,
+                    next,
+                });
+                *head.or_insert(edge) = edge;
+                return Some(edge);
+            }
+        };
+        let edge = uses.push(Use {
             value,
             user,
             operand_index,
-            next,
+            next: *head,
         });
-        self.set_first_use_of(value, Some(edge));
+        *head = Some(edge);
         Some(edge)
     }
 
@@ -2100,7 +2167,7 @@ impl<'str> FunctionBody<'str> {
     fn add_operand_uses(&mut self, insn: LocalInsnId) {
         // Inline for up to two operands, which covers most instructions.
         let operands = self.insns[insn].mnemonic().args();
-        for (index, value) in operands.into_iter().enumerate() {
+        for (index, &value) in operands.iter().enumerate() {
             self.add_use(value, insn, index);
         }
     }
@@ -2426,14 +2493,42 @@ impl<'str> FunctionBody<'str> {
             id.name_scope_function().is_some(),
             "register_body_name on a global-scoped value {id:?}"
         );
-        if let Some(existing) = self.names.get(&name).map(|id| id.qualify(self.id())) {
-            return if existing == id {
-                Ok(())
-            } else {
-                Err(Error::spanless(ErrorTy::DuplicateName(name.to_string())))
-            };
+        let local = id.localize(self.id());
+        match self.names.register(name, local, old_name) {
+            // Registering a value's own name again is nothing.
+            Err(Error {
+                ty: ErrorTy::DuplicateName(name),
+                ..
+            }) if self.names.get(&name) == Some(local) => Ok(()),
+            registered => registered,
         }
-        self.names.register(name, id.localize(self.id()), old_name)
+    }
+
+    /// Names instruction `local`, which has no name yet, `name` made unique
+    /// in this body — as a lift names a register's load. See
+    /// [`NameTable::register_unique`](crate::context::NameTable::register_unique).
+    pub(crate) fn name_insn_unique(&mut self, local: LocalInsnId, name: &str) {
+        debug_assert!(
+            self.insns[local].name.is_none(),
+            "{local:?} is named already"
+        );
+        let name = self
+            .names
+            .register_unique(name, LocalValueId::Instruction(local));
+        self.insns[local].name = Some(name);
+    }
+
+    /// Names block `local`, which has no name yet, `name` made unique in
+    /// this body.
+    pub(crate) fn name_block_unique(&mut self, local: LocalBlockId, name: &str) {
+        debug_assert!(
+            self.blocks[local].local_name().is_none(),
+            "{local:?} is named already"
+        );
+        let name = self
+            .names
+            .register_unique(name, LocalValueId::BasicBlock(local));
+        self.blocks[local].set_name(Some(name));
     }
 
     /// Gets a reference to a function from its ID

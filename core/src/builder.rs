@@ -629,16 +629,24 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         &mut self,
         mnemonic: Mnemonic,
         type_id: TypeId,
-        name: Option<Cow<'str, str>>,
+        name: Option<&str>,
     ) -> InstructionRef<'str, '_, BodyView<'_, 'str>> {
-        let local = self.store_insn_with_type(mnemonic, type_id);
-        if let Some(name) = name
-            && self.naming()
-        {
-            let unique = self.body.names.unique(name);
-            self.rename_insn_local(local, unique)
-                .expect("the name was deduplicated");
+        let name = name.filter(|_| self.naming());
+        if self.insert_point.is_some() || (name.is_some() && self.body.try_id().is_none()) {
+            let local = self.store_insn_with_type(mnemonic, type_id);
+            if let Some(name) = name {
+                let unique = self.body.names.unique(Cow::Owned(name.to_owned()));
+                self.rename_insn_local(local, unique)
+                    .expect("the name was deduplicated");
+            }
+            return self.insn_ref(local);
         }
+        self.check_open();
+        let mut insn = Instruction::new(type_id, mnemonic);
+        if let Some(address) = self.address {
+            insn.set_address(address);
+        }
+        let local = self.body.append_insn(self.block, insn, name);
         self.insn_ref(local)
     }
 
@@ -656,12 +664,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     /// registry identity, so it drives an id-less (detached) body.
     #[track_caller]
     fn store_insn_with_type(&mut self, mnemonic: Mnemonic, type_id: TypeId) -> LocalInsnId {
-        if self.is_terminated && self.insert_point.is_none() {
-            let block_address = self.body.blocks[self.block].address;
-            if let Some(address) = self.address.or(block_address) {
-                panic!("cannot append instruction to a terminated block at {address:#x}");
-            }
-            panic!("cannot append instruction to a terminated block");
+        if self.insert_point.is_none() {
+            self.check_open();
         }
 
         let block = self.block;
@@ -679,6 +683,18 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         }
 
         local
+    }
+
+    /// Panics when the working block is terminated: nothing appends there.
+    #[track_caller]
+    fn check_open(&self) {
+        if self.is_terminated {
+            let block_address = self.body.blocks[self.block].address;
+            if let Some(address) = self.address.or(block_address) {
+                panic!("cannot append instruction to a terminated block at {address:#x}");
+            }
+            panic!("cannot append instruction to a terminated block");
+        }
     }
 
     fn get_value(&self, id: ValueId) -> ValueRef<'str, '_, BodyView<'_, 'str>> {

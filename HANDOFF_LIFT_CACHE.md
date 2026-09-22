@@ -94,6 +94,61 @@ through every nesting level (~5 per instruction, memmove ~12 %), and
 allocation. Slimming the instance to 80 bytes was estimated at ~5 % of a
 decode and not done.
 
+## 3b. The session's replay (2026-09-21, late)
+
+`LiftSession` hits replay a template into a growing `FunctionBody`, and
+were bounded by that construction, not the cache: on `/usr/bin/bash` linear
+(252 413 instructions, 8.4 operations and 3.8 named operations each) a
+hit-only pass cost 4.55 µs per instruction (0.94 MB/s), 28k retired
+instructions per replay, against 0.18 µs for a scratch (view-only) hit.
+The example's `--warm` now works with `--session` — the warm pass runs in
+a throwaway session — and prints the body's block, instruction and name
+counts. Wall-clock on this laptop is noisy (another agent runs `juju` on
+every core); measure retired instructions net of `--stage none`, or
+callgrind over `/usr/bin/ls`.
+
+What was done, all exact (the replayed function renders the same, names
+included; `sleigh/tests/cache.rs` checks):
+
+- `NameTable` in three tiers: `base_<n>` names as a vector per base
+  indexed by suffix, canonical hex block labels keyed by their value, and
+  a string map for everything else. Minting and registering a suffixed
+  name is one small-table probe and one slot; growing the table no longer
+  re-hashes a hundred thousand heap strings. `register_unique` fuses mint
+  and register; serde is custom (a sequence of pairs; round-trip tests).
+- `FunctionBody::append_insn`: push, use edges, link, name in one verb,
+  behind `Builder::push_mnemonic_with_type_named` (its name is now
+  `Option<&str>`). `add_use` matches once and uses `entry` for shared
+  values.
+- `ReplayScratch` on the session: no per-replay `Vec`s; a per-session
+  `TypeKey → TypeId` memo (a scan; a hash cost more than the interner).
+- Names baked into the template after probing (`Template::bake_names`,
+  lowercase names per register table in `TableView`), so a replay does not
+  look the register up and lowercase it per named operation.
+- `AddressIndex` remembers the last address registered: the fall-through
+  placeholder is the next instruction's entry.
+- `suffixed_name`/`hex_name` by hand; `format!` was a third of naming.
+
+Result: 2.4–2.5 µs per instruction hit-only (1.7 MB/s), 15.0k retired
+instructions per replay; cold 2.9 µs (1.46 MB/s). Not 10 MB/s. Where the
+15k go (exact, from callgrind on `ls`): per operation ~1 000 —
+the 160-byte `Instruction` moved a few times (~120), use edges (~300,
+half of it the `shared_first_use` hash for literal and varnode operands),
+naming (~250 per named: the string allocation and the base probe), the
+mnemonic clone and operand remap (~180), the builder and arena layers
+(~200); per instruction ~2.5k — the fall-through placeholder block with
+its label and index entry (~900), literal interning behind an `RwLock`
+(~400), `begin`/`commit` (~700), the lookup (~800). Misses are a floor of
+their own: 1 983 on bash at ~110 µs each (three decodes, three lifts, a
+capture) is 0.2 s, so cold bash cannot pass ~5 MB/s whatever a hit costs.
+
+Getting the session to 10 MB/s (~1.7k cycles per instruction) is not
+more shaving: it needs a body that costs less per operation — prototype
+`Instruction`s memcpy'd from the template with fix-up lists, use edges
+built from a per-template plan, and no heap string per named operation
+(names as `(base, suffix)` rendered on demand). That changes what a
+`FunctionBody` stores, which is a design decision, not an optimisation.
+
 ## 4. Rejected along the way
 
 - A per-session memo of recent encodings (first eight bytes → template)
@@ -142,8 +197,7 @@ directory and `perf record -g`.
    strategy or arena-allocated instances, in wazabin-sleigh.
 2. **Cheaper hits.** A scratch hit on real code is a few thousand
    instructions of key walk, `Arc` clone and `lifted_at`'s allocations.
-3. **Bulk IR append for `LiftSession` hits**: replay is bounded by per-op
-   construction in `FunctionBody`; a slab-append verb would make it a few
-   memcpys.
+3. **Bulk IR append for `LiftSession` hits**: see §3b — the cheap part is
+   done; the rest is a change to what a body stores per operation.
 4. **`lift_decoded` through the cache** needs the decode context on
    `sleigh::Instruction`.
