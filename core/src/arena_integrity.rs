@@ -141,20 +141,20 @@ pub fn verify_body_arena_integrity_scoped(
                     break;
                 }
                 let insn = &body.insns[insn_local];
-                if insn.parent != Some(local) {
+                if insn.parent.get() != Some(local) {
                     out.push(format!(
                         "block {block_id:?} contains {insn_id:?}, whose parent is {:?}",
-                        insn.parent
+                        insn.parent.get()
                     ));
                 }
-                if insn.prev != prev {
+                if insn.prev.get() != prev {
                     out.push(format!(
                         "block {block_id:?}: {insn_id:?} links back to {:?}, not to {prev:?}",
-                        insn.prev
+                        insn.prev.get()
                     ));
                 }
                 prev = Some(insn_local);
-                at = insn.next;
+                at = insn.next.get();
             }
             if walked != list.len {
                 out.push(format!(
@@ -220,7 +220,7 @@ pub fn verify_body_arena_integrity_scoped(
                 .get(&local)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            if let Some(parent) = insn_entry.parent {
+            if let Some(parent) = insn_entry.parent.get() {
                 if !live_blocks.contains(&parent) {
                     out.push(format!(
                         "instruction {insn_id:?} has removed parent {:?}",
@@ -827,7 +827,7 @@ mod tests {
             .unwrap();
         let x = ctx.block(entry).params[0];
         // Point `@x`'s head at `%y`'s only use (by the return).
-        let y_use = ctx.bodies[f].insns[y.local].first_use;
+        let y_use = ctx.bodies[f].insns[y.local].first_use.get();
         assert!(y_use.is_some());
         ctx.bodies[f].params[x].first_use = y_use;
 

@@ -22,7 +22,7 @@ use crate::{
 use jstd::Identifier;
 
 #[derive(Identifier)]
-pub struct LiteralId(usize);
+pub struct LiteralId(u32);
 
 /// An optional symbolic meaning attached to a [`Literal`].
 ///

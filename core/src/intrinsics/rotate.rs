@@ -138,7 +138,7 @@ fn as_rotate<'ctx, 'str: 'ctx>(
     if name != "rol" && name != "ror" {
         return None;
     }
-    let &[x, k] = intr.args.as_slice() else {
+    let &[x, k] = &*intr.args else {
         return None;
     };
     // Operands are stored bare-local; qualify with the intrinsic's own function.
@@ -199,7 +199,7 @@ fn simplify_rotate(
             let rotate = IntrinsicApp {
                 id,
                 // Expression operands live in the same body; store bare-local.
-                args: vec![x.strip_func(), reduced.strip_func()],
+                args: Box::new([x.strip_func(), reduced.strip_func()]),
             };
             return Some(Simplified::Expression(Mnemonic::Intrinsic(rotate)));
         }

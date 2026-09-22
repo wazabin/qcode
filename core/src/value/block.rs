@@ -118,8 +118,8 @@ impl WithUsers for BasicBlock<'_> {
         self.first_use
     }
 
-    fn first_use_mut(&mut self) -> &mut Option<UseId> {
-        &mut self.first_use
+    fn set_first_use(&mut self, head: Option<UseId>) {
+        self.first_use = head;
     }
 }
 
@@ -662,7 +662,7 @@ where
         let local = self.front?;
         let id = InstructionId::new(self.func, local);
         self.remaining -= 1;
-        self.front = self.view.instruction(id).next;
+        self.front = self.view.instruction(id).next.get();
         Some(InstructionRef::new(self.view, id))
     }
 
@@ -682,7 +682,7 @@ where
         let local = self.back?;
         let id = InstructionId::new(self.func, local);
         self.remaining -= 1;
-        self.back = self.view.instruction(id).prev;
+        self.back = self.view.instruction(id).prev.get();
         Some(InstructionRef::new(self.view, id))
     }
 }
@@ -986,7 +986,7 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     pub fn insert_insn_after(&mut self, after_id: InstructionId, insn_id: InstructionId) {
         let block = self.id;
         assert_eq!(
-            self.ctx.body(block.func).insn(after_id).parent,
+            self.ctx.body(block.func).insn(after_id).parent.get(),
             Some(block.local),
             "after_id not found in block"
         );

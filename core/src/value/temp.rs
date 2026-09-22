@@ -16,13 +16,13 @@ use crate::value::{
 
 /// Function-local temporary-space index.
 #[derive(Identifier)]
-pub struct LocalTempSpaceId(usize);
+pub struct LocalTempSpaceId(u32);
 
 crate::composite_id!(TempSpaceId, LocalTempSpaceId);
 
 /// Function-local temporary-value index.
 #[derive(Identifier)]
-pub struct LocalTempId(usize);
+pub struct LocalTempId(u32);
 
 crate::composite_id!(TempId, LocalTempId);
 
@@ -75,8 +75,8 @@ impl WithUsers for Temp<'_> {
         self.first_use
     }
 
-    fn first_use_mut(&mut self) -> &mut Option<UseId> {
-        &mut self.first_use
+    fn set_first_use(&mut self, head: Option<UseId>) {
+        self.first_use = head;
     }
 }
 

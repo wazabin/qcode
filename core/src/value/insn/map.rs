@@ -30,7 +30,7 @@ pub struct Map {
     pub src: LocalValueId,
     /// Loop-invariant values the body closes over (the element is supplied
     /// per-lane by the map itself). Empty for a closed body.
-    pub captures: Vec<LocalValueId>,
+    pub captures: Box<[LocalValueId]>,
 }
 
 impl MnemonicKind for Map {
@@ -173,6 +173,6 @@ mod tests {
             Callee::Real(body),
             "body symbol is untouched by replace_value"
         );
-        assert_eq!(r.captures, vec![cap.strip_func()]);
+        assert_eq!(&*r.captures, [cap.strip_func()]);
     }
 }

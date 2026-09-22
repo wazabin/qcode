@@ -36,7 +36,7 @@ pub(crate) struct Use {
 /// A value that owns the head of its own use list.
 pub(crate) trait WithUsers {
     fn first_use(&self) -> Option<UseId>;
-    fn first_use_mut(&mut self) -> &mut Option<UseId>;
+    fn set_first_use(&mut self, head: Option<UseId>);
 }
 
 /// Body-local slab storage for use edges. Removed slots are reused; `UseId`

@@ -155,7 +155,7 @@ fn selective_replacement_picks_edges_by_user_and_operand() {
 
     // Only the uses in `<other>`.
     ctx.bodies[f].replace_uses_where(ValueId::Instruction(a), ten, |body, user, _| {
-        body.insn(user).parent == Some(other.local)
+        body.insn(user).parent.get() == Some(other.local)
     });
     assert_clean(&ctx);
     assert_eq!(users(&ctx, f, a), vec![here]);

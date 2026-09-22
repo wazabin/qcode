@@ -551,7 +551,7 @@ pub trait Interpreter {
             // ===== Other operations =====
             Mnemonic::PCodeOp(op) => {
                 let name = self.ctx().shared.pcode_ops[op.id].clone();
-                match (name.as_ref(), op.args.as_slice()) {
+                match (name.as_ref(), &*op.args) {
                     ("swap_bytes", [src]) => Some(self.get_value(src.qualify(func))?.byte_swap()?),
                     // SLEIGH uses this zero-argument user-op as an explicit
                     // write of an architecturally undefined value. Concrete

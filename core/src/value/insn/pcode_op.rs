@@ -16,7 +16,7 @@ pub const VM_INTERRUPT: &str = "vm.interrupt";
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PCodeOp {
     pub id: PCodeOpId,
-    pub args: Vec<LocalValueId>,
+    pub args: Box<[LocalValueId]>,
     pub dst: Option<LocalValueId>,
 }
 

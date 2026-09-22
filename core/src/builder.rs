@@ -390,7 +390,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     /// Panics if `before_id` is not an instruction in the current block.
     pub fn set_insert_point_before(&mut self, before_id: InstructionId) {
         assert_eq!(
-            self.body.insns[before_id.local].parent,
+            self.body.insns[before_id.local].parent.get(),
             Some(self.block),
             "before_id not found in block"
         );
@@ -1602,7 +1602,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             Mnemonic::Map(Map {
                 body: body.into(),
                 src,
-                captures,
+                captures: captures.into(),
             }),
             result_type,
         )
@@ -1683,7 +1683,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 body: body.into(),
                 init,
                 src,
-                captures,
+                captures: captures.into(),
             }),
             result_type,
         )
@@ -1717,7 +1717,13 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                     .map(|&arg| self.ltype_of(arg))
                     .unwrap_or_else(|| self.shr().types.get_or_make_int(0))
             });
-        self.store_insn_with_type(Mnemonic::Apply(Apply { target, args }), ty)
+        self.store_insn_with_type(
+            Mnemonic::Apply(Apply {
+                target,
+                args: args.into(),
+            }),
+            ty,
+        )
     }
 
     /// The type of the value returned by `body`'s first `Return`, or `None` if
@@ -1934,7 +1940,14 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             .map(|arg| self.ensure_local_local(arg))
             .collect::<Vec<_>>();
 
-        self.store_insn(Mnemonic::PCodeOp(PCodeOp { id, args, dst }), size)
+        self.store_insn(
+            Mnemonic::PCodeOp(PCodeOp {
+                id,
+                args: args.into(),
+                dst,
+            }),
+            size,
+        )
     }
 
     /// Creates a pure intrinsic instruction (e.g. `rol`, `ror`, `enumerate`).
@@ -1983,7 +1996,13 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             .collect::<Vec<_>>();
         let type_id = desc.result_type(&self.shr().types, &arg_types);
 
-        self.store_insn_with_type(Mnemonic::Intrinsic(IntrinsicApp { id, args }), type_id)
+        self.store_insn_with_type(
+            Mnemonic::Intrinsic(IntrinsicApp {
+                id,
+                args: args.into(),
+            }),
+            type_id,
+        )
     }
 
     // --- Loads & Stores ---
@@ -2228,7 +2247,13 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     ) -> LocalInsnId {
         let current = self.block;
         self.add_cfg_edge_local(current, target);
-        let id = self.store_insn(Mnemonic::Branch(Branch { target, args }), 0);
+        let id = self.store_insn(
+            Mnemonic::Branch(Branch {
+                target,
+                args: args.into(),
+            }),
+            0,
+        );
         self.is_terminated = true;
         id
     }
@@ -2294,10 +2319,10 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         let id = self.store_insn(
             Mnemonic::CBranch(CBranch {
                 success_block: target,
-                success_args: target_args,
+                success_args: target_args.into(),
                 condition,
                 failure_block: fallthrough,
-                failure_args: fallthrough_args,
+                failure_args: fallthrough_args.into(),
             }),
             0,
         );
@@ -2353,11 +2378,11 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                     .map(|(value, target, args)| SwitchArm {
                         value,
                         target,
-                        args,
+                        args: args.into(),
                     })
                     .collect(),
                 default: default_block,
-                default_args,
+                default_args: default_args.into(),
             }),
             0,
         );
@@ -2410,8 +2435,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         let id = self.store_insn(
             Mnemonic::Call(Call {
                 target,
-                args,
-                clobbers: vec![],
+                args: args.into(),
+                clobbers: Box::new([]),
                 tag: Default::default(),
             }),
             0,
@@ -2454,7 +2479,13 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         args: Vec<LocalValueId>,
     ) -> LocalInsnId {
         let target = target.into();
-        let id = self.store_insn(Mnemonic::TailCall(TailCall { target, args }), 0);
+        let id = self.store_insn(
+            Mnemonic::TailCall(TailCall {
+                target,
+                args: args.into(),
+            }),
+            0,
+        );
         self.is_terminated = true;
         id
     }
@@ -2485,7 +2516,13 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         ptr: LocalValueId,
         args: Vec<LocalValueId>,
     ) -> LocalInsnId {
-        let id = self.store_insn(Mnemonic::CallInd(CallInd { ptr, args }), 0);
+        let id = self.store_insn(
+            Mnemonic::CallInd(CallInd {
+                ptr,
+                args: args.into(),
+            }),
+            0,
+        );
         self.is_terminated = true;
         id
     }

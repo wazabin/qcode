@@ -119,6 +119,7 @@ pub mod bytes;
 pub mod function;
 pub mod insn;
 pub mod interner;
+pub(crate) mod link;
 pub mod literal;
 pub mod poison;
 pub mod registry;

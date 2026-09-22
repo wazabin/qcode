@@ -78,8 +78,8 @@ impl WithUsers for BlockParam<'_> {
         self.first_use
     }
 
-    fn first_use_mut(&mut self) -> &mut Option<UseId> {
-        &mut self.first_use
+    fn set_first_use(&mut self, head: Option<UseId>) {
+        self.first_use = head;
     }
 }
 

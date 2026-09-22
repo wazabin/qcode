@@ -25,7 +25,7 @@ use crate::{
 use jstd::Identifier;
 
 #[derive(Identifier)]
-pub struct BytesId(usize);
+pub struct BytesId(u32);
 
 /// A compile-time opaque byte blob stored in a [`Context`](crate::context::Context).
 ///

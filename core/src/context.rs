@@ -1762,7 +1762,7 @@ impl<'str> Context<'str> {
                 insn,
                 Mnemonic::TailCall(TailCall {
                     target: Callee::Real(callee),
-                    args: vec![],
+                    args: Box::new([]),
                 }),
             );
         }
@@ -3775,8 +3775,8 @@ mod tests {
             call_id,
             Mnemonic::Call(Call {
                 target: Callee::Real(target),
-                args: vec![],
-                clobbers: vec![],
+                args: Box::new([]),
+                clobbers: Box::new([]),
                 tag: Default::default(),
             }),
         );
@@ -3919,7 +3919,7 @@ mod tests {
 
         // Manually detach from block without using remove_instruction,
         // simulating an instruction with no parent.
-        ctx.instruction_mut(load_id).parent = None;
+        ctx.instruction_mut(load_id).parent.set(None);
 
         // Should not panic even though parent is None.
         ctx.remove_instruction(load_id);

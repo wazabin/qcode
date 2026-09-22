@@ -675,7 +675,7 @@ impl Iterator for InsnIds<'_, '_> {
         }
         let local = self.front?;
         self.remaining -= 1;
-        self.front = self.body.insns[local].next;
+        self.front = self.body.insns[local].next.get();
         Some(local)
     }
 
@@ -691,7 +691,7 @@ impl DoubleEndedIterator for InsnIds<'_, '_> {
         }
         let local = self.back?;
         self.remaining -= 1;
-        self.back = self.body.insns[local].prev;
+        self.back = self.body.insns[local].prev.get();
         Some(local)
     }
 }
@@ -1228,10 +1228,10 @@ impl<'str> FunctionBody<'str> {
         // A caller may clone a linked instruction as its template; the copy is
         // a new value in no block, used by nothing, whatever the original's
         // links said.
-        insn.parent = None;
-        insn.prev = None;
-        insn.next = None;
-        insn.first_use = None;
+        insn.parent.set(None);
+        insn.prev.set(None);
+        insn.next.set(None);
+        insn.first_use.set(None);
         let local = self.insns.push(insn);
         self.add_operand_uses(local);
         local
@@ -1248,14 +1248,14 @@ impl<'str> FunctionBody<'str> {
         name: Option<&str>,
     ) -> LocalInsnId {
         let last = self.blocks[block].instructions.last;
-        insn.parent = Some(block);
-        insn.prev = last;
-        insn.next = None;
-        insn.first_use = None;
+        insn.parent.set(Some(block));
+        insn.prev.set(last);
+        insn.next.set(None);
+        insn.first_use.set(None);
         let local = self.insns.push(insn);
         self.add_operand_uses(local);
         match last {
-            Some(last) => self.insns[last].next = Some(local),
+            Some(last) => self.insns[last].next.set(Some(local)),
             None => self.blocks[block].instructions.first = Some(local),
         }
         let list = &mut self.blocks[block].instructions;
@@ -1384,12 +1384,12 @@ impl<'str> FunctionBody<'str> {
         let last = self.blocks[block].instructions.last;
         {
             let i = &mut self.insns[insn];
-            i.parent = Some(block);
-            i.prev = last;
-            i.next = None;
+            i.parent.set(Some(block));
+            i.prev.set(last);
+            i.next.set(None);
         }
         match last {
-            Some(last) => self.insns[last].next = Some(insn),
+            Some(last) => self.insns[last].next.set(Some(insn)),
             None => self.blocks[block].instructions.first = Some(insn),
         }
         let list = &mut self.blocks[block].instructions;
@@ -1405,20 +1405,20 @@ impl<'str> FunctionBody<'str> {
         }
         self.unlink(insn);
         debug_assert_eq!(
-            self.insns[before].parent,
+            self.insns[before].parent.get(),
             Some(block),
             "{before:?} is not in {block:?}"
         );
-        let prev = self.insns[before].prev;
+        let prev = self.insns[before].prev.get();
         {
             let i = &mut self.insns[insn];
-            i.parent = Some(block);
-            i.prev = prev;
-            i.next = Some(before);
+            i.parent.set(Some(block));
+            i.prev.set(prev);
+            i.next.set(Some(before));
         }
-        self.insns[before].prev = Some(insn);
+        self.insns[before].prev.set(Some(insn));
         match prev {
-            Some(prev) => self.insns[prev].next = Some(insn),
+            Some(prev) => self.insns[prev].next.set(Some(insn)),
             None => self.blocks[block].instructions.first = Some(insn),
         }
         self.blocks[block].instructions.len += 1;
@@ -1427,11 +1427,11 @@ impl<'str> FunctionBody<'str> {
     /// Links `insn` immediately after `after`, which must be in `block`.
     pub fn link_after(&mut self, block: LocalBlockId, after: LocalInsnId, insn: LocalInsnId) {
         debug_assert_eq!(
-            self.insns[after].parent,
+            self.insns[after].parent.get(),
             Some(block),
             "{after:?} is not in {block:?}"
         );
-        match self.insns[after].next {
+        match self.insns[after].next.get() {
             Some(next) => self.link_before(block, next, insn),
             None => self.link_last(block, insn),
         }
@@ -1448,11 +1448,11 @@ impl<'str> FunctionBody<'str> {
             (block, i.prev.take(), i.next.take())
         };
         match prev {
-            Some(prev) => self.insns[prev].next = next,
+            Some(prev) => self.insns[prev].next.set(next),
             None => self.blocks[block].instructions.first = next,
         }
         match next {
-            Some(next) => self.insns[next].prev = prev,
+            Some(next) => self.insns[next].prev.set(prev),
             None => self.blocks[block].instructions.last = prev,
         }
         self.blocks[block].instructions.len -= 1;
@@ -1478,9 +1478,9 @@ impl<'str> FunctionBody<'str> {
         let ids: Vec<LocalInsnId> = self.insn_ids(block).collect();
         for &id in &ids {
             let i = &mut self.insns[id];
-            i.parent = None;
-            i.prev = None;
-            i.next = None;
+            i.parent.set(None);
+            i.prev.set(None);
+            i.next.set(None);
         }
         self.blocks[block].instructions = InsnList::default();
         ids
@@ -1529,7 +1529,7 @@ impl<'str> FunctionBody<'str> {
         insn: InstructionId,
     ) {
         assert_eq!(
-            self.insn(before).parent,
+            self.insn(before).parent.get(),
             Some(block.local),
             "before not in block"
         );
@@ -1561,12 +1561,13 @@ impl<'str> FunctionBody<'str> {
         );
 
         assert!(
-            self.insn(insn).parent.is_some(),
+            self.insn(insn).parent.get().is_some(),
             "moved instruction must belong to a block"
         );
         let target = self
             .insn(before)
             .parent
+            .get()
             .expect("anchor instruction must belong to a block");
         self.unlink(insn.local);
         self.link_before(target, before.local, insn.local);
@@ -1760,7 +1761,7 @@ impl<'str> FunctionBody<'str> {
         let (parent, name, is_terminator) = {
             let insn = self.insn(id);
             (
-                insn.parent.map(|l| BlockId::new(self.id(), l)),
+                insn.parent.get().map(|l| BlockId::new(self.id(), l)),
                 insn.name.clone(),
                 insn.mnemonic().is_terminator(),
             )
@@ -1872,7 +1873,7 @@ impl<'str> FunctionBody<'str> {
             "instruction belongs to another function"
         );
         assert_eq!(
-            self.insn(insn).parent,
+            self.insn(insn).parent.get(),
             Some(block.local),
             "split point is not in the block"
         );
@@ -1880,7 +1881,7 @@ impl<'str> FunctionBody<'str> {
         let mut moved: Vec<LocalInsnId> = Vec::new();
         let mut at = Some(insn.local);
         while let Some(local) = at {
-            at = self.insns[local].next;
+            at = self.insns[local].next.get();
             moved.push(local);
         }
         for &local in &moved {
@@ -1978,10 +1979,10 @@ impl<'str> FunctionBody<'str> {
     /// storage for `value`: check [`has_use_home`](Self::has_use_home) first.
     fn set_first_use_of(&mut self, value: LocalValueId, head: Option<UseId>) {
         match value {
-            LocalValueId::Instruction(id) => *self.insns[id].first_use_mut() = head,
-            LocalValueId::BlockParam(id) => *self.params[id].first_use_mut() = head,
-            LocalValueId::BasicBlock(id) => *self.blocks[id].first_use_mut() = head,
-            LocalValueId::Temp(id) => *self.temps[id].first_use_mut() = head,
+            LocalValueId::Instruction(id) => self.insns[id].set_first_use(head),
+            LocalValueId::BlockParam(id) => self.params[id].set_first_use(head),
+            LocalValueId::BasicBlock(id) => self.blocks[id].set_first_use(head),
+            LocalValueId::Temp(id) => self.temps[id].set_first_use(head),
             LocalValueId::Literal(_)
             | LocalValueId::Bytes(_)
             | LocalValueId::Varnode(_)
@@ -2022,15 +2023,15 @@ impl<'str> FunctionBody<'str> {
             shared_first_use,
             ..
         } = self;
-        let head: &mut Option<UseId> = match value {
-            LocalValueId::Instruction(id) => insns.get_mut(id)?.inner.first_use_mut(),
-            LocalValueId::BlockParam(id) => params.get_mut(id)?.inner.first_use_mut(),
-            LocalValueId::BasicBlock(id) => blocks.get_mut(id)?.inner.first_use_mut(),
+        let holder: &mut dyn WithUsers = match value {
+            LocalValueId::Instruction(id) => insns.get_mut(id)?.inner,
+            LocalValueId::BlockParam(id) => params.get_mut(id)?.inner,
+            LocalValueId::BasicBlock(id) => blocks.get_mut(id)?.inner,
             LocalValueId::Temp(id) => {
                 if usize::from(id) >= temps.len() {
                     return None;
                 }
-                temps[id].first_use_mut()
+                &mut temps[id]
             }
             LocalValueId::Literal(_)
             | LocalValueId::Bytes(_)
@@ -2056,9 +2057,9 @@ impl<'str> FunctionBody<'str> {
             value,
             user,
             operand_index,
-            next: *head,
+            next: holder.first_use(),
         });
-        *head = Some(edge);
+        holder.set_first_use(Some(edge));
         Some(edge)
     }
 
@@ -2251,16 +2252,16 @@ impl<'str> FunctionBody<'str> {
         self.uses.clear();
         self.shared_first_use.clear();
         for mut insn in self.insns.iter_mut() {
-            *insn.first_use_mut() = None;
+            insn.set_first_use(None);
         }
         for mut param in self.params.iter_mut() {
-            *param.first_use_mut() = None;
+            param.set_first_use(None);
         }
         for mut block in self.blocks.iter_mut() {
-            *block.first_use_mut() = None;
+            block.set_first_use(None);
         }
         for mut temp in self.temps.iter_mut() {
-            *temp.first_use_mut() = None;
+            temp.set_first_use(None);
         }
         let live: Vec<LocalInsnId> = self.insns.iter().map(|insn| insn.id).collect();
         for insn in live {

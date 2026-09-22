@@ -31,7 +31,7 @@ use crate::{
 pub mod register;
 
 #[derive(Identifier)]
-pub struct VarnodeId(usize);
+pub struct VarnodeId(u32);
 
 /// A named, typed reference to a specific location in a memory [`Space`].
 ///

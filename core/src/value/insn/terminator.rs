@@ -50,7 +50,7 @@ pub struct Branch {
     /// own `id.func`.
     pub target: LocalBlockId,
     /// Arguments passed to the target block's parameters.
-    pub args: Vec<LocalValueId>,
+    pub args: Box<[LocalValueId]>,
 }
 
 impl MnemonicKind for Branch {
@@ -73,7 +73,7 @@ pub struct SwitchArm {
     /// [`Branch::target`].
     pub target: LocalBlockId,
     /// Arguments passed to `target`'s parameters when this arm is taken.
-    pub args: Vec<LocalValueId>,
+    pub args: Box<[LocalValueId]>,
 }
 
 /// Multi-way dispatch on an integer scrutinee: the resolved form of a jump
@@ -96,11 +96,11 @@ pub struct Switch {
     /// The value dispatched on (the table index, after any bias).
     pub scrutinee: LocalValueId,
     /// Arms in table order. Case values are pairwise distinct.
-    pub cases: Vec<SwitchArm>,
+    pub cases: Box<[SwitchArm]>,
     /// Where an unlisted scrutinee value goes, when that is representable.
     pub default: Option<LocalBlockId>,
     /// Arguments passed to `default`'s parameters.
-    pub default_args: Vec<LocalValueId>,
+    pub default_args: Box<[LocalValueId]>,
 }
 
 impl MnemonicKind for Switch {
@@ -142,7 +142,7 @@ pub struct TailCall {
     pub target: Callee,
     /// Values passed to the callee, one per inferred callee input, in order.
     /// Empty on the freshly-lifted IR; populated once the call interface is known.
-    pub args: Vec<LocalValueId>,
+    pub args: Box<[LocalValueId]>,
 }
 
 impl MnemonicKind for TailCall {
@@ -159,7 +159,7 @@ impl MnemonicKind for TailCall {
 pub struct Apply {
     pub target: Callee,
     /// Values passed to the lambda, one per root block param, in order.
-    pub args: Vec<LocalValueId>,
+    pub args: Box<[LocalValueId]>,
 }
 
 impl MnemonicKind for Apply {
@@ -214,12 +214,12 @@ impl CallTag {
 pub struct Call {
     pub target: Callee,
     /// Values passed to the callee, one per inferred callee input, in order.
-    pub args: Vec<LocalValueId>,
+    pub args: Box<[LocalValueId]>,
     /// Register / memory locations the call may write or alias (the callee's
     /// clobbered set plus escaping pointer arguments). These are *defs*, not
     /// reads: they are intentionally excluded from `MnemonicKind::args` so
     /// they do not participate in use-def bookkeeping.
-    pub clobbers: Vec<LocalValueId>,
+    pub clobbers: Box<[LocalValueId]>,
     /// Binding-convention tag (argpromote v2). Serialized so rewritten regpure
     /// sites persist; older snapshots default it to `Opaque` (see [`CallTag`]).
     #[serde(default)]
@@ -239,7 +239,7 @@ impl MnemonicKind for Call {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CallInd {
     pub ptr: LocalValueId,
-    pub args: Vec<LocalValueId>,
+    pub args: Box<[LocalValueId]>,
 }
 
 impl MnemonicKind for CallInd {
@@ -259,12 +259,12 @@ pub struct CBranch {
     /// terminator — see [`Branch::target`]).
     pub success_block: LocalBlockId,
     /// Arguments passed to `success_block`'s parameters when the branch is taken.
-    pub success_args: Vec<LocalValueId>,
+    pub success_args: Box<[LocalValueId]>,
     /// Fall-through CFG successor (bare body-local index; same arena as this
     /// terminator).
     pub failure_block: LocalBlockId,
     /// Arguments passed to `failure_block`'s parameters when the branch falls through.
-    pub failure_args: Vec<LocalValueId>,
+    pub failure_args: Box<[LocalValueId]>,
 }
 
 impl MnemonicKind for CBranch {
@@ -360,8 +360,8 @@ mod tests {
             func,
             Mnemonic::Call(super::Call {
                 target: Callee::Minted(7),
-                args: vec![],
-                clobbers: vec![],
+                args: Box::new([]),
+                clobbers: Box::new([]),
                 tag: Default::default(),
             }),
             0,
@@ -510,8 +510,8 @@ mod tests {
             call_id,
             Mnemonic::Call(super::Call {
                 target: Callee::Real(callee),
-                args: vec![first.strip_func(), second.strip_func()],
-                clobbers: vec![],
+                args: Box::new([first.strip_func(), second.strip_func()]),
+                clobbers: Box::new([]),
                 tag: Default::default(),
             }),
         );
@@ -562,8 +562,8 @@ mod tests {
             call_id,
             Mnemonic::Call(super::Call {
                 target: Callee::Real(callee),
-                args: vec![arg.strip_func()],
-                clobbers: vec![],
+                args: Box::new([arg.strip_func()]),
+                clobbers: Box::new([]),
                 tag: Default::default(),
             }),
         );
@@ -752,11 +752,11 @@ mod tests {
             panic!("expected cbranch");
         };
         assert_eq!(
-            cbranch.success_args,
+            &*cbranch.success_args,
             [ValueId::BlockParam(then_arg).strip_func()]
         );
         assert_eq!(
-            cbranch.failure_args,
+            &*cbranch.failure_args,
             [ValueId::BlockParam(else_arg).strip_func()]
         );
         assert_ne!(cbranch.success_block, cbranch.failure_block);
@@ -801,7 +801,7 @@ mod tests {
             panic!("expected branch");
         };
         assert_eq!(
-            branch.args,
+            &*branch.args,
             [
                 ValueId::BlockParam(b).strip_func(),
                 ValueId::BlockParam(a).strip_func()
