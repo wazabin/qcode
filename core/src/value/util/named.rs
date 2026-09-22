@@ -64,7 +64,7 @@ mod tests {
         var.rename("var".into()).unwrap();
 
         assert_eq!(var.ctx().get_named("var"), Some(var.id()));
-        assert_eq!(var.name().as_deref(), Some("var"));
+        assert_eq!(var.name().unwrap(), "var");
     }
 
     #[test]
@@ -78,12 +78,12 @@ mod tests {
         var.rename("var".into()).unwrap();
 
         assert_eq!(var.ctx().get_named("var"), Some(var.id()));
-        assert_eq!(var.name().as_deref(), Some("var"));
+        assert_eq!(var.name().unwrap(), "var");
 
         var.rename("var".into()).unwrap();
 
         assert_eq!(var.ctx().get_named("var"), Some(var.id()));
-        assert_eq!(var.name().as_deref(), Some("var"));
+        assert_eq!(var.name().unwrap(), "var");
     }
 
     #[test]

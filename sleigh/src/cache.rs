@@ -321,6 +321,16 @@ impl Node {
 }
 
 /// The answer of [`LiftCache::find`].
+/// How a cache lowers: the lifter and the decoder it lowers with, and
+/// whether control flow is flattened. One instruction's worth of context,
+/// which the key and every probe need.
+#[derive(Clone, Copy)]
+pub(crate) struct Lowering<'a, 'spec> {
+    pub(crate) lifter: &'a SleighLifter<'spec>,
+    pub(crate) decoder: &'a FixedDecoder<'spec>,
+    pub(crate) flat: bool,
+}
+
 pub(crate) enum Lookup {
     /// The shape's template, instantiated for the instruction.
     Hit(Arc<Template>, Instance),
@@ -615,22 +625,19 @@ impl LiftCache {
 
     /// Lifts `instruction` into `target` through the cache: a replay when
     /// its shape is known, a real lift — probed and remembered — otherwise.
-    /// `decoder` decoded the instruction and decodes its probes; `shape` is
-    /// the instruction's, when that decode reported it.
+    /// `shape` is the instruction's, when its decode reported it.
     pub(crate) fn lower(
         &self,
-        lifter: &SleighLifter<'_>,
+        how: Lowering<'_, '_>,
         target: &mut LiftTarget<'_, 'static>,
         instruction: &Decoded<'_, '_>,
         shape: Option<Shape>,
-        decoder: &FixedDecoder<'_>,
-        flat: bool,
         scratch: &mut ReplayScratch,
     ) -> Result<Lifted, LiftError> {
-        match self.find(lifter, instruction, decoder, flat)? {
+        match self.find(how, instruction)? {
             Lookup::Hit(template, instance) => template.replay(target, &instance, scratch),
-            Lookup::Uncacheable => lifter.lower(target, instruction, flat),
-            Lookup::Unknown => self.miss(lifter, target, instruction, shape, decoder, flat),
+            Lookup::Uncacheable => how.lifter.lower(target, instruction, how.flat),
+            Lookup::Unknown => self.miss(how, target, instruction, shape),
         }
     }
 
@@ -646,11 +653,14 @@ impl LiftCache {
     /// instruction is not lifted.
     pub(crate) fn find(
         &self,
-        lifter: &SleighLifter<'_>,
+        how: Lowering<'_, '_>,
         instruction: &Decoded<'_, '_>,
-        decoder: &FixedDecoder<'_>,
-        flat: bool,
     ) -> Result<Lookup, LiftError> {
+        let Lowering {
+            lifter,
+            decoder,
+            flat,
+        } = how;
         self.check(lifter)?;
         let mut buffer = [0u8; MAX_PREFIX];
         let Some(prefix) = prefix(&mut buffer, flat, decoder.context()) else {
@@ -688,12 +698,15 @@ impl LiftCache {
     /// the decoded path counts.
     pub(crate) fn find_undecoded(
         &self,
-        lifter: &SleighLifter<'_>,
-        decoder: &FixedDecoder<'_>,
-        flat: bool,
+        how: Lowering<'_, '_>,
         address: u64,
         bytes: &[u8],
     ) -> Result<Option<(Arc<Template>, Instance)>, LiftError> {
+        let Lowering {
+            lifter,
+            decoder,
+            flat,
+        } = how;
         self.check(lifter)?;
         if self.validating {
             return Ok(None);
@@ -716,13 +729,16 @@ impl LiftCache {
     /// its decode reported one; otherwise it is decoded again for it.
     pub(crate) fn miss(
         &self,
-        lifter: &SleighLifter<'_>,
+        how: Lowering<'_, '_>,
         target: &mut LiftTarget<'_, 'static>,
         instruction: &Decoded<'_, '_>,
         shape: Option<Shape>,
-        decoder: &FixedDecoder<'_>,
-        flat: bool,
     ) -> Result<Lifted, LiftError> {
+        let Lowering {
+            lifter,
+            decoder,
+            flat,
+        } = how;
         self.misses.fetch_add(1, Ordering::Relaxed);
         let marks = Marks::of(target);
         let lifted = lifter.lower(target, instruction, flat)?;
