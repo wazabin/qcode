@@ -16,10 +16,8 @@ use crate::{
         },
     },
 };
-use jstd::graph::FxBuildHasher;
 use std::{
     borrow::Cow,
-    collections::HashSet,
     fmt::{Display, Formatter},
     marker::PhantomData,
 };
@@ -27,7 +25,7 @@ use std::{
 use rustc_hash::FxHashMap as HashMap;
 
 pub(crate) use self::cfg::EdgeData;
-pub use self::cfg::{BlockId, EdgeId};
+pub use self::cfg::{BlockId, EdgeId, EdgeSet};
 pub mod cfg;
 
 /// Simultaneously replace operands without allowing a target-arena local id to
@@ -90,9 +88,9 @@ pub struct BasicBlock<'str> {
     /// rather than stored per edge (stage 6a, mirroring the stage-4 `EdgeId`
     /// strip).
     ///
-    /// Uses a fixed-seed hasher (matching `Context`'s `Graph::Hasher`) so that
-    /// `predecessors()`/`successors()` iterate deterministically across runs.
-    pub edges: HashSet<EdgeId, FxBuildHasher>,
+    /// Insertion-ordered, so `predecessors()`/`successors()` iterate
+    /// deterministically across runs.
+    pub edges: EdgeSet,
 
     /// The address of this block, if it corresponds to a machine address.
     ///
@@ -1503,7 +1501,8 @@ mod tests {
         let cloned_id = BasicBlock::clone_into_ctx(&mut ctx, block, &mut value_map);
         let cloned = BasicBlock::from_id(&ctx, cloned_id);
 
-        let orig_value_ids: HashSet<ValueId> = value_map.keys().copied().collect();
+        let orig_value_ids: std::collections::HashSet<ValueId> =
+            value_map.keys().copied().collect();
 
         // All operands in the clone must reference new (remapped) values, not the originals
         // so no value map key should be referenced
