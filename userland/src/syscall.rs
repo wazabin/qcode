@@ -5,6 +5,10 @@
 //! the SLEIGH constructor does not model; no userland code relies on them
 //! surviving a call, so nothing here touches them.
 
+use std::fs::File;
+
+use crate::fs::FdKind;
+use std::os::unix::fs::FileExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::warn;
@@ -16,11 +20,12 @@ use crate::errno::{
 use crate::fs::{AT_FDCWD, O_CLOEXEC};
 use crate::guest;
 use crate::loader::page_up;
-use crate::process::{AddressSpace, Request, Task};
+use crate::process::{AddressSpace, Machine, PTRACE_TRACEME, Request, Task};
 
 const PROT_READ: u64 = 1;
 const PROT_WRITE: u64 = 2;
 const PROT_EXEC: u64 = 4;
+const MAP_SHARED: u64 = 0x1;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
@@ -39,6 +44,13 @@ const SIGCHLD: u64 = 17;
 /// fork cannot provide.
 const CLONE_FLAGS: u64 = !0xff;
 const WNOHANG: u64 = 1;
+const WSTOPPED: u64 = 2;
+const WEXITED: u64 = 4;
+const P_ALL: u64 = 0;
+const P_PID: u64 = 1;
+const CLD_EXITED: i32 = 1;
+const CLD_KILLED: i32 = 2;
+const CLD_TRAPPED: i32 = 4;
 const SIGPIPE: u64 = 13;
 const POLLIN: u16 = 1;
 const POLLOUT: u16 = 4;
@@ -49,6 +61,8 @@ fn describe(nr: u64) -> (&'static str, usize) {
     match nr {
         0 => ("read", 3),
         1 => ("write", 3),
+        101 => ("ptrace", 4),
+        247 => ("waitid", 5),
         2 => ("open", 3),
         3 => ("close", 1),
         4 => ("stat", 2),
@@ -149,19 +163,42 @@ fn timespec(secs: i64, nanos: i64) -> [u8; 16] {
     out
 }
 
+/// A `MAP_SHARED` mapping of a file: the guest's bytes are carried back to
+/// the file at `msync`, at `munmap`, and before the file is mapped again,
+/// which is when another mapping could observe them.
+#[derive(Debug)]
+pub(crate) struct SharedMap {
+    pub file: File,
+    pub at: u64,
+    pub len: u64,
+    pub offset: u64,
+}
+
+impl SharedMap {
+    pub(crate) fn duplicate(&self) -> Option<Self> {
+        self.file.try_clone().ok().map(|file| Self {
+            file,
+            at: self.at,
+            len: self.len,
+            offset: self.offset,
+        })
+    }
+}
+
 impl Task {
     /// Services the `syscall` the machine is stopped at and returns the value
     /// for `RAX`.
     pub(crate) fn syscall(&mut self) -> u64 {
-        let m = self.machine.vm.memory_mut();
-        let nr = self.machine.regs.rax.read(m);
+        let Machine { vm, regs, .. } = self.machine();
+        let m = vm.memory_mut();
+        let nr = regs.rax.read(m);
         let args = [
-            self.machine.regs.rdi.read(m),
-            self.machine.regs.rsi.read(m),
-            self.machine.regs.rdx.read(m),
-            self.machine.regs.r10.read(m),
-            self.machine.regs.r8.read(m),
-            self.machine.regs.r9.read(m),
+            regs.rdi.read(m),
+            regs.rsi.read(m),
+            regs.rdx.read(m),
+            regs.r10.read(m),
+            regs.r8.read(m),
+            regs.r9.read(m),
         ];
         let result = self.dispatch(nr, args);
         if self.trace && self.request != Some(Request::Block) {
@@ -196,6 +233,10 @@ impl Task {
             8 => self.files.lseek(a[0] as i32, a[1] as i64, a[2] as u32),
             9 => self.sys_mmap(a[0], a[1], a[2], a[3], a[4] as i32, a[5]),
             10 => self.sys_mprotect(a[0], a[1], a[2]),
+            26 => {
+                self.sync_shared(a[0], a[1]);
+                Ok(0)
+            }
             11 => self.sys_munmap(a[0], a[1]),
             12 => Ok(self.set_brk(a[0])),
             13 => self.sys_rt_sigaction(a[0], a[1], a[2]),
@@ -225,6 +266,8 @@ impl Task {
             }
             59 => self.sys_execve(a[0], a[1], a[2]),
             61 => self.sys_wait4(a[0] as i64, a[1], a[2]),
+            101 => self.sys_ptrace(a[0], a[1], a[2], a[3]),
+            247 => self.sys_waitid(a[0], a[1], a[2], a[3]),
             60 | 231 => {
                 self.exit_code = Some((a[0] & 0xff) as i32);
                 Ok(0)
@@ -232,6 +275,7 @@ impl Task {
             62 | 234 => self.sys_kill(a),
             63 => self.sys_uname(a[0]),
             72 => self.sys_fcntl(a[0] as i32, a[1], a[2]),
+            77 => self.files.truncate(a[0] as i32, a[1]).map(|()| 0),
             79 => self.sys_getcwd(a[0], a[1]),
             80 => {
                 let path = guest::read_path(self.mmu(), a[0])?;
@@ -285,12 +329,27 @@ impl Task {
             }
             302 => self.sys_prlimit64(a[1], a[3]),
             318 => self.sys_getrandom(a[0], a[1]),
+            319 => self.sys_memfd_create(a[0], a[1]),
             334 => Err(ENOSYS),
             _ => {
                 warn!("unimplemented syscall {nr} ({})", describe(nr).0);
                 Err(ENOSYS)
             }
         }
+    }
+
+    /// `memfd_create`: an anonymous file. Sealing and huge pages are
+    /// accepted and ignored; the name only shows in the descriptor's path.
+    fn sys_memfd_create(&mut self, name: u64, flags: u64) -> SysResult {
+        const MFD_CLOEXEC: u64 = 1;
+        const MFD_KNOWN: u64 = 0x1f;
+        if flags & !MFD_KNOWN != 0 {
+            return Err(EINVAL);
+        }
+        let name = guest::read_path(self.mmu(), name)?;
+        self.files
+            .memfd(&name, flags & MFD_CLOEXEC != 0)
+            .map(|fd| fd as u64)
     }
 
     fn sys_read(&mut self, fd: i32, buf: u64, count: u64) -> SysResult {
@@ -462,8 +521,85 @@ impl Task {
         Ok(0)
     }
 
+    /// `ptrace`: the caller asks to be traced by its parent here; anything
+    /// on another task is the scheduler's to do.
+    fn sys_ptrace(&mut self, request: u64, pid: u64, addr: u64, data: u64) -> SysResult {
+        if request == PTRACE_TRACEME {
+            self.traced_by = Some(self.ppid);
+            return Ok(0);
+        }
+        self.request = Some(Request::Ptrace {
+            request,
+            pid,
+            addr,
+            data,
+        });
+        Ok(0)
+    }
+
+    /// `waitid`: reports a stopped tracee or an exited child in a
+    /// `siginfo_t`, or waits for one.
+    fn sys_waitid(&mut self, idtype: u64, id: u64, infop: u64, options: u64) -> SysResult {
+        let matches = |child: u64| match idtype {
+            P_ALL => true,
+            P_PID => child == id,
+            _ => false,
+        };
+        if idtype != P_ALL && idtype != P_PID {
+            return Err(EINVAL);
+        }
+        let report = |task: &mut Self, code: i32, pid: u64, status: i32| -> SysResult {
+            if infop != 0 {
+                let mut si = [0u8; 128];
+                si[0..4].copy_from_slice(&(SIGCHLD as i32).to_le_bytes());
+                si[8..12].copy_from_slice(&code.to_le_bytes());
+                si[16..20].copy_from_slice(&(pid as i32).to_le_bytes());
+                si[24..28].copy_from_slice(&status.to_le_bytes());
+                guest::write(task.mmu(), infop, &si)?;
+            }
+            Ok(0)
+        };
+        if options & WSTOPPED != 0
+            && let Some(i) = self.stops.iter().position(|&(c, _)| matches(c))
+        {
+            let (child, signal) = self.stops.remove(i);
+            return report(self, CLD_TRAPPED, child, signal);
+        }
+        if options & WEXITED != 0
+            && let Some(i) = self.zombies.iter().position(|&(c, _)| matches(c))
+        {
+            let (child, status) = self.zombies.remove(i);
+            self.children.retain(|&c| c != child);
+            let (code, value) = if status & 0x7f == 0 {
+                (CLD_EXITED, status >> 8)
+            } else {
+                (CLD_KILLED, status & 0x7f)
+            };
+            return report(self, code, child, value);
+        }
+        if !self.children.iter().any(|&c| matches(c)) {
+            return Err(ECHILD);
+        }
+        if options & WNOHANG != 0 {
+            if infop != 0 {
+                guest::write(self.mmu(), infop, &[0u8; 128])?;
+            }
+            return Ok(0);
+        }
+        self.request = Some(Request::Block);
+        Ok(0)
+    }
+
     fn sys_wait4(&mut self, pid: i64, status: u64, options: u64) -> SysResult {
         let matches = |child: u64| pid == -1 || pid == child as i64;
+        // A tracee's stop goes to its tracer whatever the options say.
+        if let Some(i) = self.stops.iter().position(|&(c, _)| matches(c)) {
+            let (child, signal) = self.stops.remove(i);
+            if status != 0 {
+                guest::write_u32(self.mmu(), status, ((signal as u32) << 8) | 0x7f)?;
+            }
+            return Ok(child);
+        }
         if let Some(i) = self.zombies.iter().position(|&(c, _)| matches(c)) {
             let (child, code) = self.zombies.remove(i);
             self.children.retain(|&c| c != child);
@@ -633,7 +769,13 @@ impl Task {
         }
         let len = page_up(len);
         let bits = prot_to_perm(prot);
-        let mmu = &self.machine.vm.memory_mut().mmu;
+        let Self { machine, space, .. } = self;
+        let mmu = &machine
+            .as_mut()
+            .expect("the task holds the machine")
+            .vm
+            .memory_mut()
+            .mmu;
         let at = if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
             if addr == 0 {
                 return Err(EINVAL);
@@ -645,16 +787,31 @@ impl Task {
         } else if addr != 0 && AddressSpace::is_free(mmu, addr, len) {
             addr
         } else {
-            self.machine.space.find_free(mmu, len).ok_or(ENOMEM)?
+            space.find_free(mmu, len).ok_or(ENOMEM)?
         };
+        if flags & MAP_FIXED != 0 {
+            self.sync_shared(at, len);
+            self.shared
+                .retain(|m| m.at >= at + len || m.at + m.len <= at);
+            self.shared_anon
+                .retain(|&(s, l)| s >= at + len || s + l <= at);
+        }
+        if flags & MAP_SHARED != 0 && flags & MAP_ANONYMOUS != 0 {
+            self.shared_anon.push((at, len));
+        }
+        if flags & MAP_ANONYMOUS == 0 {
+            // Another mapping of the file may hold bytes this one must see.
+            self.sync_shared(0, u64::MAX);
+        }
         let mmu = self.mmu();
         if flags & MAP_FIXED != 0 {
             let _ = mmu.unmap(at, len);
         }
         mmu.map(at, len, bits).map_err(|_| ENOMEM)?;
         if flags & MAP_ANONYMOUS == 0 {
-            // File-backed: a private snapshot of the file's bytes. Writes are
-            // never carried back to the host file, even for MAP_SHARED.
+            // File-backed: a snapshot of the file's bytes. A MAP_SHARED
+            // mapping is carried back to the file by `sync_shared`; a
+            // private one never is.
             let mut data = vec![0; len as usize];
             let n = match self.files.pread(fd, &mut data, offset) {
                 Ok(n) => n,
@@ -664,16 +821,50 @@ impl Task {
                 }
             };
             self.mmu().write_unchecked(at, &data[..n], bits);
+            if flags & MAP_SHARED != 0
+                && let Ok(fd) = self.files.get(fd)
+                && let FdKind::File(file) = &fd.kind
+                && let Ok(file) = file.try_clone()
+            {
+                self.shared.push(SharedMap {
+                    file,
+                    at,
+                    len,
+                    offset,
+                });
+            }
         }
         Ok(at)
+    }
+
+    /// Carries the guest's bytes of every shared mapping overlapping
+    /// `[addr, addr + len)` back to its file.
+    pub(crate) fn sync_shared(&mut self, addr: u64, len: u64) {
+        let maps = std::mem::take(&mut self.shared);
+        for m in &maps {
+            let lo = m.at.max(addr);
+            let hi = (m.at + m.len).min(addr.saturating_add(len));
+            if lo < hi
+                && let Ok(bytes) = guest::read(self.mmu(), lo, (hi - lo) as usize)
+            {
+                let _ = m.file.write_all_at(&bytes, m.offset + (lo - m.at));
+            }
+        }
+        self.shared = maps;
     }
 
     fn sys_munmap(&mut self, addr: u64, len: u64) -> SysResult {
         if !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
             return Err(EINVAL);
         }
+        let len = page_up(len);
+        self.sync_shared(addr, len);
+        self.shared
+            .retain(|m| m.at >= addr + len || m.at + m.len <= addr);
+        self.shared_anon
+            .retain(|&(s, l)| s >= addr + len || s + l <= addr);
         // Unmapping what is not mapped is not an error on Linux either.
-        let _ = self.mmu().unmap(addr, page_up(len));
+        let _ = self.mmu().unmap(addr, len);
         Ok(0)
     }
 
@@ -784,26 +975,24 @@ impl Task {
     fn sys_arch_prctl(&mut self, code: u64, addr: u64) -> SysResult {
         match code {
             ARCH_SET_FS => {
-                self.machine
-                    .regs
-                    .fs_base
-                    .write(self.machine.vm.memory_mut(), addr);
+                let machine = self.machine();
+                machine.regs.fs_base.write(machine.vm.memory_mut(), addr);
                 Ok(0)
             }
             ARCH_SET_GS => {
-                self.machine
-                    .regs
-                    .gs_base
-                    .write(self.machine.vm.memory_mut(), addr);
+                let machine = self.machine();
+                machine.regs.gs_base.write(machine.vm.memory_mut(), addr);
                 Ok(0)
             }
             ARCH_GET_FS => {
-                let base = self.machine.regs.fs_base.read(self.machine.vm.memory_mut());
+                let machine = self.machine();
+                let base = machine.regs.fs_base.read(machine.vm.memory_mut());
                 guest::write_u64(self.mmu(), addr, base)?;
                 Ok(0)
             }
             ARCH_GET_GS => {
-                let base = self.machine.regs.gs_base.read(self.machine.vm.memory_mut());
+                let machine = self.machine();
+                let base = machine.regs.gs_base.read(machine.vm.memory_mut());
                 guest::write_u64(self.mmu(), addr, base)?;
                 Ok(0)
             }

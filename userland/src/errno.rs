@@ -49,6 +49,7 @@ impl std::fmt::Display for Errno {
 }
 
 pub const EPERM: Errno = Errno(1);
+pub const ESRCH: Errno = Errno(3);
 pub const ENOENT: Errno = Errno(2);
 pub const EINTR: Errno = Errno(4);
 pub const EIO: Errno = Errno(5);

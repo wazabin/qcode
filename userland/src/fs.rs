@@ -532,6 +532,41 @@ impl Files {
         )
     }
 
+    /// `memfd_create`: an anonymous host file, unlinked from birth, with
+    /// the guest path Linux would report.
+    pub fn memfd(&mut self, name: &str, cloexec: bool) -> Result<i32, Errno> {
+        const O_TMPFILE: i32 = 0o20000000 | 0o200000;
+        let file = ["/dev/shm", "/tmp"]
+            .iter()
+            .find_map(|dir| {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(O_TMPFILE)
+                    .mode(0o600)
+                    .open(dir)
+                    .ok()
+            })
+            .ok_or(errno::ENOMEM)?;
+        self.install(
+            Fd {
+                kind: FdKind::File(file),
+                path: format!("/memfd:{name}"),
+                cloexec,
+                append: false,
+            },
+            0,
+        )
+    }
+
+    /// `ftruncate`.
+    pub fn truncate(&mut self, fd: i32, len: u64) -> Result<(), Errno> {
+        match &mut self.get_mut(fd)?.kind {
+            FdKind::File(file) => file.set_len(len).map_err(|e| errno::from_io(&e)),
+            _ => Err(EINVAL),
+        }
+    }
+
     pub fn close(&mut self, fd: i32) -> Result<(), Errno> {
         let slot = usize::try_from(fd).map_err(|_| EBADF)?;
         match self.fds.get_mut(slot) {

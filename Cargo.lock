@@ -2199,6 +2199,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "sha2",
  "wazabin-binary",
  "wazabin-qcode",
  "wazabin-qcode-emulator",

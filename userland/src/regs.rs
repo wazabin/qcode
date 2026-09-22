@@ -9,6 +9,7 @@
 
 use qcode::{context::Context, space::MemorySpaceId, value::ValueId, value::Varnode};
 use qcode_vm::VmMemory;
+use qcode_vm::flat::FlatSpace;
 
 /// One register's storage.
 #[derive(Debug, Clone, Copy)]
@@ -36,6 +37,27 @@ impl Reg {
             .flat_mut()
             .read_u128(self.space, self.addr, self.size)
             .unwrap_or(0) as u64
+    }
+
+    /// The register's value in a saved copy of its space.
+    pub fn read_saved(&self, space: &FlatSpace) -> u64 {
+        space
+            .read_bytes(self.addr, self.size)
+            .map(|bytes| {
+                bytes
+                    .iter()
+                    .take(8)
+                    .rev()
+                    .fold(0u64, |acc, &b| (acc << 8) | u64::from(b))
+            })
+            .unwrap_or(0)
+    }
+
+    /// Writes the register into a saved copy of its space.
+    pub fn write_saved(&self, space: &mut FlatSpace, value: u64) {
+        space
+            .write_u128(self.addr, self.size, u128::from(value))
+            .expect("register storage is always addressable");
     }
 
     pub fn write(&self, memory: &mut VmMemory, value: u64) {
