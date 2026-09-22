@@ -1260,6 +1260,22 @@ struct Literal {
     ty: TypeKey,
 }
 
+impl Literal {
+    /// Whether the constant is the same at every instance.
+    fn is_fixed(&self) -> bool {
+        !self.affine.relative && self.affine.params == 0
+    }
+
+    /// The literal at `instance`, interned in `ctx`.
+    fn resolve(&self, ctx: &Context<'static>, instance: &Instance) -> LocalValueId {
+        LocalValueId::Literal(ctx.shared.values.get_or_make_typed_literal(
+            self.affine.at(instance),
+            self.ty.resolve(ctx),
+            self.affine.size,
+        ))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TempSpaceKey {
     word_size: usize,
@@ -1425,6 +1441,19 @@ pub struct Template {
     varnodes: Vec<VarnodeSlot>,
     ops: Vec<Op>,
     exits: Vec<ExitRecord>,
+}
+
+/// What a template's context-independent keys resolve to in one session's
+/// context: its types, and its constants that are the same at every
+/// instance, which are most of them. Interned values never move, so the
+/// ids hold for the context's life.
+#[derive(Debug)]
+struct Resolved {
+    /// Keeps the template alive, so its address is not reused for another.
+    _template: Arc<Template>,
+    types: Box<[TypeId]>,
+    /// Per literal, its id when the literal is fixed.
+    literals: Box<[Option<LocalValueId>]>,
 }
 
 /// Where a lift's additions to its body start.
@@ -2912,7 +2941,7 @@ impl Template {
     /// Lifts the instruction this template is at `instance` into `target`,
     /// from the record alone. `scratch` is the replay's working memory.
     pub(crate) fn replay(
-        &self,
+        self: &Arc<Self>,
         target: &mut LiftTarget<'_, 'static>,
         instance: &Instance,
         scratch: &mut ReplayScratch,
@@ -2958,7 +2987,7 @@ impl Template {
     }
 
     fn emit(
-        &self,
+        self: &Arc<Self>,
         construction: &mut Construction<'_, '_, 'static>,
         instance: &Instance,
         scratch: &mut ReplayScratch,
@@ -2969,7 +2998,7 @@ impl Template {
             externals,
             callees,
             types,
-            type_ids,
+            resolved,
             varnodes,
             literals,
             spaces,
@@ -2999,26 +3028,25 @@ impl Template {
         }
 
         let ctx = construction.context();
-        types.extend(self.types.iter().map(|key| {
-            // A session sees a handful of types: a scan beats hashing.
-            match type_ids.iter().find(|(known, _)| known == key) {
-                Some(&(_, id)) => id,
-                None => {
-                    let id = key.resolve(ctx);
-                    type_ids.push((*key, id));
-                    id
-                }
-            }
-        }));
+        let resolved = resolved
+            .entry(Arc::as_ptr(self) as usize)
+            .or_insert_with(|| Resolved {
+                _template: Arc::clone(self),
+                types: self.types.iter().map(|key| key.resolve(ctx)).collect(),
+                literals: self
+                    .literals
+                    .iter()
+                    .map(|literal| literal.is_fixed().then(|| literal.resolve(ctx, instance)))
+                    .collect(),
+            });
+        types.extend_from_slice(&resolved.types);
+        literals.extend(
+            self.literals
+                .iter()
+                .zip(&resolved.literals)
+                .map(|(literal, fixed)| fixed.unwrap_or_else(|| literal.resolve(ctx, instance))),
+        );
         varnodes.extend((0..self.varnodes.len()).map(|k| self.varnode_at(k, instance)));
-        literals.extend(self.literals.iter().map(|literal| {
-            let ty = literal.ty.resolve(ctx);
-            LocalValueId::Literal(ctx.shared.values.get_or_make_typed_literal(
-                literal.affine.at(instance),
-                ty,
-                literal.affine.size,
-            ))
-        }));
 
         let mut emitter = construction.emitter();
         emitter.set_address(address);
@@ -3129,9 +3157,9 @@ pub struct ReplayScratch {
     externals: Vec<Option<BlockId>>,
     callees: Vec<Callee>,
     types: Vec<TypeId>,
-    /// The session's context's id for each type a template has named,
-    /// once resolved: the context interns types behind a lock.
-    type_ids: Vec<(TypeKey, TypeId)>,
+    /// Per template replayed, by address, what its keys resolve to in the
+    /// session's context.
+    resolved: HashMap<usize, Resolved>,
     varnodes: Vec<VarnodeId>,
     literals: Vec<LocalValueId>,
     spaces: Vec<LocalTempSpaceId>,
