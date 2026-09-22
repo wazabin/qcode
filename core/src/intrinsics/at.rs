@@ -178,7 +178,7 @@ fn forward(view: BodyView<'_, '_>, out_size: usize, base: ValueId, index: ValueI
             id: IntrinsicId::from_name("at").unwrap(),
             // The expression's operands are all in `base`/`index`'s own body; strip
             // the func to store them bare-local (no ambient func needed here).
-            args: vec![base.strip_func(), index.strip_func()],
+            args: Box::new([base.strip_func(), index.strip_func()]),
         }))
     })
 }
@@ -271,8 +271,8 @@ mod tests {
             Some(Simplified::Expression(Mnemonic::Intrinsic(app))) => {
                 assert_eq!(app.id.name(), "at");
                 assert_eq!(
-                    app.args,
-                    vec![ValueId::BlockParam(a).strip_func(), j.strip_func()]
+                    &*app.args,
+                    [ValueId::BlockParam(a).strip_func(), j.strip_func()]
                 );
             }
             other => panic!("expected at(a, j), got {other:?}"),
@@ -344,8 +344,8 @@ mod tests {
             Some(Simplified::Expression(Mnemonic::Intrinsic(app))) => {
                 assert_eq!(app.id.name(), "at");
                 assert_eq!(
-                    app.args,
-                    vec![ValueId::BlockParam(a).strip_func(), j0.strip_func()]
+                    &*app.args,
+                    [ValueId::BlockParam(a).strip_func(), j0.strip_func()]
                 );
             }
             other => panic!("expected at(a, 0), got {other:?}"),

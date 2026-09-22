@@ -141,20 +141,20 @@ pub fn verify_body_arena_integrity_scoped(
                     break;
                 }
                 let insn = &body.insns[insn_local];
-                if insn.parent != Some(local) {
+                if insn.parent.get() != Some(local) {
                     out.push(format!(
                         "block {block_id:?} contains {insn_id:?}, whose parent is {:?}",
-                        insn.parent
+                        insn.parent.get()
                     ));
                 }
-                if insn.prev != prev {
+                if insn.prev.get() != prev {
                     out.push(format!(
                         "block {block_id:?}: {insn_id:?} links back to {:?}, not to {prev:?}",
-                        insn.prev
+                        insn.prev.get()
                     ));
                 }
                 prev = Some(insn_local);
-                at = insn.next;
+                at = insn.next.get();
             }
             if walked != list.len {
                 out.push(format!(
@@ -220,7 +220,7 @@ pub fn verify_body_arena_integrity_scoped(
                 .get(&local)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            if let Some(parent) = insn_entry.parent {
+            if let Some(parent) = insn_entry.parent.get() {
                 if !live_blocks.contains(&parent) {
                     out.push(format!(
                         "instruction {insn_id:?} has removed parent {:?}",
@@ -538,7 +538,7 @@ fn verify_use_edges(
     for temp in body.temps.iter() {
         walk(LocalValueId::Temp(temp.id), out);
     }
-    for &value in body.shared_first_use.keys() {
+    for value in body.shared_first_use.values() {
         if matches!(
             value,
             LocalValueId::Instruction(_)
@@ -565,7 +565,6 @@ fn verify_use_edges(
 #[cfg(test)]
 mod tests {
     use crate::value::QCodeMut;
-    use std::borrow::Cow;
 
     use wazabin_qcode_macro::qcode;
 
@@ -771,13 +770,10 @@ mod tests {
         let f = ctx.function_ids()[0];
         let dead_block = BasicBlock::make(&mut ctx, f).id;
         ctx.delete_block(dead_block);
+        let stale = ctx.bodies[f].names.parse("stale");
         ctx.bodies[f]
             .names
-            .register(
-                Cow::Borrowed("stale"),
-                ValueId::BasicBlock(dead_block).localize(f),
-                None,
-            )
+            .register(stale, ValueId::BasicBlock(dead_block).localize(f))
             .expect("register corruption fixture");
 
         assert_has(&ctx, "local name \"stale\"");
@@ -827,7 +823,7 @@ mod tests {
             .unwrap();
         let x = ctx.block(entry).params[0];
         // Point `@x`'s head at `%y`'s only use (by the return).
-        let y_use = ctx.bodies[f].insns[y.local].first_use;
+        let y_use = ctx.bodies[f].insns[y.local].first_use.get();
         assert!(y_use.is_some());
         ctx.bodies[f].params[x].first_use = y_use;
 

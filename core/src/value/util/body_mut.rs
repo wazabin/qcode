@@ -268,7 +268,7 @@ impl<'a, 'str> BodyMut<'a, 'str> {
         &mut self,
         id: ValueId,
         name: std::borrow::Cow<'str, str>,
-        old_name: Option<&str>,
+        _old_name: Option<&str>,
     ) -> Result<()> {
         let existing = match id.name_scope_function() {
             Some(func) => self
@@ -288,8 +288,7 @@ impl<'a, 'str> BodyMut<'a, 'str> {
         match id.name_scope_function() {
             Some(func) => self
                 .function_mut(func)
-                .names
-                .register(name, id.localize(func), old_name),
+                .set_local_name(id.localize(func), &name),
             None => {
                 unimplemented!("a checked-out host has read-only shared access (mints via &self)")
             }

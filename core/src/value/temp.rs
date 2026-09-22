@@ -10,19 +10,20 @@ use jstd::Identifier;
 
 use crate::value::{
     ModuleView, QCodeView, Value, ValueId,
+    name::Name,
     uses::{UseId, WithUsers},
     util::named::Named,
 };
 
 /// Function-local temporary-space index.
 #[derive(Identifier)]
-pub struct LocalTempSpaceId(usize);
+pub struct LocalTempSpaceId(u32);
 
 crate::composite_id!(TempSpaceId, LocalTempSpaceId);
 
 /// Function-local temporary-value index.
 #[derive(Identifier)]
-pub struct LocalTempId(usize);
+pub struct LocalTempId(u32);
 
 crate::composite_id!(TempId, LocalTempId);
 
@@ -59,7 +60,8 @@ impl TempSpace {
 /// A body-owned temporary memory value.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Temp<'str> {
-    pub(crate) name: Option<Cow<'str, str>>,
+    /// The temporary's name, in the owning body's bases.
+    pub(crate) name: Option<Name>,
     pub(crate) label: Option<u32>,
     pub(crate) address: i64,
     pub(crate) size: usize,
@@ -68,6 +70,9 @@ pub struct Temp<'str> {
     /// Derived bookkeeping, rebuilt after deserialization.
     #[serde(skip)]
     pub(crate) first_use: Option<UseId>,
+
+    #[serde(skip)]
+    marker: std::marker::PhantomData<&'str ()>,
 }
 
 impl WithUsers for Temp<'_> {
@@ -75,8 +80,8 @@ impl WithUsers for Temp<'_> {
         self.first_use
     }
 
-    fn first_use_mut(&mut self) -> &mut Option<UseId> {
-        &mut self.first_use
+    fn set_first_use(&mut self, head: Option<UseId>) {
+        self.first_use = head;
     }
 }
 
@@ -89,14 +94,8 @@ impl<'str> Temp<'str> {
             size,
             space,
             first_use: None,
+            marker: std::marker::PhantomData,
         }
-    }
-
-    /// Attaches the function-local name registered when this temporary is
-    /// inserted into its owning body.
-    pub fn with_name(mut self, name: Cow<'str, str>) -> Self {
-        self.name = Some(name);
-        self
     }
 }
 
@@ -174,8 +173,10 @@ where
         self.view.temp(self.id)
     }
 
-    pub fn name(self) -> Option<&'ctx str> {
-        self.inner().name.as_deref()
+    pub fn name(self) -> Option<Cow<'ctx, str>> {
+        self.view
+            .function(self.id.func)
+            .local_name_of(crate::value::LocalValueId::Temp(self.id.local))
     }
 
     pub fn label(self) -> Option<u32> {
@@ -208,7 +209,7 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(name) = self.name() {
-            f.write_str(name)
+            f.write_str(&name)
         } else if let Some(label) = self.label() {
             write!(f, "v{label}")
         } else {
@@ -221,7 +222,7 @@ impl<'str: 'ctx, 'ctx, R> Named for TempRef<'str, 'ctx, R>
 where
     R: QCodeView<'ctx, 'str>,
 {
-    fn name(&self) -> Option<&str> {
+    fn name(&self) -> Option<Cow<'_, str>> {
         TempRef::name(*self)
     }
 }

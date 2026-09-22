@@ -7,7 +7,10 @@ use crate::{
 };
 
 pub trait Named {
-    fn name(&self) -> Option<&str>;
+    /// The value's debug name, if it has one. Borrowed where it is stored
+    /// as written; a name a body derives — a load's `rax_2`, a block's
+    /// address label — is rendered on the way out.
+    fn name(&self) -> Option<Cow<'_, str>>;
 }
 
 /// Attempts to set the name in the reverse name table that owns `id`'s kind
@@ -61,7 +64,7 @@ mod tests {
         var.rename("var".into()).unwrap();
 
         assert_eq!(var.ctx().get_named("var"), Some(var.id()));
-        assert_eq!(var.name(), Some("var"));
+        assert_eq!(var.name().unwrap(), "var");
     }
 
     #[test]
@@ -75,12 +78,12 @@ mod tests {
         var.rename("var".into()).unwrap();
 
         assert_eq!(var.ctx().get_named("var"), Some(var.id()));
-        assert_eq!(var.name(), Some("var"));
+        assert_eq!(var.name().unwrap(), "var");
 
         var.rename("var".into()).unwrap();
 
         assert_eq!(var.ctx().get_named("var"), Some(var.id()));
-        assert_eq!(var.name(), Some("var"));
+        assert_eq!(var.name().unwrap(), "var");
     }
 
     #[test]

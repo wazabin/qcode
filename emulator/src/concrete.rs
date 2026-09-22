@@ -1896,7 +1896,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
 
         // The significand/exponent split is a pure decomposition of the
         // encoding and needs no context at all.
-        if let [src] = op.args.as_slice() {
+        if let [src] = &*op.args {
             let value = self.scalar_value(ctx, src.qualify(func))?;
             if value.size != 10 {
                 return Ok(None);
@@ -1914,7 +1914,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
 
         // The three-argument form is the explicit, architecture-neutral IEEE
         // interface.  Leave two-argument user-ops on the legacy dispatch below.
-        if let [lhs, rhs, rounding_mode] = op.args.as_slice() {
+        if let [lhs, rhs, rounding_mode] = &*op.args {
             let lhs = self.scalar_value(ctx, lhs.qualify(func))?;
             let rhs = self.scalar_value(ctx, rhs.qualify(func))?;
             let rounding_mode = self.scalar_value(ctx, rounding_mode.qualify(func))?;
@@ -1984,7 +1984,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             return Ok(None);
         }
 
-        let [lhs, rhs] = op.args.as_slice() else {
+        let [lhs, rhs] = &*op.args else {
             return Ok(None);
         };
         let lhs = self.scalar_value(ctx, lhs.qualify(func))?;
@@ -2643,7 +2643,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             .map(|param| {
                 let src = param
                     .name()
-                    .and_then(|name| ctx.get_named(name))
+                    .and_then(|name| ctx.get_named(&name))
                     .and_then(|value| match value {
                         ValueId::Varnode(id) => Some(Seed::Reg(id)),
                         _ => None,
@@ -4054,7 +4054,7 @@ mod tests {
                 entry.func,
                 Mnemonic::Intrinsic(IntrinsicApp {
                     id: enum_id,
-                    args: vec![src.localize(entry.func)],
+                    args: Box::new([src.localize(entry.func)]),
                 }),
                 list_ty,
             )

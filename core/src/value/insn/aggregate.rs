@@ -18,7 +18,7 @@ use super::mnemonic::MnemonicKind;
 /// types.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Tuple {
-    pub fields: Vec<LocalValueId>,
+    pub fields: Box<[LocalValueId]>,
 }
 
 impl MnemonicKind for Tuple {

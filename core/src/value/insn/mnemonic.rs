@@ -746,6 +746,7 @@ impl Mnemonic {
 
     /// Calls `f` on each operand, in canonical order. Allocation-free; the
     /// operand's position in this order is its *operand index*.
+    #[inline]
     pub fn for_each_operand(&self, mut f: impl FnMut(LocalValueId)) {
         let mut visit = |operand: &LocalValueId| f(*operand);
         visit_operands!(self, visit);
@@ -757,6 +758,7 @@ impl Mnemonic {
     /// Crate-private: an installed instruction's operands are mirrored by its
     /// body's use edges, which only the body's use-maintaining verbs may
     /// desynchronize and repair. A detached mnemonic is free to change.
+    #[inline]
     pub(crate) fn for_each_operand_mut(&mut self, mut f: impl FnMut(&mut LocalValueId)) {
         visit_operands!(self, f, mut);
     }
@@ -860,35 +862,35 @@ mod tests {
             Mnemonic::CBranch(CBranch {
                 condition: insn(0),
                 success_block: block,
-                success_args: vec![lit(1), insn(2)],
+                success_args: Box::new([lit(1), insn(2)]),
                 failure_block: block,
-                failure_args: vec![insn(3)],
+                failure_args: Box::new([insn(3)]),
             }),
             Mnemonic::Switch(Switch {
                 scrutinee: insn(0),
-                cases: vec![
+                cases: Box::new([
                     SwitchArm {
                         value: 1,
                         target: block,
-                        args: vec![lit(1)],
+                        args: Box::new([lit(1)]),
                     },
                     SwitchArm {
                         value: 2,
                         target: block,
-                        args: vec![],
+                        args: Box::new([]),
                     },
                     SwitchArm {
                         value: 3,
                         target: block,
-                        args: vec![insn(2), insn(3)],
+                        args: Box::new([insn(2), insn(3)]),
                     },
-                ],
+                ]),
                 default: Some(block),
-                default_args: vec![lit(4)],
+                default_args: Box::new([lit(4)]),
             }),
             Mnemonic::CallInd(CallInd {
                 ptr: insn(0),
-                args: vec![insn(1), insn(1), lit(2)],
+                args: Box::new([insn(1), insn(1), lit(2)]),
             }),
             Mnemonic::Return(Return {
                 ptr: insn(0),
@@ -902,12 +904,12 @@ mod tests {
                 body: crate::value::insn::Callee::Minted(0),
                 init: lit(0),
                 src: insn(1),
-                captures: vec![insn(2), lit(3)],
+                captures: Box::new([insn(2), lit(3)]),
             }),
             Mnemonic::Map(Map {
                 body: crate::value::insn::Callee::Minted(0),
                 src: insn(0),
-                captures: vec![],
+                captures: Box::new([]),
             }),
             Mnemonic::BadInsn(BadInsn),
         ]

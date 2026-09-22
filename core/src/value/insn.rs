@@ -9,8 +9,10 @@ use crate::{
     space::{MemorySpaceId, Space, SpaceId, SpaceRef, SpaceType},
     types::TypeId,
     value::{
-        BlockId, BlockRef, FunctionId, FunctionRef, LocalBlockId, ModuleView, QCodeView, Value,
-        ValueId,
+        BlockId, BlockRef, FunctionId, FunctionRef, LocalBlockId, LocalValueId, ModuleView,
+        QCodeView, Value, ValueId,
+        link::{Link, PackedAddress},
+        name::Name,
         uses::{UseId, WithUsers},
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
@@ -73,8 +75,8 @@ crate::composite_id!(InstructionId, LocalInsnId);
 /// Local values are not associated with any particular memory location.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Instruction<'str> {
-    /// The name of this instruction
-    pub(crate) name: Option<Cow<'str, str>>,
+    /// The name of this instruction, in the owning body's bases.
+    pub(crate) name: Option<Name>,
 
     /// The type of this instruction's result value (encodes size and semantic kind).
     pub(crate) type_id: TypeId,
@@ -86,7 +88,7 @@ pub struct Instruction<'str> {
     /// strict IR locality means the parent block lives in the same arena as the
     /// instruction, so its owning `FunctionId` is the instruction's own `id.func`).
     /// Instructions that are not part of any block (e.g. lifted from data sections) have `None` here.
-    pub(crate) parent: Option<LocalBlockId>,
+    pub(crate) parent: Link<LocalBlockId>,
 
     /// The instructions before and after this one in its block (bare
     /// body-local indices). A block's instruction order is a doubly linked
@@ -94,27 +96,27 @@ pub struct Instruction<'str> {
     /// another and unlinking one cost the same however long the block is;
     /// see [`FunctionBody::link_before`](crate::value::FunctionBody::link_before).
     /// `None` at either end of the block, and both `None` outside any block.
-    pub(crate) prev: Option<LocalInsnId>,
-    pub(crate) next: Option<LocalInsnId>,
+    pub(crate) prev: Link<LocalInsnId>,
+    pub(crate) next: Link<LocalInsnId>,
 
     /// Head of the list of this instruction's uses (see [`crate::value::uses`]).
     /// Derived bookkeeping, rebuilt after deserialization.
     #[serde(skip)]
-    pub(crate) first_use: Option<UseId>,
+    pub(crate) first_use: Link<UseId>,
 
     // Address of the binary instruction
-    address: Option<u64>,
+    address: PackedAddress,
 
     _marker: std::marker::PhantomData<&'str ()>,
 }
 
 impl WithUsers for Instruction<'_> {
     fn first_use(&self) -> Option<UseId> {
-        self.first_use
+        self.first_use.get()
     }
 
-    fn first_use_mut(&mut self) -> &mut Option<UseId> {
-        &mut self.first_use
+    fn set_first_use(&mut self, head: Option<UseId>) {
+        self.first_use.set(head);
     }
 }
 
@@ -122,13 +124,36 @@ impl<'str> Instruction<'str> {
     pub(crate) fn new(type_id: TypeId, mnemonic: Mnemonic) -> Self {
         Self {
             name: None,
-            parent: None,
-            prev: None,
-            next: None,
-            first_use: None,
+            parent: Link::none(),
+            prev: Link::none(),
+            next: Link::none(),
+            first_use: Link::none(),
             type_id,
             mnemonic,
-            address: None,
+            address: PackedAddress::none(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// An instruction already linked into `parent` after `prev`, at
+    /// `address`: what appending a recorded run makes, without touching the
+    /// fields again afterwards.
+    pub(crate) fn linked(
+        type_id: TypeId,
+        mnemonic: Mnemonic,
+        parent: LocalBlockId,
+        prev: Option<LocalInsnId>,
+        address: Option<u64>,
+    ) -> Self {
+        Self {
+            name: None,
+            parent: Link::from(Some(parent)),
+            prev: Link::from(prev),
+            next: Link::none(),
+            first_use: Link::none(),
+            type_id,
+            mnemonic,
+            address: PackedAddress::from(address),
             _marker: std::marker::PhantomData,
         }
     }
@@ -139,12 +164,12 @@ impl<'str> Instruction<'str> {
 
     /// The instruction before this one in its block, if any.
     pub fn prev_in_block(&self) -> Option<LocalInsnId> {
-        self.prev
+        self.prev.get()
     }
 
     /// The instruction after this one in its block, if any.
     pub fn next_in_block(&self) -> Option<LocalInsnId> {
-        self.next
+        self.next.get()
     }
 
     /// Mutable access to this instruction's mnemonic (crate-internal).
@@ -162,7 +187,7 @@ impl<'str> Instruction<'str> {
     /// Sets this instruction's machine address (crate-internal; used by the
     /// generic builder, which routes through the mutation host).
     pub(crate) fn set_address(&mut self, address: u64) {
-        self.address = Some(address);
+        self.address.set(Some(address));
     }
 
     pub fn from_id<'ctx>(
@@ -189,8 +214,10 @@ where
     }
 
     /// The name of this instruction's output value
-    pub fn name(&'s self) -> Option<&'ctx str> {
-        self.inner().name.as_deref()
+    pub fn name(&'s self) -> Option<Cow<'ctx, str>> {
+        self.view
+            .function(self.id.func)
+            .local_name_of(LocalValueId::Instruction(self.id.local))
     }
 
     /// The [`TypeId`] of this instruction's result value.
@@ -207,6 +234,7 @@ where
     pub fn parent(&'s self) -> Option<BlockRef<'str, 'ctx, R>> {
         self.inner()
             .parent
+            .get()
             .map(|local| BlockRef::new(self.view, BlockId::new(self.id.func, local)))
     }
 
@@ -219,6 +247,7 @@ where
     pub fn prev(&'s self) -> Option<InstructionRef<'str, 'ctx, R>> {
         self.inner()
             .prev
+            .get()
             .map(|local| InstructionRef::new(self.view, InstructionId::new(self.id.func, local)))
     }
 
@@ -227,6 +256,7 @@ where
     pub fn next(&'s self) -> Option<InstructionRef<'str, 'ctx, R>> {
         self.inner()
             .next
+            .get()
             .map(|local| InstructionRef::new(self.view, InstructionId::new(self.id.func, local)))
     }
 
@@ -260,7 +290,7 @@ where
 
     /// The address of the corresponding instruction
     pub fn address(&'s self) -> Option<u64> {
-        self.inner().address
+        self.inner().address.get()
     }
 
     /// The address-space provenance for this instruction's result, if any.
@@ -333,17 +363,7 @@ impl<'str, H: QCodeMut<'str>> BaseRef<H, InstructionId> {
     /// Renames this instruction in its owning function's local name table
     /// (own-instruction edit, host-routed). Errors only on a duplicate name.
     pub fn rename_local(&mut self, name: Cow<'str, str>) -> Result<()> {
-        let old_name = self
-            .ctx
-            .body(self.id.func)
-            .insn(self.id)
-            .name
-            .as_deref()
-            .map(str::to_owned);
-        self.ctx
-            .register_body_name(self.id.into(), name.clone(), old_name.as_deref())?;
-        self.ctx.instruction_mut(self.id).name = Some(name);
-        Ok(())
+        self.ctx.register_body_name(self.id.into(), name, None)
     }
 }
 
@@ -440,8 +460,10 @@ impl<'str: 'ctx, 'ctx, R> Named for InstructionRef<'str, 'ctx, R>
 where
     R: QCodeView<'ctx, 'str>,
 {
-    fn name(&self) -> Option<&str> {
-        self.view.instruction(self.id).name.as_deref()
+    fn name(&self) -> Option<Cow<'_, str>> {
+        self.view
+            .function(self.id.func)
+            .local_name_of(LocalValueId::Instruction(self.id.local))
     }
 }
 
@@ -490,12 +512,13 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
         self.ctx.bodies[self.id.func].replace_instruction_mnemonic(self.id, mnemonic);
     }
 
-    pub fn address_mut(&mut self) -> &mut Option<u64> {
-        &mut self.inner_mut().address
+    pub fn set_address(&mut self, address: u64) {
+        self.inner_mut().address.set(Some(address));
     }
 
-    pub fn set_address(&mut self, address: u64) {
-        *self.address_mut() = Some(address);
+    /// Forgets this instruction's machine address.
+    pub fn clear_address(&mut self) {
+        self.inner_mut().address.set(None);
     }
 
     /// Sets the type of this instruction's result.
@@ -561,8 +584,10 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for InstructionMutRef<'str, 
 // signature-pinned return lifetime needs `'str` to outlive the `&self` borrow,
 // which only a host type that carries `'str` (not a generic `H`) can prove.
 impl Named for InstructionMutRef<'_, '_> {
-    fn name(&self) -> Option<&str> {
-        self.ctx.instruction(self.id).name.as_deref()
+    fn name(&self) -> Option<Cow<'_, str>> {
+        self.ctx
+            .body(self.id.func)
+            .local_name_of(LocalValueId::Instruction(self.id.local))
     }
 }
 

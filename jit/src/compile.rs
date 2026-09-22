@@ -461,7 +461,7 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
         };
         let name = &self.ctx.shared.pcode_ops[op.id];
         !matches!(
-            (name.as_ref(), op.args.as_slice()),
+            (name.as_ref(), &*op.args),
             ("undef", []) | ("LOCK" | "UNLOCK", [])
         )
     }
@@ -770,7 +770,7 @@ impl<'a, 'ctx> BlockTranslator<'a, 'ctx> {
             // nothing observable in a single-threaded replay.
             Mnemonic::PCodeOp(op) => {
                 let name = &self.ctx.shared.pcode_ops[op.id];
-                match (name.as_ref(), op.args.as_slice()) {
+                match (name.as_ref(), &*op.args) {
                     ("undef", []) => {
                         let out = self.width_of(ValueId::Instruction(insn_id))?;
                         let ty = int_type(out)?;

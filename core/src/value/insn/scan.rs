@@ -43,7 +43,7 @@ pub struct Scan {
     pub src: LocalValueId,
     /// Loop-invariant values the body closes over (the accumulator and element
     /// are supplied per-lane by the scan itself). Empty for a closed body.
-    pub captures: Vec<LocalValueId>,
+    pub captures: Box<[LocalValueId]>,
 }
 
 impl MnemonicKind for Scan {
@@ -186,6 +186,6 @@ mod tests {
             "body symbol is untouched by replace_value"
         );
         assert_eq!(r.init, init.strip_func());
-        assert_eq!(r.captures, vec![cap.strip_func()]);
+        assert_eq!(&*r.captures, [cap.strip_func()]);
     }
 }

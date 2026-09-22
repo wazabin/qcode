@@ -495,6 +495,54 @@ fn a_session_hit_builds_the_same_function_names_included() {
     }
 }
 
+/// A replayed instruction connects its blocks as a fresh lift does: the
+/// CFG edges and the use edges, which the text does not show, agree.
+#[test]
+fn a_session_hit_builds_the_same_edges() {
+    let lifter = SleighLifter::new(sleigh_precompile::x64::spec()).with_flat_control_flow();
+    let cache = Arc::new(LiftCache::new(lifter.spec()));
+    let shape = |session: LiftSession<'_, '_>| {
+        let function = session.function();
+        let ctx = session.into_context().unwrap();
+        let body = qcode::value::FunctionBody::from_id(&ctx, function);
+        let mut blocks: Vec<(String, usize, usize)> = body
+            .blocks()
+            .map(|block| {
+                (
+                    block.name().unwrap().into_owned(),
+                    block.successors().count(),
+                    block.predecessors().count(),
+                )
+            })
+            .collect();
+        blocks.sort();
+        let mut uses: Vec<(String, usize)> = body
+            .blocks()
+            .flat_map(|block| block.instructions().collect::<Vec<_>>())
+            .map(|insn| (insn.to_string(), body.users_of(insn.id.into()).len()))
+            .collect();
+        uses.sort();
+        (blocks, uses)
+    };
+    // Warm, then a session of hits, against a session of misses.
+    lift_sequence(
+        &mut LiftSession::new(&lifter, Host::At(0x1000)).with_cache(Arc::clone(&cache)),
+        0x1000,
+    );
+    let start = ADDRESSES[1];
+    let mut cached = LiftSession::new(&lifter, Host::At(start)).with_cache(Arc::clone(&cache));
+    lift_sequence(&mut cached, start);
+    let mut plain = LiftSession::new(&lifter, Host::At(start));
+    lift_sequence(&mut plain, start);
+    assert_eq!(
+        cache.stats().hits as usize,
+        2 + SEQUENCE.len(),
+        "{:?}",
+        cache.stats()
+    );
+    assert_eq!(shape(cached), shape(plain));
+}
+
 #[test]
 fn the_cache_is_shared_across_threads() {
     let lifter = lifter();

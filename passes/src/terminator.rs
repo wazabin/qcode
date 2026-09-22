@@ -48,14 +48,14 @@ pub fn replace_terminator_with_branch<'a, 'str>(
             term_id,
             Mnemonic::Branch(Branch {
                 target: local_target,
-                args,
+                args: args.into(),
             }),
         );
     } else {
         let branch = body.push_mnemonic(
             Mnemonic::Branch(Branch {
                 target: local_target,
-                args,
+                args: args.into(),
             }),
             0,
         );

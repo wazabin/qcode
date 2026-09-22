@@ -219,7 +219,7 @@ pub fn recognizers_for(root: RootOp) -> &'static [IntrinsicId] {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct IntrinsicApp {
     pub id: IntrinsicId,
-    pub args: Vec<LocalValueId>,
+    pub args: Box<[LocalValueId]>,
 }
 
 impl MnemonicKind for IntrinsicApp {

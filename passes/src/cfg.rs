@@ -403,15 +403,15 @@ fn try_bypass_empty_block<'a, 'str>(
         let new_mnemonic = match body.insn(p_term).mnemonic().clone() {
             Mnemonic::Branch(br) => Mnemonic::Branch(Branch {
                 target,
-                args: substitute(&b_args, &params, &br.args),
+                args: substitute(&b_args, &params, &br.args).into(),
             }),
             Mnemonic::CBranch(mut cb) => {
                 if BlockId::new(p.func, cb.success_block) == b_id {
-                    cb.success_args = substitute(&b_args, &params, &cb.success_args);
+                    cb.success_args = substitute(&b_args, &params, &cb.success_args).into();
                     cb.success_block = target;
                 }
                 if BlockId::new(p.func, cb.failure_block) == b_id {
-                    cb.failure_args = substitute(&b_args, &params, &cb.failure_args);
+                    cb.failure_args = substitute(&b_args, &params, &cb.failure_args).into();
                     cb.failure_block = target;
                 }
                 Mnemonic::CBranch(cb)

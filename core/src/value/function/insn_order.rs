@@ -61,7 +61,10 @@ fn assert_consistent(ctx: &Context<'_>, block: BlockId, expected: &[InstructionI
     let ids = ctx.bodies[block.func].insn_ids(block.local);
     assert_eq!(ids.len(), expected.len(), "exact size");
     for id in expected {
-        assert_eq!(ctx.bodies[block.func].insn(*id).parent, Some(block.local));
+        assert_eq!(
+            ctx.bodies[block.func].insn(*id).parent.get(),
+            Some(block.local)
+        );
     }
     assert_eq!(verify_body_arena_integrity(ctx), Vec::<String>::new());
 }
@@ -127,7 +130,7 @@ fn unlinking_the_first_middle_and_last() {
     // An unlinked instruction is in no block and carries no links, and
     // unlinking it again is a no-op.
     let gone = &ctx.bodies[f].insns[ids[2].local];
-    assert_eq!(gone.parent, None);
+    assert_eq!(gone.parent.get(), None);
     assert_eq!((gone.prev_in_block(), gone.next_in_block()), (None, None));
     ctx.bodies[f].unlink(ids[2].local);
     assert_consistent(&ctx, block, &[ids[1], ids[3]]);
@@ -345,7 +348,7 @@ fn a_cloned_block_keeps_the_order() {
         "
     );
     let target = ctx.anon_function();
-    let mut value_map = FxHashMap::default();
+    let mut value_map = rustc_hash::FxHashMap::default();
     let cloned = BasicBlock::clone_block_into(&mut ctx, entry, target, &mut value_map);
     let opcodes = |ctx: &Context<'_>, block: BlockId| -> Vec<String> {
         BasicBlock::from_id(ctx, block)
@@ -406,9 +409,13 @@ fn integrity_reports_broken_links() {
     };
 
     // A back link that skips an instruction.
-    ctx.bodies[f].insns[ids[2].local].prev = Some(ids[0].local);
+    ctx.bodies[f].insns[ids[2].local]
+        .prev
+        .set(Some(ids[0].local));
     has(&ctx, "links back to");
-    ctx.bodies[f].insns[ids[2].local].prev = Some(ids[1].local);
+    ctx.bodies[f].insns[ids[2].local]
+        .prev
+        .set(Some(ids[1].local));
 
     // A count that disagrees with the walk.
     ctx.bodies[f].blocks[block.local].instructions.len = 2;
@@ -426,7 +433,7 @@ fn integrity_reports_broken_links() {
     let other = ctx.get_or_make_block(0x2000, f);
     let o = mint(&mut ctx, f, other, 9);
     ctx.bodies[f].link_last(other.local, o.local);
-    ctx.bodies[f].insns[ids[2].local].next = Some(o.local);
+    ctx.bodies[f].insns[ids[2].local].next.set(Some(o.local));
     ctx.bodies[f].blocks[block.local].instructions.len = 4;
     has(&ctx, "block memberships");
 }

@@ -3,7 +3,7 @@ use jstd::{
     registry::{Identified, Registry},
     stable_arena::StableArena,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use std::{
     borrow::Cow,
     collections::BTreeSet,
@@ -14,6 +14,8 @@ use std::{
 mod footprint;
 #[cfg(test)]
 mod insn_order;
+mod prototype;
+pub use prototype::{ProtoMap, ProtoOp};
 #[cfg(test)]
 mod use_edges;
 pub use footprint::{Footprint, RamBase, RamField, RamLocations, RamObject, RamRegion};
@@ -33,7 +35,8 @@ use crate::{
         block::{EdgeData, InsnList},
         block_param::{BlockParam, BlockParamId, LocalParamId},
         insn::{LocalInsnId, Mnemonic},
-        uses::{Use, UseArena, UseId, WithUsers},
+        name::{BaseId, LocalNames, Name, hex_name},
+        uses::{SharedHeads, Use, UseArena, UseId, WithUsers},
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable, update_context_name},
@@ -485,8 +488,10 @@ pub struct FunctionBody<'str> {
     /// parallel function passes.
     /// A value's own `name` field is the source of truth for rendering; this only
     /// enforces uniqueness and resolves names within the function.
-    #[serde(default)]
-    pub(crate) names: crate::context::NameTable<'str, LocalValueId>,
+    /// On the wire it is the interned bases alone; the table is rebuilt from
+    /// the values' names ([`rebuild_names`](Self::rebuild_names)).
+    #[serde(default, with = "name_bases")]
+    pub(crate) names: LocalNames<LocalValueId>,
 
     /// The operand relation read backwards: one [`Use`] edge per operand
     /// occurrence in this body, threaded into a singly linked list per used
@@ -513,7 +518,7 @@ pub struct FunctionBody<'str> {
     /// use tracking is per body, and bodies are mutated independently. Sparse:
     /// a value with no use in this body has no entry.
     #[serde(skip)]
-    pub(crate) shared_first_use: FxHashMap<LocalValueId, UseId>,
+    pub(crate) shared_first_use: SharedHeads,
 
     /// The module's shape clock (see
     /// [`Context::revision`](crate::context::Context::revision)), ticked by
@@ -675,7 +680,7 @@ impl Iterator for InsnIds<'_, '_> {
         }
         let local = self.front?;
         self.remaining -= 1;
-        self.front = self.body.insns[local].next;
+        self.front = self.body.insns[local].next.get();
         Some(local)
     }
 
@@ -691,7 +696,7 @@ impl DoubleEndedIterator for InsnIds<'_, '_> {
         }
         let local = self.back?;
         self.remaining -= 1;
-        self.back = self.body.insns[local].prev;
+        self.back = self.body.insns[local].prev.get();
         Some(local)
     }
 }
@@ -803,9 +808,9 @@ impl<'str> FunctionBody<'str> {
             temp_spaces: Registry::default(),
             temps: Registry::default(),
             instruction_addrs: BTreeSet::new(),
-            names: crate::context::NameTable::default(),
+            names: LocalNames::default(),
             uses: UseArena::default(),
-            shared_first_use: FxHashMap::default(),
+            shared_first_use: SharedHeads::default(),
             clock: crate::context::ShapeClock::default(),
         }
     }
@@ -829,9 +834,9 @@ impl<'str> FunctionBody<'str> {
             temp_spaces: Registry::default(),
             temps: Registry::default(),
             instruction_addrs: BTreeSet::new(),
-            names: crate::context::NameTable::default(),
+            names: LocalNames::default(),
             uses: UseArena::default(),
-            shared_first_use: FxHashMap::default(),
+            shared_first_use: SharedHeads::default(),
             clock: crate::context::ShapeClock::default(),
         }
     }
@@ -1067,24 +1072,24 @@ impl<'str> FunctionBody<'str> {
     /// Appends a body-local temporary value and returns its qualified ID.
     pub fn push_temp(&mut self, mut temp: Temp<'str>) -> TempId {
         temp.first_use = None;
+        temp.name = None;
         assert!(
             usize::from(temp.space) < self.temp_spaces.len(),
             "temporary references a missing local space"
         );
-        let name = temp.name.clone();
-        if let Some(name) = &name {
-            assert!(
-                !self.names.contains(name),
-                "temporary name {name:?} is already registered in this function"
-            );
-        }
-        let local = self.temps.push(temp);
-        if let Some(name) = name {
-            self.names
-                .register(name, LocalValueId::Temp(local), None)
-                .expect("temporary name was checked before insertion");
-        }
-        TempId::new(self.id(), local)
+        TempId::new(self.id(), self.temps.push(temp))
+    }
+
+    /// Appends a body-local temporary value named `name` made unique in
+    /// this body, and returns its qualified ID.
+    pub fn push_named_temp(&mut self, temp: Temp<'str>, name: &str) -> TempId {
+        let id = self.push_temp(temp);
+        let base = self.names.intern(name);
+        let name = self
+            .names
+            .register_unique(base, LocalValueId::Temp(id.local));
+        self.temps[id.local].name = Some(name);
+        id
     }
 
     /// Empties the body and starts a new epoch of its arenas: every id is
@@ -1115,7 +1120,7 @@ impl<'str> FunctionBody<'str> {
     /// nothing may still refer to the dropped temporaries.
     pub(crate) fn take_back_temps(&mut self, temps: usize, temp_spaces: usize) {
         for raw in temps..self.temps.len() {
-            if let Some(name) = &self.temps[crate::value::LocalTempId::from(raw)].name {
+            if let Some(name) = self.temps[crate::value::LocalTempId::from(raw)].name {
                 self.names.forget(name);
             }
         }
@@ -1193,9 +1198,8 @@ impl<'str> FunctionBody<'str> {
             self.contains_block_param(id),
             "cannot remove stale param {id:?}"
         );
-        let name = self.params[id.local].name.clone();
-        if let Some(name) = name {
-            self.names.forget(name.as_ref());
+        if let Some(name) = self.params[id.local].name {
+            self.names.forget(name);
         }
         self.drop_uses_of(LocalValueId::BlockParam(id.local));
         self.params.remove(id.local);
@@ -1228,10 +1232,10 @@ impl<'str> FunctionBody<'str> {
         // A caller may clone a linked instruction as its template; the copy is
         // a new value in no block, used by nothing, whatever the original's
         // links said.
-        insn.parent = None;
-        insn.prev = None;
-        insn.next = None;
-        insn.first_use = None;
+        insn.parent.set(None);
+        insn.prev.set(None);
+        insn.next.set(None);
+        insn.first_use.set(None);
         let local = self.insns.push(insn);
         self.add_operand_uses(local);
         local
@@ -1245,24 +1249,24 @@ impl<'str> FunctionBody<'str> {
         &mut self,
         block: LocalBlockId,
         mut insn: Instruction<'str>,
-        name: Option<&str>,
+        name: Option<BaseId>,
     ) -> LocalInsnId {
         let last = self.blocks[block].instructions.last;
-        insn.parent = Some(block);
-        insn.prev = last;
-        insn.next = None;
-        insn.first_use = None;
+        insn.parent.set(Some(block));
+        insn.prev.set(last);
+        insn.next.set(None);
+        insn.first_use.set(None);
         let local = self.insns.push(insn);
         self.add_operand_uses(local);
         match last {
-            Some(last) => self.insns[last].next = Some(local),
+            Some(last) => self.insns[last].next.set(Some(local)),
             None => self.blocks[block].instructions.first = Some(local),
         }
         let list = &mut self.blocks[block].instructions;
         list.last = Some(local);
         list.len += 1;
-        if let Some(name) = name {
-            self.name_insn_unique(local, name);
+        if let Some(base) = name {
+            self.name_insn_unique(local, base);
         }
         local
     }
@@ -1384,12 +1388,12 @@ impl<'str> FunctionBody<'str> {
         let last = self.blocks[block].instructions.last;
         {
             let i = &mut self.insns[insn];
-            i.parent = Some(block);
-            i.prev = last;
-            i.next = None;
+            i.parent.set(Some(block));
+            i.prev.set(last);
+            i.next.set(None);
         }
         match last {
-            Some(last) => self.insns[last].next = Some(insn),
+            Some(last) => self.insns[last].next.set(Some(insn)),
             None => self.blocks[block].instructions.first = Some(insn),
         }
         let list = &mut self.blocks[block].instructions;
@@ -1405,20 +1409,20 @@ impl<'str> FunctionBody<'str> {
         }
         self.unlink(insn);
         debug_assert_eq!(
-            self.insns[before].parent,
+            self.insns[before].parent.get(),
             Some(block),
             "{before:?} is not in {block:?}"
         );
-        let prev = self.insns[before].prev;
+        let prev = self.insns[before].prev.get();
         {
             let i = &mut self.insns[insn];
-            i.parent = Some(block);
-            i.prev = prev;
-            i.next = Some(before);
+            i.parent.set(Some(block));
+            i.prev.set(prev);
+            i.next.set(Some(before));
         }
-        self.insns[before].prev = Some(insn);
+        self.insns[before].prev.set(Some(insn));
         match prev {
-            Some(prev) => self.insns[prev].next = Some(insn),
+            Some(prev) => self.insns[prev].next.set(Some(insn)),
             None => self.blocks[block].instructions.first = Some(insn),
         }
         self.blocks[block].instructions.len += 1;
@@ -1427,11 +1431,11 @@ impl<'str> FunctionBody<'str> {
     /// Links `insn` immediately after `after`, which must be in `block`.
     pub fn link_after(&mut self, block: LocalBlockId, after: LocalInsnId, insn: LocalInsnId) {
         debug_assert_eq!(
-            self.insns[after].parent,
+            self.insns[after].parent.get(),
             Some(block),
             "{after:?} is not in {block:?}"
         );
-        match self.insns[after].next {
+        match self.insns[after].next.get() {
             Some(next) => self.link_before(block, next, insn),
             None => self.link_last(block, insn),
         }
@@ -1448,11 +1452,11 @@ impl<'str> FunctionBody<'str> {
             (block, i.prev.take(), i.next.take())
         };
         match prev {
-            Some(prev) => self.insns[prev].next = next,
+            Some(prev) => self.insns[prev].next.set(next),
             None => self.blocks[block].instructions.first = next,
         }
         match next {
-            Some(next) => self.insns[next].prev = prev,
+            Some(next) => self.insns[next].prev.set(prev),
             None => self.blocks[block].instructions.last = prev,
         }
         self.blocks[block].instructions.len -= 1;
@@ -1478,9 +1482,9 @@ impl<'str> FunctionBody<'str> {
         let ids: Vec<LocalInsnId> = self.insn_ids(block).collect();
         for &id in &ids {
             let i = &mut self.insns[id];
-            i.parent = None;
-            i.prev = None;
-            i.next = None;
+            i.parent.set(None);
+            i.prev.set(None);
+            i.next.set(None);
         }
         self.blocks[block].instructions = InsnList::default();
         ids
@@ -1529,7 +1533,7 @@ impl<'str> FunctionBody<'str> {
         insn: InstructionId,
     ) {
         assert_eq!(
-            self.insn(before).parent,
+            self.insn(before).parent.get(),
             Some(block.local),
             "before not in block"
         );
@@ -1561,12 +1565,13 @@ impl<'str> FunctionBody<'str> {
         );
 
         assert!(
-            self.insn(insn).parent.is_some(),
+            self.insn(insn).parent.get().is_some(),
             "moved instruction must belong to a block"
         );
         let target = self
             .insn(before)
             .parent
+            .get()
             .expect("anchor instruction must belong to a block");
         self.unlink(insn.local);
         self.link_before(target, before.local, insn.local);
@@ -1760,8 +1765,8 @@ impl<'str> FunctionBody<'str> {
         let (parent, name, is_terminator) = {
             let insn = self.insn(id);
             (
-                insn.parent.map(|l| BlockId::new(self.id(), l)),
-                insn.name.clone(),
+                insn.parent.get().map(|l| BlockId::new(self.id(), l)),
+                insn.name,
                 insn.mnemonic().is_terminator(),
             )
         };
@@ -1786,7 +1791,7 @@ impl<'str> FunctionBody<'str> {
         }
 
         if let Some(n) = name {
-            self.names.forget(n.as_ref());
+            self.names.forget(n);
         }
         self.remove_operand_uses(id.local);
         self.drop_uses_of(LocalValueId::Instruction(id.local));
@@ -1823,7 +1828,7 @@ impl<'str> FunctionBody<'str> {
                 !insn.mnemonic().is_terminator(),
                 "bulk removal does not unlink CFG edges; {id:?} is a terminator"
             );
-            if let Some(name) = insn.name.clone() {
+            if let Some(name) = insn.name {
                 names.push(name);
             }
         }
@@ -1839,9 +1844,9 @@ impl<'str> FunctionBody<'str> {
     ///
     /// The shared tail of removing instructions in bulk. It does not touch any
     /// block's instruction list — the caller has already unlinked them.
-    fn purge_instructions(&mut self, dead: &FxHashSet<LocalInsnId>, names: Vec<Cow<'str, str>>) {
+    fn purge_instructions(&mut self, dead: &FxHashSet<LocalInsnId>, names: Vec<Name>) {
         for name in names {
-            self.names.forget(name.as_ref());
+            self.names.forget(name);
         }
         self.remove_uses_of_dead_instructions(dead);
         for &id in dead {
@@ -1872,7 +1877,7 @@ impl<'str> FunctionBody<'str> {
             "instruction belongs to another function"
         );
         assert_eq!(
-            self.insn(insn).parent,
+            self.insn(insn).parent.get(),
             Some(block.local),
             "split point is not in the block"
         );
@@ -1880,7 +1885,7 @@ impl<'str> FunctionBody<'str> {
         let mut moved: Vec<LocalInsnId> = Vec::new();
         let mut at = Some(insn.local);
         while let Some(local) = at {
-            at = self.insns[local].next;
+            at = self.insns[local].next.get();
             moved.push(local);
         }
         for &local in &moved {
@@ -1970,7 +1975,7 @@ impl<'str> FunctionBody<'str> {
             | LocalValueId::Bytes(_)
             | LocalValueId::Varnode(_)
             | LocalValueId::Function(_)
-            | LocalValueId::Poison(_) => self.shared_first_use.get(&value).copied(),
+            | LocalValueId::Poison(_) => self.shared_first_use.get(value),
         }
     }
 
@@ -1978,22 +1983,15 @@ impl<'str> FunctionBody<'str> {
     /// storage for `value`: check [`has_use_home`](Self::has_use_home) first.
     fn set_first_use_of(&mut self, value: LocalValueId, head: Option<UseId>) {
         match value {
-            LocalValueId::Instruction(id) => *self.insns[id].first_use_mut() = head,
-            LocalValueId::BlockParam(id) => *self.params[id].first_use_mut() = head,
-            LocalValueId::BasicBlock(id) => *self.blocks[id].first_use_mut() = head,
-            LocalValueId::Temp(id) => *self.temps[id].first_use_mut() = head,
+            LocalValueId::Instruction(id) => self.insns[id].set_first_use(head),
+            LocalValueId::BlockParam(id) => self.params[id].set_first_use(head),
+            LocalValueId::BasicBlock(id) => self.blocks[id].set_first_use(head),
+            LocalValueId::Temp(id) => self.temps[id].set_first_use(head),
             LocalValueId::Literal(_)
             | LocalValueId::Bytes(_)
             | LocalValueId::Varnode(_)
             | LocalValueId::Function(_)
-            | LocalValueId::Poison(_) => match head {
-                Some(head) => {
-                    self.shared_first_use.insert(value, head);
-                }
-                None => {
-                    self.shared_first_use.remove(&value);
-                }
-            },
+            | LocalValueId::Poison(_) => self.shared_first_use.set(value, head),
         }
     }
 
@@ -2004,6 +2002,7 @@ impl<'str> FunctionBody<'str> {
     /// `value`: the operand is dangling, which the integrity check reports,
     /// and which a clone into another function's arenas leaves behind until
     /// the caller remaps the operands and rebuilds the edges.
+    #[inline]
     pub(crate) fn add_use(
         &mut self,
         value: LocalValueId,
@@ -2022,44 +2021,55 @@ impl<'str> FunctionBody<'str> {
             shared_first_use,
             ..
         } = self;
-        let head: &mut Option<UseId> = match value {
-            LocalValueId::Instruction(id) => insns.get_mut(id)?.inner.first_use_mut(),
-            LocalValueId::BlockParam(id) => params.get_mut(id)?.inner.first_use_mut(),
-            LocalValueId::BasicBlock(id) => blocks.get_mut(id)?.inner.first_use_mut(),
+        let mut edge = Use {
+            value,
+            user,
+            operand_index,
+            next: None,
+        };
+        match value {
+            LocalValueId::Instruction(id) => {
+                let holder = insns.get_mut(id)?.inner;
+                edge.next = holder.first_use.get();
+                let edge = uses.push(edge);
+                holder.first_use.set(Some(edge));
+                Some(edge)
+            }
+            LocalValueId::BlockParam(id) => {
+                let holder = params.get_mut(id)?.inner;
+                edge.next = holder.first_use;
+                let edge = uses.push(edge);
+                holder.first_use = Some(edge);
+                Some(edge)
+            }
+            LocalValueId::BasicBlock(id) => {
+                let holder = blocks.get_mut(id)?.inner;
+                edge.next = holder.first_use();
+                let edge = uses.push(edge);
+                holder.set_first_use(Some(edge));
+                Some(edge)
+            }
             LocalValueId::Temp(id) => {
                 if usize::from(id) >= temps.len() {
                     return None;
                 }
-                temps[id].first_use_mut()
+                let holder = &mut temps[id];
+                edge.next = holder.first_use;
+                let edge = uses.push(edge);
+                holder.first_use = Some(edge);
+                Some(edge)
             }
             LocalValueId::Literal(_)
             | LocalValueId::Bytes(_)
             | LocalValueId::Varnode(_)
             | LocalValueId::Function(_)
             | LocalValueId::Poison(_) => {
-                let head = shared_first_use.entry(value);
-                let next = match &head {
-                    std::collections::hash_map::Entry::Occupied(head) => Some(*head.get()),
-                    std::collections::hash_map::Entry::Vacant(_) => None,
-                };
-                let edge = uses.push(Use {
-                    value,
-                    user,
-                    operand_index,
-                    next,
-                });
-                *head.or_insert(edge) = edge;
-                return Some(edge);
+                edge.next = shared_first_use.get(value);
+                let edge = uses.push(edge);
+                shared_first_use.set(value, Some(edge));
+                Some(edge)
             }
-        };
-        let edge = uses.push(Use {
-            value,
-            user,
-            operand_index,
-            next: *head,
-        });
-        *head = Some(edge);
-        Some(edge)
+        }
     }
 
     /// Finds the edge recording that `user`'s operand `operand_index` names
@@ -2165,7 +2175,9 @@ impl<'str> FunctionBody<'str> {
     /// Records a use edge for each operand of `insn`: on creation, and after
     /// its mnemonic is swapped.
     fn add_operand_uses(&mut self, insn: LocalInsnId) {
-        // Inline for up to two operands, which covers most instructions.
+        // The mnemonic is borrowed from the arena the edges' heads live in,
+        // so the operands are read out first: inline for up to two, which
+        // covers most instructions.
         let operands = self.insns[insn].mnemonic().args();
         for (index, &value) in operands.iter().enumerate() {
             self.add_use(value, insn, index);
@@ -2247,20 +2259,64 @@ impl<'str> FunctionBody<'str> {
     /// Rebuilds every use edge from the operands of this body's live
     /// instructions: after deserialization, which does not carry the edges,
     /// and after a relocation that rewrote operands wholesale.
+    /// Rebuilds the name table from the values' names, after
+    /// deserialization: the wire carries the names and the bases they index,
+    /// not the table.
+    pub(crate) fn rebuild_names(&mut self) {
+        self.names.clear();
+        for insn in self.insns.iter() {
+            if let Some(name) = insn.name {
+                self.names
+                    .register(name, LocalValueId::Instruction(insn.id))
+                    .expect("a deserialized body's names are unique");
+            }
+        }
+        for param in self.params.iter() {
+            if let Some(name) = param.name {
+                self.names
+                    .register(name, LocalValueId::BlockParam(param.id))
+                    .expect("a deserialized body's names are unique");
+            }
+        }
+        for block in self.blocks.iter() {
+            match (block.local_name(), block.address) {
+                (Some(name), _) => self
+                    .names
+                    .register(name, LocalValueId::BasicBlock(block.id))
+                    .expect("a deserialized body's names are unique"),
+                (None, Some(address)) => self
+                    .names
+                    .label(address, LocalValueId::BasicBlock(block.id))
+                    .expect("a deserialized body's labels are unique"),
+                (None, None) => {}
+            }
+        }
+        for (raw, temp) in self.temps.iter().enumerate() {
+            if let Some(name) = temp.name {
+                self.names
+                    .register(
+                        name,
+                        LocalValueId::Temp(crate::value::LocalTempId::from(raw)),
+                    )
+                    .expect("a deserialized body's names are unique");
+            }
+        }
+    }
+
     pub(crate) fn rebuild_uses(&mut self) {
         self.uses.clear();
         self.shared_first_use.clear();
         for mut insn in self.insns.iter_mut() {
-            *insn.first_use_mut() = None;
+            insn.set_first_use(None);
         }
         for mut param in self.params.iter_mut() {
-            *param.first_use_mut() = None;
+            param.set_first_use(None);
         }
         for mut block in self.blocks.iter_mut() {
-            *block.first_use_mut() = None;
+            block.set_first_use(None);
         }
         for mut temp in self.temps.iter_mut() {
-            *temp.first_use_mut() = None;
+            temp.set_first_use(None);
         }
         let live: Vec<LocalInsnId> = self.insns.iter().map(|insn| insn.id).collect();
         for insn in live {
@@ -2279,19 +2335,7 @@ impl<'str> FunctionBody<'str> {
     /// restricted to the id-free local parts, usable on a detached body). Errors
     /// only on a duplicate name.
     pub fn rename_block_local(&mut self, block: LocalBlockId, name: Cow<'str, str>) -> Result<()> {
-        let target = LocalValueId::BasicBlock(block);
-        if let Some(existing) = self.names.get(&name) {
-            return if existing == target {
-                Ok(())
-            } else {
-                Err(Error::spanless(ErrorTy::DuplicateName(name.to_string())))
-            };
-        }
-        let old_name = self.blocks[block].local_name().map(str::to_owned);
-        self.names
-            .register(name.clone(), target, old_name.as_deref())?;
-        self.blocks[block].set_name(Some(name));
-        Ok(())
+        self.set_local_name(LocalValueId::BasicBlock(block), &name)
     }
 
     /// Whether `block`, body-local, is on this body's roster. A block is
@@ -2335,9 +2379,9 @@ impl<'str> FunctionBody<'str> {
         // sharing a few operands.
         let insns = self.take_insns(block.local);
         let dead: FxHashSet<LocalInsnId> = insns.iter().copied().collect();
-        let names: Vec<Cow<'str, str>> = insns
+        let names: Vec<Name> = insns
             .iter()
-            .filter_map(|&local| self.insns[local].name.clone())
+            .filter_map(|&local| self.insns[local].name)
             .collect();
         self.purge_instructions(&dead, names);
     }
@@ -2363,13 +2407,18 @@ impl<'str> FunctionBody<'str> {
         for param in params {
             self.remove_block_param(param);
         }
-        let name = self.block(block).local_name().map(str::to_owned);
+        let (name, address) = {
+            let block = self.block(block);
+            (block.local_name(), block.address)
+        };
         self.unroster_block(block);
         if self.root == Some(block.local) {
             self.root = None;
         }
-        if let Some(name) = name {
-            self.names.forget(&name);
+        match (name, address) {
+            (Some(name), _) => self.names.forget(name),
+            (None, Some(address)) => self.names.forget_label(address),
+            (None, None) => {}
         }
         let addressed = {
             let block = &self.blocks[block.local];
@@ -2427,11 +2476,7 @@ impl<'str> FunctionBody<'str> {
         self.rehome_outgoing_edges(keep, other);
         let (b_addr, b_extra, b_name) = {
             let b = self.block(other);
-            (
-                b.address,
-                b.extra_addresses.clone(),
-                b.local_name().map(str::to_owned),
-            )
+            (b.address, b.extra_addresses.clone(), b.local_name())
         };
         for param in other_params {
             self.remove_block_param(param);
@@ -2440,8 +2485,10 @@ impl<'str> FunctionBody<'str> {
         if self.root == Some(other.local) {
             self.root = Some(keep.local);
         }
-        if let Some(name) = b_name {
-            self.names.forget(&name);
+        match (b_name, b_addr) {
+            (Some(name), _) => self.names.forget(name),
+            (None, Some(address)) => self.names.forget_label(address),
+            (None, None) => {}
         }
         self.blocks.remove(other.local);
         // The addresses `other` carried move to `keep`: an index naming
@@ -2479,56 +2526,136 @@ impl<'str> FunctionBody<'str> {
         self.register_body_name(id, name, old_name)
     }
 
-    /// Register `name` for the function-scoped `id` (block/instruction/param/Temp)
-    /// in this body's local name table. The shared-arm-free canon behind
-    /// [`register_local_name`](Self::register_local_name); panics on a
-    /// global-scoped `id`. Errors only on a duplicate name.
+    /// Sets the name of the function-scoped `id` (block/instruction/param/
+    /// Temp) to `name`, registered in this body's local name table; the
+    /// name it held before, if any, is forgotten. The shared-arm-free
+    /// canon behind [`register_local_name`](Self::register_local_name);
+    /// panics on a global-scoped `id`. Errors only on a duplicate name.
     pub fn register_body_name(
         &mut self,
         id: ValueId,
         name: Cow<'str, str>,
-        old_name: Option<&str>,
+        _old_name: Option<&str>,
     ) -> Result<()> {
         assert!(
             id.name_scope_function().is_some(),
             "register_body_name on a global-scoped value {id:?}"
         );
-        let local = id.localize(self.id());
-        match self.names.register(name, local, old_name) {
-            // Registering a value's own name again is nothing.
-            Err(Error {
-                ty: ErrorTy::DuplicateName(name),
-                ..
-            }) if self.names.get(&name) == Some(local) => Ok(()),
-            registered => registered,
+        self.set_local_name(id.localize(self.id()), &name)
+    }
+
+    /// The name field of the function-scoped `id`.
+    fn name_slot(&mut self, id: LocalValueId) -> &mut Option<Name> {
+        match id {
+            LocalValueId::Instruction(local) => &mut self.insns[local].name,
+            LocalValueId::BasicBlock(local) => self.blocks[local].name_mut(),
+            LocalValueId::BlockParam(local) => &mut self.params[local].name,
+            LocalValueId::Temp(local) => &mut self.temps[local].name,
+            _ => unreachable!("{id:?} has no function-scoped name"),
         }
     }
 
-    /// Names instruction `local`, which has no name yet, `name` made unique
-    /// in this body — as a lift names a register's load. See
-    /// [`NameTable::register_unique`](crate::context::NameTable::register_unique).
-    pub(crate) fn name_insn_unique(&mut self, local: LocalInsnId, name: &str) {
+    /// The name of the function-scoped `id`, as it renders: a block at an
+    /// address with no name of its own renders as the address.
+    pub fn local_name_of(&self, id: LocalValueId) -> Option<Cow<'_, str>> {
+        let name = match id {
+            LocalValueId::Instruction(local) => self.insns[local].name,
+            LocalValueId::BasicBlock(local) => {
+                let block = &self.blocks[local];
+                match (block.local_name(), block.address) {
+                    (None, Some(address)) => return Some(Cow::Owned(hex_name(address))),
+                    (name, _) => name,
+                }
+            }
+            LocalValueId::BlockParam(local) => self.params[local].name,
+            LocalValueId::Temp(local) => self.temps[local].name,
+            _ => unreachable!("{id:?} has no function-scoped name"),
+        };
+        name.map(|name| self.names.render(name))
+    }
+
+    /// Names the function-scoped `id` what `text` spells, forgetting the
+    /// name it held. Nothing happens when it holds that name already;
+    /// errors when another value does.
+    pub fn set_local_name(&mut self, id: LocalValueId, text: &str) -> Result<()> {
+        if self.names.get(text) == Some(id) {
+            return Ok(());
+        }
+        let name = self.names.parse(text);
+        self.names.register(name, id)?;
+        if let LocalValueId::BasicBlock(local) = id
+            && let Some(address) = self.blocks[local].address
+            && self.blocks[local].local_name().is_none()
+        {
+            self.names.forget_label(address);
+        }
+        if let Some(old) = self.name_slot(id).replace(name) {
+            self.names.forget(old);
+        }
+        Ok(())
+    }
+
+    /// The base `text`, interned in this body's names, for naming values
+    /// after it in bulk.
+    pub(crate) fn intern_base(&mut self, text: &str) -> BaseId {
+        self.names.intern(text)
+    }
+
+    /// The name `text` would get if registered now: itself when free, else
+    /// its first free `base_<n>`.
+    pub fn unique_local_name(&mut self, text: &str) -> String {
+        let (base, suffix) = crate::value::name::split_suffix(text);
+        let base = self.names.intern(base);
+        self.names
+            .render(self.names.peek_unique(Name::new(base, suffix)))
+            .into_owned()
+    }
+
+    /// Names instruction `local`, which has no name yet, after `base` made
+    /// unique in this body — as a lift names a register's load.
+    pub(crate) fn name_insn_unique(&mut self, local: LocalInsnId, base: BaseId) {
         debug_assert!(
             self.insns[local].name.is_none(),
             "{local:?} is named already"
         );
         let name = self
             .names
-            .register_unique(name, LocalValueId::Instruction(local));
+            .register_unique(base, LocalValueId::Instruction(local));
         self.insns[local].name = Some(name);
     }
 
-    /// Names block `local`, which has no name yet, `name` made unique in
-    /// this body.
-    pub(crate) fn name_block_unique(&mut self, local: LocalBlockId, name: &str) {
+    /// Names block `local`, which has no name yet, after `base` made unique
+    /// in this body.
+    pub(crate) fn name_block_unique(&mut self, local: LocalBlockId, base: BaseId) {
         debug_assert!(
             self.blocks[local].local_name().is_none(),
             "{local:?} is named already"
         );
         let name = self
             .names
-            .register_unique(name, LocalValueId::BasicBlock(local));
+            .register_unique(base, LocalValueId::BasicBlock(local));
         self.blocks[local].set_name(Some(name));
+    }
+
+    /// Labels block `local`, now at `address` and without a name, with the
+    /// address — or, when a name spelled like the address is taken, names
+    /// it the first free `<address>_<n>`, as a lift always did.
+    pub(crate) fn label_block(&mut self, local: LocalBlockId, address: u64) {
+        let id = LocalValueId::BasicBlock(local);
+        if self.names.label(address, id).is_ok() {
+            return;
+        }
+        let base = self.names.intern(&hex_name(address));
+        let name = self.names.register_unique(base, id);
+        self.blocks[local].set_name(Some(name));
+    }
+
+    /// Forgets the label of block `local` at `address`, before the block
+    /// leaves or the address does.
+    pub(crate) fn unlabel_block(&mut self, local: LocalBlockId, address: u64) {
+        if self.blocks[local].local_name().is_none() {
+            self.names.forget_label(address);
+        }
     }
 
     /// Gets a reference to a function from its ID
@@ -2864,7 +2991,7 @@ where
             && let Some(name) = root
                 .params()
                 .nth(index)
-                .and_then(|p| p.name().map(str::to_owned))
+                .and_then(|p| p.name().map(Cow::into_owned))
         {
             return Some(name);
         }
@@ -3042,8 +3169,8 @@ impl<'str: 'ctx, 'ctx, R> Named for FunctionRef<'str, 'ctx, R>
 where
     R: QCodeView<'ctx, 'str>,
 {
-    fn name(&self) -> Option<&str> {
-        Some(self.view.interface(self.id).name.as_ref())
+    fn name(&self) -> Option<Cow<'_, str>> {
+        Some(Cow::Borrowed(self.view.interface(self.id).name.as_ref()))
     }
 }
 
@@ -3129,8 +3256,8 @@ impl<'ctx, 'str> Value<'str, 'ctx> for FunctionMutRef<'str, 'ctx> {
 }
 
 impl Named for FunctionMutRef<'_, '_> {
-    fn name(&self) -> Option<&str> {
-        Some(self.ctx.interfaces[self.id].name.as_ref())
+    fn name(&self) -> Option<Cow<'_, str>> {
+        Some(Cow::Borrowed(self.ctx.interfaces[self.id].name.as_ref()))
     }
 }
 
@@ -3451,6 +3578,26 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         if !self.inner().is_rostered(local) {
             self.inner_mut().roster.push(local);
         }
+    }
+}
+
+/// The wire form of a body's name table: its interned bases.
+mod name_bases {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::value::{LocalValueId, name::LocalNames};
+
+    pub(super) fn serialize<S: Serializer>(
+        names: &LocalNames<LocalValueId>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        names.bases().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<LocalNames<LocalValueId>, D::Error> {
+        Vec::<Box<str>>::deserialize(deserializer).map(LocalNames::from_bases)
     }
 }
 
@@ -3848,10 +3995,13 @@ mod tests {
 
         let f = FunctionBody::from_name(&ctx, "multiblock").unwrap();
         assert_eq!(f.root().unwrap().name().unwrap(), "bb1");
-        let block_names: Vec<_> = f.blocks().filter_map(|b| b.name()).collect();
-        assert!(block_names.contains(&"bb1"), "missing bb1");
-        assert!(block_names.contains(&"bb2"), "missing bb2");
-        assert!(block_names.contains(&"bb3"), "missing bb3");
+        let block_names: Vec<String> = f
+            .blocks()
+            .filter_map(|b| b.name().map(Cow::into_owned))
+            .collect();
+        assert!(block_names.iter().any(|n| n == "bb1"), "missing bb1");
+        assert!(block_names.iter().any(|n| n == "bb2"), "missing bb2");
+        assert!(block_names.iter().any(|n| n == "bb3"), "missing bb3");
         assert_eq!(f.blocks().count(), 3);
     }
 

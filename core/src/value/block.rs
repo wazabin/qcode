@@ -7,6 +7,7 @@ use crate::{
         block_param::{BlockParam, BlockParamId, BlockParamMutRef, BlockParamRef, LocalParamId},
         function::{FunctionId, FunctionMutRef, FunctionRef},
         insn::{InstructionId, InstructionRef, LocalInsnId, Mnemonic},
+        name::Name,
         uses::{UseId, WithUsers},
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
@@ -15,10 +16,8 @@ use crate::{
         },
     },
 };
-use jstd::graph::FxBuildHasher;
 use std::{
     borrow::Cow,
-    collections::HashSet,
     fmt::{Display, Formatter},
     marker::PhantomData,
 };
@@ -26,7 +25,7 @@ use std::{
 use rustc_hash::FxHashMap as HashMap;
 
 pub(crate) use self::cfg::EdgeData;
-pub use self::cfg::{BlockId, EdgeId};
+pub use self::cfg::{BlockId, EdgeId, EdgeSet};
 pub mod cfg;
 
 /// Simultaneously replace operands without allowing a target-arena local id to
@@ -62,8 +61,9 @@ pub(crate) fn substitute_operands(mnemonic: &mut Mnemonic, pairs: &[(LocalValueI
 /// This is the basic unit of code in our IR.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BasicBlock<'str> {
-    /// An optionnal name for this basic block
-    name: Option<Cow<'str, str>>,
+    /// The block's own name, in the owning body's bases; a block at an
+    /// address with none renders as the address.
+    name: Option<Name>,
 
     /// Optional human-readable analysis note rendered under the block label.
     comment: Option<String>,
@@ -88,9 +88,9 @@ pub struct BasicBlock<'str> {
     /// rather than stored per edge (stage 6a, mirroring the stage-4 `EdgeId`
     /// strip).
     ///
-    /// Uses a fixed-seed hasher (matching `Context`'s `Graph::Hasher`) so that
-    /// `predecessors()`/`successors()` iterate deterministically across runs.
-    pub edges: HashSet<EdgeId, FxBuildHasher>,
+    /// Insertion-ordered, so `predecessors()`/`successors()` iterate
+    /// deterministically across runs.
+    pub edges: EdgeSet,
 
     /// The address of this block, if it corresponds to a machine address.
     ///
@@ -111,6 +111,9 @@ pub struct BasicBlock<'str> {
     /// deserialization.
     #[serde(skip)]
     pub(crate) first_use: Option<UseId>,
+
+    #[serde(skip)]
+    marker: std::marker::PhantomData<&'str ()>,
 }
 
 impl WithUsers for BasicBlock<'_> {
@@ -118,8 +121,8 @@ impl WithUsers for BasicBlock<'_> {
         self.first_use
     }
 
-    fn first_use_mut(&mut self) -> &mut Option<UseId> {
-        &mut self.first_use
+    fn set_first_use(&mut self, head: Option<UseId>) {
+        self.first_use = head;
     }
 }
 
@@ -207,13 +210,17 @@ impl<'str> BasicBlock<'str> {
     /// Sets this block's name (crate-internal; the private `name` field is set
     /// through the generic builder, which lives in another module). The caller is
     /// responsible for registering the name in the owning function's name table.
-    pub(crate) fn set_name(&mut self, name: Option<Cow<'str, str>>) {
+    pub(crate) fn set_name(&mut self, name: Option<Name>) {
         self.name = name;
     }
 
-    /// The locally stored name, for owning-arena removal bookkeeping.
-    pub(crate) fn local_name(&self) -> Option<&str> {
-        self.name.as_deref()
+    /// The locally stored name, for owning-arena bookkeeping.
+    pub(crate) fn local_name(&self) -> Option<Name> {
+        self.name
+    }
+
+    pub(crate) fn name_mut(&mut self) -> &mut Option<Name> {
+        &mut self.name
     }
 
     /// A fresh, empty block value (crate-internal; the generic builder pushes it
@@ -247,10 +254,11 @@ impl<'str> BasicBlock<'str> {
 
         // Preserve the original label, deduplicated within the target function's
         // own (function-scoped) name table.
-        let name = ctx.block(orig).name.clone().unwrap_or_else(|| {
-            Cow::Owned(format!("clone_{:x}", ctx.block(orig).address.unwrap_or(0)))
-        });
-        let unique_name = ctx.get_unique_name_in(target, name);
+        let name = BasicBlock::from_id(ctx, orig)
+            .name()
+            .map(Cow::into_owned)
+            .unwrap_or_else(|| format!("clone_{:x}", ctx.block(orig).address.unwrap_or(0)));
+        let unique_name = ctx.get_unique_name_in(target, Cow::Owned(name));
         BasicBlock::from_id_mut(ctx, new_block_id)
             .rename(unique_name)
             .expect("name was deduplicated");
@@ -420,8 +428,10 @@ where
         })
     }
 
-    pub fn name(&'s self) -> Option<&'ctx str> {
-        self.inner().name.as_deref()
+    pub fn name(&'s self) -> Option<Cow<'ctx, str>> {
+        self.view
+            .function(self.id.func)
+            .local_name_of(LocalValueId::BasicBlock(self.id.local))
     }
 
     /// Returns the machine address of this block, if it has one.
@@ -521,7 +531,7 @@ where
     }
 
     fn fmt(&'s self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let name = self.name().unwrap_or("unnamed");
+        let name = self.name().unwrap_or(Cow::Borrowed("unnamed"));
         write!(f, "<{name}")?;
         for param in self.params() {
             write!(f, " ")?;
@@ -553,9 +563,13 @@ where
                 Mnemonic::Call(_) | Mnemonic::CallInd(_) | Mnemonic::BranchInd(_)
             )
         {
-            let mut succ: Vec<&str> = self
+            let mut succ: Vec<Cow<'_, str>> = self
                 .successors()
-                .map(|(_, b)| BlockRef::new(self.view, b).name().unwrap_or("unnamed"))
+                .map(|(_, b)| {
+                    BlockRef::new(self.view, b)
+                        .name()
+                        .unwrap_or(Cow::Borrowed("unnamed"))
+                })
                 .collect();
             if !succ.is_empty() {
                 succ.sort_unstable();
@@ -611,8 +625,10 @@ impl<'str: 'ctx, 'ctx, R> Named for BlockRef<'str, 'ctx, R>
 where
     R: QCodeView<'ctx, 'str>,
 {
-    fn name(&self) -> Option<&str> {
-        self.view.block(self.id).name.as_deref()
+    fn name(&self) -> Option<Cow<'_, str>> {
+        self.view
+            .function(self.id.func)
+            .local_name_of(LocalValueId::BasicBlock(self.id.local))
     }
 }
 
@@ -662,7 +678,7 @@ where
         let local = self.front?;
         let id = InstructionId::new(self.func, local);
         self.remaining -= 1;
-        self.front = self.view.instruction(id).next;
+        self.front = self.view.instruction(id).next.get();
         Some(InstructionRef::new(self.view, id))
     }
 
@@ -682,7 +698,7 @@ where
         let local = self.back?;
         let id = InstructionId::new(self.func, local);
         self.remaining -= 1;
-        self.back = self.view.instruction(id).prev;
+        self.back = self.view.instruction(id).prev.get();
         Some(InstructionRef::new(self.view, id))
     }
 }
@@ -728,14 +744,18 @@ where
 // signature-pinned return lifetime needs `'str` to outlive the `&self` borrow,
 // which only a host type that carries `'str` (not a generic `H`) can prove.
 impl Named for BlockMutRef<'_, '_> {
-    fn name(&self) -> Option<&str> {
-        self.ctx.block(self.id).name.as_deref()
+    fn name(&self) -> Option<Cow<'_, str>> {
+        self.ctx
+            .body(self.id.func)
+            .local_name_of(LocalValueId::BasicBlock(self.id.local))
     }
 }
 
 impl<'a, 'str> Named for BaseRef<BodyMut<'a, 'str>, BlockId> {
-    fn name(&self) -> Option<&str> {
-        self.ctx.fun.blocks[self.id.local].name.as_deref()
+    fn name(&self) -> Option<Cow<'_, str>> {
+        self.ctx
+            .fun
+            .local_name_of(LocalValueId::BasicBlock(self.id.local))
     }
 }
 
@@ -772,17 +792,7 @@ impl<'str, H: QCodeMut<'str>> BaseRef<H, BlockId> {
     /// a `FunctionPass` can name the blocks it mints. Returns an error only on a
     /// duplicate name.
     pub fn rename_local(&mut self, name: Cow<'str, str>) -> crate::error::Result<()> {
-        let old_name = self
-            .ctx
-            .body(self.id.func)
-            .block(self.id)
-            .name
-            .as_deref()
-            .map(str::to_owned);
-        self.ctx
-            .register_body_name(self.id.into(), name.clone(), old_name.as_deref())?;
-        self.ctx.block_raw_mut(self.id).name = Some(name);
-        Ok(())
+        self.ctx.register_body_name(self.id.into(), name, None)
     }
 
     /// Inserts an instruction at the given index, shifting later instructions
@@ -969,6 +979,7 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
                 name: None,
                 origin: None,
                 first_use: None,
+                marker: std::marker::PhantomData,
             },
         );
         self.inner_mut().params.push(id.localize(block_id.func));
@@ -986,7 +997,7 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     pub fn insert_insn_after(&mut self, after_id: InstructionId, insn_id: InstructionId) {
         let block = self.id;
         assert_eq!(
-            self.ctx.body(block.func).insn(after_id).parent,
+            self.ctx.body(block.func).insn(after_id).parent.get(),
             Some(block.local),
             "after_id not found in block"
         );
@@ -1068,9 +1079,11 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         }
         registered?;
 
-        if self.name().is_none() {
-            self.ctx.bodies[self.id.func]
-                .name_block_unique(self.id.local, &crate::context::hex_name(addr));
+        if self.inner().name.is_none() {
+            if let Some(old) = old_address {
+                self.ctx.bodies[self.id.func].unlabel_block(self.id.local, old);
+            }
+            self.ctx.bodies[self.id.func].label_block(self.id.local, addr);
         }
         Ok(())
     }
@@ -1155,7 +1168,7 @@ mod tests {
             .map(|(_, b)| {
                 BasicBlock::from_id(&ctx, b)
                     .name()
-                    .unwrap_or("")
+                    .unwrap_or(Cow::Borrowed(""))
                     .to_string()
             })
             .collect();
@@ -1286,9 +1299,9 @@ mod tests {
         assert_eq!(entry.num_params(), 2, "entry should have 2 params");
 
         let params = entry.params().collect::<Vec<_>>();
-        assert_eq!(params[0].name(), Some("v1"));
+        assert_eq!(params[0].name().as_deref(), Some("v1"));
         assert_eq!(params[0].size(), 8);
-        assert_eq!(params[1].name(), Some("v2"));
+        assert_eq!(params[1].name().as_deref(), Some("v2"));
         assert_eq!(params[1].size(), 4);
 
         let done_block = BasicBlock::from_id(&ctx, done);
@@ -1488,7 +1501,8 @@ mod tests {
         let cloned_id = BasicBlock::clone_into_ctx(&mut ctx, block, &mut value_map);
         let cloned = BasicBlock::from_id(&ctx, cloned_id);
 
-        let orig_value_ids: HashSet<ValueId> = value_map.keys().copied().collect();
+        let orig_value_ids: std::collections::HashSet<ValueId> =
+            value_map.keys().copied().collect();
 
         // All operands in the clone must reference new (remapped) values, not the originals
         // so no value map key should be referenced

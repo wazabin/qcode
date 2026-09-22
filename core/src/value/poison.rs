@@ -28,7 +28,7 @@ use crate::{
 use jstd::Identifier;
 
 #[derive(Identifier)]
-pub struct PoisonId(usize);
+pub struct PoisonId(u32);
 
 /// A typed poison value stored in a [`Context`](crate::context::Context). Carries
 /// only its [`TypeId`] (hence its width); its bits are undefined.

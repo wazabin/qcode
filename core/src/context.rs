@@ -246,8 +246,10 @@ impl<'de, 'str> serde::Deserialize<'de> for Context<'str> {
         for mut body in bodies.iter_mut() {
             let id = body.id;
             body.rehydrate_id(id);
-            // The wire carries operands, not the edges derived from them.
+            // The wire carries operands and names, not the edges and the
+            // table derived from them.
             body.rebuild_uses();
+            body.rebuild_names();
             body.link_clock(clock.clone());
         }
         Ok(Self {
@@ -1336,10 +1338,14 @@ impl<'str> Context<'str> {
             }
             let mut temp = self.bodies[old.func].temps[old.local].clone();
             temp.space = temp_space_map[&TempSpaceId::new(old.func, temp.space)].local;
-            if let Some(name) = temp.name.take() {
-                temp.name = Some(self.bodies[target].names.unique(name));
-            }
-            let new = self.bodies[target].push_temp(temp);
+            let name = temp
+                .name
+                .take()
+                .map(|name| self.bodies[old.func].names.render(name).into_owned());
+            let new = match name {
+                Some(name) => self.bodies[target].push_named_temp(temp, &name),
+                None => self.bodies[target].push_temp(temp),
+            };
             value_map.insert(ValueId::Temp(old), ValueId::Temp(new));
         }
 
@@ -1762,7 +1768,7 @@ impl<'str> Context<'str> {
                 insn,
                 Mnemonic::TailCall(TailCall {
                     target: Callee::Real(callee),
-                    args: vec![],
+                    args: Box::new([]),
                 }),
             );
         }
@@ -2543,9 +2549,7 @@ impl<'str> Context<'str> {
             };
         }
         match id.name_scope_function() {
-            Some(func) => self.bodies[func]
-                .names
-                .register(name, id.localize(func), old_name),
+            Some(func) => self.bodies[func].set_local_name(id.localize(func), &name),
             None => self.update_name(name, id, old_name),
         }
     }
@@ -2574,9 +2578,7 @@ impl<'str> Context<'str> {
         old_name: Option<&str>,
     ) -> Result<()> {
         match id.name_scope_function() {
-            Some(func) => self.bodies[func]
-                .names
-                .register(name, id.localize(func), old_name),
+            Some(func) => self.bodies[func].set_local_name(id.localize(func), &name),
             None => self.shared.name_map.register(name, id, old_name),
         }
     }
@@ -2616,7 +2618,7 @@ impl<'str> Context<'str> {
     /// instruction, block-param, and Temp names). Two functions may thus reuse the same
     /// name independently.
     pub fn get_unique_name_in(&mut self, func: FunctionId, name: Cow<'str, str>) -> Cow<'str, str> {
-        self.bodies[func].names.unique(name)
+        Cow::Owned(self.bodies[func].unique_local_name(&name))
     }
 }
 
@@ -2726,13 +2728,6 @@ impl<'str, Id: Copy + Eq> NameTable<'str, Id> {
     /// Whether `name` is taken.
     pub fn contains(&self, name: &str) -> bool {
         self.get(name).is_some()
-    }
-
-    /// Forgets every name, keeping the table's capacity.
-    pub(crate) fn clear(&mut self) {
-        self.map.clear();
-        self.suffixed.clear();
-        self.labels.clear();
     }
 
     /// Whether the bare name `name` — one with no canonical suffix — is
@@ -3321,10 +3316,15 @@ mod tests {
             let blocks = f
                 .blocks()
                 .map(|b| {
-                    let name = b.name().unwrap_or("?").to_string();
+                    let name = b.name().unwrap_or(Cow::Borrowed("?")).to_string();
                     let mut succ: Vec<String> = b
                         .successors()
-                        .map(|(_, s)| BlockRef::new(view, s).name().unwrap_or("?").to_string())
+                        .map(|(_, s)| {
+                            BlockRef::new(view, s)
+                                .name()
+                                .unwrap_or(Cow::Borrowed("?"))
+                                .to_string()
+                        })
                         .collect();
                     succ.sort();
                     let ops: Vec<String> =
@@ -3396,7 +3396,7 @@ mod tests {
             FunctionRef::from_id(ctx, fid)
                 .blocks()
                 .map(|b| {
-                    let name = b.name().unwrap_or("?").to_string();
+                    let name = b.name().unwrap_or(Cow::Borrowed("?")).to_string();
                     let comment = b.comment().map(str::to_string);
                     let params: Vec<usize> = b.params().map(|p| p.size()).collect();
                     let ops: Vec<String> =
@@ -3406,7 +3406,7 @@ mod tests {
                         .map(|(_, s)| {
                             BasicBlock::from_id(ctx, s)
                                 .name()
-                                .unwrap_or("?")
+                                .unwrap_or(Cow::Borrowed("?"))
                                 .to_string()
                         })
                         .collect();
@@ -3775,8 +3775,8 @@ mod tests {
             call_id,
             Mnemonic::Call(Call {
                 target: Callee::Real(target),
-                args: vec![],
-                clobbers: vec![],
+                args: Box::new([]),
+                clobbers: Box::new([]),
                 tag: Default::default(),
             }),
         );
@@ -3919,7 +3919,7 @@ mod tests {
 
         // Manually detach from block without using remove_instruction,
         // simulating an instruction with no parent.
-        ctx.instruction_mut(load_id).parent = None;
+        ctx.instruction_mut(load_id).parent.set(None);
 
         // Should not panic even though parent is None.
         ctx.remove_instruction(load_id);

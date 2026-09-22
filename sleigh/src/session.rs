@@ -44,7 +44,7 @@ use sleigh::{
 
 use crate::{
     FlatPcode, LiftError, SleighLifter,
-    cache::{Instance, LiftCache, Lookup, ReplayScratch, Template},
+    cache::{Instance, LiftCache, Lookup, Lowering, ReplayScratch, Template},
     decode::FixedDecoder,
 };
 
@@ -195,10 +195,12 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
             let instruction = self.decoder.decode(address, bytes)?;
             return self.lift_decoded(&instruction);
         };
-        let flat = self.lifter.flat_control_flow();
-        if let Some((template, instance)) =
-            cache.find_undecoded(self.lifter, &self.decoder, flat, address, bytes)?
-        {
+        let how = Lowering {
+            lifter: self.lifter,
+            decoder: &self.decoder,
+            flat: self.lifter.flat_control_flow(),
+        };
+        if let Some((template, instance)) = cache.find_undecoded(how, address, bytes)? {
             let mut target =
                 LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
             return template.replay(&mut target, &instance, &mut self.scratch);
@@ -206,15 +208,7 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
         let (instruction, shape) = decode_for(cache, &self.decoder, address, bytes)?;
         let mut target =
             LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
-        cache.lower(
-            self.lifter,
-            &mut target,
-            &instruction,
-            shape,
-            &self.decoder,
-            flat,
-            &mut self.scratch,
-        )
+        cache.lower(how, &mut target, &instruction, shape, &mut self.scratch)
     }
 
     /// Lifts an instruction the caller decoded, with whatever context it
@@ -375,8 +369,7 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
         // A known encoding needs no decode: the views read the template, and
         // the instruction is decoded only if asked for.
         if let Some(cache) = &self.cache
-            && let Some((template, instance)) =
-                cache.find_undecoded(self.lifter, &self.decoder, true, address, bytes)?
+            && let Some((template, instance)) = cache.find_undecoded(self.how(), address, bytes)?
         {
             let lifted = template.lifted_at(&instance, self.store.function());
             return Ok(ScratchLifted {
@@ -403,6 +396,15 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
         self.lower(instruction, None, false)
     }
 
+    /// How this session lowers: it always flattens control flow.
+    fn how(&self) -> Lowering<'_, 'spec> {
+        Lowering {
+            lifter: self.lifter,
+            decoder: &self.decoder,
+            flat: true,
+        }
+    }
+
     fn lower<'s, 'b>(
         &'s mut self,
         instruction: Instruction<'spec, 'b>,
@@ -411,7 +413,7 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
     ) -> Result<ScratchLifted<'s, 'l, 'spec, 'b>, LiftError> {
         let cache = self.cache.as_deref().filter(|_| cached);
         let lookup = match cache {
-            Some(cache) => cache.find(self.lifter, &instruction, &self.decoder, true)?,
+            Some(cache) => cache.find(self.how(), &instruction)?,
             None => Lookup::Uncacheable,
         };
         if let Lookup::Hit(template, instance) = lookup {
@@ -432,14 +434,14 @@ impl<'l, 'spec> ScratchSession<'l, 'spec> {
         // never printed: its debug names would be minted for nothing.
         let mut target = self.store.target()?.without_debug_names();
         let lifted = match (cache, lookup) {
-            (Some(cache), Lookup::Unknown) => cache.miss(
-                self.lifter,
-                &mut target,
-                &instruction,
-                shape,
-                &self.decoder,
-                true,
-            )?,
+            (Some(cache), Lookup::Unknown) => {
+                let how = Lowering {
+                    lifter: self.lifter,
+                    decoder: &self.decoder,
+                    flat: true,
+                };
+                cache.miss(how, &mut target, &instruction, shape)?
+            }
             _ => self.lifter.lower(&mut target, &instruction, true)?,
         };
         Ok(ScratchLifted {

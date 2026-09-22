@@ -31,7 +31,7 @@ use crate::{
 pub mod register;
 
 #[derive(Identifier)]
-pub struct VarnodeId(usize);
+pub struct VarnodeId(u32);
 
 /// A named, typed reference to a specific location in a memory [`Space`].
 ///
@@ -166,8 +166,8 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithShared<'s, 'ctx, 'str> for VarnodeRef<'str, '
 }
 
 impl Named for VarnodeRef<'_, '_> {
-    fn name(&self) -> Option<&str> {
-        self.name()
+    fn name(&self) -> Option<Cow<'_, str>> {
+        self.name().map(Cow::Borrowed)
     }
 }
 
@@ -215,8 +215,8 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithShared<'s, 's, 'str> for VarnodeMutRef<'str, 
 }
 
 impl Named for VarnodeMutRef<'_, '_> {
-    fn name(&self) -> Option<&str> {
-        self.name()
+    fn name(&self) -> Option<Cow<'_, str>> {
+        self.name().map(Cow::Borrowed)
     }
 }
 
@@ -261,7 +261,7 @@ mod tests {
         qcode!(ctx, "<block> varnode i64 ptr; goto <0x1001>;");
 
         let temp = TempRef::new(ModuleView::new(&ctx), ptr);
-        assert_eq!(temp.name(), Some("ptr"));
+        assert_eq!(temp.name().as_deref(), Some("ptr"));
         assert_eq!(temp.space().name(), Some("ptr"));
     }
 }
