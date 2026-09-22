@@ -4,7 +4,7 @@
 //! every instruction in one function, which is what a cache hit replays into.
 //!
 //! ```sh
-//! cargo run --release -p wazabin-qcode-sleigh --example lift-throughput -- /usr/bin/ls [--linear] [--stage decode|pcode|lift] [--cache] [--validate] [--session]
+//! cargo run --release -p wazabin-qcode-sleigh --example lift-throughput -- /usr/bin/ls [--linear] [--stage decode|pcode|lift] [--cache] [--validate] [--session] [--warm]
 //! cargo run --release -p wazabin-qcode-sleigh --example lift-throughput -- --bytes dec9 --iters 3000 --cache
 //! cargo run --release -p wazabin-qcode-sleigh --example lift-throughput -- xul.dll --offset 0x400 --len 0x24603E1 --linear --stage decode
 //! ```
@@ -83,6 +83,9 @@ fn main() {
     let use_cache = args.iter().any(|a| a == "--cache");
     let validate = args.iter().any(|a| a == "--validate");
     let keep = args.iter().any(|a| a == "--session");
+    // Run the lift stage twice and report the second pass: with a cache,
+    // every instruction of it is a hit.
+    let warm = args.iter().any(|a| a == "--warm");
     let stage = flag("--stage").unwrap_or_else(|| "all".into());
     let (path, base, text) = if let Some(hex) = flag("--bytes") {
         // One encoding, repeated `--iters` times at consecutive addresses.
@@ -143,6 +146,11 @@ fn main() {
     let n = offsets.len();
 
     let run = |name: &str, mut f: Stage<'_>| {
+        if warm && name != "decode" && name != "pcode" {
+            for &off in &offsets {
+                f(base + off as u64, &text[off..]);
+            }
+        }
         let t = Instant::now();
         let mut ok = 0usize;
         for &off in &offsets {

@@ -896,7 +896,12 @@ impl<'v> ScratchInsn<'v> {
             LocalValueId::Varnode(id) => ScratchOperand::Varnode(ScratchVarnode {
                 ctx: self.source.ctx(),
                 spec: self.spec,
-                id,
+                id: match self.source {
+                    Source::Store(_) => id,
+                    Source::Template {
+                        template, instance, ..
+                    } => template.varnode_at(usize::from(id), instance),
+                },
             }),
             LocalValueId::Instruction(local) => ScratchOperand::Result(ScratchInsn {
                 source: self.source,
