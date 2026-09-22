@@ -149,6 +149,65 @@ built from a per-template plan, and no heap string per named operation
 (names as `(base, suffix)` rendered on demand). That changes what a
 `FunctionBody` stores, which is a design decision, not an optimisation.
 
+## 3c. Making the eager path cheap (2026-09-22)
+
+§3b's two routes were put to Jack, who ruled out deferring anything
+("doing things later doesn't speed them up") and kept every guarantee:
+the work stays inside the timed loop and the API loses nothing. What
+followed is on the branch `lift-fast`, one commit per step, measured
+each time (`perf stat -e instructions:u` net of `--stage none`, and
+callgrind on a repeated encoding for exact per-operation costs).
+
+Replaying one instruction of `/usr/bin/bash`, retired instructions and
+peak memory of the whole session:
+
+| | instrs/insn | peak |
+|---|---|---|
+| before §3b | 28 000 | 695 MB |
+| after §3b (name tiers, append verb) | 14 400 | 558 MB |
+| id and link packing | 14 400 | 558 MB |
+| names as base + suffix | 11 000 | 484 MB |
+| prototype append, dense use heads | 9 400 | — |
+| inline edge sets, cheaper labels, batched runs | **8 300** | 493 MB |
+
+What each step did: `LocalValueId` 16 → 8 bytes (the module-interned ids
+are `u32`), an instruction's links and address packed (`value::link`),
+argument lists `Box<[_]>` rather than `Vec` — `Instruction` 160 → 96,
+`Mnemonic` 80 → 56; function-local names as `{BaseId, suffix}` rendered
+on demand, with a block at an address holding no name at all
+(`value::name`); `FunctionBody::append_prototype`, which takes a
+recorded run and does per operation only what the body must, with the
+template's operations, type ids and name bases built once per template
+and session; use-list heads of literals and varnodes in dense vectors; a
+block's incident edges inline; a block's instruction list read and
+written once per run.
+
+It also fixed a replay bug found by writing the test for it: a replayed
+branch made no CFG edge, so a session's hits had blocks with no
+successors (`a_session_hit_builds_the_same_edges`).
+
+Not 10 MB/s: measured hit-only throughput is ~2–2.5 MB/s (the laptop is
+usually loaded; instruction counts are the metric to track). Exactly
+where the 8 300 go, from callgrind on one repeated encoding — a `nop`
+(one operation) costs 3 900 and a 17-operation instruction 13 200, so
+**583 per operation and ~3 300 fixed**:
+
+- Per operation: `append_prototype` itself 250 (the mnemonic clone, the
+  operand walks, the 96-byte push), `add_use` 94 for two edges,
+  `StableArena::push` 63, the use-edge arena 52, naming 54, the replay's
+  scratch 33.
+- Per instruction: the fall-through placeholder block with its label and
+  index entry ~750, the undecoded key walk ~560, `begin`/`commit` ~300,
+  the replay's prologue ~360, allocator ~200.
+
+The next moves, in order, and what they are worth: a `reserve` on
+jstd's `StableArena` and `RecyclingArena` (a jstd release; the growth
+memcpy and capacity checks are ~100 per operation), boxing the large
+`Mnemonic` variants to shrink an instruction to ~80 bytes, and a leaner
+`Construction` for a run that promises nothing. Below ~5 000 per
+instruction the fall-through block plumbing dominates, and that is the
+IR the flat lowering is defined to produce.
+
 ## 4. Rejected along the way
 
 - A per-session memo of recent encodings (first eight bytes → template)
