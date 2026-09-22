@@ -20,7 +20,6 @@ use crate::{
         FunctionBody, Instruction, LocalBlockId, LocalTempId, LocalTempSpaceId, LocalValueId,
         VarnodeId,
         insn::{Callee, LocalInsnId, Mnemonic},
-        link::Link,
         name::BaseId,
     },
 };
@@ -70,7 +69,21 @@ impl<'str> FunctionBody<'str> {
         out: &mut Vec<LocalInsnId>,
     ) {
         let first = out.len();
+        // The run's operations are grouped by block, so a block's list is
+        // read and written once per run of its own rather than per
+        // operation: `tail` is the last operation appended to `block`, and
+        // `added` how many are not counted in its list yet.
+        let mut block = map.blocks[ops.first().map_or(0, |op| op.block as usize)];
+        let mut tail = self.blocks[block].instructions.last;
+        let mut added = 0usize;
         for op in ops {
+            let at = map.blocks[op.block as usize];
+            if at != block {
+                self.close_run(block, tail, added);
+                block = at;
+                tail = self.blocks[block].instructions.last;
+                added = 0;
+            }
             let mut mnemonic = op.mnemonic.clone();
             mnemonic.for_each_operand_mut(|operand| {
                 *operand = match *operand {
@@ -83,7 +96,6 @@ impl<'str> FunctionBody<'str> {
                     other => other,
                 }
             });
-            let block = map.blocks[op.block as usize];
             match &mut mnemonic {
                 Mnemonic::Load(load) => {
                     if let LocalMemorySpaceId::Temp(space) = &mut load.space {
@@ -122,21 +134,15 @@ impl<'str> FunctionBody<'str> {
             let mut operands: SmallVec<[LocalValueId; 4]> = SmallVec::new();
             mnemonic.for_each_operand(|operand| operands.push(operand));
 
-            let mut insn = Instruction::new(op.type_id, mnemonic);
-            if let Some(address) = address {
-                insn.set_address(address);
-            }
-            let last = self.blocks[block].instructions.last;
-            insn.parent = Link::from(Some(block));
-            insn.prev = Link::from(last);
-            let local = self.insns.push(insn);
-            match last {
-                Some(last) => self.insns[last].next.set(Some(local)),
+            let local = self.insns.push(Instruction::linked(
+                op.type_id, mnemonic, block, tail, address,
+            ));
+            match tail {
+                Some(tail) => self.insns[tail].next.set(Some(local)),
                 None => self.blocks[block].instructions.first = Some(local),
             }
-            let list = &mut self.blocks[block].instructions;
-            list.last = Some(local);
-            list.len += 1;
+            tail = Some(local);
+            added += 1;
 
             for (index, &value) in operands.iter().enumerate() {
                 self.add_use(value, local, index);
@@ -148,5 +154,15 @@ impl<'str> FunctionBody<'str> {
             }
             out.push(local);
         }
+        if !ops.is_empty() {
+            self.close_run(block, tail, added);
+        }
+    }
+
+    /// Records that `added` operations ending at `tail` joined `block`.
+    fn close_run(&mut self, block: LocalBlockId, tail: Option<LocalInsnId>, added: usize) {
+        let list = &mut self.blocks[block].instructions;
+        list.last = tail;
+        list.len += added;
     }
 }

@@ -63,6 +63,9 @@ impl std::fmt::Debug for Name {
 /// The names of one base, by suffix.
 #[derive(Clone, Debug)]
 struct Suffixes<Id> {
+    /// The address this base spells, when it is one: a block labelled with
+    /// it excludes the bare name, and minting checks that per name.
+    hex: Option<u64>,
     /// The value holding `base_<n>` at index `n`; index `0` is the bare
     /// base.
     taken: Vec<Option<Id>>,
@@ -74,9 +77,10 @@ struct Suffixes<Id> {
     far: u32,
 }
 
-impl<Id> Default for Suffixes<Id> {
-    fn default() -> Self {
+impl<Id> Suffixes<Id> {
+    fn new(base: &str) -> Self {
         Self {
+            hex: hex_value(base),
             taken: Vec::new(),
             hint: 1,
             far: 0,
@@ -97,6 +101,9 @@ pub(crate) struct LocalNames<Id> {
     suffixes: Vec<Suffixes<Id>>,
     /// Explicit names whose suffix is far past their base's vector.
     far: HashMap<(BaseId, u32), Id>,
+    /// The bases that spell an address, by the address: what a block's
+    /// label has to be free of, without building the spelling.
+    hex_bases: HashMap<u64, BaseId>,
     /// The blocks labelled with an address and no name, by address.
     labels: HashMap<u64, Id>,
 }
@@ -108,6 +115,7 @@ impl<Id> Default for LocalNames<Id> {
             index: HashMap::default(),
             suffixes: Vec::new(),
             far: HashMap::default(),
+            hex_bases: HashMap::default(),
             labels: HashMap::default(),
         }
     }
@@ -120,9 +128,13 @@ impl<Id: Copy + Eq> LocalNames<Id> {
             return id;
         }
         let id = BaseId::from(self.bases.len());
+        let suffixes = Suffixes::new(base);
+        if let Some(address) = suffixes.hex {
+            self.hex_bases.insert(address, id);
+        }
         self.bases.push(base.into());
         self.index.insert(base.into(), id);
-        self.suffixes.push(Suffixes::default());
+        self.suffixes.push(suffixes);
         id
     }
 
@@ -176,10 +188,18 @@ impl<Id: Copy + Eq> LocalNames<Id> {
 
     /// Whether `name` is taken, by a value or by a label spelled like it.
     fn is_taken(&self, name: Name) -> bool {
-        self.holder(name).is_some()
-            || (name.suffix == 0
-                && hex_value(&self.bases[usize::from(name.base())])
-                    .is_some_and(|address| self.labels.contains_key(&address)))
+        let suffixes = &self.suffixes[usize::from(name.base())];
+        match suffixes.taken.get(name.suffix as usize) {
+            Some(Some(_)) => return true,
+            _ if suffixes.far > 0 && self.far.contains_key(&(name.base(), name.suffix)) => {
+                return true;
+            }
+            _ => {}
+        }
+        name.suffix == 0
+            && suffixes
+                .hex
+                .is_some_and(|address| self.labels.contains_key(&address))
     }
 
     fn duplicate(&self, name: Name) -> Error {
@@ -273,7 +293,9 @@ impl<Id: Copy + Eq> LocalNames<Id> {
     /// Errors if a name spelled like the address is taken: the block then
     /// needs a name of its own.
     pub(crate) fn label(&mut self, address: u64, id: Id) -> Result<()> {
-        if let Some(base) = self.base(&hex_name(address))
+        // The spelling is not built: a base that spells the address is
+        // listed under it.
+        if let Some(&base) = self.hex_bases.get(&address)
             && self.holder(Name::new(base, 0)).is_some()
         {
             return Err(Error::spanless(ErrorTy::DuplicateName(hex_name(address))));
@@ -332,6 +354,7 @@ impl<Id: Copy + Eq> LocalNames<Id> {
 
     /// Forgets every name and label, keeping the bases and the capacity.
     pub(crate) fn clear(&mut self) {
+        // The bases, and so what each spells, are kept.
         for suffixes in &mut self.suffixes {
             suffixes.taken.clear();
             suffixes.hint = 1;
@@ -354,12 +377,18 @@ impl<Id: Copy + Eq> LocalNames<Id> {
             .enumerate()
             .map(|(id, base)| (base.clone(), BaseId::from(id)))
             .collect();
-        let suffixes = bases.iter().map(|_| Suffixes::default()).collect();
+        let suffixes: Vec<Suffixes<Id>> = bases.iter().map(|base| Suffixes::new(base)).collect();
+        let hex_bases = suffixes
+            .iter()
+            .enumerate()
+            .filter_map(|(id, suffixes)| suffixes.hex.map(|address| (address, BaseId::from(id))))
+            .collect();
         Self {
             bases,
             index,
             suffixes,
             far: HashMap::default(),
+            hex_bases,
             labels: HashMap::default(),
         }
     }

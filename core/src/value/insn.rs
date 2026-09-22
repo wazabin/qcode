@@ -135,6 +135,29 @@ impl<'str> Instruction<'str> {
         }
     }
 
+    /// An instruction already linked into `parent` after `prev`, at
+    /// `address`: what appending a recorded run makes, without touching the
+    /// fields again afterwards.
+    pub(crate) fn linked(
+        type_id: TypeId,
+        mnemonic: Mnemonic,
+        parent: LocalBlockId,
+        prev: Option<LocalInsnId>,
+        address: Option<u64>,
+    ) -> Self {
+        Self {
+            name: None,
+            parent: Link::from(Some(parent)),
+            prev: Link::from(prev),
+            next: Link::none(),
+            first_use: Link::none(),
+            type_id,
+            mnemonic,
+            address: PackedAddress::from(address),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     pub fn mnemonic(&self) -> &Mnemonic {
         &self.mnemonic
     }
