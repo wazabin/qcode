@@ -22,6 +22,7 @@ use crate::{
         varnode::Varnode,
     },
 };
+use std::borrow::Cow;
 
 /// What a token *is*, semantically — drives syntax coloring in a viewer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +225,7 @@ where
     fn branch_target(&mut self, func: FunctionId, target: LocalBlockId, args: &[LocalValueId]) {
         let target = BlockId::new(func, target);
         let block = self.view.block_ref(target);
-        let name = block.name().unwrap_or("unnamed");
+        let name = block.name().unwrap_or(Cow::Borrowed("unnamed"));
         self.push(
             format!("<{name}"),
             TokenKind::Label,
@@ -251,7 +252,10 @@ fn instruction_atom<'ctx, 'str: 'ctx>(
     view: impl QCodeView<'ctx, 'str>,
     id: crate::value::InstructionId,
 ) -> String {
-    match view.instruction(id).name.as_deref() {
+    match view
+        .function(id.func)
+        .local_name_of(LocalValueId::Instruction(id.local))
+    {
         Some(name) => format!("%{name}"),
         None => format!("%tmp{:x}", usize::from(id.local)),
     }
@@ -792,24 +796,30 @@ where
     match id {
         ValueId::Instruction(iid) => {
             let insn = view.instruction(iid);
-            let atom = insn.name.as_deref().map_or_else(
-                || {
-                    let local: usize = iid.local.into();
-                    format!("%tmp{local:x}")
-                },
-                |name| format!("%{name}"),
-            );
+            let atom = view
+                .function(iid.func)
+                .local_name_of(LocalValueId::Instruction(iid.local))
+                .map_or_else(
+                    || {
+                        let local: usize = iid.local.into();
+                        format!("%tmp{local:x}")
+                    },
+                    |name| format!("%{name}"),
+                );
             typed(insn.type_id, atom, TokenKind::Variable);
         }
         ValueId::BlockParam(pid) => {
             let param = view.block_param(pid);
-            let atom = param.name.as_deref().map_or_else(
-                || {
-                    let local: usize = pid.local.into();
-                    format!("@param{local:x}")
-                },
-                |name| format!("@{name}"),
-            );
+            let atom = view
+                .function(pid.func)
+                .local_name_of(LocalValueId::BlockParam(pid.local))
+                .map_or_else(
+                    || {
+                        let local: usize = pid.local.into();
+                        format!("@param{local:x}")
+                    },
+                    |name| format!("@{name}"),
+                );
             typed(param.type_id, atom, TokenKind::BlockParam);
         }
         ValueId::Literal(lid) => {

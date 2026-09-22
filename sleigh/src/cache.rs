@@ -118,9 +118,9 @@ use qcode::{
     space::{LocalMemorySpaceId, MemorySpaceId},
     types::{TypeId, TypeRepr},
     value::{
-        BasicBlock, BlockId, FunctionBody, FunctionId, Instruction, InstructionId, LiteralId,
-        LocalBlockId, LocalInsnId, LocalTempId, LocalTempSpaceId, LocalValueId, Temp, TempId,
-        TempRef, TempSpace, TempSpaceId, Varnode, VarnodeId,
+        BaseId, BasicBlock, BlockId, FunctionBody, FunctionId, Instruction, InstructionId,
+        LiteralId, LocalBlockId, LocalInsnId, LocalTempId, LocalTempSpaceId, LocalValueId, Temp,
+        TempId, TempRef, TempSpace, TempSpaceId, Varnode, VarnodeId,
         insn::{Callee, Mnemonic},
         view::ModuleView,
     },
@@ -1454,6 +1454,9 @@ struct Resolved {
     types: Box<[TypeId]>,
     /// Per literal, its id when the literal is fixed.
     literals: Box<[Option<LocalValueId>]>,
+    /// Per operation with a fixed name, the name's base in the session's
+    /// body, once interned there.
+    bases: Box<[Option<BaseId>]>,
 }
 
 /// Where a lift's additions to its body start.
@@ -1552,7 +1555,9 @@ impl Template {
             numbering.blocks.push((block.local, index as u32));
             if index > 0 {
                 let name = BasicBlock::from_id(ctx, block).name();
-                template.blocks.push(BlockName::parse(name, base));
+                template
+                    .blocks
+                    .push(BlockName::parse(name.as_deref(), base));
             }
         }
 
@@ -1714,7 +1719,7 @@ impl Template {
             // A load is named after its register; the name then follows
             // the slot, not the record.
             let name = reference.name().map(|name| {
-                let base = base_name(ctx, name);
+                let base = base_name(ctx, &name);
                 let slot = (first_slot..template.varnodes.len()).find(|&slot| {
                     let VarnodeSlot::Fixed(varnode) = template.varnodes[slot] else {
                         return false;
@@ -3038,6 +3043,7 @@ impl Template {
                     .iter()
                     .map(|literal| literal.is_fixed().then(|| literal.resolve(ctx, instance)))
                     .collect(),
+                bases: vec![None; self.ops.len()].into_boxed_slice(),
             });
         types.extend_from_slice(&resolved.types);
         literals.extend(
@@ -3123,12 +3129,22 @@ impl Template {
                 }
                 _ => {}
             }
+            let base = match &op.name {
+                None => None,
+                Some(OpName::Fixed(name)) => Some(match resolved.bases[k] {
+                    Some(base) => base,
+                    None => {
+                        let base = emitter.intern_base(name);
+                        resolved.bases[k] = Some(base);
+                        base
+                    }
+                }),
+                Some(OpName::Varnode(_)) => self
+                    .name_at(k, instance)
+                    .map(|name| emitter.intern_base(name)),
+            };
             let id = emitter
-                .push_mnemonic_with_type_named(
-                    mnemonic,
-                    types[op.ty as usize],
-                    self.name_at(k, instance),
-                )
+                .push_mnemonic_with_type_based(mnemonic, types[op.ty as usize], base)
                 .id;
             insns.push(id);
         }

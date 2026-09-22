@@ -565,7 +565,6 @@ fn verify_use_edges(
 #[cfg(test)]
 mod tests {
     use crate::value::QCodeMut;
-    use std::borrow::Cow;
 
     use wazabin_qcode_macro::qcode;
 
@@ -771,13 +770,10 @@ mod tests {
         let f = ctx.function_ids()[0];
         let dead_block = BasicBlock::make(&mut ctx, f).id;
         ctx.delete_block(dead_block);
+        let stale = ctx.bodies[f].names.parse("stale");
         ctx.bodies[f]
             .names
-            .register(
-                Cow::Borrowed("stale"),
-                ValueId::BasicBlock(dead_block).localize(f),
-                None,
-            )
+            .register(stale, ValueId::BasicBlock(dead_block).localize(f))
             .expect("register corruption fixture");
 
         assert_has(&ctx, "local name \"stale\"");

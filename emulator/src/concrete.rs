@@ -2643,7 +2643,7 @@ impl<M: EmulatorMemory + Default> StandaloneEmulator<M> {
             .map(|param| {
                 let src = param
                     .name()
-                    .and_then(|name| ctx.get_named(name))
+                    .and_then(|name| ctx.get_named(&name))
                     .and_then(|value| match value {
                         ValueId::Varnode(id) => Some(Seed::Reg(id)),
                         _ => None,

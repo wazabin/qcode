@@ -105,6 +105,7 @@ pub use function::{
 pub use insn::LocalInsnId;
 pub use insn::{Instruction, InstructionId, InstructionRef};
 pub use literal::{LiteralId, LiteralRef};
+pub use name::{BaseId, Name};
 pub use poison::{Poison, PoisonId, PoisonRef};
 pub use temp::{
     LocalTempId, LocalTempSpaceId, Temp, TempId, TempRef, TempSpace, TempSpaceId, TempSpaceRef,
@@ -121,6 +122,7 @@ pub mod insn;
 pub mod interner;
 pub(crate) mod link;
 pub mod literal;
+pub mod name;
 pub mod poison;
 pub mod registry;
 pub mod temp;

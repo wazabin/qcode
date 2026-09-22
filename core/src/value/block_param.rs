@@ -6,6 +6,7 @@ use crate::{
     value::{
         LocalBlockId, LocalValueId, ModuleView, QCodeView, Value, ValueId,
         block::{BlockId, BlockRef},
+        name::Name,
         uses::{UseId, WithUsers},
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
@@ -58,8 +59,9 @@ pub struct BlockParam<'str> {
     /// cross-module constructor).
     pub(crate) parent: Option<LocalBlockId>,
 
-    /// Optional debug name (displayed as `%name`).
-    pub name: Option<Cow<'str, str>>,
+    /// Optional debug name (displayed as `%name`), in the owning body's
+    /// bases. Set through the body, which keeps it unique.
+    pub(crate) name: Option<Name>,
 
     /// Optional source value this param was created to promote (the varnode or
     /// stack-slot literal). Not displayed; it is a stable cross-run identity that
@@ -71,6 +73,9 @@ pub struct BlockParam<'str> {
     /// Derived bookkeeping, rebuilt after deserialization.
     #[serde(skip)]
     pub(crate) first_use: Option<UseId>,
+
+    #[serde(skip)]
+    pub(crate) marker: std::marker::PhantomData<&'str ()>,
 }
 
 impl WithUsers for BlockParam<'_> {
@@ -103,6 +108,7 @@ impl<'str> BlockParam<'str> {
                 name: None,
                 origin: None,
                 first_use: None,
+                marker: std::marker::PhantomData,
             },
         );
         BlockParamMutRef::from_id(ctx, id)
@@ -120,6 +126,7 @@ impl<'str> BlockParam<'str> {
             name: None,
             origin: None,
             first_use: None,
+            marker: std::marker::PhantomData,
         }
     }
 
@@ -191,8 +198,10 @@ where
             .map(|local| BlockRef::new(self.view, BlockId::new(self.id.func, local)))
     }
 
-    pub fn name(&'s self) -> Option<&'ctx str> {
-        self.inner().name.as_deref()
+    pub fn name(&'s self) -> Option<Cow<'ctx, str>> {
+        self.view
+            .function(self.id.func)
+            .local_name_of(LocalValueId::BlockParam(self.id.local))
     }
 
     /// The source value this param was created to promote, if recorded.
@@ -278,8 +287,10 @@ impl<'str: 'ctx, 'ctx, R> Named for BlockParamRef<'str, 'ctx, R>
 where
     R: QCodeView<'ctx, 'str>,
 {
-    fn name(&self) -> Option<&str> {
-        self.view.block_param(self.id).name.as_deref()
+    fn name(&self) -> Option<Cow<'_, str>> {
+        self.view
+            .function(self.id.func)
+            .local_name_of(LocalValueId::BlockParam(self.id.local))
     }
 }
 
@@ -349,17 +360,7 @@ impl<'str, H: QCodeMut<'str>> BaseRef<H, BlockParamId> {
     /// Renames this parameter in its owning function's local name table
     /// (own-param edit, host-routed). Errors only on a duplicate name.
     pub fn rename_local(&mut self, name: Cow<'str, str>) -> Result<()> {
-        let old_name = self
-            .ctx
-            .body(self.id.func)
-            .block_param(self.id)
-            .name
-            .as_deref()
-            .map(str::to_owned);
-        self.ctx
-            .register_body_name(self.id.into(), name.clone(), old_name.as_deref())?;
-        self.ctx.block_param_mut(self.id).name = Some(name);
-        Ok(())
+        self.ctx.register_body_name(self.id.into(), name, None)
     }
 }
 
@@ -376,8 +377,10 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for BlockParamMutRef<'str, '
 }
 
 impl Named for BlockParamMutRef<'_, '_> {
-    fn name(&self) -> Option<&str> {
-        self.ctx.block_param(self.id).name.as_deref()
+    fn name(&self) -> Option<Cow<'_, str>> {
+        self.ctx
+            .body(self.id.func)
+            .local_name_of(LocalValueId::BlockParam(self.id.local))
     }
 }
 

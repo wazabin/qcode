@@ -221,8 +221,8 @@ mod tests {
         assert_eq!(body.temps.len(), 1);
         assert_eq!(body.uses.len(), first_uses);
         let last_address = 0x1000 + 4 * 9_999;
-        assert!(body.names.contains(&format!("local_{last_address:x}")));
-        assert!(!body.names.contains("local_1000"));
+        assert!(body.names.get(&format!("local_{last_address:x}")).is_some());
+        assert!(body.names.get("local_1000").is_none());
         assert_eq!(store.context().block_ids().len(), 3);
     }
 

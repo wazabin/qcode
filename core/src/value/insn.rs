@@ -9,9 +9,10 @@ use crate::{
     space::{MemorySpaceId, Space, SpaceId, SpaceRef, SpaceType},
     types::TypeId,
     value::{
-        BlockId, BlockRef, FunctionId, FunctionRef, LocalBlockId, ModuleView, QCodeView, Value,
-        ValueId,
+        BlockId, BlockRef, FunctionId, FunctionRef, LocalBlockId, LocalValueId, ModuleView,
+        QCodeView, Value, ValueId,
         link::{Link, PackedAddress},
+        name::Name,
         uses::{UseId, WithUsers},
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
@@ -74,8 +75,8 @@ crate::composite_id!(InstructionId, LocalInsnId);
 /// Local values are not associated with any particular memory location.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Instruction<'str> {
-    /// The name of this instruction
-    pub(crate) name: Option<Cow<'str, str>>,
+    /// The name of this instruction, in the owning body's bases.
+    pub(crate) name: Option<Name>,
 
     /// The type of this instruction's result value (encodes size and semantic kind).
     pub(crate) type_id: TypeId,
@@ -190,8 +191,10 @@ where
     }
 
     /// The name of this instruction's output value
-    pub fn name(&'s self) -> Option<&'ctx str> {
-        self.inner().name.as_deref()
+    pub fn name(&'s self) -> Option<Cow<'ctx, str>> {
+        self.view
+            .function(self.id.func)
+            .local_name_of(LocalValueId::Instruction(self.id.local))
     }
 
     /// The [`TypeId`] of this instruction's result value.
@@ -337,17 +340,7 @@ impl<'str, H: QCodeMut<'str>> BaseRef<H, InstructionId> {
     /// Renames this instruction in its owning function's local name table
     /// (own-instruction edit, host-routed). Errors only on a duplicate name.
     pub fn rename_local(&mut self, name: Cow<'str, str>) -> Result<()> {
-        let old_name = self
-            .ctx
-            .body(self.id.func)
-            .insn(self.id)
-            .name
-            .as_deref()
-            .map(str::to_owned);
-        self.ctx
-            .register_body_name(self.id.into(), name.clone(), old_name.as_deref())?;
-        self.ctx.instruction_mut(self.id).name = Some(name);
-        Ok(())
+        self.ctx.register_body_name(self.id.into(), name, None)
     }
 }
 
@@ -444,8 +437,10 @@ impl<'str: 'ctx, 'ctx, R> Named for InstructionRef<'str, 'ctx, R>
 where
     R: QCodeView<'ctx, 'str>,
 {
-    fn name(&self) -> Option<&str> {
-        self.view.instruction(self.id).name.as_deref()
+    fn name(&self) -> Option<Cow<'_, str>> {
+        self.view
+            .function(self.id.func)
+            .local_name_of(LocalValueId::Instruction(self.id.local))
     }
 }
 
@@ -566,8 +561,10 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for InstructionMutRef<'str, 
 // signature-pinned return lifetime needs `'str` to outlive the `&self` borrow,
 // which only a host type that carries `'str` (not a generic `H`) can prove.
 impl Named for InstructionMutRef<'_, '_> {
-    fn name(&self) -> Option<&str> {
-        self.ctx.instruction(self.id).name.as_deref()
+    fn name(&self) -> Option<Cow<'_, str>> {
+        self.ctx
+            .body(self.id.func)
+            .local_name_of(LocalValueId::Instruction(self.id.local))
     }
 }
 

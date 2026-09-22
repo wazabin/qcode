@@ -412,10 +412,10 @@ mod tests {
         let second = FunctionBody::make(&mut ctx, "second".into()).unwrap().id;
         let first_space = ctx.bodies[first].push_temp_space(TempSpace::new(None, 1, 8));
         let second_space = ctx.bodies[second].push_temp_space(TempSpace::new(None, 1, 8));
-        let first_temp = ctx.bodies[first]
-            .push_temp(Temp::new(0x20, 4, first_space.local).with_name("scratch".into()));
-        let second_temp = ctx.bodies[second]
-            .push_temp(Temp::new(0x20, 4, second_space.local).with_name("scratch".into()));
+        let first_temp =
+            ctx.bodies[first].push_named_temp(Temp::new(0x20, 4, first_space.local), "scratch");
+        let second_temp =
+            ctx.bodies[second].push_named_temp(Temp::new(0x20, 4, second_space.local), "scratch");
 
         assert_eq!(first_temp.local, second_temp.local);
         assert_eq!(

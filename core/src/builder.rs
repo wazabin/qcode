@@ -46,8 +46,8 @@ use crate::{
     space::{LocalMemorySpaceId, SPACE_CONST, Space, SpaceId, SpaceType},
     types::{AggregateField, TypeId},
     value::{
-        BodyView, FunctionBody, Instruction, LocalBlockId, LocalValueId, Temp, TempId, TempSpace,
-        TempSpaceId, ValueId, ValueRef,
+        BaseId, BodyView, FunctionBody, Instruction, LocalBlockId, LocalValueId, Temp, TempId,
+        TempSpace, TempSpaceId, ValueId, ValueRef,
         block::{BasicBlock, BlockId},
         block_param::{BlockParam, BlockParamId},
         function::FunctionId,
@@ -216,10 +216,10 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
     /// Creates a named body-local temporary memory value.
     pub fn make_named_temp(&mut self, name: Cow<'str, str>, size: usize) -> TempId {
-        let unique = self.body.names.unique(name);
-        let space = self.fresh_temp_space(Some(unique.as_ref()));
+        let unique = self.body.unique_local_name(&name);
+        let space = self.fresh_temp_space(Some(&unique));
         self.body
-            .push_temp(Temp::new(0, size, space.local).with_name(unique))
+            .push_named_temp(Temp::new(0, size, space.local), &unique)
     }
 
     /// Creates a body-local temporary identified by a SLEIGH local label.
@@ -570,27 +570,22 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         self.body.insns[local].type_id = type_id;
     }
 
-    /// Rename instruction `local`'s result. On an installed body this registers
-    /// the (function-local) name in the owning function's table (uniqueness
-    /// enforced); on a detached body it sets only the arena field — the source of
-    /// truth for rendering — since the local name table keys on the registry id.
+    /// Rename instruction `local`'s result, registering the name in the
+    /// body's table (uniqueness enforced).
     fn rename_insn_local(
         &mut self,
         local: LocalInsnId,
         name: Cow<'str, str>,
     ) -> crate::error::Result<()> {
-        if self.body.try_id().is_some() {
-            let id = InstructionId::new(self.func(), local);
-            let old = self.body.insns[local].name.clone();
-            self.body.register_local_name(
-                self.shared,
-                ValueId::Instruction(id),
-                name.clone(),
-                old.as_deref(),
-            )?;
-        }
-        self.body.insns[local].name = Some(name);
-        Ok(())
+        self.body
+            .set_local_name(LocalValueId::Instruction(local), &name)
+    }
+
+    /// Names instruction `local`, which has no name yet, `base` made unique
+    /// in the body — as a register's load is named after the register.
+    fn name_insn_unique(&mut self, local: LocalInsnId, base: &str) {
+        let base = self.body.intern_base(base);
+        self.body.name_insn_unique(local, base);
     }
 
     /// Rename an instruction's result — composite skin over
@@ -631,13 +626,33 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         type_id: TypeId,
         name: Option<&str>,
     ) -> InstructionRef<'str, '_, BodyView<'_, 'str>> {
-        let name = name.filter(|_| self.naming());
-        if self.insert_point.is_some() || (name.is_some() && self.body.try_id().is_none()) {
+        let base = name
+            .filter(|_| self.naming())
+            .map(|name| self.body.intern_base(name));
+        self.push_mnemonic_with_type_based(mnemonic, type_id, base)
+    }
+
+    /// The base `name` interned in the body, for
+    /// [`push_mnemonic_with_type_based`](Self::push_mnemonic_with_type_based).
+    pub fn intern_base(&mut self, name: &str) -> BaseId {
+        self.body.intern_base(name)
+    }
+
+    /// [`push_mnemonic_with_type_named`](Self::push_mnemonic_with_type_named)
+    /// with the name's base already [interned](Self::intern_base): a replay
+    /// names thousands of loads after the same few registers.
+    #[track_caller]
+    pub fn push_mnemonic_with_type_based(
+        &mut self,
+        mnemonic: Mnemonic,
+        type_id: TypeId,
+        base: Option<BaseId>,
+    ) -> InstructionRef<'str, '_, BodyView<'_, 'str>> {
+        let base = base.filter(|_| self.naming());
+        if self.insert_point.is_some() {
             let local = self.store_insn_with_type(mnemonic, type_id);
-            if let Some(name) = name {
-                let unique = self.body.names.unique(Cow::Owned(name.to_owned()));
-                self.rename_insn_local(local, unique)
-                    .expect("the name was deduplicated");
+            if let Some(base) = base {
+                self.body.name_insn_unique(local, base);
             }
             return self.insn_ref(local);
         }
@@ -646,7 +661,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         if let Some(address) = self.address {
             insn.set_address(address);
         }
-        let local = self.body.append_insn(self.block, insn, name);
+        let local = self.body.append_insn(self.block, insn, base);
         self.insn_ref(local)
     }
 
@@ -811,17 +826,9 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         // the original name so within-instruction references still resolve here.
         // Routed through the host so a checked-out builder mints the block into its
         // owned function's arena (and registers the name in that function's table).
-        let unique_name = self.body.names.unique(name.clone());
         let id = self.body.push_block(BasicBlock::detached());
-        self.body
-            .register_local_name(
-                self.shared,
-                ValueId::BasicBlock(id),
-                unique_name.clone(),
-                None,
-            )
-            .expect("name was deduplicated");
-        self.body.block_raw_mut(id).set_name(Some(unique_name));
+        let base = self.body.intern_base(&name);
+        self.body.name_block_unique(id.local, base);
         self.local_labels.insert(name, id.local);
         id
     }
@@ -869,9 +876,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 if let (true, Some(name), LocalValueId::Instruction(local)) =
                     (self.naming, name, id)
                 {
-                    let unique = self.body.names.unique(name.to_lowercase().into());
-                    self.rename_insn_local(local, unique)
-                        .expect("This name was deduplicated");
+                    self.name_insn_unique(local, &name.to_lowercase());
                 }
 
                 id
@@ -883,7 +888,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                     (
                         temp.size,
                         LocalMemorySpaceId::Temp(temp.space),
-                        temp.name.clone(),
+                        temp.name
+                            .map(|name| self.body.names.render(name).to_lowercase()),
                     )
                 };
                 let id = self.push_load_local::<false>(src, size, space);
@@ -892,9 +898,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 };
 
                 if let Some(name) = name {
-                    let unique = self.body.names.unique(Cow::Owned(name.to_lowercase()));
-                    self.rename_insn_local(local, unique)
-                        .expect("temporary load name was deduplicated");
+                    self.name_insn_unique(local, &name);
                 }
 
                 id
@@ -2039,7 +2043,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 (
                     temp.size,
                     LocalMemorySpaceId::Temp(temp.space),
-                    temp.name.as_deref().map(str::to_owned),
+                    temp.name
+                        .map(|name| self.body.names.render(name).into_owned()),
                 )
             }
             _ => panic!("copy destination must be a varnode or body-local temporary"),
@@ -2098,10 +2103,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
             // Add a name hint for the store instruction for easier debugging
             if let Some(name) = &name {
-                let lowered = name.to_lowercase();
-                let name = self.body.names.unique(Cow::Owned(lowered));
-                self.rename_insn_local(id, name)
-                    .expect("This name was deduplicated");
+                self.name_insn_unique(id, &name.to_lowercase());
             }
 
             id
@@ -2185,6 +2187,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 name: None,
                 origin: None,
                 first_use: None,
+                marker: std::marker::PhantomData,
             },
         )
     }
@@ -2650,7 +2653,7 @@ mod tests {
             FunctionRef::from_id(ctx, fid)
                 .blocks()
                 .map(|blk| {
-                    let name = blk.name().unwrap_or("?").to_string();
+                    let name = blk.name().unwrap_or(Cow::Borrowed("?")).to_string();
                     let insns: Vec<String> = blk
                         .instructions()
                         .map(|i| format!("{:?}", i.mnemonic()))
@@ -2660,7 +2663,7 @@ mod tests {
                         .map(|(_, s)| {
                             BasicBlock::from_id(ctx, s)
                                 .name()
-                                .unwrap_or("?")
+                                .unwrap_or(Cow::Borrowed("?"))
                                 .to_string()
                         })
                         .collect();
@@ -2992,11 +2995,13 @@ mod tests {
         builder.finalize(target);
 
         assert_eq!(
-            TempRef::new(ModuleView::new(&ctx), value).name(),
+            TempRef::new(ModuleView::new(&ctx), value).name().as_deref(),
             Some("dup")
         );
         assert_eq!(
-            TempRef::new(ModuleView::new(&ctx), other_value).name(),
+            TempRef::new(ModuleView::new(&ctx), other_value)
+                .name()
+                .as_deref(),
             Some("dup_1")
         );
     }
