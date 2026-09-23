@@ -1,0 +1,11 @@
+[package]
+name = "unpackbase"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "What the unpackbench baselines share: static-ELF loader, Linux syscalls, provenance record, harvest"
+
+[dependencies]
+rustc-hash = "2"
+serde_json = "1"
+sha2 = "0.10"

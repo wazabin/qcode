@@ -1,0 +1,13 @@
+[package]
+name = "unpack-icicle"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The unpack task under icicle-emu: provenance and first entries as injected p-code"
+
+[dependencies]
+unpackbase = { path = "../common" }
+icicle-vm = { path = "/home/jack/dev/icicle-emu/icicle-vm" }
+pcode = { path = "/home/jack/dev/icicle-emu/sleigh/pcode" }
+rustc-hash = "2"
+serde_json = "1"

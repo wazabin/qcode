@@ -1,0 +1,7 @@
+{
+ "engine": "qcode",
+ "description": "the unpack example (userland/examples/unpack): two hooks compiled into the IR, no callbacks",
+ "configs": ["nohooks", "hooks", "edges", "interp"],
+ "hook_source": ["userland/examples/unpack/hooks.rs"],
+ "build": ["cargo", "build", "--release", "-p", "wazabin-qcode-userland", "--example", "unpack"]
+}

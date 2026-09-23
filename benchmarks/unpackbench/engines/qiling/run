@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# engines/qiling/run <ELF> --out DIR [--edges] [--no-hooks] [--stdin FILE] [--budget N] [--reps N] -- args...
+# Runs driver.py in .venv (Python 3.12, qiling 1.4.6 pinned), made with uv on first use.
+set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+PY=$HERE/.venv/bin/python
+if [ ! -x "$PY" ] || ! "$PY" -c "import qiling" 2>/dev/null; then
+  (uv venv -q -p 3.12 "$HERE/.venv" && uv pip install -q -p "$PY" qiling==1.4.6) >&2
+fi
+# -P: nothing on the caller's side may shadow the stdlib.
+exec "$PY" -P "$HERE/driver.py" "$@"

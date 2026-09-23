@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""unpackbench engine driver for QCode (the unpack example).
+
+The driver interface every engine under engines/<engine>/ implements:
+
+    driver --config CFG --out DIR --budget N --launch static|ldso
+           [--stdin FILE] -- BIN [ARGS...]
+
+CFG is one of nohooks, hooks, edges, interp (lib/ub.py CONFIGS). The driver
+runs BIN once and writes DIR/result.json:
+
+    {"wall_ms": float, "steps": int|null, "exit": int|null,
+     "stop_reason": "exit"|"...", "crashed": bool, "stdout_sha256": "..",
+     "vm": {..}|null}
+
+or {"unsupported": "<reason>"} when the engine cannot run BIN in CFG. With
+hooks on, DIR also holds graph.json (the unpack example's schema) and
+regions/<0xstart>-g<gen>.bin. The driver's own stdout and stderr are kept by
+the sweep; its exit status only says whether result.json was written (0).
+
+`launch: ldso` runs /lib64/ld-linux-x86-64.so.2 BIN ARGS with --root /.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[4]
+UNPACK = Path(os.environ.get("UNPACK_BIN", REPO / "target/release/examples/unpack"))
+LDSO = os.environ.get("LDSO", "/lib64/ld-linux-x86-64.so.2")
+
+FLAGS = {
+    "nohooks": ["--jit", "--no-hooks"],
+    "hooks": ["--jit"],
+    "edges": ["--jit", "--edges"],
+    "interp": ["--edges"],
+}
+
+UNITS = {"ns": 1e-6, "µs": 1e-3, "us": 1e-3, "ms": 1.0, "s": 1e3}
+
+
+def parse_wall(text):
+    m = re.fullmatch(r"([0-9.]+)\s*(ns|µs|us|ms|s)", text.strip())
+    return float(m.group(1)) * UNITS[m.group(2)] if m else None
+
+
+def summary(stdout):
+    """The `key: value` lines the example prints before the guest's output."""
+    fields = {}
+    for line in stdout.splitlines():
+        m = re.match(r"^([a-z]+):\s+(.*)$", line)
+        if m and m.group(1) not in fields:
+            fields[m.group(1)] = m.group(2)
+    return fields
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True, choices=sorted(FLAGS))
+    ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--budget", type=int, default=5_000_000_000)
+    ap.add_argument("--launch", default="static", choices=["static", "ldso"])
+    ap.add_argument("--stdin", type=Path)
+    argv = sys.argv[1:]
+    if "--" not in argv:
+        ap.error("usage: driver [options] -- BIN [ARGS...]")
+    cut = argv.index("--")
+    a = ap.parse_args(argv[:cut])
+    prog = argv[cut + 1:]
+    if not prog:
+        ap.error("no program")
+    a.out.mkdir(parents=True, exist_ok=True)
+    result_path = a.out / "result.json"
+
+    def done(result):
+        result_path.write_text(json.dumps(result, indent=1) + "\n")
+        sys.exit(0)
+
+    elf, args = prog[0], prog[1:]
+    cmd = [str(UNPACK)]
+    if a.launch == "ldso":
+        cmd += [LDSO, "--root", "/"]
+        args = [elf] + args
+    else:
+        cmd += [elf]
+    cmd += ["--out", str(a.out), "--budget", str(a.budget)] + FLAGS[a.config]
+    if a.stdin:
+        cmd += ["--stdin", str(a.stdin)]
+    if args:
+        cmd += ["--"] + args
+
+    started = time.perf_counter()
+    proc = subprocess.run(cmd, capture_output=True)
+    proc_ms = (time.perf_counter() - started) * 1e3
+    out = proc.stdout.decode(errors="replace")
+    err = proc.stderr.decode(errors="replace")
+    sys.stdout.write(out)
+    sys.stderr.write(err)
+    sys.stderr.write("\n[driver] " + " ".join(cmd) + "\n")
+
+    if proc.returncode != 0:
+        message = next((l for l in err.splitlines() if l.startswith("error:")), None)
+        if message and ("cannot load" in message or "cannot track" in message):
+            done({"unsupported": message.removeprefix("error: ")})
+        done({"wall_ms": proc_ms, "proc_ms": proc_ms, "steps": None, "exit": None,
+              "stop_reason": message or f"unpack exited with {proc.returncode}",
+              "crashed": True, "stdout_sha256": None, "vm": None})
+
+    f = summary(out)
+    vm = {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", f.get("vm", ""))}
+    exit_text = f.get("exit", "")
+    exit_status = int(exit_text) if re.fullmatch(r"-?\d+", exit_text) else None
+    stopped = f.get("stopped", "?")
+    graph = a.out / "graph.json"
+    stdout_bytes = b""
+    if graph.exists():
+        # The guest's stdout, as the artifact keeps it (lossy UTF-8).
+        stdout_bytes = json.loads(graph.read_text())["io"]["stdout"].encode()
+    if a.config == "nohooks":
+        # A hooks-off graph records nothing; keep the directory contract-shaped.
+        for name in ("graph.json", "context.bin", "context.meta.json"):
+            (a.out / name).unlink(missing_ok=True)
+    done({
+        "wall_ms": parse_wall(f.get("wall", "")),
+        "proc_ms": proc_ms,
+        "steps": int(f["steps"]) if f.get("steps", "").isdigit() else None,
+        "exit": exit_status,
+        "stop_reason": "exit" if stopped == "exit" else stopped,
+        "crashed": stopped != "exit",
+        "stdout_sha256": hashlib.sha256(stdout_bytes).hexdigest(),
+        "vm": vm or None,
+        "wall_scope": "load and run (Process::new to exit); artifact writing excluded",
+    })
+
+
+if __name__ == "__main__":
+    main()

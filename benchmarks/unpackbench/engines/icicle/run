@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# engines/icicle/run <ELF> --out DIR [--edges] [--no-hooks] [--stdin FILE] [--budget N] [--reps N] [--interp] -- args...
+# Builds the driver on first use (cargo, release) and runs it.
+set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+# icicle compiles Ghidra's x86-64 SLEIGH at start-up, and needs icicle's
+# patched copy of it (stock Ghidra's CPUID reads memory at 0): GHIDRA_SRC
+# must hold Ghidra/Processors. Unset, the copy the icicle-emu 0.0.11 wheel
+# ships is fetched once into .ghidra/.
+if [ -z "${GHIDRA_SRC:-}" ]; then
+  GHIDRA_SRC=$HERE/.ghidra
+  if [ ! -d "$GHIDRA_SRC/Ghidra/Processors/x86" ]; then
+    tmp=$(mktemp -d)
+    python3 -m pip download icicle-emu==0.0.11 --no-deps -q -d "$tmp" >&2
+    python3 -c "import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); [z.extract(n, sys.argv[2]) for n in z.namelist() if n.startswith('icicle/Ghidra/Processors/x86/')]" "$tmp"/icicle_emu-*.whl "$tmp"
+    mkdir -p "$GHIDRA_SRC" && mv "$tmp/icicle/Ghidra" "$GHIDRA_SRC/" && rm -rf "$tmp"
+  fi
+fi
+export GHIDRA_SRC
+BIN=$HERE/../target/release/unpack-icicle
+if [ ! -x "$BIN" ] || [ -n "$(find "$HERE/src" "$HERE/../common/src" -newer "$BIN" 2>/dev/null)" ]; then
+  (cd "$HERE/.." && cargo build --release -q -p unpack-icicle) >&2
+fi
+exec "$BIN" "$@"

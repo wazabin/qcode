@@ -1,0 +1,9 @@
+# The Rust baselines of E3: Unicorn and icicle, sharing one loader, one
+# syscall layer and one harvest (common/). Detached from the repository's
+# workspace, like benchmarks/hookbench.
+[workspace]
+members = ["common", "unicorn", "icicle"]
+resolver = "2"
+
+[profile.release]
+debug = 1

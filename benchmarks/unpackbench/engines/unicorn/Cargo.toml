@@ -1,0 +1,12 @@
+[package]
+name = "unpack-unicorn"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The unpack task under Unicorn: one native callback per guest store and per block"
+
+[dependencies]
+unpackbase = { path = "../common" }
+unicorn-engine = { path = "/home/jack/dev/unicorn/bindings/rust/unicorn-engine", default-features = false, features = ["arch_x86"] }
+rustc-hash = "2"
+serde_json = "1"

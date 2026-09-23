@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# engines/unicorn/run <ELF> --out DIR [--edges] [--no-hooks] [--stdin FILE] [--budget N] [--reps N] -- args...
+# Builds the driver on first use (cargo, release) and runs it.
+set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+BIN=$HERE/../target/release/unpack-unicorn
+if [ ! -x "$BIN" ] || [ -n "$(find "$HERE/src" "$HERE/../common/src" -newer "$BIN" 2>/dev/null)" ]; then
+  (cd "$HERE/.." && cargo build --release -q -p unpack-unicorn) >&2
+fi
+exec "$BIN" "$@"

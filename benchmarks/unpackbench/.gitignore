@@ -1,0 +1,10 @@
+# Built corpus binaries and their large byte artifacts are reproducible from
+# build-corpus.sh; keep the scripts, manifest and small truth files, not these.
+corpus/**/bin
+corpus/**/truth/segments/
+corpus/**/*.upx
+runs/
+corpus/
+engines/*/.venv/
+engines/*/target/
+engines/**/__pycache__/
