@@ -43,8 +43,31 @@ pub const PAGE: u64 = 4096;
 pub const SHADOW_SPACE: &str = "unpack.shadow";
 /// The space holding the first-entry log.
 pub const ENTRIES_SPACE: &str = "unpack.entries";
-/// The space holding one byte per instrumented block.
+/// The space holding one byte per instrumented block, per task lane.
 pub const VISITED_SPACE: &str = "unpack.visited";
+/// The one-word cell the scheduler keeps the running task's id in; the hooks
+/// read it to stamp their records. See [`Process::set_task_id_space`].
+///
+/// [`Process::set_task_id_space`]: qcode_userland::Process::set_task_id_space
+pub const TASK_SPACE: &str = "unpack.task";
+/// The space holding the last task to execute each store site, by site id.
+pub const SITETASK_SPACE: &str = "unpack.sitetask";
+
+/// The pid of the first task; task lanes count up from it (`ROOT_PID` in
+/// `userland/src/process.rs`). Restated as a lane origin so the hooks can map
+/// a running pid to a dense lane index in compiled code.
+pub const TASK_BASE: u64 = qcode_userland::process::ROOT_PID;
+
+/// How many tasks the per-task lanes of [`VISITED_SPACE`] distinguish before
+/// they alias. A packer is one task and its stub; a traced unpacker is two;
+/// the ceiling is a bound baked into the compiled hooks, not a swap.
+pub const MAX_TASK_LANES: u64 = 8;
+
+/// The one-word task cell's length.
+pub const TASK_LEN: usize = 8;
+
+/// The length of [`SITETASK_SPACE`]: one `u32` per possible site id.
+pub const SITETASK_LEN: usize = (SITE_ID_MAX as usize + 1) * 4;
 
 // ---- unpack.shadow
 
@@ -102,18 +125,30 @@ pub const CURSOR_OFF: u64 = 0;
 /// The index of the block entered most recently, as a `u32`; maintained
 /// only with `--edges`.
 pub const LAST_OFF: u64 = 8;
+/// The task that entered the block at [`LAST_OFF`], as a `u32`; maintained
+/// only with `--edges`, so a predecessor that is really a cooperative switch
+/// can be told from an intra-task edge.
+pub const LAST_TASK_OFF: u64 = 12;
 /// Where the log's slots start.
 pub const SLOTS_OFF: u64 = 16;
-/// One slot: the block index, then the index of the block that ran before
-/// it.
-pub const SLOT_SIZE: u64 = 8;
+/// One slot, a power of two so the cursor scales by a shift: the block index
+/// and the task that entered it, then the block that ran before it and the
+/// task that ran it.
+pub const SLOT_SIZE: u64 = 16;
+/// A slot's fields, as offsets from its start.
+pub const SLOT_K_OFF: u64 = 0;
+pub const SLOT_TASK_OFF: u64 = 4;
+pub const SLOT_PRED_K_OFF: u64 = 8;
+pub const SLOT_PRED_TASK_OFF: u64 = 12;
 
 /// The length of [`ENTRIES_SPACE`]: one slot more than there are blocks, so
 /// that the slot at the cursor is always writable.
 pub const ENTRIES_LEN: usize = (SLOTS_OFF + SLOT_SIZE * (MAX_BLOCKS + 1)) as usize;
 
-/// The length of [`VISITED_SPACE`].
-pub const VISITED_LEN: usize = MAX_BLOCKS as usize;
+/// The length of [`VISITED_SPACE`]: one byte per block, per task lane, so a
+/// block entered by two tasks logs an entry for each — one sized space
+/// indexed by an injected lane, never a swapped one.
+pub const VISITED_LEN: usize = (MAX_TASK_LANES * MAX_BLOCKS) as usize;
 
 /// A guest byte range provenance tracks, and where its shadow lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

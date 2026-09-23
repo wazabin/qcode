@@ -37,6 +37,11 @@ serde.workspace = true
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+# The `consume` example runs an unchanged pass of this crate over a context.
+qcode_passes.workspace = true
 
 [[example]]
 name = "unpack"
+
+[[example]]
+name = "consume"

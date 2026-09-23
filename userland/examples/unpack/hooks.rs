@@ -94,6 +94,40 @@ fn is_guest(block: &BlockView<'_>, site: &Site) -> bool {
         .is_some()
 }
 
+/// Loads the running task's id from the scheduler's cell, as a four-byte
+/// value.
+///
+/// The scheduler keeps this cell holding the pid of the task on the machine,
+/// updated on every switch and on fork/exec (see
+/// [`Process::set_task_id_space`](qcode_userland::Process::set_task_id_space)),
+/// so a record a hook makes is stamped with the task that made it and two
+/// tasks' work either side of a cooperative switch is never conflated.
+fn current_task(emit: &mut Emitter<'_>) -> ValueId {
+    let space = emit.state_space(layout::TASK_SPACE);
+    let zero = emit.constant(0, 8);
+    emit.load_from(space, zero, 4)
+}
+
+/// The task lane of the running task: `min(task - TASK_BASE, MAX_TASK_LANES -
+/// 1)`, computed branchlessly so the per-task visited map is one sized space
+/// reached at an injected index rather than a swapped one.
+fn task_lane(emit: &mut Emitter<'_>, task: ValueId) -> ValueId {
+    let task = emit.zext(task, 8);
+    let base = emit.constant(layout::TASK_BASE, 8);
+    let raw = emit.binop(IntBinop::Sub, task, base);
+    let max = emit.constant(layout::MAX_TASK_LANES, 8);
+    let inside = emit.binop(IntBinop::Less, raw, max);
+    let wide = emit.zext(inside, 8);
+    let zero = emit.constant(0, 8);
+    let mask = emit.binop(IntBinop::Sub, zero, wide);
+    let ones = emit.constant(u64::MAX, 8);
+    let notmask = emit.binop(IntBinop::Xor, mask, ones);
+    let ceil = emit.constant(layout::MAX_TASK_LANES - 1, 8);
+    let lo = emit.binop(IntBinop::And, raw, mask);
+    let hi = emit.binop(IntBinop::And, ceil, notmask);
+    emit.binop(IntBinop::Or, lo, hi)
+}
+
 /// Stamps the id of the storing site into the shadow bytes of everything a
 /// guest store writes.
 ///
@@ -159,6 +193,15 @@ impl Hook for ProvenanceHook {
         };
         let id = self.take_id(emit.address(), size);
         let space = emit.state_space(layout::SHADOW_SPACE);
+
+        // Stamp the running task into the site's slot of the site-task table,
+        // so the host can say which task wrote the code a site produced —
+        // the writer half of a cross-task provenance edge. One store at a
+        // constant offset, no branch.
+        let task = current_task(emit);
+        let sitetask = emit.state_space(layout::SITETASK_SPACE);
+        let slot = emit.constant(u64::from(id) * 4, 8);
+        emit.store_to(sitetask, task, slot);
 
         let p = emit.zext(ptr, 8);
         let image = selected(emit, p, self.layout.image_window());
@@ -269,7 +312,15 @@ impl Hook for EntryHook {
         let entries = emit.state_space(layout::ENTRIES_SPACE);
         let visited = emit.state_space(layout::VISITED_SPACE);
 
-        let seat = emit.constant(k, 8);
+        // The running task and its lane. `visited` is laned per task, so a
+        // block entered by two tasks logs an entry for each; the log's
+        // `visited[lane][k]` is one sized space reached at an injected lane.
+        let task = current_task(emit);
+        let lane = task_lane(emit, task);
+        let stride = emit.constant(layout::MAX_BLOCKS, 8);
+        let base = emit.binop(IntBinop::Mul, lane, stride);
+        let k_wide = emit.constant(k, 8);
+        let seat = emit.binop(IntBinop::Add, base, k_wide);
         let flag = emit.load_from(visited, seat, 1);
 
         let cursor = emit.constant(layout::CURSOR_OFF, 8);
@@ -280,18 +331,27 @@ impl Hook for EntryHook {
         let slot = emit.binop(IntBinop::Add, scaled, slots);
         let index = emit.constant(k, 4);
         emit.store_to(entries, index, slot);
+        let task_delta = emit.constant(layout::SLOT_TASK_OFF, 8);
+        let task_off = emit.binop(IntBinop::Add, slot, task_delta);
+        emit.store_to(entries, task, task_off);
 
         if self.edges {
             let last = emit.constant(layout::LAST_OFF, 8);
+            let last_task = emit.constant(layout::LAST_TASK_OFF, 8);
             let pred = emit.load_from(entries, last, 4);
-            let four = emit.constant(4, 8);
-            let second = emit.binop(IntBinop::Add, slot, four);
-            emit.store_to(entries, pred, second);
+            let pred_task = emit.load_from(entries, last_task, 4);
+            let pred_k_delta = emit.constant(layout::SLOT_PRED_K_OFF, 8);
+            let pk = emit.binop(IntBinop::Add, slot, pred_k_delta);
+            let pred_task_delta = emit.constant(layout::SLOT_PRED_TASK_OFF, 8);
+            let pt = emit.binop(IntBinop::Add, slot, pred_task_delta);
+            emit.store_to(entries, pred, pk);
+            emit.store_to(entries, pred_task, pt);
             emit.store_to(entries, index, last);
+            emit.store_to(entries, task, last_task);
         }
 
-        // `1 - visited[k]`: one the first time the block runs, zero after,
-        // so the slot just written is kept exactly once.
+        // `1 - visited[lane][k]`: one the first time this task runs the block,
+        // zero after, so the slot just written is kept exactly once.
         let wide = emit.zext(flag, 8);
         let one = emit.constant(1, 8);
         let step = emit.binop(IntBinop::Sub, one, wide);
@@ -308,8 +368,14 @@ impl Hook for EntryHook {
 pub struct LogEntry {
     /// The block's index in [`Recorder::blocks`].
     pub k: u32,
+    /// The task that entered it.
+    pub task: u32,
     /// The block that ran immediately before it, with `--edges`.
     pub pred: Option<u32>,
+    /// The task that ran that predecessor, with `--edges`: when it differs
+    /// from [`task`](Self::task) the predecessor is a cooperative switch and
+    /// not a control-flow edge.
+    pub pred_task: Option<u32>,
 }
 
 /// Reads the first-entry log back out of [`layout::ENTRIES_SPACE`].
@@ -333,16 +399,44 @@ pub fn read_log(
     ) else {
         return Vec::new();
     };
+    let u32_at = |slot: &[u8], off: usize| {
+        u32::from_le_bytes([slot[off], slot[off + 1], slot[off + 2], slot[off + 3]])
+    };
     bytes
         .chunks_exact(layout::SLOT_SIZE as usize)
         .enumerate()
         .map(|(position, slot)| LogEntry {
-            k: u32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]),
+            k: u32_at(slot, layout::SLOT_K_OFF as usize),
+            task: u32_at(slot, layout::SLOT_TASK_OFF as usize),
             // Nothing ran before the first block, and `last` reads as the
             // zero the space was born with, which is a block index: the
-            // first slot's second half is not a predecessor.
-            pred: (edges && position > 0)
-                .then(|| u32::from_le_bytes([slot[4], slot[5], slot[6], slot[7]])),
+            // first slot's predecessor half is not a predecessor.
+            pred: (edges && position > 0).then(|| u32_at(slot, layout::SLOT_PRED_K_OFF as usize)),
+            pred_task: (edges && position > 0)
+                .then(|| u32_at(slot, layout::SLOT_PRED_TASK_OFF as usize)),
+        })
+        .collect()
+}
+
+/// Reads the last task to execute each store site out of
+/// [`layout::SITETASK_SPACE`], as `site_tasks[i]` for the site of id `i + 1`.
+///
+/// A site the run never reached reads as the zero the space was born with,
+/// reported as `None`; the pid of a real task is never zero.
+pub fn read_site_tasks(
+    flat: &qcode_vm::flat::FlatSpaces,
+    sitetask: qcode::space::SpaceId,
+    sites: usize,
+) -> Vec<Option<u32>> {
+    let space = qcode::space::MemorySpaceId::Shared(sitetask);
+    let Ok(bytes) = flat.read_bytes(space, 4, sites * 4) else {
+        return vec![None; sites];
+    };
+    bytes
+        .chunks_exact(4)
+        .map(|w| {
+            let v = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            (v != 0).then_some(v)
         })
         .collect()
 }

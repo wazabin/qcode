@@ -2204,6 +2204,7 @@ dependencies = [
  "wazabin-qcode",
  "wazabin-qcode-emulator",
  "wazabin-qcode-jit",
+ "wazabin-qcode-passes",
  "wazabin-qcode-sleigh",
  "wazabin-qcode-vm",
  "wazabin-sleigh-precompile",

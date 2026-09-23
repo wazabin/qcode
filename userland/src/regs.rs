@@ -96,7 +96,14 @@ pub struct Regs {
     pub fpu_status: Reg,
     pub fpu_tag: Reg,
     pub mxcsr: Reg,
+    /// The arithmetic and direction flags, one byte each in the SLEIGH
+    /// model, with their bit positions in `EFLAGS`.
+    pub flags: [(u32, Reg); 7],
 }
+
+/// `EFLAGS` bits the machine does not model but user code always sees set:
+/// the reserved bit 1 and `IF`.
+const EFLAGS_FIXED: u64 = 0x202;
 
 impl Regs {
     pub fn resolve(ctx: &Context<'_>) -> Result<Self, String> {
@@ -126,6 +133,15 @@ impl Regs {
             fpu_status: get("FPUStatusWord")?,
             fpu_tag: get("FPUTagWord")?,
             mxcsr: get("MXCSR")?,
+            flags: [
+                (0, get("CF")?),
+                (2, get("PF")?),
+                (4, get("AF")?),
+                (6, get("ZF")?),
+                (7, get("SF")?),
+                (10, get("DF")?),
+                (11, get("OF")?),
+            ],
         })
     }
 
@@ -152,6 +168,21 @@ impl Regs {
         self.fpu_tag.write(memory, 0xffff);
         // Round to nearest, all exceptions masked.
         self.mxcsr.write(memory, 0x1f80);
+    }
+
+    /// `EFLAGS` assembled from the flag registers, `read` giving each one's
+    /// value.
+    pub fn eflags(&self, mut read: impl FnMut(Reg) -> u64) -> u64 {
+        self.flags.iter().fold(EFLAGS_FIXED, |acc, &(bit, reg)| {
+            acc | (read(reg) & 1) << bit
+        })
+    }
+
+    /// Writes the modelled bits of `eflags` back through `write`.
+    pub fn set_eflags(&self, eflags: u64, mut write: impl FnMut(Reg, u64)) {
+        for &(bit, reg) in &self.flags {
+            write(reg, eflags >> bit & 1);
+        }
     }
 
     /// All general-purpose registers, in a stable order for dumps.

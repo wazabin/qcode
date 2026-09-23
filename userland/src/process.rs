@@ -38,7 +38,8 @@ use qcode::space::{MemorySpaceId, SpaceId};
 use qcode::value::BasicBlock;
 use qcode_vm::flat::FlatSpace;
 use qcode_vm::{
-    Interrupt, InterruptKind, Mmu, MmuSnapshot, PAGE_SIZE, Parked, Vm, VmExit, VmMemory, perm,
+    FaultKind, Interrupt, InterruptKind, Mmu, MmuSnapshot, PAGE_SIZE, Parked, Vm, VmExit, VmMemory,
+    perm,
 };
 use wazabin_qcode_sleigh::vm_source::SleighCodeSource;
 
@@ -47,8 +48,12 @@ use crate::fs::{Files, Stdio};
 use crate::guest;
 use crate::loader::{self, LoadedImage, page_up};
 use crate::regs::Regs;
+use crate::signal::{
+    self, SEGV_ACCERR, SEGV_MAPERR, SI_KERNEL, SIGFPE, SIGILL, SIGSEGV, SIGTRAP, SigInfo,
+};
 use crate::stack::{self, Identity};
 use crate::syscall::SharedMap;
+use crate::traps::{self, DivideHook, StepHook};
 
 /// The pid of the first task; children count up from it.
 pub const ROOT_PID: u64 = 4242;
@@ -172,6 +177,9 @@ pub(crate) struct Machine {
     /// and the architecture's private and temporary spaces. Every space the
     /// module had at boot; a space a hook adds later is shared by every task.
     arch_spaces: Vec<MemorySpaceId>,
+    /// The single-step flag's space, once a tracer first stepped a task.
+    /// Shared by every task; the one put on the machine writes its own.
+    step_space: Option<SpaceId>,
 }
 
 /// What a task leaves the machine with when another takes it.
@@ -220,6 +228,7 @@ impl Machine {
         if jit {
             vm.set_block_executor(Box::new(qcode_jit::Jit::new()));
         }
+        vm.add_hook(DivideHook);
         let arch_spaces = (0..vm.context().space_count())
             .map(|index| MemorySpaceId::from(SpaceId::from(index)))
             .filter(|&space| vm.memory().is_flat(space))
@@ -229,9 +238,37 @@ impl Machine {
                 vm,
                 regs,
                 arch_spaces,
+                step_space: None,
             },
             loaded,
         ))
+    }
+
+    /// Installs the single-step hook if it is not already, returning the
+    /// flag's space.
+    fn step_space(&mut self) -> SpaceId {
+        if let Some(space) = self.step_space {
+            return space;
+        }
+        let space = self
+            .vm
+            .state_space(traps::STEP_SPACE, 8)
+            .expect("the step flag's space is one word");
+        self.vm.add_hook(StepHook);
+        self.step_space = Some(space);
+        space
+    }
+
+    /// Sets the single-step flag, if the hook that reads it is installed.
+    fn set_stepping(&mut self, on: bool) {
+        if let Some(space) = self.step_space {
+            self.vm
+                .memory_mut()
+                .flat_mut()
+                .entry(MemorySpaceId::Shared(space))
+                .write_u128(0, 8, u128::from(on))
+                .expect("the step flag is one word");
+        }
     }
 
     /// The task's own flat spaces, as they are on the machine.
@@ -243,12 +280,54 @@ impl Machine {
     }
 }
 
+/// How a `fork`, `vfork` or `clone` makes its child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct CloneArgs {
+    /// The parent sleeps until the child execs or exits (`CLONE_VFORK`).
+    pub vfork: bool,
+    /// The child runs in the parent's memory (`CLONE_VM`, with
+    /// `CLONE_VFORK` only): whatever it does to memory before it execs or
+    /// exits, the parent finds when it wakes.
+    pub share_vm: bool,
+    /// The child's stack pointer, when not the parent's.
+    pub stack: u64,
+    /// Where the parent gets the child's tid (`CLONE_PARENT_SETTID`).
+    pub parent_tid: u64,
+    /// Where the child gets its own tid (`CLONE_CHILD_SETTID`).
+    pub child_tid: u64,
+    /// Where the child's tid is cleared when it exits or execs
+    /// (`CLONE_CHILD_CLEARTID`).
+    pub clear_tid: u64,
+}
+
+/// A step the scheduler asked of a traced task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// About to run the instruction it is stepped over.
+    Armed,
+    /// Ran it; stops before the next.
+    Running,
+}
+
+/// What a `CLONE_VFORK` child hands back to the parent it held asleep.
+struct Release {
+    parent: u64,
+    /// With `CLONE_VM`, the memory the two shared as the child left it.
+    memory: Option<Shared>,
+}
+
+struct Shared {
+    memory: MmuSnapshot,
+    space: AddressSpace,
+    shared_anon: Vec<(u64, u64)>,
+    shared: Vec<SharedMap>,
+}
+
 /// What a system call asked of the scheduler, beyond a value in `RAX`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Request {
-    /// Create a child; the caller has not been resumed. `vfork` runs the
-    /// child before the parent gets another turn.
-    Fork { vfork: bool },
+    /// Create a child; the caller has not been resumed.
+    Fork(CloneArgs),
     /// The call cannot complete yet; the caller has not been resumed and
     /// re-issues it when it next runs.
     Block,
@@ -285,16 +364,17 @@ const PTRACE_PEEKDATA: u64 = 2;
 const PTRACE_POKETEXT: u64 = 4;
 const PTRACE_POKEDATA: u64 = 5;
 const PTRACE_CONT: u64 = 7;
+const PTRACE_SINGLESTEP: u64 = 9;
 const PTRACE_GETREGS: u64 = 12;
 const PTRACE_SETREGS: u64 = 13;
 const PTRACE_SEIZE: u64 = 0x4206;
 
-const SIGTRAP: i32 = 5;
-const SIGSEGV: i32 = 11;
-
 /// `user_regs_struct`: 27 words, in the kernel's order.
 const USER_REGS: usize = 27;
 const REG_RIP: usize = 16;
+const REG_CS: usize = 17;
+const REG_EFLAGS: usize = 18;
+const REG_SS: usize = 20;
 
 /// One thread of execution with its own address space and descriptor table.
 pub(crate) struct Task {
@@ -336,6 +416,31 @@ pub(crate) struct Task {
     /// sees the same: their bytes travel through the scheduler's arena at
     /// each switch. Inherited by a fork, dropped by `munmap`.
     pub(crate) shared_anon: Vec<(u64, u64)>,
+    /// Tasks this one seized that are not its children, which its waits
+    /// report on too.
+    pub(crate) tracees: Vec<u64>,
+    /// Why the task last stopped for its tracer, for a signal the tracer
+    /// continues it with.
+    stop_info: Option<SigInfo>,
+    /// A signal to enter the handler for before the task next runs.
+    pending_signal: Option<SigInfo>,
+    /// A single step its tracer asked for.
+    stepping: Option<Step>,
+    /// The alternate signal stack: base and size.
+    pub(crate) altstack: Option<(u64, u64)>,
+    /// Cleared, as a 32-bit tid, when the task exits or execs
+    /// (`CLONE_CHILD_CLEARTID`, `set_tid_address`).
+    pub(crate) clear_child_tid: u64,
+    /// The parent a `CLONE_VFORK` holds asleep until this task execs or
+    /// exits.
+    vfork_parent: Option<u64>,
+    /// Whether this task runs in its vfork parent's memory.
+    share_vm: bool,
+    /// The `CLONE_VFORK` child this task sleeps on.
+    vfork_child: Option<u64>,
+    /// Set by an exec that woke the vfork parent; the scheduler hands it
+    /// over.
+    released: Option<Release>,
     /// Operations retired before the task was last put on the machine.
     retired: u64,
     /// The machine's count when the task was last put on it.
@@ -379,6 +484,16 @@ impl Task {
             stopped: None,
             stops: Vec::new(),
             shared_anon: Vec::new(),
+            tracees: Vec::new(),
+            stop_info: None,
+            pending_signal: None,
+            stepping: None,
+            altstack: None,
+            clear_child_tid: 0,
+            vfork_parent: None,
+            share_vm: false,
+            vfork_child: None,
+            released: None,
             retired: 0,
             steps_in: 0,
         })
@@ -398,10 +513,10 @@ impl Task {
         &mut self.machine().vm.memory_mut().mmu
     }
 
-    /// Whether the scheduler may run this task: live and not stopped by a
-    /// tracer.
+    /// Whether the scheduler may run this task: live, not stopped by a
+    /// tracer and not asleep on a vfork child.
     fn runnable(&self) -> bool {
-        self.exit_code.is_none() && self.stopped.is_none()
+        self.exit_code.is_none() && self.stopped.is_none() && self.vfork_child.is_none()
     }
 
     /// Operations this task has retired, on the machine and before.
@@ -443,6 +558,7 @@ impl Task {
             *machine.vm.memory_mut().flat_mut().entry(space) = contents;
         }
         self.steps_in = machine.vm.stats.steps;
+        machine.set_stepping(self.stepping.is_some());
         let result = machine.vm.unpark(saved.parked);
         self.machine = Some(machine);
         result.map_err(|error| self.crash(format!("cannot put the task back: {error}"), None))
@@ -455,16 +571,39 @@ impl Task {
     /// The child is off the machine: its address space is a copy-on-write
     /// snapshot of the parent's, its registers a copy. Lifted code is the
     /// process's and needs no copying.
-    fn fork(&mut self, pid: u64) -> Result<Task, Crash> {
+    ///
+    /// `args` may give the child its own stack, and places to store its tid
+    /// in; with `CLONE_VM` the snapshot is the memory the parent gets back
+    /// when the child releases it.
+    fn fork(&mut self, pid: u64, args: CloneArgs) -> Result<Task, Crash> {
         let Some(pc) = self.pc() else {
             return Err(self.crash("fork from an unknown position".to_owned(), None));
         };
         // `syscall` is two bytes and lifts to the one op the machine sits at.
         let next = pc + 2;
         let machine = self.machine();
-        machine.regs.rax.write(machine.vm.memory_mut(), 0);
+        let m = machine.vm.memory_mut();
+        let rax = machine.regs.rax.read(m);
+        let rsp = machine.regs.rsp.read(m);
+        machine.regs.rax.write(m, 0);
+        if args.stack != 0 {
+            machine.regs.rsp.write(m, args.stack);
+        }
         let spaces = machine.save_spaces();
-        let memory = machine.vm.memory_mut().mmu.snapshot();
+        let m = machine.vm.memory_mut();
+        machine.regs.rax.write(m, rax);
+        machine.regs.rsp.write(m, rsp);
+        let mut memory = m.mmu.snapshot();
+        if args.child_tid != 0 {
+            let mut scratch = Mmu::new();
+            scratch.restore(&memory);
+            // A tid the child cannot be told is its own loss, as on Linux.
+            let _ = scratch.write(args.child_tid, &(pid as u32).to_le_bytes());
+            memory = scratch.snapshot();
+        }
+        if args.parent_tid != 0 {
+            let _ = guest::write_u32(self.mmu(), args.parent_tid, pid as u32);
+        }
         let files = match self.files.fork() {
             Ok(files) => files,
             Err(e) => return Err(self.crash(format!("cannot duplicate descriptors: {e}"), None)),
@@ -501,9 +640,77 @@ impl Task {
             stopped: None,
             stops: Vec::new(),
             shared_anon: self.shared_anon.clone(),
+            tracees: Vec::new(),
+            stop_info: None,
+            pending_signal: None,
+            stepping: None,
+            altstack: self.altstack,
+            clear_child_tid: args.clear_tid,
+            vfork_parent: args.vfork.then_some(self.pid),
+            share_vm: args.vfork && args.share_vm,
+            vfork_child: None,
+            released: None,
             retired: 0,
             steps_in: 0,
         })
+    }
+
+    /// Writes `bytes` into the task's memory, on the machine or parked.
+    fn write_memory(&mut self, addr: u64, bytes: &[u8]) -> bool {
+        if self.machine.is_some() {
+            return self.mmu().write(addr, bytes).is_ok();
+        }
+        let Some(saved) = self.saved.as_mut() else {
+            return false;
+        };
+        let mut scratch = Mmu::new();
+        scratch.restore(&saved.memory);
+        if scratch.write(addr, bytes).is_err() {
+            return false;
+        }
+        saved.memory = scratch.snapshot();
+        true
+    }
+
+    /// Lets go of the vfork parent, if the task holds one asleep: an exec
+    /// or an exit. The tid `CLONE_CHILD_CLEARTID` named is cleared first,
+    /// in the memory the parent may get back.
+    fn release(&mut self) -> Option<Release> {
+        if self.clear_child_tid != 0 {
+            let at = std::mem::take(&mut self.clear_child_tid);
+            self.write_memory(at, &0u32.to_le_bytes());
+        }
+        let parent = self.vfork_parent.take()?;
+        let memory = self.share_vm.then(|| {
+            let memory = match self.machine.as_mut() {
+                Some(machine) => machine.vm.memory_mut().mmu.snapshot(),
+                None => self
+                    .saved
+                    .as_ref()
+                    .expect("a task off the machine was parked")
+                    .memory
+                    .clone(),
+            };
+            Shared {
+                memory,
+                space: self.space,
+                shared_anon: self.shared_anon.clone(),
+                shared: std::mem::take(&mut self.shared),
+            }
+        });
+        self.share_vm = false;
+        Some(Release { parent, memory })
+    }
+
+    /// Takes back the memory a vfork child ran in, as it left it. The task
+    /// is parked, asleep on the child.
+    fn adopt(&mut self, shared: Shared) {
+        if let Some(saved) = self.saved.as_mut() {
+            saved.memory = shared.memory;
+        }
+        self.space = shared.space;
+        self.shared_anon = shared.shared_anon;
+        self.shared = shared.shared;
     }
 
     /// Replaces the machine with a fresh one running `image`, as `execve`
@@ -521,6 +728,7 @@ impl Task {
         let mut fresh = Mmu::new();
         let (loaded, rsp) =
             load_into(&mut fresh, image, argv, envp, self.identity).map_err(|_| ENOEXEC)?;
+        self.released = self.release();
         let machine = self.machine();
         machine.vm.memory_mut().mmu.adopt(fresh);
         machine.regs.reset(machine.vm.memory_mut());
@@ -539,6 +747,7 @@ impl Task {
         self.sigactions.clear();
         self.shared.clear();
         self.shared_anon.clear();
+        self.altstack = None;
         Ok(())
     }
 
@@ -549,6 +758,12 @@ impl Task {
     fn run(&mut self, budget: u64) -> TaskExit {
         if let Some(code) = self.exit_code {
             return TaskExit::Exited(code);
+        }
+        if let Some(info) = self.pending_signal.take() {
+            let rip = self.pc().unwrap_or(0);
+            if let Err(crash) = self.deliver(info, rip) {
+                return TaskExit::Crashed(crash);
+            }
         }
         let deadline = self.vm().stats.steps.saturating_add(budget);
         loop {
@@ -567,6 +782,22 @@ impl Task {
     fn settle(&mut self, exit: VmExit) -> Option<TaskExit> {
         match exit {
             VmExit::InstructionLimit | VmExit::Breakpoint(_) | VmExit::HookStop(_) => None,
+            VmExit::Interrupt(interrupt) if interrupt.kind == DIVIDE_ERROR_KIND => {
+                let rip = interrupt.pc.or_else(|| self.pc()).unwrap_or(0);
+                let info = SigInfo::raised(SIGFPE, signal::FPE_INTDIV, rip, 0);
+                self.trap(info, rip, "integer divide by zero".to_owned())
+            }
+            VmExit::Interrupt(interrupt) if interrupt.kind == SINGLE_STEP_KIND => {
+                self.step_check(&interrupt)
+            }
+            VmExit::Interrupt(interrupt)
+                if matches!(&interrupt.kind, InterruptKind::Intrinsic { name, .. }
+                    if name.as_ref() == "invalidInstructionException") =>
+            {
+                let rip = interrupt.pc.or_else(|| self.pc()).unwrap_or(0);
+                let info = SigInfo::raised(SIGILL, signal::ILL_ILLOPN, rip, 6);
+                self.trap(info, rip, "illegal instruction".to_owned())
+            }
             VmExit::Interrupt(interrupt) => match self.handle_interrupt(&interrupt) {
                 Ok(()) => {
                     if let Some(code) = self.exit_code {
@@ -580,23 +811,32 @@ impl Task {
                 Some(TaskExit::Crashed(self.crash(message.to_string(), None)))
             }
             VmExit::Fault(fault) => {
-                if self.traced_by.is_some()
-                    && let Some(pc) = self.pc()
-                {
-                    // `int3` lifts to a read of the interrupt descriptor
-                    // table, which is unmapped, so it arrives here as a
-                    // fault too: the byte at the position tells the two
-                    // apart. Linux reports a breakpoint one byte past it,
-                    // and a faulting access at the instruction itself.
-                    let int3 = guest::read(self.mmu(), pc, 1).is_ok_and(|b| b == [0xcc]);
-                    let (signal, rip) = if int3 {
-                        (SIGTRAP, pc + 1)
-                    } else {
-                        (SIGSEGV, pc)
-                    };
-                    return Some(TaskExit::Stopped { signal, rip });
+                let Some(pc) = self.pc() else {
+                    return Some(TaskExit::Crashed(self.crash(fault.to_string(), Some(11))));
+                };
+                // `int3` lifts to a read of the interrupt descriptor table,
+                // which is unmapped, so it arrives here as a fault too: the
+                // byte at the position tells the two apart. Linux reports a
+                // breakpoint one byte past it, and a faulting access at the
+                // instruction itself.
+                if guest::read(self.mmu(), pc, 1).is_ok_and(|b| b == [0xcc]) {
+                    let info = SigInfo::raised(SIGTRAP, SI_KERNEL, 0, 3);
+                    return self.trap(info, pc + 1, "breakpoint".to_owned());
                 }
-                Some(TaskExit::Crashed(self.crash(fault.to_string(), Some(11))))
+                let unmapped = matches!(
+                    fault.kind,
+                    FaultKind::ReadUnmapped | FaultKind::WriteUnmapped | FaultKind::ExecUnmapped
+                );
+                let mut info = SigInfo::raised(
+                    SIGSEGV,
+                    if unmapped { SEGV_MAPERR } else { SEGV_ACCERR },
+                    fault.addr,
+                    14,
+                );
+                // The page-fault error code: user mode, a write, a page
+                // that was present.
+                info.err = 4 | u64::from(fault.is_write()) << 1 | u64::from(!unmapped);
+                self.trap(info, pc, fault.to_string())
             }
             VmExit::Unlifted { addr, error } => {
                 let reason = match &error {
@@ -629,7 +869,7 @@ impl Task {
         let value = match name {
             "syscall" => {
                 let result = self.syscall();
-                if let Some(Request::Fork { .. } | Request::Block | Request::Ptrace { .. }) =
+                if let Some(Request::Fork(_) | Request::Block | Request::Ptrace { .. }) =
                     self.request
                 {
                     return Ok(());
@@ -657,9 +897,6 @@ impl Task {
                         | u128::from(ecx) << 96,
                 )
             }
-            "invalidInstructionException" => {
-                return Err(self.crash("illegal instruction".to_owned(), Some(4)));
-            }
             other => {
                 return Err(self.crash(format!("unsupported p-code operation `{other}`"), None));
             }
@@ -667,6 +904,49 @@ impl Task {
         self.vm()
             .resume(value)
             .map_err(|error| self.crash(error.to_string(), None))
+    }
+
+    /// A signal the task's own instruction raised, positioned to resume at
+    /// `rip`: a stop for its tracer if it has one, its handler if it
+    /// installed one, and otherwise the end of it.
+    fn trap(&mut self, info: SigInfo, rip: u64, reason: String) -> Option<TaskExit> {
+        if self.traced_by.is_some() {
+            self.stop_info = Some(info);
+            return Some(TaskExit::Stopped {
+                signal: info.signo,
+                rip,
+            });
+        }
+        if self.handler(info.signo).is_none() {
+            return Some(TaskExit::Crashed(self.crash(reason, Some(info.signo))));
+        }
+        self.deliver(info, rip).err().map(TaskExit::Crashed)
+    }
+
+    /// The step flag's check before an instruction: the first after a
+    /// `PTRACE_SINGLESTEP` is the instruction stepped over, the second the
+    /// stop after it.
+    fn step_check(&mut self, interrupt: &Interrupt) -> Option<TaskExit> {
+        match self.stepping {
+            Some(Step::Running) => {
+                self.stepping = None;
+                self.machine().set_stepping(false);
+                let rip = interrupt.pc.or_else(|| self.pc()).unwrap_or(0);
+                let info = SigInfo::raised(SIGTRAP, signal::TRAP_TRACE, rip, 1);
+                self.trap(info, rip, "single step".to_owned())
+            }
+            step => {
+                if step == Some(Step::Armed) {
+                    self.stepping = Some(Step::Running);
+                } else {
+                    self.machine().set_stepping(false);
+                }
+                self.vm()
+                    .resume(None)
+                    .err()
+                    .map(|error| TaskExit::Crashed(self.crash(error.to_string(), None)))
+            }
+        }
     }
 
     /// The parent's side of a fork, once the child exists: `RAX` is the
@@ -714,7 +994,10 @@ impl Task {
             out[i] = read(reg);
         }
         out[REG_RIP] = saved.parked.address().unwrap_or(0);
+        out[REG_CS] = 0x33;
+        out[REG_EFLAGS] = r.eflags(read);
         out[19] = read(r.rsp);
+        out[REG_SS] = 0x2b;
         out[21] = read(r.fs_base);
         out[22] = read(r.gs_base);
         Some(out)
@@ -746,6 +1029,7 @@ impl Task {
         write(r.rsp, regs[19]);
         write(r.fs_base, regs[21]);
         write(r.gs_base, regs[22]);
+        r.set_eflags(regs[REG_EFLAGS], &mut write);
         saved.parked = Parked::at_address(regs[REG_RIP]);
         true
     }
@@ -867,7 +1151,40 @@ pub struct Process {
     /// The latest bytes of every shared anonymous mapping, by start address:
     /// written by a task leaving the machine, read by the task taking it.
     arena: HashMap<u64, Vec<u8>>,
+    /// A one-word flat cell an instrumenter can point the scheduler at, kept
+    /// holding the pid of the task currently on the machine: written on every
+    /// switch and whenever a fork or exec changes who runs. Compiled hooks
+    /// read it to stamp their records with the running task, so a record made
+    /// either side of a cooperative switch is not mistaken for one task's.
+    task_id_space: Option<SpaceId>,
+    /// A tracer redirecting a tracee with `PTRACE_SETREGS`, recorded for a
+    /// consumer that wants the one cross-task control-flow transfer the
+    /// scheduler mediates: `(tracer pid, tracee pid, the rip it was set to,
+    /// the tracer's own pc when it asked)`. A cooperative switch is *not* a
+    /// control-flow edge and is deliberately not recorded here.
+    ptrace_redirects: Vec<PtraceRedirect>,
 }
+
+/// A tracer pointing a tracee somewhere new through `ptrace`: the one
+/// cross-task control-flow transfer a [`Process`] mediates, as opposed to a
+/// bare cooperative switch, which transfers nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtraceRedirect {
+    pub tracer: u64,
+    pub tracee: u64,
+    /// The instruction pointer the tracer set the tracee to.
+    pub rip: u64,
+    /// The tracer's own position when it issued the request, if known.
+    pub tracer_pc: Option<u64>,
+}
+
+/// The exits of the two trap hooks.
+const DIVIDE_ERROR_KIND: InterruptKind = InterruptKind::Explicit {
+    code: traps::DIVIDE_ERROR,
+};
+const SINGLE_STEP_KIND: InterruptKind = InterruptKind::Explicit {
+    code: traps::SINGLE_STEP,
+};
 
 /// Operations a task runs before the next runnable one gets a turn.
 const SLICE: u64 = 1 << 20;
@@ -881,7 +1198,46 @@ impl Process {
             next_pid: ROOT_PID + 1,
             machine: None,
             arena: HashMap::new(),
+            task_id_space: None,
+            ptrace_redirects: Vec::new(),
         })
+    }
+
+    /// Points the scheduler at a one-word flat cell to keep the running
+    /// task's pid in, for compiled hooks that stamp their records with the
+    /// task that made them. The cell is written now with the current task's
+    /// pid, then on every switch and on fork/exec. The space must be a
+    /// bounded flat space of at least four bytes (see
+    /// [`Vm::state_space`](qcode_vm::Vm::state_space)).
+    pub fn set_task_id_space(&mut self, space: SpaceId) {
+        self.task_id_space = Some(space);
+        self.write_task_id(self.current);
+    }
+
+    /// The cross-task control-flow transfers `ptrace` mediated, in order.
+    pub fn ptrace_redirects(&self) -> &[PtraceRedirect] {
+        &self.ptrace_redirects
+    }
+
+    /// Writes the pid of the task in `slot` into the task-id cell, if one was
+    /// registered and the task holds the machine.
+    fn write_task_id(&mut self, slot: usize) {
+        let Some(space) = self.task_id_space else {
+            return;
+        };
+        let Some(pid) = self.tasks.get(slot).and_then(|task| {
+            let task = task.as_ref()?;
+            task.machine.is_some().then_some(task.pid)
+        }) else {
+            return;
+        };
+        let _ = self
+            .machine_mut()
+            .vm
+            .memory_mut()
+            .flat_mut()
+            .entry(MemorySpaceId::Shared(space))
+            .write_u128(0, 4, u128::from(pid as u32));
     }
 
     fn root(&self) -> &Task {
@@ -1004,13 +1360,29 @@ impl Process {
         self.machine_ref().vm.stats.steps
     }
 
-    /// The first live task at or after `from`, wrapping around.
-    fn next_live(&self, from: usize) -> usize {
+    /// The first runnable task at or after `from`, wrapping around; none
+    /// when every task is stopped or asleep.
+    fn next_live(&self, from: usize) -> Option<usize> {
         let n = self.tasks.len();
         (0..n)
             .map(|k| (from + k) % n)
             .find(|&i| self.tasks[i].as_ref().is_some_and(Task::runnable))
-            .expect("the initial task is live")
+    }
+
+    /// Wakes the vfork parent the task in `slot` let go of, handing it the
+    /// memory they shared.
+    fn wake_vfork_parent(&mut self, release: Release) {
+        if let Some(parent) = self
+            .tasks
+            .iter_mut()
+            .flatten()
+            .find(|t| t.pid == release.parent && t.exit_code.is_none())
+        {
+            parent.vfork_child = None;
+            if let Some(shared) = release.memory {
+                parent.adopt(shared);
+            }
+        }
     }
 
     fn live_count(&self) -> usize {
@@ -1043,13 +1415,25 @@ impl Process {
         // tracer that seizes a child it just forked relies on.
         let mut yield_to = None;
         let result: Result<u64, Errno> = match request {
+            // Any task of the process, an ancestor included: they all run
+            // as one user. Not the caller, and not one traced already.
             PTRACE_SEIZE => match target {
-                Some(i) if self.tasks[i].as_ref().expect("live").ppid == tracer_pid => {
-                    self.tasks[i].as_mut().expect("live").traced_by = Some(tracer_pid);
-                    yield_to = Some(i);
-                    Ok(0)
+                Some(i) if i == tracer => Err(errno::EPERM),
+                Some(i) => {
+                    let task = self.tasks[i].as_mut().expect("live");
+                    if task.traced_by.is_some() {
+                        Err(errno::EPERM)
+                    } else {
+                        task.traced_by = Some(tracer_pid);
+                        let is_child = task.ppid == tracer_pid;
+                        let tracer = self.tasks[tracer].as_mut().expect("live");
+                        if !is_child {
+                            tracer.tracees.push(pid);
+                        }
+                        yield_to = Some(i);
+                        Ok(0)
+                    }
                 }
-                Some(_) => Err(errno::EPERM),
                 None => Err(errno::ESRCH),
             },
             PTRACE_GETREGS => stopped.ok_or(errno::ESRCH).and_then(|i| {
@@ -1067,6 +1451,7 @@ impl Process {
                 Ok(0)
             }),
             PTRACE_SETREGS => stopped.ok_or(errno::ESRCH).and_then(|i| {
+                let tracer_slot = tracer;
                 let tracer = self.tasks[tracer].as_mut().expect("live");
                 let bytes = guest::read(tracer.mmu(), data, USER_REGS * 8)?;
                 let mut regs = [0u64; USER_REGS];
@@ -1074,22 +1459,54 @@ impl Process {
                     *word = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
                 }
                 if self.tasks[i].as_mut().expect("live").set_user_regs(&regs) {
+                    // The one cross-task control-flow transfer the scheduler
+                    // mediates: the tracer just pointed the tracee's rip
+                    // somewhere. A consumer that reconstructs control flow
+                    // wants this edge and not the bare switch that carries it.
+                    let tracer_pc = self.tasks[tracer_slot].as_mut().expect("live").pc();
+                    self.ptrace_redirects.push(PtraceRedirect {
+                        tracer: tracer_pid,
+                        tracee: pid,
+                        rip: regs[REG_RIP],
+                        tracer_pc,
+                    });
                     Ok(0)
                 } else {
                     Err(errno::ESRCH)
                 }
             }),
-            PTRACE_CONT => stopped.ok_or(errno::ESRCH).map(|i| {
+            PTRACE_CONT | PTRACE_SINGLESTEP => stopped.ok_or(errno::ESRCH).and_then(|i| {
                 let signal = data as i32;
+                if !(0..=64).contains(&signal) {
+                    return Err(errno::EIO);
+                }
+                if request == PTRACE_SINGLESTEP {
+                    self.machine_mut().step_space();
+                }
                 let task = self.tasks[i].as_mut().expect("live");
                 task.stopped = None;
-                if signal != 0 {
-                    // Delivered, and nothing handles signals: fatal, as a
-                    // kill would be.
-                    task.exit_code = Some(128 + signal);
-                    self.reap(i, signal);
+                let stop = task.stop_info.take();
+                if request == PTRACE_SINGLESTEP {
+                    task.stepping = Some(Step::Armed);
                 }
-                0
+                if signal != 0 {
+                    if task.handler(signal).is_some() {
+                        // The signal the task stopped with keeps what its
+                        // trap recorded; another is the tracer's.
+                        task.pending_signal = Some(
+                            stop.filter(|info| info.signo == signal)
+                                .unwrap_or_else(|| SigInfo::sent(signal, tracer_pid)),
+                        );
+                    } else {
+                        // Fatal, as a kill would be. The initial task is
+                        // never reaped; the run loop sees it has ended.
+                        task.exit_code = Some(128 + signal);
+                        if i != 0 {
+                            self.reap(i, signal);
+                        }
+                    }
+                }
+                Ok(0)
             }),
             PTRACE_PEEKTEXT | PTRACE_PEEKDATA => stopped.ok_or(errno::ESRCH).and_then(|i| {
                 let word = self.tasks[i]
@@ -1128,13 +1545,24 @@ impl Process {
         // proceed; as many in a row as there are live tasks means nobody can.
         let mut blocked_streak = 0;
         loop {
+            if let Some(code) = self.root().exit_code {
+                return ProcessExit::Exited(code);
+            }
             let remaining = deadline.saturating_sub(self.steps());
             if remaining == 0 {
                 return ProcessExit::Budget;
             }
-            let index = self.next_live(self.current);
+            let Some(index) = self.next_live(self.current) else {
+                let root = self.root_mut();
+                return ProcessExit::Crashed(
+                    root.crash("every task is stopped or asleep".to_owned(), None),
+                );
+            };
             self.current = index;
             let switched = self.switch_to(index);
+            if switched.is_ok() {
+                self.write_task_id(index);
+            }
             let task = self.tasks[index].as_mut().expect("live");
             let before = task.steps();
             let exit = match switched {
@@ -1143,6 +1571,9 @@ impl Process {
             };
             if !matches!(exit, TaskExit::Requested(Request::Block)) || task.steps() != before {
                 blocked_streak = 0;
+            }
+            if let Some(release) = task.released.take() {
+                self.wake_vfork_parent(release);
             }
             match exit {
                 TaskExit::Budget => {
@@ -1163,7 +1594,8 @@ impl Process {
                     if index == 0 {
                         return ProcessExit::Crashed(crash);
                     }
-                    log::warn!("child {}: {crash}", task.pid);
+                    let pid = self.tasks[index].as_ref().expect("live").pid;
+                    log::warn!("child {pid}: {crash}");
                     let status = crash.signal.unwrap_or(9);
                     self.tasks[index].as_mut().expect("live").exit_code = Some(128 + status);
                     self.reap(index, status);
@@ -1180,11 +1612,11 @@ impl Process {
                     }
                     self.current = index + 1;
                 }
-                TaskExit::Requested(Request::Fork { vfork }) => {
+                TaskExit::Requested(Request::Fork(args)) => {
                     let pid = self.next_pid;
                     self.next_pid += 1;
                     let parent = self.tasks[index].as_mut().expect("live");
-                    let child = match parent.fork(pid) {
+                    let child = match parent.fork(pid, args) {
                         Ok(child) => child,
                         Err(crash) => {
                             if index == 0 {
@@ -1200,6 +1632,9 @@ impl Process {
                         return ProcessExit::Crashed(crash);
                     }
                     parent.children.push(pid);
+                    if args.vfork {
+                        parent.vfork_child = Some(pid);
+                    }
                     let slot = (1..self.tasks.len())
                         .find(|&i| self.tasks[i].is_none())
                         .unwrap_or_else(|| {
@@ -1207,11 +1642,11 @@ impl Process {
                             self.tasks.len() - 1
                         });
                     self.tasks[slot] = Some(child);
-                    // A vfork parent must not proceed before its child. After
-                    // a plain fork the parent keeps its turn, as it does on
-                    // Linux: a tracer seizes the child it just forked before
-                    // the child reaches its first trap.
-                    self.current = if vfork { slot } else { index };
+                    // A vfork parent sleeps until its child execs or exits.
+                    // After a plain fork the parent keeps its turn, as it
+                    // does on Linux: a tracer seizes the child it just
+                    // forked before the child reaches its first trap.
+                    self.current = if args.vfork { slot } else { index };
                 }
                 TaskExit::Requested(Request::Kill { pid, signal }) => {
                     if let Some(victim) = self.tasks.iter().position(|t| {
@@ -1276,12 +1711,26 @@ impl Process {
     fn reap(&mut self, slot: usize, status: i32) {
         self.stash_shared(slot);
         let mut task = self.tasks[slot].take().expect("live");
+        let release = task.release();
         if let Some(machine) = task.machine.take() {
             self.machine = Some(machine);
         }
         let (pid, ppid) = (task.pid, task.ppid);
         let orphans = task.children.clone();
         drop(task);
+        if let Some(release) = release {
+            self.wake_vfork_parent(release);
+        }
+        // Its tracer stops waiting on it; its tracees go free.
+        for t in self.tasks.iter_mut().flatten() {
+            t.tracees.retain(|&p| p != pid);
+            if t.traced_by == Some(pid) {
+                t.traced_by = None;
+                t.stopped = None;
+                t.stepping = None;
+            }
+            t.stops.retain(|&(p, _)| p != pid);
+        }
         // A task's parent is live: an exiting parent hands its children to
         // the initial task, which is never dropped.
         if let Some(parent) = self

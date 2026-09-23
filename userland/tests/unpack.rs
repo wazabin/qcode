@@ -359,7 +359,7 @@ fn edges_link_a_stage_to_the_block_that_jumped_into_it() {
         .as_array()
         .expect("edges is a list")
         .iter()
-        .filter(|edge| edge["origin"] == "observed")
+        .filter(|edge| edge["kind"] == "observed")
         .map(|edge| (hex(&edge["from"]), hex(&edge["to"])))
         .collect();
     assert!(!observed.is_empty(), "no observed edge was recorded");
@@ -396,7 +396,7 @@ fn edges_link_a_stage_to_the_block_that_jumped_into_it() {
             .as_array()
             .expect("edges is a list")
             .iter()
-            .all(|edge| edge["origin"] != "observed"),
+            .all(|edge| edge["kind"] != "observed"),
         "observed edges were recorded without --edges"
     );
 
@@ -522,9 +522,15 @@ fn a_static_glibc_hello_runs_under_the_hooks() {
     let summary = artifact::write(&dir, &mut process, &outcome).expect("the artifact is written");
     assert!(summary.nodes >= 1, "a libc run lifted no block");
     assert!(summary.executed >= 1, "a libc run entered no block");
-    // Nothing a static hello does writes code it then runs.
+    // Nothing a static hello does writes code it then runs, so no code is
+    // generated and no region is of kind code; the program does write data,
+    // which is now captured as data regions (that is expected, not a fault).
     assert!(summary.generated.is_empty(), "{:?}", summary.generated);
-    assert!(summary.regions.is_empty(), "{:?}", summary.regions);
+    assert!(
+        summary.regions.iter().all(|r| r.3 == "data"),
+        "a static hello produced a code region: {:?}",
+        summary.regions
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -566,21 +572,46 @@ fn a_upx_packed_hello_unpacks_to_one_region() {
     let summary = artifact::write(&dir, &mut process, &outcome).expect("the artifact is written");
     let graph = read_graph(&dir);
 
-    // One region, one generation deep, the unpacked program inside the image
-    // window at the image base: half a megabyte the stub wrote.
+    // The unpacked program comes back as one generation-1 CODE region inside
+    // the image window at the base (half a megabyte the stub wrote), and its
+    // writable segments come back as DATA regions — the data recovery the
+    // reviewer asked for. hw-upx's two RW `PT_LOAD`s are at 0x47b000 and
+    // 0x4a3108.
     let image = outcome.layout.image_window();
     let regions = graph["regions"].as_array().expect("regions is a list");
-    assert_eq!(regions.len(), 1, "{regions:?}");
-    let region = &regions[0];
+    let code: Vec<&serde_json::Value> = regions.iter().filter(|r| r["kind"] == "code").collect();
+    assert_eq!(code.len(), 1, "expected one code region: {code:?}");
+    let region = code[0];
     assert_eq!(region["generation"].as_u64(), Some(1));
     let start = hex(&region["start"]);
     let len = region["bytes_len"].as_u64().expect("a region length");
-    assert!(len > 400_000, "the region is {len} bytes");
+    assert!(len > 400_000, "the code region is {len} bytes");
     assert!(
         start >= image.start && start + len <= image.end(),
         "the region {start:#x}+{len:#x} leaves the image window"
     );
-    assert_eq!(summary.regions.len(), 1);
+    assert_eq!(summary.regions.iter().filter(|r| r.3 == "code").count(), 1);
+
+    // The data segments are recovered: their bytes are captured as data
+    // regions summing to the bulk of the two writable segments.
+    let data_bytes: u64 = regions
+        .iter()
+        .filter(|r| r["kind"] == "data")
+        .map(|r| r["bytes_len"].as_u64().unwrap_or(0))
+        .sum();
+    assert!(
+        data_bytes > 150_000,
+        "the writable segments were not recovered: {data_bytes} data bytes"
+    );
+    assert!(
+        regions.iter().any(|r| {
+            r["kind"] == "data" && {
+                let s = hex(&r["start"]);
+                (0x47b000..0x4a3108 + 0x20000).contains(&s)
+            }
+        }),
+        "the RW data segments at 0x47b000/0x4a3108 were not captured"
+    );
 
     // Every generated node is generation 1 and lies in that region: the
     // program the stub unpacked runs no unpacker of its own.

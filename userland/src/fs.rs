@@ -237,6 +237,13 @@ pub struct Files {
 
 impl Files {
     pub fn new(stdio: Stdio, root: Option<PathBuf>, exe_path: String) -> Self {
+        // `/proc/self/exe` must resolve to an absolute host path: glibc's
+        // loader (`_dl_get_origin`) asserts on a relative one, so a guest
+        // launched with a relative program path would abort.
+        let exe_path = std::fs::canonicalize(&exe_path)
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_owned))
+            .unwrap_or(exe_path);
         let mut fds: Vec<Option<Fd>> = Vec::with_capacity(8);
         for (kind, path) in [
             (FdKind::Stdin, "/dev/stdin"),

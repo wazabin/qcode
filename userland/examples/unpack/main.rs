@@ -49,6 +49,9 @@ struct Cli {
     /// A file the guest reads as its standard input
     #[arg(long, value_name = "FILE")]
     stdin: Option<PathBuf>,
+    /// Resolve the guest's paths under DIR (`/` or absent: the host's own)
+    #[arg(long, value_name = "DIR")]
+    root: Option<PathBuf>,
     /// Arguments handed to the guest after its own name
     #[arg(trailing_var_arg = true)]
     args: Vec<String>,
@@ -62,6 +65,7 @@ fn main() {
         hooks: !cli.no_hooks,
         edges: cli.edges,
         args: cli.args.clone(),
+        root: cli.root.clone(),
         stdin: cli.stdin.as_ref().map(|path| {
             std::fs::read(path).unwrap_or_else(|e| {
                 eprintln!("error: cannot read {}: {e}", path.display());

@@ -20,7 +20,7 @@ use crate::errno::{
 use crate::fs::{AT_FDCWD, O_CLOEXEC};
 use crate::guest;
 use crate::loader::page_up;
-use crate::process::{AddressSpace, Machine, PTRACE_TRACEME, Request, Task};
+use crate::process::{AddressSpace, CloneArgs, Machine, PTRACE_TRACEME, Request, Task};
 
 const PROT_READ: u64 = 1;
 const PROT_WRITE: u64 = 2;
@@ -40,9 +40,17 @@ const AT_REMOVEDIR: u64 = 0x200;
 const AT_EMPTY_PATH: u64 = 0x1000;
 
 const SIGCHLD: u64 = 17;
-/// `clone` flags other than the exit signal; any of them asks for sharing a
-/// fork cannot provide.
-const CLONE_FLAGS: u64 = !0xff;
+const CLONE_VM: u64 = 0x100;
+const CLONE_VFORK: u64 = 0x4000;
+const CLONE_PARENT_SETTID: u64 = 0x10_0000;
+const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
+const CLONE_CHILD_SETTID: u64 = 0x100_0000;
+/// The `clone` flags a fork or a vfork can honour: glibc's `fork` passes
+/// `CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD`, `posix_spawn`
+/// `CLONE_VM | CLONE_VFORK | SIGCHLD`. Any other asks for sharing — a
+/// thread, a namespace — that tasks with their own memory cannot provide.
+const CLONE_KNOWN: u64 =
+    CLONE_VM | CLONE_VFORK | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID;
 const WNOHANG: u64 = 1;
 const WSTOPPED: u64 = 2;
 const WEXITED: u64 = 4;
@@ -75,6 +83,7 @@ fn describe(nr: u64) -> (&'static str, usize) {
         11 => ("munmap", 2),
         12 => ("brk", 1),
         13 => ("rt_sigaction", 4),
+        15 => ("rt_sigreturn", 0),
         14 => ("rt_sigprocmask", 4),
         16 => ("ioctl", 3),
         17 => ("pread64", 4),
@@ -240,6 +249,7 @@ impl Task {
             11 => self.sys_munmap(a[0], a[1]),
             12 => Ok(self.set_brk(a[0])),
             13 => self.sys_rt_sigaction(a[0], a[1], a[2]),
+            15 => self.sys_rt_sigreturn(),
             14 => self.sys_rt_sigprocmask(a[0], a[1], a[2], a[3]),
             16 => self.sys_ioctl(a[0] as i32, a[1], a[2]),
             17 => self.sys_pread(a[0] as i32, a[1], a[2], a[3]),
@@ -253,15 +263,17 @@ impl Task {
             32 => self.files.dup(a[0] as i32, None, false).map(|fd| fd as u64),
             33 => self.sys_dup2(a[0] as i32, a[1] as i32),
             39 | 186 => Ok(self.pid),
-            56 => {
-                if a[0] & CLONE_FLAGS != 0 || a[0] & 0xff != SIGCHLD {
-                    return Err(ENOSYS);
-                }
-                self.request = Some(Request::Fork { vfork: false });
+            56 => self.sys_clone(a[0], a[1], a[2], a[3]),
+            57 => {
+                self.request = Some(Request::Fork(CloneArgs::default()));
                 Ok(0)
             }
-            57 | 58 => {
-                self.request = Some(Request::Fork { vfork: nr == 58 });
+            58 => {
+                self.request = Some(Request::Fork(CloneArgs {
+                    vfork: true,
+                    share_vm: true,
+                    ..CloneArgs::default()
+                }));
                 Ok(0)
             }
             59 => self.sys_execve(a[0], a[1], a[2]),
@@ -293,12 +305,15 @@ impl Task {
             102 | 107 => Ok(self.identity.uid),
             104 | 108 => Ok(self.identity.gid),
             110 => Ok(self.ppid),
-            131 => self.sys_sigaltstack(a[1]),
+            131 => self.sys_sigaltstack(a[0], a[1]),
             158 => self.sys_arch_prctl(a[0], a[1]),
             201 => self.sys_time(a[0]),
             202 => self.sys_futex(a[0], a[1], a[2]),
             217 => self.sys_getdents64(a[0] as i32, a[1], a[2]),
-            218 => Ok(self.pid),
+            218 => {
+                self.clear_child_tid = a[0];
+                Ok(self.pid)
+            }
             228 => self.sys_clock_gettime(a[0], a[1]),
             229 => {
                 guest::write(self.mmu(), a[1], &timespec(0, 1))?;
@@ -336,6 +351,35 @@ impl Task {
                 Err(ENOSYS)
             }
         }
+    }
+
+    /// `clone(flags, stack, parent_tid, child_tid, tls)` as a fork or a
+    /// vfork: the flags glibc's `fork` and `posix_spawn` pass, and no
+    /// thread.
+    fn sys_clone(&mut self, flags: u64, stack: u64, parent_tid: u64, child_tid: u64) -> SysResult {
+        let exit_signal = flags & 0xff;
+        if exit_signal != SIGCHLD && exit_signal != 0 {
+            return Err(EINVAL);
+        }
+        if flags & !0xff & !CLONE_KNOWN != 0 {
+            warn!("clone with unsupported flags {flags:#x}");
+            return Err(ENOSYS);
+        }
+        let vfork = flags & CLONE_VFORK != 0;
+        if flags & CLONE_VM != 0 && !vfork {
+            warn!("clone of a thread ({flags:#x})");
+            return Err(ENOSYS);
+        }
+        let when = |flag: u64, addr: u64| if flags & flag != 0 { addr } else { 0 };
+        self.request = Some(Request::Fork(CloneArgs {
+            vfork,
+            share_vm: flags & CLONE_VM != 0,
+            stack,
+            parent_tid: when(CLONE_PARENT_SETTID, parent_tid),
+            child_tid: when(CLONE_CHILD_SETTID, child_tid),
+            clear_tid: when(CLONE_CHILD_CLEARTID, child_tid),
+        }));
+        Ok(0)
     }
 
     /// `memfd_create`: an anonymous file. Sealing and huge pages are
@@ -577,7 +621,12 @@ impl Task {
             };
             return report(self, code, child, value);
         }
-        if !self.children.iter().any(|&c| matches(c)) {
+        if !self
+            .children
+            .iter()
+            .chain(&self.tracees)
+            .any(|&c| matches(c))
+        {
             return Err(ECHILD);
         }
         if options & WNOHANG != 0 {
@@ -608,7 +657,12 @@ impl Task {
             }
             return Ok(child);
         }
-        if !self.children.iter().any(|&c| matches(c)) {
+        if !self
+            .children
+            .iter()
+            .chain(&self.tracees)
+            .any(|&c| matches(c))
+        {
             return Err(ECHILD);
         }
         if options & WNOHANG != 0 {
@@ -912,16 +966,6 @@ impl Task {
                 2 => mask,
                 _ => return Err(EINVAL),
             };
-        }
-        Ok(0)
-    }
-
-    fn sys_sigaltstack(&mut self, old: u64) -> SysResult {
-        if old != 0 {
-            // ss_sp, ss_flags = SS_DISABLE, ss_size.
-            let mut bytes = [0; 24];
-            bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
-            guest::write(self.mmu(), old, &bytes)?;
         }
         Ok(0)
     }

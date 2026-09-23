@@ -21,6 +21,8 @@
 //! - [`fs`]: the file-descriptor table and the (optionally sandboxed) host
 //!   filesystem behind it.
 //! - [`syscall`]: the Linux system call dispatcher.
+//! - `signal`: signal frames for handlers, `rt_sigreturn`, `sigaltstack`.
+//! - `traps`: hooks raising the divide error and single-step trap.
 //! - [`process`]: the run loop that ties the above to the VM.
 
 pub mod bare;
@@ -30,7 +32,9 @@ pub mod guest;
 pub mod loader;
 pub mod process;
 pub mod regs;
+mod signal;
 pub mod stack;
 pub mod syscall;
+mod traps;
 
 pub use process::{Config, Crash, Process, ProcessExit};

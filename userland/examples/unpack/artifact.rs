@@ -54,6 +54,8 @@ pub fn write(dir: &Path, process: &mut Process, outcome: &Outcome) -> Result<Sum
         layout: &outcome.layout,
         recorder: &outcome.recorder,
         log: &outcome.log,
+        site_tasks: &outcome.site_tasks,
+        ptrace_redirects: &outcome.ptrace_redirects,
         edges_recorded,
     });
     let mut warnings = graph.warnings.clone();
@@ -75,7 +77,8 @@ pub fn write(dir: &Path, process: &mut Process, outcome: &Outcome) -> Result<Sum
     fs::create_dir_all(&regions_dir).map_err(|e| fail("regions/", e))?;
     let mut files = Vec::new();
     for region in &graph.regions {
-        let name = format!("{:#x}-g{}.bin", region.start, region.generation);
+        let suffix = if region.kind == "data" { "-data" } else { "" };
+        let name = format!("{:#x}-g{}{suffix}.bin", region.start, region.generation);
         let mut bytes = vec![0u8; region.bytes_len() as usize];
         // Generated code is usually readable and executable, but a sample is
         // free to `mprotect` it down to either one once it is written.
@@ -121,7 +124,8 @@ pub fn write(dir: &Path, process: &mut Process, outcome: &Outcome) -> Result<Sum
                 from: edge.from,
                 to: edge.to,
                 kind: edge.kind,
-                origin: edge.origin,
+                from_task: edge.from_task,
+                to_task: edge.to_task,
                 site: edge.site,
             })
             .collect(),
@@ -143,6 +147,7 @@ pub fn write(dir: &Path, process: &mut Process, outcome: &Outcome) -> Result<Sum
                 start: region.start,
                 end: region.end,
                 generation: region.generation,
+                kind: region.kind,
                 bytes_len: region.bytes_len(),
             })
             .collect(),
@@ -178,8 +183,8 @@ pub struct Summary {
     pub executed: usize,
     /// How many *generated* nodes carry each generation from 1 up.
     pub generated: BTreeMap<u32, usize>,
-    /// The regions, as `(start, end, generation, file name)`.
-    pub regions: Vec<(u64, u64, u32, String)>,
+    /// The regions, as `(start, end, generation, kind, file name)`.
+    pub regions: Vec<(u64, u64, u32, &'static str, String)>,
     /// How many store sites the provenance hook instrumented.
     pub sites: usize,
     /// How many blocks the first-entry log holds.
@@ -212,7 +217,15 @@ impl Summary {
                 .regions
                 .iter()
                 .zip(files)
-                .map(|(region, file)| (region.start, region.end, region.generation, file))
+                .map(|(region, file)| {
+                    (
+                        region.start,
+                        region.end,
+                        region.generation,
+                        region.kind,
+                        file,
+                    )
+                })
                 .collect(),
             sites: outcome.recorder.sites.len(),
             entries: outcome.log.len(),
@@ -236,10 +249,10 @@ impl fmt::Display for Summary {
             writeln!(f, "  gen {generation}:  {count} generated node(s)")?;
         }
         writeln!(f, "regions:  {}", self.regions.len())?;
-        for (start, end, generation, file) in &self.regions {
+        for (start, end, generation, kind, file) in &self.regions {
             writeln!(
                 f,
-                "  gen {generation}:  {start:#x}..{end:#x}, {} bytes -> regions/{file}",
+                "  {kind} gen {generation}:  {start:#x}..{end:#x}, {} bytes -> regions/{file}",
                 end - start
             )?;
         }
@@ -315,6 +328,8 @@ impl WindowWire {
 struct NodeWire {
     #[serde(serialize_with = "hex")]
     addr: u64,
+    task: u32,
+    version: u32,
     range: [String; 2],
     generated: bool,
     generation: u32,
@@ -330,6 +345,8 @@ impl NodeWire {
     fn new(node: &graph::Node) -> Self {
         Self {
             addr: node.addr,
+            task: node.task,
+            version: node.version,
             range: [format!("{:#x}", node.start), format!("{:#x}", node.end)],
             generated: node.generated,
             generation: node.generation,
@@ -349,7 +366,9 @@ struct EdgeWire {
     to: u64,
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    origin: Option<&'static str>,
+    from_task: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    to_task: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     site: Option<u16>,
 }
@@ -369,6 +388,7 @@ struct RegionWire {
     #[serde(serialize_with = "hex")]
     end: u64,
     generation: u32,
+    kind: &'static str,
     bytes_len: u64,
 }
 

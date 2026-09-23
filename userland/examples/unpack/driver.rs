@@ -38,6 +38,9 @@ pub struct Options {
     pub args: Vec<String>,
     /// What the guest reads on its standard input.
     pub stdin: Option<Vec<u8>>,
+    /// Sandbox root for the guest's paths; `None` exposes the host
+    /// filesystem (the same as `/`).
+    pub root: Option<std::path::PathBuf>,
 }
 
 impl Default for Options {
@@ -49,16 +52,21 @@ impl Default for Options {
             edges: false,
             args: Vec::new(),
             stdin: None,
+            root: None,
         }
     }
 }
 
-/// The three state spaces the hooks share, once the machine has made them.
+/// The state spaces the hooks share, once the machine has made them.
 #[derive(Debug, Clone, Copy)]
 pub struct Spaces {
     pub shadow: SpaceId,
     pub entries: SpaceId,
     pub visited: SpaceId,
+    /// The one-word cell the scheduler keeps the running task's id in.
+    pub task: SpaceId,
+    /// The last task to execute each store site, by site id.
+    pub sitetask: SpaceId,
 }
 
 /// What a run produced.
@@ -88,8 +96,12 @@ pub struct Outcome {
     pub spaces: Option<Spaces>,
     /// What the hooks knew that the spaces did not; empty with `--no-hooks`.
     pub recorder: Recorder,
-    /// The blocks that ran, once each, in the order they first ran.
+    /// The blocks that ran, once each per task, in the order they first ran.
     pub log: Vec<LogEntry>,
+    /// The last task to execute each store site, by site index.
+    pub site_tasks: Vec<Option<u32>>,
+    /// The cross-task control-flow transfers `ptrace` mediated during the run.
+    pub ptrace_redirects: Vec<qcode_userland::process::PtraceRedirect>,
     /// Lifted blocks the machine threw away because the guest wrote over
     /// their bytes: this branch's self-modifying-code counter.
     pub evicted: u64,
@@ -119,7 +131,7 @@ pub fn run_keeping(path: &str, options: &Options) -> Result<(Process, Outcome), 
         envp: Vec::new(),
         jit: options.jit,
         trace: false,
-        root: None,
+        root: options.root.clone(),
         stdio: Stdio::Captured,
         exe_path: path.to_owned(),
     };
@@ -155,6 +167,9 @@ pub fn run_keeping(path: &str, options: &Options) -> Result<(Process, Outcome), 
         // order is a convention rather than a constraint.
         vm.add_hook(ProvenanceHook::new(Rc::clone(&recorder), layout));
         vm.add_hook(EntryHook::new(Rc::clone(&recorder), options.edges));
+        // Point the cooperative scheduler at the task cell so the hooks read
+        // the running task on every switch and on fork/exec.
+        process.set_task_id_space(spaces.task);
         Some(spaces)
     } else {
         None
@@ -162,12 +177,18 @@ pub fn run_keeping(path: &str, options: &Options) -> Result<(Process, Outcome), 
 
     let exit = process.run(options.budget);
     let steps = process.steps();
-    let log = match spaces {
+    let sites = recorder.borrow().sites.len();
+    let (log, site_tasks) = match spaces {
         Some(spaces) => {
-            hooks::read_log(process.vm().memory().flat(), spaces.entries, options.edges)
+            let flat = process.vm().memory().flat();
+            (
+                hooks::read_log(flat, spaces.entries, options.edges),
+                hooks::read_site_tasks(flat, spaces.sitetask, sites),
+            )
         }
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
+    let ptrace_redirects = process.ptrace_redirects().to_vec();
     let stats = process.vm().stats.clone();
 
     let (exit_status, stop_reason, crashed) = match &exit {
@@ -194,6 +215,8 @@ pub fn run_keeping(path: &str, options: &Options) -> Result<(Process, Outcome), 
         spaces,
         recorder: recorder.borrow().clone(),
         log,
+        site_tasks,
+        ptrace_redirects,
         evicted: stats.evicted,
         absorbed: stats.absorbed,
         native_bodies: stats.native_bodies,
@@ -228,9 +251,23 @@ fn make_spaces(process: &mut Process) -> Result<Spaces, String> {
             .vm()
             .state_space(layout::VISITED_SPACE, layout::VISITED_LEN),
     )?;
+    let task = made(
+        layout::TASK_SPACE,
+        process
+            .vm()
+            .state_space(layout::TASK_SPACE, layout::TASK_LEN),
+    )?;
+    let sitetask = made(
+        layout::SITETASK_SPACE,
+        process
+            .vm()
+            .state_space(layout::SITETASK_SPACE, layout::SITETASK_LEN),
+    )?;
     Ok(Spaces {
         shadow,
         entries,
         visited,
+        task,
+        sitetask,
     })
 }

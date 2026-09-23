@@ -1,26 +1,48 @@
-# Evaluation plan: provenance graphs over a shared static/dynamic IR
+# Evaluation plan: an unpacking system on a shared static/dynamic IR
 
-Written 2026-09-22. Companion to `PLAN_UNPACKER_POC.md` (design) and
-`HANDOFF_UNPACK.md` (state). Runs from the `emulator-suite` branch once the
-2026-09-22 working tree is committed.
+Written 2026-09-22, refocused after a reviewer pass. Companion to
+`PLAN_UNPACKER_POC.md` (design) and `HANDOFF_UNPACK.md` (state). Runs from
+the `emulator-suite` branch.
 
-## 0. Claims and research questions
+## 0. Thesis, claims and research questions
 
-The VM runs the same IR as the static analysis tool. Four claims follow;
-every experiment below is tied to one.
+This is an **unpacking system**, not a general emulator. Thesis: a
+process-aware, versioned provenance graph of executable code, produced by
+low-exit IR instrumentation and lifted into the same `Context` a static
+pass consumes, enables downstream static analysis of code that the
+original file's static CFG cannot reach — for ordinary packers and for
+control flow split across processes (nanomites) alike.
 
-| id | claim | evidence |
+Three linked contributions and the honest claims they support:
+
+| id | claim (as it may stand) | evidence |
 |---|---|---|
-| C1 | Hooks compiled into the IR cost less than callback hooks in Unicorn, Qiling and icicle. | per-hook ratios (hookbench, done) and whole-task overhead (E3) |
-| C2 | Instrumentation is easier to write: a hook is a few IR ops, not a native patch or a marshalled callback. | instrumentation size and shape per engine on one task (E3) |
-| C3 | A provenance graph over that IR recovers what a static CFG cannot: code produced at runtime, and control flow split across processes. | byte-exact regions, CFG recall, cross-process edges (E1, E2, E4) |
-| C4 | Generated code is lifted into the same `Context`, so the static tool consumes the result directly, with no rebuilt binary. | a static pass over `context.bin` yields facts a static run on the original file cannot (E5) |
+| C1 | Generated code enters the same `Context` static passes use, so an unchanged static pass produces correct, useful findings from the unpacked context that it cannot from the original file. Counts of extra blocks alone are not enough: E5 must show a downstream analysis win checked against an independent oracle. | E5 |
+| C2 | Compiled hooks record writes and entries with no host exit per event, which makes the shared-IR workflow practical. NOT "cheaper than every engine on every workload" — hookbench already shows icicle at or below QCode on some overheads. Report per-engine overhead ratio AND absolute end-to-end time, including setup, failures and unsupported cases. | E3 |
+| C3 | The graph extends past a single process: it recovers the control-flow decisions a tracer holds over a tracee, attributes them to the tracer, and hands the recovered code and edges to the same static pass. Requires process-qualified nodes and explicit ptrace-mediated edges. | E4, E5 |
 
-- **RQ1** How complete and exact is the recovered code, per generator? (C3)
-- **RQ2** How much executed control flow does the dynamic graph recover, and what does the static CFG miss? (C3, C4)
-- **RQ3** What does recording cost, and how does the same task compare on the other engines? (C1, C2)
-- **RQ4** Does the process model hold on real split-control-flow binaries, and at what cost? (C3)
-- **RQ5** Is the result identical across interpreter and JIT, and stable across runs? (soundness of all of the above)
+Corrections this plan now bakes in (reviewer points):
+
+- **Independent edge oracle.** Recall is not measured against another run
+  recorded by the same first-entry hook (circular). E2 uses a complete
+  execution-edge oracle, and `static_miss` compares against the static CFG
+  of the **original file**, computed separately, not the final dynamic
+  context.
+- **Time and identity.** Nodes are `(task, address, version)`, not address
+  alone; a code byte's history is versioned at execution time, not
+  inferred from the final shadow; cross-task edges are explicit causal
+  (ptrace-mediated) edges, never a global predecessor that spans a
+  scheduler switch.
+- **Boundaries reported, not hidden.** The two fixed provenance windows,
+  the final-writer shadow where still used, the region cap, and every
+  unsupported or failed case appear in the results, prominently.
+
+- **RQ1** How complete and exact is the recovered code, per generator, with versioned history? (C3, C1)
+- **RQ2** Against an independent oracle, how much executed control flow does the graph recover, and what does the original file's static CFG miss? (C3)
+- **RQ3** What does recording cost, per engine as a ratio and as absolute end-to-end time with failures counted? (C2)
+- **RQ4** Does the process-aware graph recover a tracer's control-flow decisions and attribute them, on corpus guests and real nanomites? (C3)
+- **RQ5** Does an unchanged static pass gain a checkable downstream result from the unpacked context? (C1)
+- **RQ6** Is the result identical across interpreter and JIT, and stable across runs? (soundness)
 
 ## 1. Corpus
 

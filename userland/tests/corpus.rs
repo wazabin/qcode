@@ -280,3 +280,21 @@ fn budget_exhaustion_is_resumable() {
     assert!(matches!(process.run(BUDGET), ProcessExit::Exited(0)));
     assert_eq!(&*process.files().stdout(), b"hi\n");
 }
+
+#[test]
+fn signal_handlers_run_and_redirect_rip() {
+    check(
+        "signals",
+        false,
+        &[],
+        &[],
+        None,
+        "segv handled\nfpe handled\ndone\n",
+        7,
+    );
+}
+
+#[test]
+fn glibc_style_clone_forks_and_is_reaped() {
+    check("clone", false, &[], &[], None, "clone ok\n", 0);
+}
