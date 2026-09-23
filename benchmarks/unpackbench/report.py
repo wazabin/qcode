@@ -405,23 +405,28 @@ def e2(rows):
         if r["family"] in ("1.1", "1.3") and rec is not None:
             verdicts.append(rec >= 1.0)
         state = esc(e.get("pending")) if e.get("pending") else esc(e.get("source") or "–")
-        body.append([binname(r), esc(r["engine"]), fmt_int(e.get("reference")), fmt_int(e.get("found")),
-                     fmt_frac(rec), fmt_int(e.get("observed")), fmt_int(t.get("static_miss")),
-                     fmt_int((t.get("graph") or {}).get("static_edges")), f'<span class="muted">{state}</span>'])
+        xo = t.get("exec_oracle") or {}
+        body.append([binname(r), esc(r["engine"]), fmt_frac(xo.get("coverage")),
+                     fmt_int(xo.get("image_blocks")), fmt_int(xo.get("miss")),
+                     fmt_int(e.get("reference")), fmt_int(e.get("found")),
+                     fmt_frac(rec), fmt_int(t.get("static_miss")),
+                     f'<span class="muted">{state}</span>'])
         if rec is not None:
             bars.append((f'{r["family"]}/{r["name"]}', [(rec, engine_slot(r["engine"]), r["engine"],
                          f'{r["family"]}/{r["name"]} {r["engine"]}: {e.get("found")} of {e.get("reference")} reference edges')]))
     fig = hbar_chart("Figure 2a. Observed-edge recall against the reference", bars,
                      "recall (reference edges found in the graph)", x_max=1.0,
                      tick_fmt=lambda v: f"{v:g}", value_fmt=lambda v: f"{v:.3f}", reference=1.0)
-    tab = table(["binary", "engine", "reference edges", "found", "recall", "observed", "static miss",
-                 "static edges", "reference source"], body, numeric={2, 3, 4, 5, 6, 7})
+    tab = table(["binary", "engine", "independent recall (qemu)", "blocks (image)", "missed",
+                 "reference edges", "found", "first-entry recall", "static miss",
+                 "reference source"], body, numeric={2, 3, 4, 5, 6, 7, 8})
     verdict = None if not verdicts else badge(all(verdicts), f"{sum(verdicts)}/{len(verdicts)} at 1.0",
                                                f"{sum(verdicts)}/{len(verdicts)} at 1.0")
     return section("E2", "E2 Control-flow recovery (RQ2)",
-                   "Observed edges are first-entry edges (the block that ran just before each block's first entry). "
-                   "<i>Static miss</i> counts observed edges absent from the static <code>control_flow</code> edges of "
-                   "the same graph. Cross-process edges (1.4) are not in the graph schema yet.",
+                   "<i>Independent recall</i> is non-circular: it is the fraction of image-range basic blocks that "
+                   "a different engine (qemu-x86-64) executed which fall inside a block our graph also executed. "
+                   "<i>First-entry recall</i> against a reference run of our own hook is shown for contrast and is not "
+                   "independent. <i>Static miss</i> counts observed edges absent from the graph's static edges.",
                    tab + fig, "recall 1.0 on families 1.1 and 1.3; on 1.4, every cross-process oracle edge present.",
                    verdict)
 
@@ -499,14 +504,20 @@ def e4(rows):
     rs = [r for r in rows if r["family"] == "1.4"]
     body = []
     for r in rs:
+        t = r.get("truth") or {}
+        g = t.get("graph") or {}
+        ed = t.get("edges") or {}
+        ptrace = (f'{ed.get("found")}/{ed.get("reference")}'
+                  if ed.get("mode") == "ptrace" else fmt_int(g.get("ptrace_edges")))
         body.append([binname(r), esc(r["engine"]), badge(run_ok(r), "ok", "wrong"),
-                     fmt_ms(cfg(r, "nohooks")), fmt_ms(cfg(r, "hooks")), fmt_ratio(ratio(cfg(r, "hooks"), cfg(r, "nohooks"))),
-                     esc(r.get("stop_reason"))])
-    note = ("Children, traps serviced, switches and bytes per switch are not reported by the unpack example yet; "
-            "the table shows what the harness has.")
+                     fmt_int(t.get("tasks")), esc(ptrace), fmt_frac(ed.get("recall")),
+                     fmt_ms(cfg(r, "hooks")), esc(r.get("stop_reason"))])
+    note = ("<i>Tasks</i> is the number of distinct processes the graph attributes nodes to; <i>ptrace edges</i> "
+            "are the cross-task control-flow transfers a tracer makes (found/expected for the nanomite guest, whose "
+            "tracer rewrites its tracee's rip). A scheduler switch is not counted as a control-flow edge.")
     return section("E4", "E4 Process model (RQ4)", note,
-                   table(["binary", "engine", "run", "no hooks", "hooks", "ratio", "stop"], body, numeric={3, 4, 5}),
-                   "oracle output and exit reproduced for every corpus guest; voracious reaches exit with 15 fan-out edges.")
+                   table(["binary", "engine", "run", "tasks", "ptrace edges", "recall", "hooks", "stop"], body, numeric={3, 5, 6}),
+                   "the nanomite guest recovers both tracer-to-tracee redirections; voracious runs with its 16 tasks.")
 
 
 def e5(rows):
