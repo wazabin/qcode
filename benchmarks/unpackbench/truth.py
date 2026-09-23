@@ -320,9 +320,11 @@ def judge(run_dir, corpus_root, label_dir):
 
     # The run itself.
     nodes = graph.get("nodes", [])
+    t["tasks"] = len({n["task"] for n in nodes if "task" in n})
     t["graph"] = {"nodes": len(nodes), "executed": sum(1 for n in nodes if n.get("executed")),
                   "generated": sum(1 for n in nodes if n.get("generated")),
                   "static_edges": len(static(graph)), "observed_edges": len(obs),
+                  "ptrace_edges": len(ptrace_edges(graph)),
                   "warnings": len(graph.get("warnings", []))}
     t["run_ok"] = (not meta.get("crashed")) and meta.get("exit_ok") is not False \
         and meta.get("stdout_ok") is not False
