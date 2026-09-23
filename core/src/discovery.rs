@@ -24,6 +24,10 @@ pub enum FunctionDiscoveryReason {
     /// itself called indirectly (`call [@param]`). See the
     /// `propagate_code_pointer_args` pass.
     CodePointer,
+    /// Code found by scanning the executable bytes no lifted function owns:
+    /// an unreferenced function that survives only as bytes between two
+    /// discovered ones (no symbol, no unwind entry, no caller).
+    GapScan,
 }
 
 /// The control-flow edge that exposed a block target.
