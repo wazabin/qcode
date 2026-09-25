@@ -83,7 +83,7 @@ use qcode::{
     context::{ArchitectureId, Context},
     lift::{
         CallTarget, Construction, Continuation, Emitter, ExitArm, ExitKind, LiftTarget, Lifted,
-        TargetError,
+        Promotion, TargetError, Transfer,
     },
     space::SpaceType,
     value::{
@@ -547,11 +547,18 @@ impl<'spec> SleighLifter<'spec> {
         let length = construction.length();
 
         let mut workspace = take_workspace();
+        // A direct jump — or the fall-through — to another function's entry
+        // is a tail call: it lands in a block of this instruction that holds
+        // the `TailCall`, made once the builder exists (see `FlatEmitter::new`).
+        let mut tails: Vec<(u64, Callee)> = Vec::new();
         let filled = (|| {
             for &target in plan.direct_branches() {
-                workspace
-                    .branches
-                    .insert(target, construction.block_at(target)?);
+                match construction.transfer_at(target, Promotion::Refuse)? {
+                    Transfer::Block(block) => {
+                        workspace.branches.insert(target, block);
+                    }
+                    Transfer::Function(callee) => tails.push((target, callee)),
+                }
             }
             for &target in plan.direct_calls() {
                 if flat {
@@ -565,7 +572,7 @@ impl<'spec> SleighLifter<'spec> {
                         .insert(target, construction.callee_at(target)?);
                 }
             }
-            construction.block_at(address + length as u64)
+            construction.transfer_at(address + length as u64, Promotion::Refuse)
         })();
         let next = match filled {
             Ok(next) => next,
@@ -577,11 +584,13 @@ impl<'spec> SleighLifter<'spec> {
 
         Ok(FlatEmitter::new(
             next,
+            tails,
             construction.emitter(),
             self.spec,
             self.unique_space,
             workspace,
             address,
+            length,
             plan,
             flat,
         ))
@@ -789,8 +798,17 @@ struct FlatEmitter<'spec, 'str, 'ctx> {
     calls: HashMap<u64, Callee>,
     /// Blocks for the plan's instruction-local labels, made on first mention.
     labels: Vec<Option<BlockId>>,
-    next: BlockId,
+    /// The fall-through block: `None` until first needed when the next
+    /// instruction is another function's entry (`next_tail`), since most
+    /// instructions before a function entry (a `ret`, a `jmp`) never fall
+    /// through and a tail-call block made for nothing would be dead.
+    next: Option<BlockId>,
+    /// The function the fall-through tail-calls, when it is another's entry.
+    next_tail: Option<Callee>,
+    /// The tail-call blocks made so far, by target address.
+    tail_blocks: Vec<(u64, BlockId)>,
     address: u64,
+    length: usize,
     fallthrough: usize,
     /// Lower the guest's calls and returns as jumps. See
     /// [`SleighLifter::with_flat_control_flow`].
@@ -803,21 +821,23 @@ struct FlatEmitter<'spec, 'str, 'ctx> {
 impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        next: BlockId,
+        next: Transfer,
+        tails: Vec<(u64, Callee)>,
         builder: Emitter<'ctx, 'str>,
         spec: &'spec CompiledSpec,
         unique_space: SpaceId,
-        mut workspace: Workspace,
+        workspace: Workspace,
         address: u64,
+        length: usize,
         plan: &PcodePlan,
         flat: bool,
     ) -> Self {
-        // A terminal label is the instruction's fall-through, not a block.
-        workspace.labels.extend(
-            (0..plan.labels().len())
-                .map(|index| plan.is_terminal(LabelId::from_index(index)).then_some(next)),
-        );
-        Self {
+        let (next, next_tail) = match next {
+            Transfer::Block(block) => (Some(block), None),
+            Transfer::Function(callee) => (None, Some(callee)),
+        };
+        let terminal = (0..plan.labels().len()).any(|index| plan.is_terminal(LabelId::from_index(index)));
+        let mut this = Self {
             builder,
             spec,
             unique_space,
@@ -829,11 +849,56 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             calls: workspace.calls,
             labels: workspace.labels,
             next,
+            next_tail,
+            tail_blocks: Vec::new(),
             address,
+            length,
             fallthrough: 0,
             flat,
             error: None,
+        };
+        for (target, callee) in tails {
+            let block = this.tail_block(target, callee);
+            this.branches.insert(target, block);
         }
+        // A terminal label is the instruction's fall-through, not a block, so
+        // an instruction that has one needs the fall-through block now.
+        let next = if terminal { Some(this.next_block()) } else { None };
+        this.labels.extend(
+            (0..plan.labels().len())
+                .map(|index| next.filter(|_| plan.is_terminal(LabelId::from_index(index)))),
+        );
+        this
+    }
+
+    /// The fall-through block, made on first need when it is a tail call.
+    fn next_block(&mut self) -> BlockId {
+        if let Some(next) = self.next {
+            return next;
+        }
+        let callee = self.next_tail.expect("a fall-through is a block or a tail call");
+        let next = self.tail_block(self.address.wrapping_add(self.length as u64), callee);
+        self.next = Some(next);
+        next
+    }
+
+    /// A block of this instruction that tail-calls `callee`, the function at
+    /// `target`: where a direct transfer to another function's entry lands.
+    fn tail_block(&mut self, target: u64, callee: Callee) -> BlockId {
+        if let Some(&(_, block)) = self.tail_blocks.iter().find(|(at, _)| *at == target) {
+            return block;
+        }
+        let address = self.address;
+        let block = self.fresh_block(|| format!("pcode_tail_{address:x}_{target:x}"));
+        self.builder.block(block);
+        let current = self.builder.current_block();
+        self.builder.switch_to_block(block);
+        self.builder.set_address(address);
+        self.builder.push_tail_call(callee);
+        self.builder.clear_address();
+        self.builder.switch_to_block(current);
+        self.tail_blocks.push((target, block));
+        block
     }
 
     /// Closes the instruction. Running off the end of its p-code is a
@@ -843,7 +908,8 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             return Err(error);
         }
         if !self.builder.is_terminated() {
-            let site = self.builder.push_branch(self.next).id;
+            let next = self.next_block();
+            let site = self.builder.push_branch(next).id;
             self.builder
                 .exit(site, ExitArm::Unconditional, ExitKind::Fallthrough);
         }
@@ -853,7 +919,7 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
     /// Branches to the instruction's fall-through, the target of a local
     /// branch past the last operation.
     fn branch_next(&mut self, opcode: Opcode, condition: Option<Varnode>) {
-        let next = self.next;
+        let next = self.next_block();
         if let Some((site, arm)) = self.branch_to(opcode, next, condition) {
             self.builder.exit(site, arm, ExitKind::Fallthrough);
         }
@@ -1415,7 +1481,7 @@ impl PcodeSink for FlatEmitter<'_, '_, '_> {
         let block = self.block_for(label);
         // A terminal label is the instruction's fall-through: execution
         // reaches it by falling out of the instruction, not through a block.
-        if block == self.next || self.builder.current_block() == block {
+        if Some(block) == self.next || self.builder.current_block() == block {
             return;
         }
         if !self.builder.is_terminated() {
@@ -1434,7 +1500,7 @@ impl PcodeSink for FlatEmitter<'_, '_, '_> {
         self.open_continuation();
         self.builder.set_address(self.address);
         let target = self.block_for(label);
-        if target == self.next {
+        if Some(target) == self.next {
             // A branch to the terminal label leaves the instruction.
             self.branch_next(opcode, condition);
         } else {
@@ -1736,6 +1802,95 @@ mod tests {
         lifter
             .lift_instruction_indexed(&mut ctx, &mut addresses, &next, Some(function))
             .unwrap();
+    }
+
+    /// Lifts `bytes` at 0x1000 into a function there, in a context that also
+    /// has a function at 0x2000 and one at the instruction's next address:
+    /// the structured lowering of a transfer into another function.
+    fn lift_beside_functions(
+        bytes: &[u8],
+        flat: bool,
+    ) -> (qcode::context::Context<'static>, Lifted, [qcode::value::FunctionId; 3]) {
+        use qcode::value::FunctionBody;
+        let spec = sleigh_precompile::x64::spec();
+        let mut lifter = SleighLifter::new(spec);
+        if flat {
+            lifter = lifter.with_flat_control_flow();
+        }
+        let instruction = Decoder::new(spec)
+            .decode_one(0x1000, bytes, &spec.new_context())
+            .unwrap();
+        let mut ctx = lifter.new_context();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let host = FunctionBody::make_at_addr_indexed(&mut ctx, &mut addresses, 0x1000, None).id;
+        let other = FunctionBody::make_at_addr_indexed(&mut ctx, &mut addresses, 0x2000, None).id;
+        let next = 0x1000 + instruction.len() as u64;
+        let after = FunctionBody::make_at_addr_indexed(&mut ctx, &mut addresses, next, None).id;
+        let lifted = lifter
+            .lift_instruction_indexed(&mut ctx, &mut addresses, &instruction, Some(host))
+            .unwrap();
+        (ctx, lifted, [host, other, after])
+    }
+
+    /// The tail call a block of `lifted` makes, if one does.
+    fn tail_callee(
+        ctx: &qcode::context::Context<'static>,
+        block: qcode::value::BlockId,
+    ) -> Option<qcode::value::FunctionId> {
+        use qcode::value::insn::Mnemonic;
+        let last = BasicBlock::from_id(ctx, block).iter().last()?;
+        match last.mnemonic() {
+            Mnemonic::TailCall(call) => call.target.real(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_jump_into_another_function_is_a_tail_call() {
+        // jmp 0x2000 (e9 rel32 from 0x1005)
+        for flat in [false, true] {
+            let (ctx, lifted, [_, other, _]) = lift_beside_functions(b"\xe9\xfb\x0f\x00\x00", flat);
+            assert_eq!(kinds(&lifted), vec![(ExitArm::Unconditional, ExitKind::Branch { target: 0x2000 })]);
+            // The entry branches to a block of the instruction that tail-calls
+            // the other function; the fall-through, never taken, made nothing.
+            assert_eq!(lifted.blocks().len(), 2, "{}", ctx);
+            assert_eq!(tail_callee(&ctx, lifted.blocks()[1]), Some(other));
+            let exit = &lifted.exits()[0];
+            assert_eq!(site_opcode(&ctx, exit), "branch");
+        }
+    }
+
+    #[test]
+    fn a_conditional_jump_into_another_function_tail_calls_on_its_taken_arm() {
+        // je 0x2000 (0f 84 rel32 from 0x1006); the next address is a function too.
+        let (ctx, lifted, [_, other, after]) = lift_beside_functions(b"\x0f\x84\xfa\x0f\x00\x00", false);
+        let callees: Vec<_> = lifted.blocks()[1..].iter().map(|&b| tail_callee(&ctx, b)).collect();
+        assert!(callees.contains(&Some(other)), "{ctx}");
+        assert!(callees.contains(&Some(after)), "{ctx}");
+        assert_eq!(
+            kinds(&lifted),
+            vec![
+                (ExitArm::Taken, ExitKind::Branch { target: 0x2000 }),
+                (ExitArm::Unconditional, ExitKind::Fallthrough)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fall_through_into_another_function_is_a_tail_call_and_a_ret_makes_none() {
+        // mov rax, rbx: falls into the function after it.
+        let (ctx, lifted, [_, _, after]) = lift_beside_functions(b"\x48\x89\xd8", false);
+        assert_eq!(lifted.blocks().len(), 2);
+        assert_eq!(tail_callee(&ctx, lifted.blocks()[1]), Some(after));
+        // ret: never falls through, so no tail-call block is made.
+        let (ctx, lifted, _) = lift_beside_functions(b"\xc3", false);
+        assert_eq!(lifted.blocks().len(), 1, "{ctx}");
+        // A structured call to the other function is a call, whose continuation
+        // (the next function) is left to the caller: no block for it either.
+        let (ctx, lifted, [_, other, _]) = lift_beside_functions(b"\xe8\xfb\x0f\x00\x00", false);
+        assert_eq!(lifted.blocks().len(), 1, "{ctx}");
+        let last = BasicBlock::from_id(&ctx, lifted.entry()).iter().last().unwrap();
+        assert!(matches!(last.mnemonic(), qcode::value::insn::Mnemonic::Call(c) if c.target.real() == Some(other)));
     }
 
     #[test]
