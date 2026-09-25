@@ -3747,6 +3747,26 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_instruction_is_a_recoverable_error_not_a_panic() {
+        let mut ctx = Context::new();
+        let func = ctx.anon_function();
+        let entry = BasicBlock::make(&mut ctx, func).with_address(0x1000).id;
+        ctx.builder(entry).push_bad_insn();
+
+        let mut emu = StandaloneEmulator::new(entry);
+        let err = emu
+            .step(&ctx)
+            .expect_err("undecodable bytes must not be executed");
+
+        assert!(
+            matches!(err.kind, EmulatorErrorKind::BadInstruction),
+            "expected BadInstruction, got {:?}",
+            err.kind
+        );
+        assert_eq!(err.address, Some(0x1000));
+    }
+
+    #[test]
     fn minted_callee_is_not_executable() {
         assert!(matches!(
             require_real_callee(Callee::Minted(7)),
