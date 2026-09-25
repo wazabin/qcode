@@ -168,6 +168,13 @@ pub enum EmulatorErrorKind {
     /// propagating it as an unread operand is fine. Bounded consumers (e.g.
     /// pure-call folding) treat this as a bail signal.
     PoisonRead,
+    /// Execution reached bytes the decoder could not decode (`badinsn`).
+    ///
+    /// Not [`UnsupportedMnemonic`](Self::UnsupportedMnemonic): there are no
+    /// semantics to model. It says something about the program (control
+    /// reached undecodable bytes), so bounded consumers decline rather than
+    /// fabricate a value. [`EmulatorError::address`] locates the block.
+    BadInstruction,
 }
 
 impl std::fmt::Display for EmulatorErrorKind {
@@ -197,6 +204,7 @@ impl std::fmt::Display for EmulatorErrorKind {
             Self::UnsupportedMnemonic(op) => write!(f, "unsupported mnemonic `{op}`"),
             Self::EmptyBlock(block) => write!(f, "block {block:?} has no instructions"),
             Self::PoisonRead => write!(f, "read of a poison value (undefined bits)"),
+            Self::BadInstruction => write!(f, "execution reached undecodable bytes"),
         }
     }
 }
@@ -590,6 +598,10 @@ pub trait Interpreter {
             // field instead of crashing the whole analysis. (Element projection
             // does not go through emulation; it inlines the body via `ArrayProject`.)
             Mnemonic::Map(_) => return Err(EmulatorErrorKind::UnsupportedMnemonic("map")),
+
+            // Undecodable bytes have no semantics; stepping into them is an
+            // error about the program, not a gap in the interpreter.
+            Mnemonic::BadInsn(_) => return Err(EmulatorErrorKind::BadInstruction),
 
             _ => todo!("unimplemented mnemonic: {mnemonic:?}"),
         };
