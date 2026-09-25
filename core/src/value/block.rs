@@ -434,6 +434,27 @@ where
             .local_name_of(LocalValueId::BasicBlock(self.id.local))
     }
 
+    /// The label this block prints under: its [`name`](Self::name), or
+    /// `bb_<local id>` for a block with neither name nor address.
+    ///
+    /// A local block id is never reused, so no two nameless blocks of a
+    /// function share a label, and a `_<n>` suffix steps around a name the
+    /// function already holds, so the printed text parses back.
+    pub fn label(&'s self) -> Cow<'ctx, str> {
+        if let Some(name) = self.name() {
+            return name;
+        }
+        let names = &self.view.function(self.id.func).names;
+        let base = format!("bb_{}", usize::from(self.id.local));
+        let mut label = base.clone();
+        let mut suffix = 1u32;
+        while names.get(&label).is_some() {
+            label = format!("{base}_{suffix}");
+            suffix += 1;
+        }
+        Cow::Owned(label)
+    }
+
     /// Returns the machine address of this block, if it has one.
     pub fn address(&'s self) -> Option<u64> {
         self.inner().address
@@ -531,7 +552,7 @@ where
     }
 
     fn fmt(&'s self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let name = self.name().unwrap_or(Cow::Borrowed("unnamed"));
+        let name = self.label();
         write!(f, "<{name}")?;
         for param in self.params() {
             write!(f, " ")?;
@@ -565,11 +586,7 @@ where
         {
             let mut succ: Vec<Cow<'_, str>> = self
                 .successors()
-                .map(|(_, b)| {
-                    BlockRef::new(self.view, b)
-                        .name()
-                        .unwrap_or(Cow::Borrowed("unnamed"))
-                })
+                .map(|(_, b)| BlockRef::new(self.view, b).label())
                 .collect();
             if !succ.is_empty() {
                 succ.sort_unstable();
@@ -1113,6 +1130,82 @@ mod tests {
             unreachable!();
         };
         assert_eq!((binary.lhs, binary.rhs), (b, c));
+    }
+
+    /// `<entry>` branches on `%c` to two blocks made with no name and no
+    /// address, both falling through to `<done>`. Returns the printed context
+    /// and the two arms. `taken_name` renames `<done>` first.
+    fn print_with_two_nameless_arms(taken_name: Option<&str>) -> (String, [BlockId; 2]) {
+        let mut ctx = Context::new();
+        crate::lower::lower_str(
+            &mut ctx,
+            "
+            <entry @b:i8 @x:i32>
+                %c = i8 @b != i8 0x0;
+                goto <done>;
+            <done>
+                return i32 @x;
+            ",
+        )
+        .unwrap();
+        let entry = BasicBlock::from_name(&ctx, "entry").unwrap().id;
+        let done = BasicBlock::from_name(&ctx, "done").unwrap().id;
+        let cond = ctx.functions().next().unwrap().local_named("c").unwrap();
+        if let Some(name) = taken_name {
+            BasicBlock::from_id_mut(&mut ctx, done)
+                .rename_local(Cow::Owned(name.to_string()))
+                .unwrap();
+        }
+        let arms = [0, 1].map(|_| {
+            let arm = BasicBlock::make(&mut ctx, entry.func).id;
+            ctx.builder(arm).push_branch(done);
+            arm
+        });
+        let edges: Vec<EdgeId> = BasicBlock::from_id(&ctx, entry)
+            .successors()
+            .map(|(edge, _)| edge)
+            .collect();
+        for edge in edges {
+            ctx.remove_cfg_edge(entry.func, edge);
+        }
+        BasicBlock::from_id_mut(&mut ctx, entry).pop_insn();
+        ctx.builder(entry).push_cbranch(cond, arms[0], arms[1]);
+        (format!("{ctx}"), arms)
+    }
+
+    fn assert_round_trips(printed: &str) {
+        let mut reparsed = Context::new();
+        crate::lower::lower_str(&mut reparsed, printed)
+            .unwrap_or_else(|e| panic!("printed form does not parse: {e}\n{printed}"));
+        assert_eq!(format!("{reparsed}"), printed);
+    }
+
+    #[test]
+    fn a_nameless_block_prints_under_its_local_id() {
+        let (printed, arms) = print_with_two_nameless_arms(None);
+        let [a, b] = arms.map(|arm| format!("bb_{}", usize::from(arm.local)));
+        assert_ne!(a, b);
+        for label in [&a, &b] {
+            assert!(printed.contains(&format!("<{label}>\n")), "{printed}");
+            assert!(printed.contains(&format!("goto <{label}>")), "{printed}");
+        }
+        assert!(!printed.contains("unnamed"), "{printed}");
+    }
+
+    #[test]
+    fn nameless_blocks_survive_a_print_parse_round_trip() {
+        let (printed, _) = print_with_two_nameless_arms(None);
+        assert_round_trips(&printed);
+    }
+
+    #[test]
+    fn a_fallback_label_steps_around_a_name_the_function_holds() {
+        // `<entry>` and `<done>` are blocks 0 and 1, so the first arm is block 2.
+        let (printed, arms) = print_with_two_nameless_arms(Some("bb_2"));
+        assert_eq!(usize::from(arms[0].local), 2);
+        assert!(printed.contains("<bb_2>\n"), "{printed}");
+        assert!(printed.contains("<bb_2_1>\n"), "{printed}");
+        assert_round_trips(&printed);
     }
 
     #[test]
