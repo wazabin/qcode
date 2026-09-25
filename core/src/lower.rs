@@ -13,7 +13,7 @@
 //! it produced, so callers can look declarations back up after lowering.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     address_index::{AddressIndex, AddressTarget},
@@ -311,7 +311,7 @@ fn lower_fn_body(
 
     let mut block_ids: HashMap<String, BlockId> = HashMap::new();
     block_ids.insert(entry.clone(), entry_id);
-    create_blocks_and_params(ctx, statements, Some(fid), &entry, &mut block_ids, symbols);
+    create_blocks_and_params(ctx, statements, Some(fid), &entry, &mut block_ids, symbols)?;
     let address_blocks = prepare_address_blocks(ctx, addresses, statements, fid)?;
 
     lower_body(
@@ -371,7 +371,7 @@ fn lower_statement_block(
     // A bare-block program (no `fn`) still forms one CFG, so all its blocks must
     // live in a single function; mint one anonymous host up front.
     let host = ctx.anon_function();
-    create_blocks_and_params(ctx, body, Some(host), "", &mut block_ids, symbols);
+    create_blocks_and_params(ctx, body, Some(host), "", &mut block_ids, symbols)?;
     let address_blocks = prepare_address_blocks(ctx, addresses, body, host)?;
 
     lower_body(
@@ -449,7 +449,8 @@ fn prepare_address_blocks(
 }
 
 /// Pre-creates all named blocks (except `skip_entry`, already made) and their
-/// params. `func` attaches the blocks to a function in function-mode.
+/// params. `func` attaches the blocks to a function in function-mode. A
+/// label declared twice is an error.
 fn create_blocks_and_params(
     ctx: &mut Context,
     statements: &[Statement],
@@ -457,7 +458,8 @@ fn create_blocks_and_params(
     skip_entry: &str,
     block_ids: &mut HashMap<String, BlockId>,
     symbols: &mut Symbols,
-) {
+) -> Result<(), String> {
+    let mut declared = HashSet::new();
     for stmt in statements {
         let Statement::LabelDecl {
             label: Label::Named { name, params, .. },
@@ -466,6 +468,9 @@ fn create_blocks_and_params(
         else {
             continue;
         };
+        if !declared.insert(name.as_str()) {
+            return Err(format!("duplicate block label <{name}>"));
+        }
         let block_id = if name == skip_entry {
             block_ids[name]
         } else {
@@ -475,7 +480,7 @@ fn create_blocks_and_params(
             let fid = func.unwrap_or_else(|| ctx.anon_function());
             let id = BasicBlock::make(ctx, fid)
                 .with_name(Cow::Owned(name.clone()))
-                .expect("qcode: block name conflict")
+                .map_err(|e| format!("block label <{name}>: {e}"))?
                 .id;
             block_ids.insert(name.clone(), id);
             symbols.blocks.insert(name.clone(), id);
@@ -489,6 +494,7 @@ fn create_blocks_and_params(
             symbols.block_params.insert(param.name.clone(), pid);
         }
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // Explicit construction index stays operation-scoped.
@@ -1415,5 +1421,22 @@ mod tests {
             err.contains("cross-function control flow"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn a_duplicate_block_label_is_an_error_not_a_panic() {
+        for source in [
+            // Statement mode, a label other than the entry.
+            "<entry> goto <b>; <b> goto <b>; <b> goto <b>;",
+            // Statement mode, the entry label.
+            "<entry> goto <entry>; <entry> goto <entry>;",
+            // Function mode, the entry label (made before the other blocks).
+            "fn f:\n<entry>\n goto <entry>;\n<entry>\n goto <entry>;",
+        ] {
+            let mut ctx = Context::new();
+            let err =
+                lower_str(&mut ctx, source).expect_err("a label declared twice must be rejected");
+            assert!(err.contains("duplicate block label"), "{source}: {err}");
+        }
     }
 }
