@@ -22,7 +22,6 @@ use crate::{
         varnode::Varnode,
     },
 };
-use std::borrow::Cow;
 
 /// What a token *is*, semantically — drives syntax coloring in a viewer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,7 +224,7 @@ where
     fn branch_target(&mut self, func: FunctionId, target: LocalBlockId, args: &[LocalValueId]) {
         let target = BlockId::new(func, target);
         let block = self.view.block_ref(target);
-        let name = block.name().unwrap_or(Cow::Borrowed("unnamed"));
+        let name = block.label();
         self.push(
             format!("<{name}"),
             TokenKind::Label,
