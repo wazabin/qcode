@@ -103,7 +103,7 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex, RwLock, RwLockWriteGuard,
         atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
 };
@@ -458,6 +458,21 @@ impl LiftCache {
         &self.shards[usize::from(first & self.shard_mask.load(Ordering::Relaxed))]
     }
 
+    /// The shard of `first`, write-locked. The mask is read again under the
+    /// lock: [`Self::narrow_shards`] holds every shard's lock while it moves
+    /// subtrees, so once one is held the mask cannot change, and a writer that
+    /// picked its shard before a narrowing retries instead of writing into a
+    /// shard its subtree has left.
+    fn shard_write(&self, first: u8) -> RwLockWriteGuard<'_, HashMap<Box<[u8]>, Node>> {
+        loop {
+            let mask = self.shard_mask.load(Ordering::Relaxed);
+            let guard = self.shards[usize::from(first & mask)].write().unwrap();
+            if self.shard_mask.load(Ordering::Relaxed) == mask {
+                return guard;
+            }
+        }
+    }
+
     /// Narrows the shard mask to `mask` — the bits a new entry's leading
     /// byte keeps — moving every subtree of a leading byte to the shard it
     /// now belongs in. A lookup racing this may miss; nothing worse.
@@ -568,7 +583,7 @@ impl LiftCache {
             self.narrow_shards(narrowed);
         }
         let depth = keyed(mask);
-        let mut shard = self.shard(first).write().unwrap();
+        let mut shard = self.shard_write(first);
         let leaf = &mut shard
             .entry(Box::from(prefix))
             .or_default()
@@ -605,7 +620,7 @@ impl LiftCache {
         let Some(&first) = keys.masked.first() else {
             return;
         };
-        let mut shard = self.shard(first).write().unwrap();
+        let mut shard = self.shard_write(first);
         let depth = keyed(&keys.mask);
         if let Some(node) = shard
             .get_mut(prefix)
