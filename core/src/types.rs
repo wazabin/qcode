@@ -1757,4 +1757,43 @@ mod tests {
         );
         assert_eq!(restored.size_of(return_type), 4);
     }
+
+    /// An edit may give a return record a field whose type was minted AFTER the
+    /// record, so the table is no longer ordered by dependency: record `r`
+    /// references a type with a higher `TypeId` than its own. Replaying the
+    /// table in `TypeId` order must still rebuild it — the record cannot be
+    /// sized before that field type exists.
+    #[test]
+    fn edited_function_return_round_trips_when_its_field_type_is_newer() {
+        let mut tm = TypeManager::new();
+        let i8 = tm.get_or_make_int(1);
+        let owner = FunctionId::from(0usize);
+        let record = tm
+            .create_function_return(owner, vec![AggregateField::new("value", i8)])
+            .unwrap();
+        // Minted after the record, then referenced by it.
+        let wide = tm.get_or_make_int(16);
+        assert!(wide.0 > record.0);
+        // A type after the wide one, so replay has to keep going past the record.
+        let arr = tm.get_or_make_array(i8, 16);
+        let fields = vec![
+            AggregateField::new("value", i8),
+            AggregateField::new("write1_value", wide),
+        ];
+        tm.edit_function_return(owner, fields.clone()).unwrap();
+
+        let bytes = bincode::serde::encode_to_vec(&tm, bincode::config::standard()).unwrap();
+        let (restored, _): (TypeManager, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+
+        assert_eq!(restored.function_return(owner), Some(record));
+        assert_eq!(restored.function_return_owner(record), Some(owner));
+        assert_eq!(
+            restored.aggregate_fields(record).unwrap(),
+            fields.as_slice()
+        );
+        assert_eq!(restored.size_of(record), 17);
+        assert_eq!(restored.size_of(wide), 16);
+        assert_eq!(restored.array_of(arr), Some((i8, 16)));
+    }
 }
