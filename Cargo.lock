@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-qcode"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "bincode 2.0.1",
  "inventory",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-qcode-emulator"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "rustc-hash",
  "rustc_apfloat",
@@ -1997,7 +1997,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-qcode-jit"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "clap",
  "cranelift",
@@ -2018,7 +2018,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-qcode-macro"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -2029,7 +2029,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-qcode-parser"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "pest",
  "pest_derive",
@@ -2037,7 +2037,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-qcode-passes"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "rustc-hash",
  "wazabin-jstd",
@@ -2047,7 +2047,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-qcode-sleigh"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "bincode 2.0.1",
  "clap",
@@ -2071,7 +2071,7 @@ dependencies = [
 
 [[package]]
 name = "wazabin-qcode-vm"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "rustc-hash",
  "wazabin-qcode",
