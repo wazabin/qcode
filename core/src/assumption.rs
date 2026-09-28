@@ -131,12 +131,21 @@ pub enum Proposition {
     /// by default, recorded by the `assume_calling_convention` pass when the user
     /// opts in, and surfaced in the assumptions panel.
     ///
-    /// It is a **downstream refinement only**: it sharpens how the mem2reg / alias
-    /// register classifier (`classify_call_reg_effect`) clobbers around such
-    /// calls, and does *not* feed back into the argpromote effect-summary fixpoint
-    /// (which keeps modelling `CallInd` as `Some(empty)`). No verifier in v1 (it is
-    /// never proven, so it is not discharged and the checkpoint+replay net never
-    /// acts on it).
+    /// The same switch (qcode-analysis's `ArchConfig::assume_calling_convention`)
+    /// has two consumers:
+    ///
+    /// - the mem2reg / alias register classifier (`classify_call_reg_effect`),
+    ///   which clobbers only the convention's caller-saved set around such calls;
+    /// - argpromote's register channel, whose `indirect_leaf` models a `CallInd`
+    ///   with the convention's clobber leaf only when the switch is on. Off, it
+    ///   returns `None` and the `CallInd` stays a lifted clobbers-all register and
+    ///   memory barrier.
+    ///
+    /// So off (the default) is conservative everywhere, and on assumes the ABI
+    /// everywhere: it sharpens both the clobbers around such calls and the
+    /// interface argpromote gives a function containing one. No verifier in v1
+    /// (it is never proven, so it is not discharged and the checkpoint+replay net
+    /// never acts on it).
     AssumeCallingConvention,
     /// The external function (second field), reached from the caller (first
     /// field), has a prototype-derived argmem footprint that it honours. Two
