@@ -836,7 +836,8 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
             Transfer::Block(block) => (Some(block), None),
             Transfer::Function(callee) => (None, Some(callee)),
         };
-        let terminal = (0..plan.labels().len()).any(|index| plan.is_terminal(LabelId::from_index(index)));
+        let terminal =
+            (0..plan.labels().len()).any(|index| plan.is_terminal(LabelId::from_index(index)));
         let mut this = Self {
             builder,
             spec,
@@ -863,7 +864,11 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         }
         // A terminal label is the instruction's fall-through, not a block, so
         // an instruction that has one needs the fall-through block now.
-        let next = if terminal { Some(this.next_block()) } else { None };
+        let next = if terminal {
+            Some(this.next_block())
+        } else {
+            None
+        };
         this.labels.extend(
             (0..plan.labels().len())
                 .map(|index| next.filter(|_| plan.is_terminal(LabelId::from_index(index)))),
@@ -876,7 +881,9 @@ impl<'spec, 'str, 'ctx> FlatEmitter<'spec, 'str, 'ctx> {
         if let Some(next) = self.next {
             return next;
         }
-        let callee = self.next_tail.expect("a fall-through is a block or a tail call");
+        let callee = self
+            .next_tail
+            .expect("a fall-through is a block or a tail call");
         let next = self.tail_block(self.address.wrapping_add(self.length as u64), callee);
         self.next = Some(next);
         next
@@ -1810,7 +1817,11 @@ mod tests {
     fn lift_beside_functions(
         bytes: &[u8],
         flat: bool,
-    ) -> (qcode::context::Context<'static>, Lifted, [qcode::value::FunctionId; 3]) {
+    ) -> (
+        qcode::context::Context<'static>,
+        Lifted,
+        [qcode::value::FunctionId; 3],
+    ) {
         use qcode::value::FunctionBody;
         let spec = sleigh_precompile::x64::spec();
         let mut lifter = SleighLifter::new(spec);
@@ -1850,7 +1861,10 @@ mod tests {
         // jmp 0x2000 (e9 rel32 from 0x1005)
         for flat in [false, true] {
             let (ctx, lifted, [_, other, _]) = lift_beside_functions(b"\xe9\xfb\x0f\x00\x00", flat);
-            assert_eq!(kinds(&lifted), vec![(ExitArm::Unconditional, ExitKind::Branch { target: 0x2000 })]);
+            assert_eq!(
+                kinds(&lifted),
+                vec![(ExitArm::Unconditional, ExitKind::Branch { target: 0x2000 })]
+            );
             // The entry branches to a block of the instruction that tail-calls
             // the other function; the fall-through, never taken, made nothing.
             assert_eq!(lifted.blocks().len(), 2, "{}", ctx);
@@ -1863,8 +1877,12 @@ mod tests {
     #[test]
     fn a_conditional_jump_into_another_function_tail_calls_on_its_taken_arm() {
         // je 0x2000 (0f 84 rel32 from 0x1006); the next address is a function too.
-        let (ctx, lifted, [_, other, after]) = lift_beside_functions(b"\x0f\x84\xfa\x0f\x00\x00", false);
-        let callees: Vec<_> = lifted.blocks()[1..].iter().map(|&b| tail_callee(&ctx, b)).collect();
+        let (ctx, lifted, [_, other, after]) =
+            lift_beside_functions(b"\x0f\x84\xfa\x0f\x00\x00", false);
+        let callees: Vec<_> = lifted.blocks()[1..]
+            .iter()
+            .map(|&b| tail_callee(&ctx, b))
+            .collect();
         assert!(callees.contains(&Some(other)), "{ctx}");
         assert!(callees.contains(&Some(after)), "{ctx}");
         assert_eq!(
@@ -1889,8 +1907,13 @@ mod tests {
         // (the next function) is left to the caller: no block for it either.
         let (ctx, lifted, [_, other, _]) = lift_beside_functions(b"\xe8\xfb\x0f\x00\x00", false);
         assert_eq!(lifted.blocks().len(), 1, "{ctx}");
-        let last = BasicBlock::from_id(&ctx, lifted.entry()).iter().last().unwrap();
-        assert!(matches!(last.mnemonic(), qcode::value::insn::Mnemonic::Call(c) if c.target.real() == Some(other)));
+        let last = BasicBlock::from_id(&ctx, lifted.entry())
+            .iter()
+            .last()
+            .unwrap();
+        assert!(
+            matches!(last.mnemonic(), qcode::value::insn::Mnemonic::Call(c) if c.target.real() == Some(other))
+        );
     }
 
     #[test]
