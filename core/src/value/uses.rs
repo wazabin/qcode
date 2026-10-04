@@ -17,7 +17,7 @@
 use jstd::{Identifier, recycling_arena::RecyclingArena};
 use rustc_hash::FxHashMap;
 
-use crate::value::{LocalValueId, insn::LocalInsnId, link::Link};
+use crate::value::{LocalValueId, insn::LocalInsnId};
 
 /// Index into a body's [`UseArena`]. Crate-private: an edge is only ever
 /// reached through a value's use list.
@@ -44,91 +44,54 @@ pub(crate) trait WithUsers {
 /// varnodes, functions, poison — which cannot carry a head themselves: use
 /// tracking is per body, and bodies are mutated independently.
 ///
-/// Literals and varnodes, which every instruction of a lift names, are
-/// dense by id: the head of a literal is a slot in a vector, not a hash
-/// probe. The rest are sparse.
+/// Sparse, by hash: the ids of shared values are the module's, and a body
+/// names a handful of the module's millions. A table indexed by id would
+/// give every body the size of the module, and a module of tens of
+/// thousands of functions the square of it.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SharedHeads {
-    literals: Vec<Link<UseId>>,
-    varnodes: Vec<Link<UseId>>,
-    other: FxHashMap<LocalValueId, UseId>,
+    heads: FxHashMap<LocalValueId, UseId>,
 }
 
 impl SharedHeads {
     #[inline]
     pub(crate) fn get(&self, value: LocalValueId) -> Option<UseId> {
-        match value {
-            LocalValueId::Literal(id) => self.literals.get(usize::from(id))?.get(),
-            LocalValueId::Varnode(id) => self.varnodes.get(usize::from(id))?.get(),
-            _ => self.other.get(&value).copied(),
-        }
+        self.heads.get(&value).copied()
     }
 
     #[inline]
     pub(crate) fn set(&mut self, value: LocalValueId, head: Option<UseId>) {
-        let dense = match value {
-            LocalValueId::Literal(id) => (&mut self.literals, usize::from(id)),
-            LocalValueId::Varnode(id) => (&mut self.varnodes, usize::from(id)),
-            _ => {
-                match head {
-                    Some(head) => {
-                        self.other.insert(value, head);
-                    }
-                    None => {
-                        self.other.remove(&value);
-                    }
-                }
-                return;
+        match head {
+            Some(head) => {
+                self.heads.insert(value, head);
             }
-        };
-        let (heads, at) = dense;
-        if at >= heads.len() {
-            if head.is_none() {
-                return;
+            None => {
+                self.heads.remove(&value);
             }
-            heads.resize(at + 1, Link::none());
         }
-        heads[at].set(head);
     }
 
     /// Every shared value with a use, in no particular order.
     pub(crate) fn values(&self) -> impl Iterator<Item = LocalValueId> + '_ {
-        let literals = self
-            .literals
-            .iter()
-            .enumerate()
-            .filter(|(_, head)| head.get().is_some())
-            .map(|(id, _)| LocalValueId::Literal(crate::value::LiteralId::from(id)));
-        let varnodes = self
-            .varnodes
-            .iter()
-            .enumerate()
-            .filter(|(_, head)| head.get().is_some())
-            .map(|(id, _)| LocalValueId::Varnode(crate::value::VarnodeId::from(id)));
-        literals.chain(varnodes).chain(self.other.keys().copied())
+        self.heads.keys().copied()
     }
 
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.values().next().is_none()
+        self.heads.is_empty()
     }
 
     pub(crate) fn clear(&mut self) {
-        self.literals.clear();
-        self.varnodes.clear();
-        self.other.clear();
+        self.heads.clear();
+    }
+
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.heads.shrink_to_fit();
     }
 
     /// The bytes the heads take, by capacity.
     pub(crate) fn heap_bytes(&self) -> usize {
-        (self.literals.capacity() + self.varnodes.capacity()) * std::mem::size_of::<Link<UseId>>()
-            + self.other.capacity() * (std::mem::size_of::<(LocalValueId, UseId)>() + 1)
-    }
-
-    pub(crate) fn shrink_to_fit(&mut self) {
-        self.literals.shrink_to_fit();
-        self.varnodes.shrink_to_fit();
-        self.other.shrink_to_fit();
+        self.heads.capacity() * (std::mem::size_of::<(LocalValueId, UseId)>() + 1)
     }
 }
 
