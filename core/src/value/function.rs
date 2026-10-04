@@ -836,7 +836,7 @@ impl<'str> FunctionBody<'str> {
     /// Releases structural capacity retained from peak analysis churn.
     ///
     /// Covers the four body arenas plus the block-owned instruction/parameter/
-    /// edge collections, the roster, and the use edges. IDs, liveness,
+    /// edge collections, the roster, the use edges and the name table. IDs, liveness,
     /// ordering, and every semantic invariant are unchanged — this is an
     /// allocator hint for explicit end-of-mutation boundaries, never a
     /// correctness barrier.
@@ -852,6 +852,7 @@ impl<'str> FunctionBody<'str> {
         }
         self.uses.shrink_to_fit();
         self.shared_first_use.shrink_to_fit();
+        self.names.shrink_to_fit();
     }
 
     /// Install a registry ID onto a freshly [`detached`](Self::detached) body at

@@ -122,6 +122,19 @@ impl<Id> Default for LocalNames<Id> {
 }
 
 impl<Id: Copy + Eq> LocalNames<Id> {
+    /// Releases the capacity the table reserved past what it holds.
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.bases.shrink_to_fit();
+        self.index.shrink_to_fit();
+        self.suffixes.shrink_to_fit();
+        for suffixes in &mut self.suffixes {
+            suffixes.taken.shrink_to_fit();
+        }
+        self.far.shrink_to_fit();
+        self.hex_bases.shrink_to_fit();
+        self.labels.shrink_to_fit();
+    }
+
     /// The bytes this table holds on the heap, by capacity: what a body
     /// pays to keep its names unique and resolvable.
     pub(crate) fn heap_bytes(&self) -> usize {
