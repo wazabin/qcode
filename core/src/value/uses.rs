@@ -28,6 +28,8 @@
 use std::ops::{Index, IndexMut};
 
 use jstd::Identifier;
+use std::collections::hash_map::Entry;
+
 use rustc_hash::FxHashMap;
 
 use crate::value::{LocalValueId, insn::LocalInsnId, link::Link};
@@ -95,6 +97,22 @@ impl SharedHeads {
         }
     }
 
+    /// Links `edge`, unlinked, at the front of `value`'s list in `uses`, and
+    /// makes it the head: one probe of the map for both.
+    #[inline]
+    pub(crate) fn push_front(&mut self, value: LocalValueId, edge: UseId, uses: &mut UseSlab) {
+        match self.heads.entry(value) {
+            Entry::Occupied(mut head) => {
+                uses.push_front(edge, Some(*head.get()));
+                head.insert(edge);
+            }
+            Entry::Vacant(slot) => {
+                uses.push_front(edge, None);
+                slot.insert(edge);
+            }
+        }
+    }
+
     /// Every shared value with a use, in no particular order.
     pub(crate) fn values(&self) -> impl Iterator<Item = LocalValueId> + '_ {
         self.heads.keys().copied()
@@ -153,7 +171,7 @@ impl UseSlab {
         let at = self.edges.len();
         let run = UseId::from(at);
         assert_eq!(usize::from(run), at, "use slab identifier space exhausted");
-        self.edges.resize(at + n, unlinked);
+        self.edges.extend(std::iter::repeat_n(unlinked, n));
         run
     }
 

@@ -2150,8 +2150,7 @@ impl<'str> FunctionBody<'str> {
             | LocalValueId::Varnode(_)
             | LocalValueId::Function(_)
             | LocalValueId::Poison(_) => {
-                uses.push_front(edge, shared_first_use.get(value));
-                shared_first_use.set(value, Some(edge));
+                shared_first_use.push_front(value, edge, uses);
             }
         }
         true
