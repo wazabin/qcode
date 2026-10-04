@@ -1,37 +1,61 @@
 //! Use edges: the operand relation read backwards.
 //!
-//! Every operand occurrence in a function body is one [`Use`]: instruction
-//! `user`'s operand number `operand_index` names `value`. The uses of one
-//! value form a singly linked list threaded through the edges (their `next`),
-//! whose head lives on the value itself ([`WithUsers`]) — an instruction,
-//! block parameter, block or temporary owns its head; a shared value (a
-//! literal, varnode, bytes, function or poison) may be used by many bodies,
-//! so each body keeps its heads for those in a sparse map. The list is
-//! prepended to, so its order is unspecified.
+//! Every operand occurrence in a function body is one [`Use`]: an instruction
+//! `user`'s operand number `i` names a value. The edges of one instruction's
+//! operands are consecutive in the body's [`UseSlab`], a *run* that the
+//! instruction names ([`Instruction::use_run`](crate::value::Instruction)),
+//! so the edge of operand `i` is the run's `i`th: reaching it from the user
+//! costs nothing, and so does the user's operand number from the edge.
+//!
+//! The uses of one value form a doubly linked list threaded through the edges
+//! (their `next` and `prev`), whose head lives on the value itself
+//! ([`WithUsers`]) — an instruction, block parameter, block or temporary owns
+//! its head; a shared value (a literal, varnode, bytes, function or poison)
+//! may be used by many bodies, so each body keeps its heads for those in a
+//! sparse map. The list is prepended to, so its order is unspecified, and an
+//! edge comes out of it in constant time wherever it stands.
+//!
+//! An operand whose value this body has no storage for — one a transformation
+//! is in the middle of removing — has its edge in the run but in no list: the
+//! edge is *unlinked*. An edge is linked when it has a `prev`, or is the head
+//! of its value's list; the caller, who knows the value, tells the two apart.
 //!
 //! The edges are derived bookkeeping: they are skipped by serde and rebuilt
 //! from the operands after deserialization
 //! ([`FunctionBody::rebuild_uses`](crate::value::FunctionBody::rebuild_uses)),
 //! and [`UseId`] never leaves the crate.
 
-use jstd::{Identifier, recycling_arena::RecyclingArena};
+use std::ops::{Index, IndexMut};
+
+use jstd::Identifier;
 use rustc_hash::FxHashMap;
 
-use crate::value::{LocalValueId, insn::LocalInsnId};
+use crate::value::{LocalValueId, insn::LocalInsnId, link::Link};
 
-/// Index into a body's [`UseArena`]. Crate-private: an edge is only ever
-/// reached through a value's use list.
+/// Index into a body's [`UseSlab`]. Crate-private: an edge is only ever
+/// reached through a value's use list or its user's run.
 #[derive(Identifier)]
 pub(crate) struct UseId(u32);
 
-/// One operand occurrence: `user`'s operand `operand_index` names `value`.
+/// One operand occurrence of `user`, in the lists of the value it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Use {
-    pub(crate) value: LocalValueId,
     pub(crate) user: LocalInsnId,
-    pub(crate) operand_index: u16,
-    /// The next use of `value`, if any.
-    pub(crate) next: Option<UseId>,
+    next: Link<UseId>,
+    prev: Link<UseId>,
+}
+
+impl Use {
+    /// The next use of the same value, if any.
+    pub(crate) fn next(&self) -> Option<UseId> {
+        self.next.get()
+    }
+
+    /// The previous use of the same value; `None` at the head of the list,
+    /// and for an unlinked edge.
+    pub(crate) fn prev(&self) -> Option<UseId> {
+        self.prev.get()
+    }
 }
 
 /// A value that owns the head of its own use list.
@@ -95,162 +119,230 @@ impl SharedHeads {
     }
 }
 
-/// Body-local slab storage for use edges. Removed slots are reused; `UseId`
-/// remains stable only while its edge is live and never escapes the body.
-pub(crate) type UseArena = RecyclingArena<UseId, Use>;
+/// A body's use edges, in runs: one run per instruction with operands, as
+/// long as it has operands, which the body hands back on removal.
+///
+/// A freed run is kept on a list of the runs of its length, so the next
+/// instruction with that many operands takes it over: the slab grows to the
+/// peak of its live runs, not to the number ever made.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UseSlab {
+    edges: Vec<Use>,
+    /// `free[n]` heads the free runs of `n` edges, threaded through the
+    /// `next` of each run's first edge.
+    free: Vec<Link<UseId>>,
+    /// How many edges are in a use list.
+    linked: usize,
+}
+
+impl UseSlab {
+    /// A run of `n >= 1` unlinked edges for `user`'s operands, reusing a free
+    /// run of the same length when there is one.
+    pub(crate) fn alloc_run(&mut self, user: LocalInsnId, n: usize) -> UseId {
+        debug_assert!(n > 0, "an instruction without operands has no run");
+        let unlinked = Use {
+            user,
+            next: Link::none(),
+            prev: Link::none(),
+        };
+        if let Some(run) = self.free.get(n).and_then(|head| head.get()) {
+            self.free[n] = self.edges[usize::from(run)].next;
+            self.edges[usize::from(run)..usize::from(run) + n].fill(unlinked);
+            return run;
+        }
+        let at = self.edges.len();
+        let run = UseId::from(at);
+        assert_eq!(usize::from(run), at, "use slab identifier space exhausted");
+        self.edges.resize(at + n, unlinked);
+        run
+    }
+
+    /// Frees the run of `n` edges at `run`. Every edge in it must be
+    /// unlinked.
+    pub(crate) fn free_run(&mut self, run: UseId, n: usize) {
+        debug_assert!(
+            self.edges[usize::from(run)..usize::from(run) + n]
+                .iter()
+                .all(|edge| edge.prev.get().is_none()),
+            "a run is freed with a linked edge"
+        );
+        if self.free.len() <= n {
+            self.free.resize(n + 1, Link::none());
+        }
+        self.edges[usize::from(run)].next = self.free[n];
+        self.free[n] = Link::from(Some(run));
+    }
+
+    /// The edge `index` places on from `run`: the edge of operand `index`.
+    pub(crate) fn at(run: UseId, index: usize) -> UseId {
+        UseId::from(usize::from(run) + index)
+    }
+
+    /// The operand number of `edge` in its user's run.
+    pub(crate) fn operand_index(edge: UseId, run: UseId) -> usize {
+        usize::from(edge) - usize::from(run)
+    }
+
+    /// Puts `edge`, which is unlinked, at the front of the list headed by
+    /// `head`. The caller makes `edge` the head.
+    #[inline]
+    pub(crate) fn push_front(&mut self, edge: UseId, head: Option<UseId>) {
+        if let Some(head) = head {
+            self.edges[usize::from(head)].prev = Link::from(Some(edge));
+        }
+        let at = &mut self.edges[usize::from(edge)];
+        at.next = Link::from(head);
+        at.prev = Link::none();
+        self.linked += 1;
+    }
+
+    /// Takes the linked `edge` out of its list, joining its neighbours, and
+    /// leaves it unlinked. Returns the neighbours, so that a caller finding
+    /// no `prev` can move the head to the `next`.
+    #[inline]
+    pub(crate) fn unlink(&mut self, edge: UseId) -> (Option<UseId>, Option<UseId>) {
+        let Use { next, prev, .. } = self.edges[usize::from(edge)];
+        if let Some(prev) = prev.get() {
+            self.edges[usize::from(prev)].next = next;
+        }
+        if let Some(next) = next.get() {
+            self.edges[usize::from(next)].prev = prev;
+        }
+        let at = &mut self.edges[usize::from(edge)];
+        at.next = Link::none();
+        at.prev = Link::none();
+        self.linked -= 1;
+        (prev.get(), next.get())
+    }
+
+    /// Forgets that `edge` was in a list, without touching its neighbours:
+    /// for a whole list that is being dropped at once.
+    #[inline]
+    pub(crate) fn detach(&mut self, edge: UseId) {
+        let at = &mut self.edges[usize::from(edge)];
+        at.next = Link::none();
+        at.prev = Link::none();
+        self.linked -= 1;
+    }
+
+    /// How many edges are in a use list.
+    pub(crate) fn len(&self) -> usize {
+        self.linked
+    }
+
+    /// Whether no edge is in a use list.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.linked == 0
+    }
+
+    /// How many edges the slab has issued, live runs and free ones.
+    pub(crate) fn slots(&self) -> usize {
+        self.edges.len()
+    }
+
+    /// Every free run, as its length and its first edge.
+    pub(crate) fn free_runs(&self) -> impl Iterator<Item = (usize, UseId)> + '_ {
+        self.free.iter().enumerate().flat_map(move |(n, head)| {
+            let mut at = head.get();
+            std::iter::from_fn(move || {
+                let run = at?;
+                at = self.edges[usize::from(run)].next.get();
+                Some((n, run))
+            })
+        })
+    }
+
+    /// How many edges are in free runs.
+    #[cfg(test)]
+    pub(crate) fn free_slots(&self) -> usize {
+        self.free_runs().map(|(n, _)| n).sum()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.edges.clear();
+        self.free.clear();
+        self.linked = 0;
+    }
+
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.edges.shrink_to_fit();
+        self.free.shrink_to_fit();
+    }
+
+    /// The bytes the slab holds, by capacity.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.edges.capacity() * std::mem::size_of::<Use>()
+            + self.free.capacity() * std::mem::size_of::<Link<UseId>>()
+    }
+}
+
+impl Index<UseId> for UseSlab {
+    type Output = Use;
+
+    #[inline]
+    fn index(&self, edge: UseId) -> &Use {
+        &self.edges[usize::from(edge)]
+    }
+}
+
+impl IndexMut<UseId> for UseSlab {
+    #[inline]
+    fn index_mut(&mut self, edge: UseId) -> &mut Use {
+        &mut self.edges[usize::from(edge)]
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn edge(raw: usize) -> Use {
-        Use {
-            value: LocalValueId::Instruction(LocalInsnId::from(raw)),
-            user: LocalInsnId::from(raw + 100),
-            operand_index: 0,
-            next: None,
-        }
+    fn user(raw: usize) -> LocalInsnId {
+        LocalInsnId::from(raw)
     }
 
     #[test]
-    fn freed_slots_are_reused_most_recent_first() {
-        let mut arena = UseArena::default();
-        let a = arena.push(edge(0));
-        let b = arena.push(edge(1));
-        let c = arena.push(edge(2));
-        assert_eq!(arena.len(), 3);
+    fn a_freed_run_is_reused_by_a_run_of_its_length() {
+        let mut slab = UseSlab::default();
+        let a = slab.alloc_run(user(0), 2);
+        let b = slab.alloc_run(user(1), 1);
+        let c = slab.alloc_run(user(2), 2);
+        assert_eq!((usize::from(a), usize::from(b), usize::from(c)), (0, 2, 3));
+        assert_eq!(slab.slots(), 5);
 
-        assert_eq!(arena.remove(b), edge(1));
-        assert_eq!(arena.remove(a), edge(0));
-        assert_eq!(arena.len(), 1);
-        assert!(!arena.contains(a));
-        assert!(!arena.contains(b));
-        assert!(arena.contains(c));
-
-        assert_eq!(arena.push(edge(3)), a, "the last freed slot goes first");
-        assert_eq!(arena.push(edge(4)), b);
-        assert_eq!(arena.push(edge(5)), UseId::from(3), "then the slab grows");
-        assert_eq!(arena.len(), 4);
-
-        let live: Vec<UseId> = arena.iter().map(|edge| edge.id).collect();
-        assert_eq!(live, vec![a, b, c, UseId::from(3)]);
-    }
-
-    #[test]
-    fn iteration_skips_holes_and_yields_identified_edges() {
-        let mut arena = UseArena::default();
-        assert!(arena.is_empty());
-        let ids: Vec<UseId> = (0..5).map(|raw| arena.push(edge(raw))).collect();
-        arena.remove(ids[1]);
-        arena.remove(ids[3]);
-        assert!(!arena.is_empty());
-        assert_eq!(arena.len(), 3);
-
-        let seen: Vec<(UseId, Use)> = arena.iter().map(|e| (e.id, *e.inner)).collect();
+        slab.free_run(a, 2);
+        assert_eq!(slab.free_slots(), 2);
         assert_eq!(
-            seen,
-            vec![(ids[0], edge(0)), (ids[2], edge(2)), (ids[4], edge(4))]
+            slab.alloc_run(user(3), 1),
+            UseId::from(5),
+            "no free run of one"
         );
-        assert_eq!(arena[ids[2]], edge(2), "indexing yields the payload");
+        assert_eq!(slab.alloc_run(user(4), 2), a, "the free run of two");
+        assert_eq!(slab[a].user, user(4), "and its edges are its new user's");
+        assert_eq!(slab.free_slots(), 0);
+        assert_eq!(slab.slots(), 6);
     }
 
     #[test]
-    fn free_and_unknown_ids_do_not_resolve() {
-        let mut arena = UseArena::default();
-        let a = arena.push(edge(0));
-        let b = arena.push(edge(1));
-        arena.remove(a);
-
-        assert!(!arena.contains(a));
-        assert!(arena.get(a).is_none());
-        assert!(arena.get_mut(a).is_none());
-        assert!(!arena.contains(UseId::from(7)), "past the slab");
-        assert!(arena.get(UseId::from(7)).is_none());
-
-        let mut live = arena.get_mut(b).expect("b is live");
-        assert_eq!(live.id, b);
-        live.next = Some(b);
-        assert_eq!(arena.get(b).map(|e| e.next), Some(Some(b)));
-
-        // The freed id aliases the next edge stored: a stale `a` would now
-        // read a different edge, which is why no id outlives its edge.
-        assert_eq!(arena.push(edge(9)), a);
-        assert_eq!(arena[a], edge(9));
-    }
-
-    #[test]
-    fn clear_forgets_the_free_list_and_restarts_ids() {
-        let mut arena = UseArena::default();
-        let a = arena.push(edge(0));
-        let b = arena.push(edge(1));
-        arena.remove(a);
-        arena.clear();
-        assert!(arena.is_empty());
-        assert!(!arena.contains(a));
-        assert!(!arena.contains(b));
-        assert_eq!(arena.push(edge(2)), UseId::from(0), "ids restart at zero");
-        assert_eq!(
-            arena.push(edge(3)),
-            UseId::from(1),
-            "the old free list is gone"
-        );
-        arena.shrink_to_fit();
-        assert_eq!(arena.iter().count(), 2);
-    }
-
-    #[test]
-    fn churn_never_grows_the_slab_past_its_peak() {
-        let mut arena = UseArena::default();
-        let mut live: Vec<UseId> = (0..8).map(|raw| arena.push(edge(raw))).collect();
-        let peak = 8;
-        for round in 0..100 {
-            // Drop half, then refill: the slab must reuse the freed slots.
-            for _ in 0..4 {
-                let id = live.remove(round % live.len());
-                arena.remove(id);
-            }
-            for raw in 0..4 {
-                let id = arena.push(edge(raw + round));
-                assert!(usize::from(id) < peak, "slot {id:?} beyond the peak");
-                live.push(id);
-            }
-            assert_eq!(arena.len(), peak);
-            assert_eq!(arena.iter().count(), peak);
+    fn edges_link_and_unlink_in_constant_time_from_anywhere() {
+        let mut slab = UseSlab::default();
+        let run = slab.alloc_run(user(0), 4);
+        let edge = |i| UseSlab::at(run, i);
+        let mut head = None;
+        for i in 0..4 {
+            slab.push_front(edge(i), head);
+            head = Some(edge(i));
         }
-        let mut seen: Vec<usize> = arena.iter().map(|e| usize::from(e.id)).collect();
-        seen.sort_unstable();
-        assert_eq!(seen, (0..peak).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn cloning_copies_the_slots_and_the_free_list() {
-        let mut arena = UseArena::default();
-        let a = arena.push(edge(0));
-        let b = arena.push(edge(1));
-        arena.remove(a);
-        let mut copy = arena.clone();
-        assert_eq!(copy.len(), 1);
-        assert!(!copy.contains(a));
-        assert_eq!(copy[b], edge(1));
-        assert_eq!(copy.push(edge(2)), a, "the clone reuses the same free slot");
-        assert!(!arena.contains(a), "and the original is untouched");
-    }
-
-    #[test]
-    #[should_panic(expected = "is already free")]
-    fn double_remove_panics() {
-        let mut arena = UseArena::default();
-        let a = arena.push(edge(0));
-        arena.remove(a);
-        arena.remove(a);
-    }
-
-    #[test]
-    #[should_panic(expected = "is free")]
-    fn indexing_a_free_slot_panics() {
-        let mut arena = UseArena::default();
-        let a = arena.push(edge(0));
-        arena.remove(a);
-        let _ = arena[a];
+        assert_eq!(slab.len(), 4);
+        // Order is 3, 2, 1, 0. Take the middle, then the head, then the tail.
+        assert_eq!(slab.unlink(edge(2)), (Some(edge(3)), Some(edge(1))));
+        assert_eq!(slab.unlink(edge(3)), (None, Some(edge(1))));
+        head = Some(edge(1));
+        assert_eq!(slab.unlink(edge(0)), (Some(edge(1)), None));
+        assert_eq!(slab[edge(1)].next(), None);
+        assert_eq!(slab[edge(1)].prev(), None);
+        assert_eq!(head, Some(edge(1)));
+        assert_eq!(slab.len(), 1);
+        assert_eq!(UseSlab::operand_index(edge(3), run), 3);
     }
 }

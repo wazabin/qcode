@@ -2265,8 +2265,7 @@ impl<'str> Context<'str> {
     }
 
     pub fn push_block_param(&mut self, func: FunctionId, param: BlockParam<'str>) -> BlockParamId {
-        let local = self.bodies[func].params.push(param);
-        BlockParamId::new(func, local)
+        self.bodies[func].push_block_param(param)
     }
 
     pub fn push_edge(&mut self, func: FunctionId, edge: EdgeData) -> EdgeId {
