@@ -32,6 +32,7 @@ use crate::{
         block_param::{BlockParam, BlockParamId, LocalParamId},
         insn::{LocalInsnId, Mnemonic},
         name::{BaseId, LocalNames, Name, hex_name},
+        roster::Roster,
         uses::{SharedHeads, UseId, UseSlab, WithUsers},
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
@@ -454,7 +455,7 @@ pub struct FunctionBody<'str> {
     /// cross-arena ownership, so every entry indexes this function's `blocks`
     /// arena. Kept in sync with each block's `parent`.
     #[serde(default)]
-    pub(crate) roster: Vec<LocalBlockId>,
+    pub(crate) roster: Roster,
 
     /// Block-parameter storage for this function.
     pub(crate) params: StableArena<LocalParamId, BlockParam<'str>>,
@@ -820,7 +821,7 @@ impl<'str> FunctionBody<'str> {
                         + b.comment_bytes()
                 })
                 .sum(),
-            roster: self.roster.capacity() * size_of::<LocalBlockId>(),
+            roster: self.roster.heap_bytes(),
             params: BodyArenaKindStats::stable_arena(&self.params).structural_bytes,
             edges: BodyArenaKindStats::stable_arena(&self.edges).structural_bytes,
             uses: self.uses.heap_bytes() + self.shared_first_use.heap_bytes(),
@@ -903,7 +904,7 @@ impl<'str> FunctionBody<'str> {
             root: None,
             insns: StableArena::default(),
             blocks: StableArena::default(),
-            roster: Vec::new(),
+            roster: Roster::default(),
             params: StableArena::default(),
             edges: StableArena::default(),
             temp_spaces: Registry::default(),
@@ -929,7 +930,7 @@ impl<'str> FunctionBody<'str> {
             root: None,
             insns: StableArena::default(),
             blocks: StableArena::default(),
-            roster: Vec::new(),
+            roster: Roster::default(),
             params: StableArena::default(),
             edges: StableArena::default(),
             temp_spaces: Registry::default(),
@@ -2387,17 +2388,15 @@ impl<'str> FunctionBody<'str> {
         self.set_local_name(LocalValueId::BasicBlock(block), &name)
     }
 
-    /// Whether `block`, body-local, is on this body's roster. A block is
-    /// rostered when it is pushed, so the newest is checked first: that is
-    /// the common question, and it costs nothing.
+    /// Whether `block`, body-local, is on this body's roster.
     pub(crate) fn is_rostered(&self, block: LocalBlockId) -> bool {
-        self.roster.last() == Some(&block) || self.roster.contains(&block)
+        self.roster.contains(block)
     }
 
     /// Drop `block` from this body's ownership roster. Ownership is derived from
     /// the storing arena (`block.func`).
     pub fn unroster_block(&mut self, block: BlockId) {
-        self.roster.retain(|&b| b != block.localize(block.func));
+        self.roster.remove(block.localize(block.func));
     }
 
     /// Remove `block` from this body: unlink every incident CFG edge, remove its
@@ -3130,7 +3129,6 @@ where
         self.inner()
             .roster
             .iter()
-            .copied()
             .map(|local| BlockId::new(func, local))
             .collect()
     }
@@ -3689,8 +3687,14 @@ mod tests {
 
         assert_eq!(ctx.bodies[a].root_id(), Some(a_root.local));
         assert_eq!(ctx.bodies[b].root_id(), Some(b_root.local));
-        assert_eq!(ctx.bodies[a].roster, vec![a_root.local]);
-        assert_eq!(ctx.bodies[b].roster, vec![b_root.local]);
+        assert_eq!(
+            ctx.bodies[a].roster.iter().collect::<Vec<_>>(),
+            vec![a_root.local]
+        );
+        assert_eq!(
+            ctx.bodies[b].roster.iter().collect::<Vec<_>>(),
+            vec![b_root.local]
+        );
         assert_eq!(
             FunctionBody::from_id(&ctx, a).root().map(|root| root.id),
             Some(a_root)
@@ -3983,6 +3987,35 @@ mod tests {
         let ids: Vec<_> = f.iter().map(|b| b.id).collect();
         assert!(ids.contains(&root));
         assert!(ids.contains(&extra));
+    }
+
+    #[test]
+    fn deleting_blocks_keeps_the_roster_in_order_and_whole() {
+        use crate::value::QCodeMut;
+
+        let mut ctx = Context::new();
+        let f = ctx.anon_function();
+        let blocks: Vec<BlockId> = (0..200)
+            .map(|k| ctx.get_or_make_block(0x1000 + k, f))
+            .collect();
+        let (gone, kept): (Vec<_>, Vec<_>) =
+            blocks.iter().partition(|b| usize::from(b.local) % 3 != 1);
+        for &&block in &gone {
+            ctx.delete_block(block);
+        }
+        assert_eq!(
+            crate::arena_integrity::verify_body_arena_integrity(&ctx),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            ctx.function_ref(f).block_ids(),
+            kept.into_iter().copied().collect::<Vec<_>>()
+        );
+        // A block pushed afterwards goes to the end, and is on the roster.
+        let fresh = ctx.get_or_make_block(0x9000, f);
+        assert_eq!(ctx.function_ref(f).block_ids().last(), Some(&fresh));
+        assert!(ctx.bodies[f].is_rostered(fresh.local));
+        assert!(!ctx.bodies[f].is_rostered(gone[0].local));
     }
 
     #[test]

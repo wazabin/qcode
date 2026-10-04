@@ -125,6 +125,7 @@ pub mod literal;
 pub mod name;
 pub mod poison;
 pub mod registry;
+pub(crate) mod roster;
 pub mod temp;
 pub(crate) mod uses;
 pub mod util;

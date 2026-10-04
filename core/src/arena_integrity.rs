@@ -64,7 +64,7 @@ pub fn verify_body_arena_integrity_scoped(
         }
 
         let mut roster_count = FxHashMap::default();
-        for &local in &body.roster {
+        for local in body.roster.iter() {
             *roster_count.entry(local).or_insert(0usize) += 1;
             if !live_blocks.contains(&local) {
                 out.push(format!(
@@ -702,7 +702,7 @@ mod tests {
         let mut ctx = fixture();
         let f = ctx.function_ids()[0];
         let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
-        ctx.bodies[f].roster.push(entry.local);
+        ctx.bodies[f].roster.push_again(entry.local);
 
         assert_has(&ctx, "appears 2 times in the roster");
     }
@@ -712,7 +712,7 @@ mod tests {
         let mut ctx = fixture();
         let f = ctx.function_ids()[0];
         let block = BasicBlock::make(&mut ctx, f).id;
-        ctx.bodies[f].roster.retain(|&local| local != block.local);
+        ctx.bodies[f].roster.remove(block.local);
 
         assert_has(&ctx, "roster count 0");
     }

@@ -1777,7 +1777,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         self.body
             .roster
             .iter()
-            .flat_map(|&b| self.body.insn_ids(b))
+            .flat_map(|b| self.body.insn_ids(b))
             .find_map(|i| match self.body.insns[i].mnemonic() {
                 Mnemonic::ReturnValue(r) => self.lstored_type_of(r.value),
                 _ => None,
