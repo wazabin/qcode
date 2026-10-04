@@ -920,7 +920,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                     unreachable!("non-constant temporary load creates an instruction");
                 };
 
-                if let Some(name) = name {
+                if let (true, Some(name)) = (self.naming, name) {
                     self.name_insn_unique(local, &name);
                 }
 
@@ -2102,7 +2102,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                     0,
                 );
 
-                if let Some(name) = &name {
+                if let (true, Some(name)) = (self.naming, &name) {
                     let name = Cow::Owned(format!("{}_lane{lane}", name.to_lowercase()));
                     let _ = self.rename_insn_local(id, name);
                 }
@@ -2125,7 +2125,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             );
 
             // Add a name hint for the store instruction for easier debugging
-            if let Some(name) = &name {
+            if let (true, Some(name)) = (self.naming, &name) {
                 self.name_insn_unique(id, &name.to_lowercase());
             }
 
