@@ -185,6 +185,9 @@ fn main() {
     if let Some(cache) = &cache {
         session = session.with_cache(Arc::clone(cache));
     }
+    if has("--no-names") {
+        session = session.without_debug_names();
+    }
     let mut per_x86: HashMap<String, (usize, usize)> = HashMap::new();
     let mut failures = 0usize;
     let mut errors: HashMap<String, usize> = HashMap::new();
