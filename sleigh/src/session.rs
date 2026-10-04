@@ -69,6 +69,16 @@ fn decode_for<'spec, 'b>(
     })
 }
 
+/// Brings `addresses` up to `ctx`, if a change to the addresses the context
+/// covers was made without it: through [`LiftSession::context_mut`], the one
+/// way the context moves without the session. Instruction-level edits do not
+/// move it, so a caller that only rewrites instructions never pays for this.
+fn catch_up(ctx: &Context<'static>, addresses: &mut AddressIndex) {
+    if !addresses.is_current(ctx) {
+        addresses.refresh(ctx);
+    }
+}
+
 /// Which function a session lifts into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Host {
@@ -174,6 +184,30 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
         &self.ctx
     }
 
+    /// The IR so far, to change. Every [`Lifted`] this session returned
+    /// describes blocks of this context, and a change can invalidate them.
+    ///
+    /// Rewriting instructions leaves the session as it was. A change to the
+    /// addresses blocks or functions carry is noticed by the next lift,
+    /// which rebuilds the session's address index once: see
+    /// [`Context::revision`].
+    pub fn context_mut(&mut self) -> &mut Context<'static> {
+        &mut self.ctx
+    }
+
+    /// Lifts into `host` from now on, in this session's context: the
+    /// instructions lifted so far stay where they are. One session, and its
+    /// one address index, so lifting a module function by function costs
+    /// nothing per function beyond the function: a session per function
+    /// would rebuild the index of everything lifted before it.
+    ///
+    /// Returns the function selected.
+    pub fn set_host(&mut self, host: Host) -> FunctionId {
+        catch_up(&self.ctx, &mut self.addresses);
+        self.function = Self::select(&mut self.ctx, &mut self.addresses, host);
+        self.function
+    }
+
     /// Whether a failed lift left the context holding IR it could not take
     /// back. A poisoned session refuses every further lift and
     /// [`into_context`](Self::into_context); its context is still readable
@@ -182,15 +216,11 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
         self.ctx.is_poisoned()
     }
 
-    #[cfg(test)]
-    fn context_mut_for_test(&mut self) -> &mut Context<'static> {
-        &mut self.ctx
-    }
-
     /// Decodes the instruction at `address` from `bytes` with the session's
     /// fixed context and lifts it. An encoding the session's cache knows is
     /// replayed without a decode.
     pub fn lift(&mut self, address: u64, bytes: &[u8]) -> Result<Lifted, LiftError> {
+        catch_up(&self.ctx, &mut self.addresses);
         let Some(cache) = &self.cache else {
             let instruction = self.decoder.decode(address, bytes)?;
             return self.lift_decoded(&instruction);
@@ -214,6 +244,7 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
     /// Lifts an instruction the caller decoded, with whatever context it
     /// chose.
     pub fn lift_decoded(&mut self, instruction: &Instruction<'_, '_>) -> Result<Lifted, LiftError> {
+        catch_up(&self.ctx, &mut self.addresses);
         let mut target =
             LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
         self.lifter.lift_into(&mut target, instruction)
@@ -222,6 +253,7 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
     /// Lifts already-flattened p-code of the session's specification, for a
     /// caller inspecting or caching that intermediate.
     pub fn lift_pcode(&mut self, flat: &FlatPcode) -> Result<Lifted, LiftError> {
+        catch_up(&self.ctx, &mut self.addresses);
         let mut target =
             LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
         self.lifter.lift_pcode_into(&mut target, flat)
@@ -1041,6 +1073,39 @@ mod tests {
     }
 
     #[test]
+    fn a_session_lifts_function_after_function_in_one_context() {
+        let lifter = lifter();
+        let mut session = LiftSession::new(&lifter, Host::At(0x1000));
+        let first = session.function();
+        session.lift(0x1000, b"\x48\x89\xd8").unwrap();
+        let second = session.set_host(Host::At(0x2000));
+        assert_ne!(first, second);
+        let lifted = session.lift(0x2000, b"\xc3").unwrap();
+        assert_eq!(lifted.entry().func, second);
+        // A function already in the context is selected, not made twice.
+        assert_eq!(session.set_host(Host::At(0x1000)), first);
+        let continued = session.lift(0x1003, b"\xc3").unwrap();
+        assert_eq!(continued.entry().func, first);
+        assert_eq!(session.into_context().unwrap().functions().count(), 2);
+    }
+
+    #[test]
+    fn a_session_notices_a_change_to_addresses_made_through_its_context() {
+        let lifter = lifter();
+        let mut session = LiftSession::new(&lifter, Host::At(0x1000));
+        session.lift(0x1000, b"\x48\x89\xd8").unwrap();
+        // An address registered behind the session's back: its index is now
+        // behind the context, and the next lift catches up instead of failing.
+        let other = {
+            let ctx = session.context_mut();
+            let mut addresses = AddressIndex::analyze(ctx);
+            FunctionBody::from_addr_or_create_indexed(ctx, &mut addresses, 0x3000).id
+        };
+        session.lift(0x1003, b"\xc3").unwrap();
+        assert_eq!(session.set_host(Host::At(0x3000)), other);
+    }
+
+    #[test]
     fn a_poisoned_session_refuses_to_lift_or_publish() {
         let lifter = lifter();
         let mut session = LiftSession::new(&lifter, Host::At(0x1000));
@@ -1052,7 +1117,7 @@ mod tests {
         // because the emitter wrote into the fall-through placeholder the
         // first instruction left, which the construction does not own.
         {
-            let ctx = session.context_mut_for_test();
+            let ctx = session.context_mut();
             let mut addresses = AddressIndex::analyze(ctx);
             let placeholder = addresses.block_at(0x1003).unwrap();
             let mut target = LiftTarget::bind_or_refresh(ctx, &mut addresses, function).unwrap();
