@@ -122,6 +122,29 @@ impl<Id> Default for LocalNames<Id> {
 }
 
 impl<Id: Copy + Eq> LocalNames<Id> {
+    /// The bytes this table holds on the heap, by capacity: what a body
+    /// pays to keep its names unique and resolvable.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        use std::mem::size_of;
+        fn map<K, V>(map: &HashMap<K, V>) -> usize {
+            // A control byte per slot, and the entry itself.
+            map.capacity() * (size_of::<(K, V)>() + 1)
+        }
+        self.bases.capacity() * size_of::<Box<str>>()
+            + self.bases.iter().map(|base| base.len()).sum::<usize>()
+            + map(&self.index)
+            + self.index.keys().map(|base| base.len()).sum::<usize>()
+            + self.suffixes.capacity() * size_of::<Suffixes<Id>>()
+            + self
+                .suffixes
+                .iter()
+                .map(|s| s.taken.capacity() * size_of::<Option<Id>>())
+                .sum::<usize>()
+            + map(&self.far)
+            + map(&self.hex_bases)
+            + map(&self.labels)
+    }
+
     /// The base `base`, interned.
     pub(crate) fn intern(&mut self, base: &str) -> BaseId {
         if let Some(&id) = self.index.get(base) {

@@ -1181,6 +1181,16 @@ impl<'str> Context<'str> {
         total
     }
 
+    /// The memory every function body holds, by structure, summed. See
+    /// [`BodyMemory`](crate::value::BodyMemory).
+    pub fn body_memory(&self) -> crate::value::BodyMemory {
+        let mut total = crate::value::BodyMemory::default();
+        for body in self.bodies.iter() {
+            total.add_assign(body.memory());
+        }
+        total
+    }
+
     /// Releases body-arena capacity retained from peak analysis churn in every
     /// function (see [`FunctionBody::shrink_to_fit`](crate::value::FunctionBody::shrink_to_fit)).
     ///

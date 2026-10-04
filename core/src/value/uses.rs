@@ -119,6 +119,12 @@ impl SharedHeads {
         self.other.clear();
     }
 
+    /// The bytes the heads take, by capacity.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        (self.literals.capacity() + self.varnodes.capacity()) * std::mem::size_of::<Link<UseId>>()
+            + self.other.capacity() * (std::mem::size_of::<(LocalValueId, UseId)>() + 1)
+    }
+
     pub(crate) fn shrink_to_fit(&mut self) {
         self.literals.shrink_to_fit();
         self.varnodes.shrink_to_fit();

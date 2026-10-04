@@ -609,6 +609,76 @@ impl BodyArenaStats {
     }
 }
 
+/// The memory a function body holds, in bytes, by structure.
+///
+/// Counted by capacity — what the allocator was asked for — and excluding the
+/// allocator's own bookkeeping, so a body that has been
+/// [shrunk to fit](FunctionBody::shrink_to_fit) reports what it keeps. The
+/// values a module shares between its bodies (types, literals, varnodes) are
+/// not here; they belong to the [`Context`].
+///
+/// Heap owned by an instruction's mnemonic (the argument list of a call, say)
+/// is not counted: it is absent from a lift of straight-line code, and the
+/// total over every structure is what a counting allocator checks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BodyMemory {
+    /// The [`Instruction`] records.
+    pub instructions: usize,
+    /// The instruction arena's id-to-slot index: the stable id of each
+    /// record and where it is stored.
+    pub instruction_index: usize,
+    /// The [`BasicBlock`] records, and the arena index for them.
+    pub blocks: usize,
+    /// What blocks own on the heap: parameter lists, edge sets spilled past
+    /// their inline room, extra addresses, comments.
+    pub block_heap: usize,
+    /// The block roster.
+    pub roster: usize,
+    /// Block parameters.
+    pub params: usize,
+    /// CFG edges.
+    pub edges: usize,
+    /// Use edges (the def-use relation), and the heads kept for shared values.
+    pub uses: usize,
+    /// The name table, apart from the names the values carry.
+    pub names: usize,
+    /// The set of machine-instruction addresses lifted into the body.
+    pub instruction_addrs: usize,
+    /// Temporaries and temporary spaces.
+    pub temps: usize,
+}
+
+impl BodyMemory {
+    /// The sum over every structure.
+    pub fn total(&self) -> usize {
+        self.instructions
+            + self.instruction_index
+            + self.blocks
+            + self.block_heap
+            + self.roster
+            + self.params
+            + self.edges
+            + self.uses
+            + self.names
+            + self.instruction_addrs
+            + self.temps
+    }
+
+    pub(crate) fn add_assign(&mut self, other: Self) {
+        self.instructions += other.instructions;
+        self.instruction_index += other.instruction_index;
+        self.blocks += other.blocks;
+        self.block_heap += other.block_heap;
+        self.roster += other.roster;
+        self.params += other.params;
+        self.edges += other.edges;
+        self.uses += other.uses;
+        self.names += other.names;
+        self.instruction_addrs += other.instruction_addrs;
+        self.temps += other.temps;
+    }
+}
+
 /// Tri-state view of a function's `written_spaces` verdict, distinguishing a
 /// never-computed fresh mint from a deliberately recorded ⊤. See
 /// [`FunctionSignature::written_spaces`](super::function::FunctionSignature) and
@@ -728,6 +798,41 @@ impl<'str> FunctionBody<'str> {
             blocks: BodyArenaKindStats::stable_arena(&self.blocks),
             params: BodyArenaKindStats::stable_arena(&self.params),
             edges: BodyArenaKindStats::stable_arena(&self.edges),
+        }
+    }
+
+    /// The memory this body holds, by structure. See [`BodyMemory`].
+    pub fn memory(&self) -> BodyMemory {
+        use std::mem::size_of;
+        let insns = BodyArenaKindStats::stable_arena(&self.insns);
+        let blocks = BodyArenaKindStats::stable_arena(&self.blocks);
+        // A `BTreeSet<u64>` keeps up to eleven keys in a node of their own
+        // plus two words of bookkeeping; a node is on average two thirds full.
+        let addr_nodes = (self.instruction_addrs.len() * 3).div_ceil(2 * 11);
+        BodyMemory {
+            instructions: insns.capacity * size_of::<Instruction<'str>>(),
+            instruction_index: insns.structural_bytes
+                - insns.capacity * size_of::<Instruction<'str>>(),
+            blocks: blocks.structural_bytes,
+            block_heap: self
+                .blocks
+                .iter()
+                .map(|b| {
+                    b.params.capacity() * size_of::<LocalParamId>()
+                        + b.edges.heap_bytes()
+                        + b.extra_addresses.capacity() * size_of::<u64>()
+                        + b.comment_bytes()
+                })
+                .sum(),
+            roster: self.roster.capacity() * size_of::<LocalBlockId>(),
+            params: BodyArenaKindStats::stable_arena(&self.params).structural_bytes,
+            edges: BodyArenaKindStats::stable_arena(&self.edges).structural_bytes,
+            uses: self.uses.len() * size_of::<Use>() + self.shared_first_use.heap_bytes(),
+            names: self.names.heap_bytes(),
+            instruction_addrs: self.instruction_addrs.len() * size_of::<u64>()
+                + addr_nodes * (2 * size_of::<usize>() + size_of::<u64>() / 2),
+            temps: self.temps.len() * size_of::<Temp<'str>>()
+                + self.temp_spaces.len() * size_of::<TempSpace>(),
         }
     }
 

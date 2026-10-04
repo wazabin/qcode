@@ -80,6 +80,14 @@ impl EdgeSet {
         self.0.is_empty()
     }
 
+    /// The bytes this set holds on the heap: none while it fits inline.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match self.0.spilled() {
+            true => self.0.capacity() * std::mem::size_of::<EdgeId>(),
+            false => 0,
+        }
+    }
+
     pub fn shrink_to_fit(&mut self) {
         self.0.shrink_to_fit();
     }
