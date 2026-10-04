@@ -79,6 +79,21 @@ fn catch_up(ctx: &Context<'static>, addresses: &mut AddressIndex) {
     }
 }
 
+/// The target a session lifts into, naming its values or not.
+fn bind<'a>(
+    ctx: &'a mut Context<'static>,
+    addresses: &'a mut AddressIndex,
+    function: FunctionId,
+    naming: bool,
+) -> Result<LiftTarget<'a, 'static>, TargetError> {
+    let target = LiftTarget::bind_indexed(ctx, addresses, function)?;
+    Ok(if naming {
+        target
+    } else {
+        target.without_debug_names()
+    })
+}
+
 /// Which function a session lifts into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Host {
@@ -100,6 +115,7 @@ pub struct LiftSession<'l, 'spec> {
     function: FunctionId,
     cache: Option<Arc<LiftCache>>,
     scratch: ReplayScratch,
+    naming: bool,
 }
 
 impl<'l, 'spec> LiftSession<'l, 'spec> {
@@ -116,6 +132,7 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
             function,
             cache: None,
             scratch: ReplayScratch::default(),
+            naming: true,
         }
     }
 
@@ -141,6 +158,7 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
             function,
             cache: None,
             scratch: ReplayScratch::default(),
+            naming: true,
         })
     }
 
@@ -166,6 +184,17 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
     /// a caller-decoded instruction does not carry. See [`LiftCache`].
     pub fn with_cache(mut self, cache: Arc<LiftCache>) -> Self {
         self.cache = Some(cache);
+        self
+    }
+
+    /// Gives the values the session lifts no debug names: no register load
+    /// named after its register, no instruction named at all, and the table
+    /// that keeps such names unique stays empty. The IR means the same, but
+    /// prints its values by number, and a name that a pass later asks for
+    /// is made then. A body holds millions of them, so this is what a
+    /// consumer keeping a whole binary asks for.
+    pub fn without_debug_names(mut self) -> Self {
+        self.naming = false;
         self
     }
 
@@ -231,13 +260,21 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
             flat: self.lifter.flat_control_flow(),
         };
         if let Some((template, instance)) = cache.find_undecoded(how, address, bytes)? {
-            let mut target =
-                LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
+            let mut target = bind(
+                &mut self.ctx,
+                &mut self.addresses,
+                self.function,
+                self.naming,
+            )?;
             return template.replay(&mut target, &instance, &mut self.scratch);
         }
         let (instruction, shape) = decode_for(cache, &self.decoder, address, bytes)?;
-        let mut target =
-            LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
+        let mut target = bind(
+            &mut self.ctx,
+            &mut self.addresses,
+            self.function,
+            self.naming,
+        )?;
         cache.lower(how, &mut target, &instruction, shape, &mut self.scratch)
     }
 
@@ -245,8 +282,12 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
     /// chose.
     pub fn lift_decoded(&mut self, instruction: &Instruction<'_, '_>) -> Result<Lifted, LiftError> {
         catch_up(&self.ctx, &mut self.addresses);
-        let mut target =
-            LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
+        let mut target = bind(
+            &mut self.ctx,
+            &mut self.addresses,
+            self.function,
+            self.naming,
+        )?;
         self.lifter.lift_into(&mut target, instruction)
     }
 
@@ -254,8 +295,12 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
     /// caller inspecting or caching that intermediate.
     pub fn lift_pcode(&mut self, flat: &FlatPcode) -> Result<Lifted, LiftError> {
         catch_up(&self.ctx, &mut self.addresses);
-        let mut target =
-            LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
+        let mut target = bind(
+            &mut self.ctx,
+            &mut self.addresses,
+            self.function,
+            self.naming,
+        )?;
         self.lifter.lift_pcode_into(&mut target, flat)
     }
 
@@ -1087,6 +1132,38 @@ mod tests {
         let continued = session.lift(0x1003, b"\xc3").unwrap();
         assert_eq!(continued.entry().func, first);
         assert_eq!(session.into_context().unwrap().functions().count(), 2);
+    }
+
+    #[test]
+    fn a_session_without_debug_names_names_nothing_and_lifts_the_same() {
+        let lifter = lifter();
+        let code = [
+            (0x1000, &b"\x48\x89\xd8"[..]),
+            (0x1003, b"\x48\x01\xc3"),
+            (0x1006, b"\xc3"),
+        ];
+        let lift = |session: &mut LiftSession<'_, '_>| {
+            for (address, bytes) in code {
+                session.lift(address, bytes).unwrap();
+            }
+            let function = session.function();
+            let ctx = session.context();
+            let body = FunctionBody::from_id(ctx, function);
+            let (mut insns, mut named) = (0, 0);
+            for block in body.blocks() {
+                for insn in block.instructions() {
+                    insns += 1;
+                    named += insn.name().is_some() as usize;
+                }
+            }
+            (insns, named)
+        };
+        let (insns, named) = lift(&mut LiftSession::new(&lifter, Host::At(0x1000)));
+        let (plain_insns, plain_named) =
+            lift(&mut LiftSession::new(&lifter, Host::At(0x1000)).without_debug_names());
+        assert!(named > 0, "a lift names its register loads");
+        assert_eq!(plain_named, 0);
+        assert_eq!(plain_insns, insns);
     }
 
     #[test]
