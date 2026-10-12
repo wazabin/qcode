@@ -176,7 +176,7 @@ pub struct CacheStats {
     pub exact: u64,
     /// Hits whose validation lift disagreed with the template. Only counted
     /// when [validating](LiftCache::validating); each such hit was discarded,
-    /// lifted for real, and its entry evicted.
+    /// lifted for real, and its shape marked uncacheable.
     pub validation_failures: u64,
     /// Shapes held, as templates or as uncacheable.
     pub entries: usize,
@@ -422,7 +422,7 @@ impl LiftCache {
     }
 
     /// Lifts every hit for real as well and compares the two, discarding
-    /// the replay and evicting the entry when they differ. For measuring
+    /// the replay and marking the shape uncacheable when they differ. For measuring
     /// the cache's exactness over a corpus; it costs every hit a full lift.
     pub fn validating(mut self, validating: bool) -> Self {
         self.validating = validating;
@@ -640,7 +640,8 @@ impl LiftCache {
         }
     }
 
-    fn evict(&self, prefix: &[u8], template: &Template) {
+    /// Marks the shape of `template`, which failed validation, uncacheable.
+    fn condemn(&self, prefix: &[u8], template: &Template) {
         let keys = &template.keys;
         let Some(&first) = keys.masked.first() else {
             return;
@@ -650,16 +651,14 @@ impl LiftCache {
         if let Some(node) = shard
             .get_mut(prefix)
             .and_then(|root| root.get_mut(&keys.mask[..depth], &keys.masked[..depth]))
-            && let Some(Entry {
-                kind: Kind::Templates(templates),
-                ..
-            }) = &mut node.leaf
+            && let Some(entry) = &mut node.leaf
+            && let Kind::Templates(templates) = &entry.kind
+            && templates.iter().any(|t| std::ptr::eq(&**t, template))
         {
-            templates.retain(|t| !std::ptr::eq(&**t, template));
-            if templates.is_empty() {
-                node.leaf = None;
-                self.entries.fetch_sub(1, Ordering::Relaxed);
-            }
+            // The probes missed how the shape moves, so another instance
+            // would probe it as wrongly: the shape is uncacheable, and stays
+            // an entry.
+            entry.kind = Kind::Uncacheable;
         }
     }
 
@@ -688,8 +687,8 @@ impl LiftCache {
     }
 
     /// What the cache holds for `instruction`. A hit is counted here, and
-    /// validated when the cache validates; a hit that fails validation is
-    /// evicted and reported uncacheable. Whatever the answer, the
+    /// validated when the cache validates; a hit that fails validation
+    /// marks its shape uncacheable and is reported so. Whatever the answer, the
     /// instruction is not lifted.
     pub(crate) fn find(
         &self,
@@ -715,7 +714,7 @@ impl LiftCache {
                     && !self.validate(lifter, &template, &instance, instruction, decoder, flat)?
                 {
                     self.validation_failures.fetch_add(1, Ordering::Relaxed);
-                    self.evict(prefix, &template);
+                    self.condemn(prefix, &template);
                     return Ok(Lookup::Uncacheable);
                 }
                 Lookup::Hit(template, instance)

@@ -695,3 +695,39 @@ fn shapes_of_two_lengths_on_one_leaf_keep_their_own_templates() {
         2
     );
 }
+
+#[test]
+fn a_shape_that_fails_validation_is_not_cached_again() {
+    // `v` is `b` but for bit 5, flipped when bit 1 is set and bit 2 clear:
+    // linear wherever the probes of `b = 0` look — at 1 and at 0xff — and
+    // wrong at 2, where only validation sees it.
+    let mut sources = sleigh::SourceDb::new();
+    let root = sources.add_file(
+        "nonlinear.slaspec",
+        "define endian=little;
+         define space ram type=ram_space size=4 default;
+         define space register type=register_space size=4;
+         define register offset=0 size=4 [ r0 ];
+         define token instr(8) op=(0,7);
+         define token imm(8) b=(0,7);
+         :f v is op=1 ; b [ v = b ^ ((((b >> 1) & ~(b >> 2)) & 1) << 5); ] { r0 = v; }"
+            .to_string(),
+    );
+    let spec: &'static _ = Box::leak(Box::new(
+        sleigh::Compiler::new(&mut sources).compile(root).unwrap(),
+    ));
+    let lifter = SleighLifter::new(spec);
+    let cache = Arc::new(LiftCache::new(spec).validating(true));
+    let mut session = ScratchSession::new(&lifter).with_cache(Arc::clone(&cache));
+    session.lift(0x1000, &[1, 0]).unwrap();
+    session.lift(0x1000, &[1, 2]).unwrap();
+    let stats = cache.stats();
+    assert_eq!(stats.validation_failures, 1, "{stats:?}");
+    // The shape is known bad: no instance of it is probed or served again.
+    session.lift(0x1000, &[1, 0]).unwrap();
+    session.lift(0x1000, &[1, 2]).unwrap();
+    let after = cache.stats();
+    assert_eq!(after.misses, stats.misses, "{after:?}");
+    assert_eq!(after.validation_failures, 1, "{after:?}");
+    assert_eq!(after.entries, 1, "{after:?}");
+}
