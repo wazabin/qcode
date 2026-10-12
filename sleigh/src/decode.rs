@@ -30,6 +30,7 @@ use sleigh::{
 /// documentation](self).
 pub struct FixedDecoder<'spec> {
     decoder: Decoder<'spec>,
+    fingerprint: SpecFingerprint,
     context: ContextBytes,
 }
 
@@ -38,6 +39,7 @@ impl<'spec> FixedDecoder<'spec> {
     pub fn new(spec: &'spec CompiledSpec) -> Self {
         Self {
             decoder: Decoder::new(spec),
+            fingerprint: spec.fingerprint(),
             context: spec.new_context(),
         }
     }
@@ -56,6 +58,7 @@ impl<'spec> FixedDecoder<'spec> {
         }
         Ok(Self {
             decoder: Decoder::new(spec),
+            fingerprint: spec.fingerprint(),
             context,
         })
     }
@@ -63,6 +66,11 @@ impl<'spec> FixedDecoder<'spec> {
     /// The context every decode uses.
     pub fn context(&self) -> &ContextBytes {
         &self.context
+    }
+
+    /// The fingerprint of the specification it decodes.
+    pub fn fingerprint(&self) -> SpecFingerprint {
+        self.fingerprint
     }
 
     /// Decodes the instruction at `address` from `bytes`, which start there.

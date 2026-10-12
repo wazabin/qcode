@@ -74,6 +74,10 @@ impl LiftCache {
     /// the cache, as [`LiftSession::lift`] does, for a caller that binds its
     /// own target: replayed without a decode when its shape is known, else
     /// decoded with `decoder`, lowered by `lifter` and remembered.
+    ///
+    /// A hit is refused what a miss is: a `target` not of the lifter's
+    /// specification, or a `decoder` of another, since the template names
+    /// the lifter's registers.
     pub fn lift_into<'spec>(
         &self,
         lifter: &SleighLifter<'spec>,
@@ -83,6 +87,8 @@ impl LiftCache {
         bytes: &[u8],
         scratch: &mut ReplayScratch,
     ) -> Result<Lifted, LiftError> {
+        lifter.check_fingerprint(decoder.fingerprint())?;
+        lifter.check_compatible(target.context())?;
         let how = Lowering {
             lifter,
             decoder,

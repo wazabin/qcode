@@ -462,6 +462,7 @@ impl LiftCache {
         address: u64,
         bytes: &[u8],
     ) -> Result<usize, LiftError> {
+        lifter.check_fingerprint(decoder.fingerprint())?;
         let how = Lowering {
             lifter,
             decoder,

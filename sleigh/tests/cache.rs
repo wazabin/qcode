@@ -8,10 +8,14 @@
 
 use std::sync::Arc;
 
-use qcode::lift::Lifted;
+use qcode::{
+    address_index::AddressIndex,
+    lift::{LiftTarget, Lifted},
+};
 use wazabin_qcode_sleigh::{
     LiftError, SleighLifter,
-    cache::LiftCache,
+    cache::{LiftCache, ReplayScratch},
+    decode::FixedDecoder,
     session::{Host, LiftSession, ScratchLifted, ScratchOperand, ScratchSession},
 };
 
@@ -601,6 +605,50 @@ fn a_cache_refuses_another_specification() {
     let mut session = ScratchSession::new(&x86).with_cache(cache);
     assert_eq!(
         session.lift(0x1000, b"\x90").err(),
+        Some(LiftError::IncompatibleSpec)
+    );
+}
+
+#[test]
+fn a_hit_refuses_a_foreign_target_or_decoder() {
+    // A hit replays the template's varnodes, which name the lifter's
+    // registers: it must refuse what a miss refuses, a target of another
+    // specification or a decoder of one.
+    let x64 = lifter();
+    let cache = LiftCache::new(x64.spec());
+    let decoder = FixedDecoder::new(x64.spec());
+    let mut scratch = ReplayScratch::default();
+    let lift = |lifter: &SleighLifter<'static>,
+                decoder: &FixedDecoder<'static>,
+                scratch: &mut ReplayScratch| {
+        let mut ctx = lifter.new_context();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let function = ctx.anon_function();
+        let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+        cache
+            .lift_into(&x64, decoder, &mut target, 0x1000, b"\x48\x89\xd8", scratch)
+            .map(|_| ())
+    };
+    lift(&x64, &decoder, &mut scratch).unwrap();
+    lift(&x64, &decoder, &mut scratch).unwrap();
+    assert_eq!(cache.stats().hits, 1);
+
+    let x86 = SleighLifter::new(sleigh_precompile::x86::spec());
+    assert_eq!(
+        lift(&x86, &decoder, &mut scratch).err(),
+        Some(LiftError::IncompatibleContext)
+    );
+    let foreign =
+        FixedDecoder::with_context(sleigh_precompile::x86::spec(), decoder.context().clone())
+            .unwrap();
+    assert_eq!(
+        lift(&x64, &foreign, &mut scratch).err(),
+        Some(LiftError::IncompatibleSpec)
+    );
+    assert_eq!(
+        cache
+            .decode_len(&x64, &foreign, 0x1000, b"\x48\x89\xd8")
+            .err(),
         Some(LiftError::IncompatibleSpec)
     );
 }
