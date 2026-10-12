@@ -618,15 +618,11 @@ impl LiftCache {
             None => {
                 // The check above is a fast path; the count is claimed
                 // here, so racing inserts cannot take the cache past its
-                // capacity.
-                if self
-                    .entries
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                        (n < self.capacity).then_some(n + 1)
-                    })
-                    .is_ok()
-                {
+                // capacity. A claim past it is handed back.
+                if self.entries.fetch_add(1, Ordering::Relaxed) < self.capacity {
                     *leaf = Some(entry);
+                } else {
+                    self.entries.fetch_sub(1, Ordering::Relaxed);
                 }
             }
             // The shape is known: a new way its registers coincide joins
