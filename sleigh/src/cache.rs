@@ -453,6 +453,26 @@ impl LiftCache {
         self.entries.store(0, Ordering::Relaxed);
     }
 
+    /// The length of the instruction at `address`, at the front of `bytes`:
+    /// its shape's when the cache knows it, else decoded with `decoder`.
+    pub fn decode_len<'spec>(
+        &self,
+        lifter: &SleighLifter<'spec>,
+        decoder: &FixedDecoder<'spec>,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<usize, LiftError> {
+        let how = Lowering {
+            lifter,
+            decoder,
+            flat: lifter.flat_control_flow(),
+        };
+        Ok(match self.find_undecoded(how, address, bytes)? {
+            Some((template, _)) => template.length,
+            None => decoder.decode(address, bytes)?.len(),
+        })
+    }
+
     /// The shard of an instruction whose leading byte is `first`.
     fn shard(&self, first: u8) -> &Shard {
         &self.shards[usize::from(first & self.shard_mask.load(Ordering::Relaxed))]

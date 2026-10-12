@@ -69,6 +69,33 @@ fn decode_for<'spec, 'b>(
     })
 }
 
+impl LiftCache {
+    /// Lifts the instruction at `address` from `bytes` into `target` through
+    /// the cache, as [`LiftSession::lift`] does, for a caller that binds its
+    /// own target: replayed without a decode when its shape is known, else
+    /// decoded with `decoder`, lowered by `lifter` and remembered.
+    pub fn lift_into<'spec>(
+        &self,
+        lifter: &SleighLifter<'spec>,
+        decoder: &FixedDecoder<'spec>,
+        target: &mut LiftTarget<'_, 'static>,
+        address: u64,
+        bytes: &[u8],
+        scratch: &mut ReplayScratch,
+    ) -> Result<Lifted, LiftError> {
+        let how = Lowering {
+            lifter,
+            decoder,
+            flat: lifter.flat_control_flow(),
+        };
+        if let Some((template, instance)) = self.find_undecoded(how, address, bytes)? {
+            return template.replay(target, &instance, scratch);
+        }
+        let (instruction, shape) = decode_for(self, decoder, address, bytes)?;
+        self.lower(how, target, &instruction, shape, scratch)
+    }
+}
+
 /// Brings `addresses` up to `ctx`, if a change to the addresses the context
 /// covers was made without it: through [`LiftSession::context_mut`], the one
 /// way the context moves without the session. Instruction-level edits do not
@@ -254,28 +281,20 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
             let instruction = self.decoder.decode(address, bytes)?;
             return self.lift_decoded(&instruction);
         };
-        let how = Lowering {
-            lifter: self.lifter,
-            decoder: &self.decoder,
-            flat: self.lifter.flat_control_flow(),
-        };
-        if let Some((template, instance)) = cache.find_undecoded(how, address, bytes)? {
-            let mut target = bind(
-                &mut self.ctx,
-                &mut self.addresses,
-                self.function,
-                self.naming,
-            )?;
-            return template.replay(&mut target, &instance, &mut self.scratch);
-        }
-        let (instruction, shape) = decode_for(cache, &self.decoder, address, bytes)?;
         let mut target = bind(
             &mut self.ctx,
             &mut self.addresses,
             self.function,
             self.naming,
         )?;
-        cache.lower(how, &mut target, &instruction, shape, &mut self.scratch)
+        cache.lift_into(
+            self.lifter,
+            &self.decoder,
+            &mut target,
+            address,
+            bytes,
+            &mut self.scratch,
+        )
     }
 
     /// Lifts an instruction the caller decoded, with whatever context it
