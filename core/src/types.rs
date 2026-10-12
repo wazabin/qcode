@@ -931,7 +931,8 @@ pub struct TypeManager {
     ///
     /// Publishing replaces this pointer after a successful mint. Old indexes
     /// stay owned by `published_generations`, so a reader that raced with a
-    /// publication can safely finish through the generation it loaded. The
+    /// publication can safely finish through the generation it loaded; an
+    /// exclusive publication, which no such reader can span, drops them. The
     /// pointed-to `Type` objects live in `inner.types` or `inner.retired_types`;
     /// those boxes never move or disappear.
     published: AtomicPtr<PublishedTypes>,
@@ -1020,16 +1021,23 @@ impl TypeManager {
     /// Publish after an exclusive module-barrier mutation. Taking `&mut self`
     /// makes creation/editing unavailable through a function pass's shared
     /// `ContextView` by construction.
+    ///
+    /// It also means no reader holds a generation — a borrow of one cannot
+    /// outlive the `&self` it came from — so the superseded ones are dropped
+    /// rather than kept for the manager's lifetime. The types they point to
+    /// are not theirs and stay.
     fn publish_exclusive(&mut self) {
         let generation = {
             let inner = self.inner.get_mut().expect("type manager RwLock poisoned");
             Box::new(PublishedTypes::from_inner(inner))
         };
         let ptr = (&*generation as *const PublishedTypes).cast_mut();
-        self.published_generations
+        let generations = self
+            .published_generations
             .get_mut()
-            .expect("type publication generation lock poisoned")
-            .push(generation);
+            .expect("type publication generation lock poisoned");
+        generations.clear();
+        generations.push(generation);
         self.published.store(ptr, Ordering::Release);
     }
 
@@ -1037,8 +1045,9 @@ impl TypeManager {
         let ptr = self.published.load(Ordering::Acquire);
         debug_assert!(!ptr.is_null(), "type publication pointer is null");
         // SAFETY: `from_inner` installs the initial generation before the manager
-        // becomes observable. Every later generation is retained in
-        // `published_generations` for the manager's lifetime and is immutable.
+        // becomes observable. Every later generation is immutable and retained in
+        // `published_generations` until an exclusive publication, which no
+        // borrow of `self` — this reference's — can outlive.
         unsafe { &*ptr }
     }
 
@@ -1539,6 +1548,22 @@ mod tests {
         assert_eq!(tm.binop_result(i32, Binop::Int(IntBinop::And), i32), i32);
         // Arithmetic preserves the left type.
         assert_eq!(tm.binop_result(i32, Binop::Int(IntBinop::Add), i32), i32);
+    }
+
+    #[test]
+    fn an_exclusive_publication_drops_the_generations_it_supersedes() {
+        // Every mint through `&self` publishes a full copy of the table and
+        // keeps the ones a reader may still hold. Under `&mut self` none can
+        // be held, so the barrier keeps only what it publishes.
+        let mut tm = TypeManager::new();
+        let ints: Vec<TypeId> = (1..=64).map(|size| tm.get_or_make_int(size)).collect();
+        let generations = |tm: &mut TypeManager| tm.published_generations.get_mut().unwrap().len();
+        assert!(generations(&mut tm) > 64);
+        tm.create_requested_types(&[TypeRequest::array(ints[0], 3)]);
+        assert_eq!(generations(&mut tm), 1);
+        // Earlier types still read through the one generation left.
+        assert_eq!(tm.get_or_make_int(7), ints[6]);
+        assert_eq!(tm.size_of(ints[63]), 64);
     }
 
     #[test]
