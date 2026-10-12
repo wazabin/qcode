@@ -320,7 +320,6 @@ impl Node {
     }
 }
 
-/// The answer of [`LiftCache::find`].
 /// How a cache lowers: the lifter and the decoder it lowers with, and
 /// whether control flow is flattened. One instruction's worth of context,
 /// which the key and every probe need.
@@ -331,6 +330,7 @@ pub(crate) struct Lowering<'a, 'spec> {
     pub(crate) flat: bool,
 }
 
+/// The answer of [`LiftCache::find`].
 pub(crate) enum Lookup {
     /// The shape's template, instantiated for the instruction.
     Hit(Arc<Template>, Instance),
