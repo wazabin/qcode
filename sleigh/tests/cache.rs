@@ -652,3 +652,46 @@ fn a_hit_refuses_a_foreign_target_or_decoder() {
         Some(LiftError::IncompatibleSpec)
     );
 }
+
+#[test]
+fn shapes_of_two_lengths_on_one_leaf_keep_their_own_templates() {
+    // `long` is more specific than `short`, so `short` is taken only where
+    // `long` cannot be: at the end of the stream. Both shapes' masks are
+    // the first byte, so they meet at one leaf of the trie, and a template
+    // of one length must not serve an instruction of the other.
+    let mut sources = sleigh::SourceDb::new();
+    let root = sources.add_file(
+        "lengths.slaspec",
+        "define endian=little;
+         define space ram type=ram_space size=4 default;
+         define space register type=register_space size=4;
+         define register offset=0 size=4 [ r0 r1 r2 r3 ];
+         define token instr(8) hi=(4,7) lo=(0,3);
+         define token regs(8) r=(0,1) s=(2,3);
+         attach variables [ r s ] [ r0 r1 r2 r3 ];
+         sub: is lo=1 { r1 = 1; }
+         sub: is lo=2 { r1 = 2; }
+         :long r, s is hi=1 & lo=1 ; r & s { r = s; }
+         :short is hi=1 & sub { r0 = 1; }"
+            .to_string(),
+    );
+    let spec: &'static _ = Box::leak(Box::new(
+        sleigh::Compiler::new(&mut sources).compile(root).unwrap(),
+    ));
+    // Flat, as a scratch session lowers, so that the two share entries.
+    let lifter = SleighLifter::new(spec).with_flat_control_flow();
+    let decoder = FixedDecoder::new(spec);
+    let cache = Arc::new(LiftCache::new(spec));
+    let mut session = ScratchSession::new(&lifter).with_cache(Arc::clone(&cache));
+    // `long r0, r1`, then `short` at the end of the stream.
+    session.lift(0x1000, &[0x11, 0x04]).unwrap();
+    session.lift(0x2000, &[0x11]).unwrap();
+    // `long r0, r0`: its registers coincide, which the first template's
+    // instance does not.
+    let bytes = [0x11, 0x00];
+    assert_eq!(decoder.decode(0x3000, &bytes).unwrap().len(), 2);
+    assert_eq!(
+        cache.decode_len(&lifter, &decoder, 0x3000, &bytes).unwrap(),
+        2
+    );
+}

@@ -616,11 +616,15 @@ impl LiftCache {
                 self.entries.fetch_add(1, Ordering::Relaxed);
             }
             // The shape is known: a new way its registers coincide joins
-            // the entry, once.
+            // the entry, once. Masks that differ only in trailing unmasked
+            // bytes share a leaf, so another shape can land here too — one
+            // the decoder takes where this one's exclusions or length turn
+            // it away. Its templates are not this entry's to serve.
             Some(Entry {
+                len,
+                exclusions,
                 kind: Kind::Templates(known),
-                ..
-            }) => {
+            }) if *len == entry.len && *exclusions == entry.exclusions => {
                 if let Kind::Templates(new) = entry.kind
                     && let Some(template) = new.into_iter().next()
                 {
