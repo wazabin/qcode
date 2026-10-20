@@ -920,7 +920,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                     unreachable!("non-constant temporary load creates an instruction");
                 };
 
-                if let Some(name) = name {
+                if let (true, Some(name)) = (self.naming, name) {
                     self.name_insn_unique(local, &name);
                 }
 
@@ -1777,7 +1777,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         self.body
             .roster
             .iter()
-            .flat_map(|&b| self.body.insn_ids(b))
+            .flat_map(|b| self.body.insn_ids(b))
             .find_map(|i| match self.body.insns[i].mnemonic() {
                 Mnemonic::ReturnValue(r) => self.lstored_type_of(r.value),
                 _ => None,
@@ -2102,7 +2102,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                     0,
                 );
 
-                if let Some(name) = &name {
+                if let (true, Some(name)) = (self.naming, &name) {
                     let name = Cow::Owned(format!("{}_lane{lane}", name.to_lowercase()));
                     let _ = self.rename_insn_local(id, name);
                 }
@@ -2125,7 +2125,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             );
 
             // Add a name hint for the store instruction for easier debugging
-            if let Some(name) = &name {
+            if let (true, Some(name)) = (self.naming, &name) {
                 self.name_insn_unique(id, &name.to_lowercase());
             }
 

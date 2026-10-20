@@ -157,6 +157,33 @@ pub trait QCodeMut<'str>: sealed::Storage<'str> {
         self.function_mut(insn.func).move_insn_before(insn, before);
     }
 
+    /// Links `insn` at the end of `block`, taking it out of the block it was
+    /// in, if any; constant-time however long the block is. Both belong to
+    /// the same function. The way to build a block from instructions that
+    /// exist already, in the order wanted, or to move one to the end of
+    /// another.
+    fn link_last(&mut self, block: BlockId, insn: InstructionId) {
+        assert_eq!(
+            block.func, insn.func,
+            "an instruction is linked into a block of its own function"
+        );
+        self.function_mut(block.func)
+            .link_last(block.local, insn.local);
+    }
+
+    /// Empties `block` of its instructions in one move, returning them in
+    /// order, each now in no block: still in the function, with its operands'
+    /// uses, until it is linked into a block again or removed. The way to
+    /// rebuild a block from its own instructions.
+    fn take_insns(&mut self, block: BlockId) -> Vec<InstructionId> {
+        let func = block.func;
+        self.function_mut(func)
+            .take_insns(block.local)
+            .into_iter()
+            .map(|local| InstructionId::new(func, local))
+            .collect()
+    }
+
     /// Adds a directed edge in the CFG from `from` to `to`, returning its id.
     ///
     /// Both endpoints must belong to the same function: CFG edges are strictly

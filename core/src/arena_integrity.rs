@@ -64,7 +64,7 @@ pub fn verify_body_arena_integrity_scoped(
         }
 
         let mut roster_count = FxHashMap::default();
-        for &local in &body.roster {
+        for local in body.roster.iter() {
             *roster_count.entry(local).or_insert(0usize) += 1;
             if !live_blocks.contains(&local) {
                 out.push(format!(
@@ -411,12 +411,14 @@ pub fn verify_body_arena_integrity_scoped(
     out
 }
 
-/// Checks a body's use edges against its operands: every operand occurrence
-/// whose value has storage here has exactly one edge, every edge names the
-/// operand at its `(user, operand_index)`, every edge is reachable exactly
-/// once from its value's list head, and no edge points at removed storage.
-/// Together these say the edges are what [`FunctionBody::rebuild_uses`]
-/// would derive.
+/// Checks a body's use edges against its operands: every instruction with
+/// operands has a run of edges, one per operand, naming it as their user;
+/// every operand whose value has storage here has its edge in that value's
+/// list, and one whose value has none has an edge in no list; every list
+/// holds only edges of operands that name its value, is linked both ways,
+/// and reaches each edge once; and the slab is its live runs and its free
+/// ones, no more. Together these say the edges are what
+/// [`FunctionBody::rebuild_uses`] would derive.
 fn verify_use_edges(
     body: &crate::value::FunctionBody<'_>,
     fid: crate::value::FunctionId,
@@ -425,6 +427,8 @@ fn verify_use_edges(
     live_blocks: &FxHashSet<crate::value::LocalBlockId>,
     out: &mut Vec<String>,
 ) {
+    use crate::value::uses::UseId;
+
     let has_storage = |value: LocalValueId| match value {
         LocalValueId::Instruction(id) => live_insns.contains(&id),
         LocalValueId::BlockParam(id) => live_params.contains(&id),
@@ -432,80 +436,135 @@ fn verify_use_edges(
         LocalValueId::Temp(id) => usize::from(id) < body.temps.len(),
         _ => true,
     };
+    let slots = body.uses.slots();
 
-    // Every edge names a live user and its operand, and a value with storage.
-    let mut edges_per_operand: FxHashMap<(crate::value::LocalInsnId, usize), usize> =
-        FxHashMap::default();
-    for edge in body.use_edges() {
-        let edge_id = edge.id;
-        let user = InstructionId::new(fid, edge.user);
-        let index = usize::from(edge.operand_index);
-        if !live_insns.contains(&edge.user) {
+    // The slab is the live runs and the free ones, which do not overlap.
+    let mut taken = vec![false; slots];
+    let mut claim = |run: usize, len: usize, what: &str, out: &mut Vec<String>| {
+        if run + len > slots {
             out.push(format!(
-                "function {fid:?}: use {edge_id:?} of {:?} has removed user {user:?}",
-                edge.value.qualify(fid)
+                "function {fid:?}: {what} of {len} edges at {run} is past the slab's {slots}"
             ));
-            continue;
+            return;
         }
-        if !has_storage(edge.value) {
-            out.push(format!(
-                "function {fid:?}: use {edge_id:?} by {user:?} names removed value {:?}",
-                edge.value.qualify(fid)
-            ));
-        }
-        match body.insns[edge.user].mnemonic().operand(index) {
-            Some(operand) if operand == edge.value => {
-                *edges_per_operand.entry((edge.user, index)).or_default() += 1;
+        for slot in &mut taken[run..run + len] {
+            if std::mem::replace(slot, true) {
+                out.push(format!(
+                    "function {fid:?}: {what} of {len} edges at {run} overlaps another run"
+                ));
+                break;
             }
-            Some(operand) => out.push(format!(
-                "function {fid:?}: use {edge_id:?} says operand {index} of {user:?} is {:?} but it is {:?}",
-                edge.value.qualify(fid),
-                operand.qualify(fid)
-            )),
-            None => out.push(format!(
-                "function {fid:?}: use {edge_id:?} names operand {index} of {user:?}, which has no such operand"
-            )),
         }
-    }
+    };
 
-    // Every operand occurrence with storage has exactly one edge naming it.
+    // Every operand occurrence has an edge in its user's run, and an edge in
+    // a list if and only if its value has storage here.
+    let mut operands_with_edges = 0usize;
     for insn in body.insns.iter() {
         let user = InstructionId::new(fid, insn.id);
+        let len = insn.mnemonic().operand_count();
+        match (insn.use_run.get(), len) {
+            (None, 0) => continue,
+            (None, _) => {
+                out.push(format!(
+                    "function {fid:?}: {user:?} has {len} operands and no use run"
+                ));
+                continue;
+            }
+            (Some(_), 0) => {
+                out.push(format!(
+                    "function {fid:?}: {user:?} has no operands and a use run"
+                ));
+                continue;
+            }
+            (Some(run), _) => claim(usize::from(run), len, "use run", out),
+        }
+        let run = insn.use_run.get().expect("matched above");
+        if usize::from(run) + len > slots {
+            continue;
+        }
         let mut index = 0;
         insn.mnemonic().for_each_operand(|value| {
-            let edges = edges_per_operand
-                .get(&(insn.id, index))
-                .copied()
-                .unwrap_or(0);
-            if has_storage(value) && edges != 1 {
+            let edge = UseId::from(usize::from(run) + index);
+            if body.uses[edge].user != insn.id {
                 out.push(format!(
-                    "function {fid:?}: operand {index} of {user:?} ({:?}) has {edges} use edges",
+                    "function {fid:?}: use {edge:?}, operand {index} of {user:?}, names user {:?}",
+                    InstructionId::new(fid, body.uses[edge].user)
+                ));
+            }
+            let linked = body.uses[edge].prev().is_some()
+                || body.first_use_of(value) == Some(edge);
+            if has_storage(value) {
+                operands_with_edges += 1;
+                if !linked {
+                    out.push(format!(
+                        "function {fid:?}: operand {index} of {user:?} ({:?}) has no use edge in its list",
+                        value.qualify(fid)
+                    ));
+                }
+            } else if linked || body.uses[edge].next().is_some() {
+                out.push(format!(
+                    "function {fid:?}: use {edge:?} by {user:?} names removed value {:?}",
                     value.qualify(fid)
                 ));
             }
             index += 1;
         });
     }
+    let mut free = 0;
+    for (len, head) in body.uses.free_runs() {
+        free += len;
+        claim(usize::from(head), len, "free use run", out);
+    }
+    if let Some(slot) = taken.iter().position(|&taken| !taken) {
+        out.push(format!(
+            "function {fid:?}: use slot {slot} is in neither a live run nor a free one ({free} free)"
+        ));
+    }
 
-    // Every edge is reachable exactly once, from its own value's head.
-    let mut reached: FxHashSet<crate::value::uses::UseId> = FxHashSet::default();
+    // Every edge is reachable exactly once, from its own value's head, and
+    // names the operand its list says.
+    let mut reached: FxHashSet<UseId> = FxHashSet::default();
     let mut walk = |value: LocalValueId, out: &mut Vec<String>| {
         let mut at = body.first_use_of(value);
+        let mut prev = None;
         let mut steps = 0;
         while let Some(edge_id) = at {
-            if !body.uses.contains(edge_id) {
+            if usize::from(edge_id) >= slots {
                 out.push(format!(
-                    "function {fid:?}: use list of {:?} reaches freed use {edge_id:?}",
+                    "function {fid:?}: use list of {:?} reaches {edge_id:?}, past the slab",
                     value.qualify(fid)
                 ));
                 break;
             }
             let edge = &body.uses[edge_id];
-            if edge.value != value {
+            if edge.prev() != prev {
                 out.push(format!(
-                    "function {fid:?}: use list of {:?} holds use {edge_id:?} of {:?}",
+                    "function {fid:?}: use {edge_id:?} in the list of {:?} has prev {:?}, not {prev:?}",
                     value.qualify(fid),
-                    edge.value.qualify(fid)
+                    edge.prev()
+                ));
+            }
+            let operand = live_insns
+                .contains(&edge.user)
+                .then(|| body.insns[edge.user].use_run.get())
+                .flatten()
+                .filter(|&run| usize::from(edge_id) >= usize::from(run))
+                .and_then(|run| {
+                    body.insns[edge.user]
+                        .mnemonic()
+                        .operand(usize::from(edge_id) - usize::from(run))
+                });
+            if !live_insns.contains(&edge.user) {
+                out.push(format!(
+                    "function {fid:?}: use {edge_id:?} of {:?} has removed user {:?}",
+                    value.qualify(fid),
+                    InstructionId::new(fid, edge.user)
+                ));
+            } else if operand != Some(value) {
+                out.push(format!(
+                    "function {fid:?}: use list of {:?} holds use {edge_id:?}, which is not an operand naming it",
+                    value.qualify(fid)
                 ));
             }
             if !reached.insert(edge_id) {
@@ -523,7 +582,8 @@ fn verify_use_edges(
                 ));
                 break;
             }
-            at = edge.next;
+            prev = Some(edge_id);
+            at = edge.next();
         }
     };
     for insn in body.insns.iter() {
@@ -553,11 +613,12 @@ fn verify_use_edges(
         }
         walk(value, out);
     }
-    if reached.len() != body.uses.len() {
+    if reached.len() != body.uses.len() || reached.len() != operands_with_edges {
         out.push(format!(
-            "function {fid:?}: {} of {} use edges are reachable from a use-list head",
+            "function {fid:?}: {} of {} use edges are reachable from a use-list head ({} operands have storage)",
             reached.len(),
-            body.uses.len()
+            body.uses.len(),
+            operands_with_edges
         ));
     }
 }
@@ -641,7 +702,7 @@ mod tests {
         let mut ctx = fixture();
         let f = ctx.function_ids()[0];
         let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
-        ctx.bodies[f].roster.push(entry.local);
+        ctx.bodies[f].roster.push_again(entry.local);
 
         assert_has(&ctx, "appears 2 times in the roster");
     }
@@ -651,7 +712,7 @@ mod tests {
         let mut ctx = fixture();
         let f = ctx.function_ids()[0];
         let block = BasicBlock::make(&mut ctx, f).id;
-        ctx.bodies[f].roster.retain(|&local| local != block.local);
+        ctx.bodies[f].roster.remove(block.local);
 
         assert_has(&ctx, "roster count 0");
     }
@@ -790,7 +851,7 @@ mod tests {
         ctx.bodies[f].params.remove(x);
 
         assert_has(&ctx, "references removed local value");
-        assert_has(&ctx, "names removed value");
+        assert_has(&ctx, "use edges are reachable from a use-list head");
     }
 
     /// An operand rewritten behind the body's back has an edge that names
@@ -808,8 +869,8 @@ mod tests {
             .mnemonic_mut()
             .set_operand(0, one);
 
-        assert_has(&ctx, "but it is");
-        assert_has(&ctx, "has 0 use edges");
+        assert_has(&ctx, "which is not an operand naming it");
+        assert_has(&ctx, "has no use edge in its list");
     }
 
     /// A use list must reach each edge once, and only edges of its own value.
@@ -862,8 +923,9 @@ mod tests {
 
         let edges = |ctx: &Context<'_>| {
             let mut edges: Vec<_> = ctx.bodies[f]
-                .use_edges()
-                .map(|e| (format!("{:?}", e.value), e.user, e.operand_index))
+                .linked_uses()
+                .into_iter()
+                .map(|(value, user, index)| (format!("{value:?}"), user, index))
                 .collect();
             edges.sort();
             edges

@@ -8,10 +8,14 @@
 
 use std::sync::Arc;
 
-use qcode::lift::Lifted;
+use qcode::{
+    address_index::AddressIndex,
+    lift::{LiftTarget, Lifted},
+};
 use wazabin_qcode_sleigh::{
     LiftError, SleighLifter,
-    cache::LiftCache,
+    cache::{LiftCache, ReplayScratch},
+    decode::FixedDecoder,
     session::{Host, LiftSession, ScratchLifted, ScratchOperand, ScratchSession},
 };
 
@@ -603,4 +607,127 @@ fn a_cache_refuses_another_specification() {
         session.lift(0x1000, b"\x90").err(),
         Some(LiftError::IncompatibleSpec)
     );
+}
+
+#[test]
+fn a_hit_refuses_a_foreign_target_or_decoder() {
+    // A hit replays the template's varnodes, which name the lifter's
+    // registers: it must refuse what a miss refuses, a target of another
+    // specification or a decoder of one.
+    let x64 = lifter();
+    let cache = LiftCache::new(x64.spec());
+    let decoder = FixedDecoder::new(x64.spec());
+    let mut scratch = ReplayScratch::default();
+    let lift = |lifter: &SleighLifter<'static>,
+                decoder: &FixedDecoder<'static>,
+                scratch: &mut ReplayScratch| {
+        let mut ctx = lifter.new_context();
+        let mut addresses = AddressIndex::analyze(&ctx);
+        let function = ctx.anon_function();
+        let mut target = LiftTarget::bind_indexed(&mut ctx, &mut addresses, function).unwrap();
+        cache
+            .lift_into(&x64, decoder, &mut target, 0x1000, b"\x48\x89\xd8", scratch)
+            .map(|_| ())
+    };
+    lift(&x64, &decoder, &mut scratch).unwrap();
+    lift(&x64, &decoder, &mut scratch).unwrap();
+    assert_eq!(cache.stats().hits, 1);
+
+    let x86 = SleighLifter::new(sleigh_precompile::x86::spec());
+    assert_eq!(
+        lift(&x86, &decoder, &mut scratch).err(),
+        Some(LiftError::IncompatibleContext)
+    );
+    let foreign =
+        FixedDecoder::with_context(sleigh_precompile::x86::spec(), decoder.context().clone())
+            .unwrap();
+    assert_eq!(
+        lift(&x64, &foreign, &mut scratch).err(),
+        Some(LiftError::IncompatibleSpec)
+    );
+    assert_eq!(
+        cache
+            .decode_len(&x64, &foreign, 0x1000, b"\x48\x89\xd8")
+            .err(),
+        Some(LiftError::IncompatibleSpec)
+    );
+}
+
+#[test]
+fn shapes_of_two_lengths_on_one_leaf_keep_their_own_templates() {
+    // `long` is more specific than `short`, so `short` is taken only where
+    // `long` cannot be: at the end of the stream. Both shapes' masks are
+    // the first byte, so they meet at one leaf of the trie, and a template
+    // of one length must not serve an instruction of the other.
+    let mut sources = sleigh::SourceDb::new();
+    let root = sources.add_file(
+        "lengths.slaspec",
+        "define endian=little;
+         define space ram type=ram_space size=4 default;
+         define space register type=register_space size=4;
+         define register offset=0 size=4 [ r0 r1 r2 r3 ];
+         define token instr(8) hi=(4,7) lo=(0,3);
+         define token regs(8) r=(0,1) s=(2,3);
+         attach variables [ r s ] [ r0 r1 r2 r3 ];
+         sub: is lo=1 { r1 = 1; }
+         sub: is lo=2 { r1 = 2; }
+         :long r, s is hi=1 & lo=1 ; r & s { r = s; }
+         :short is hi=1 & sub { r0 = 1; }"
+            .to_string(),
+    );
+    let spec: &'static _ = Box::leak(Box::new(
+        sleigh::Compiler::new(&mut sources).compile(root).unwrap(),
+    ));
+    // Flat, as a scratch session lowers, so that the two share entries.
+    let lifter = SleighLifter::new(spec).with_flat_control_flow();
+    let decoder = FixedDecoder::new(spec);
+    let cache = Arc::new(LiftCache::new(spec));
+    let mut session = ScratchSession::new(&lifter).with_cache(Arc::clone(&cache));
+    // `long r0, r1`, then `short` at the end of the stream.
+    session.lift(0x1000, &[0x11, 0x04]).unwrap();
+    session.lift(0x2000, &[0x11]).unwrap();
+    // `long r0, r0`: its registers coincide, which the first template's
+    // instance does not.
+    let bytes = [0x11, 0x00];
+    assert_eq!(decoder.decode(0x3000, &bytes).unwrap().len(), 2);
+    assert_eq!(
+        cache.decode_len(&lifter, &decoder, 0x3000, &bytes).unwrap(),
+        2
+    );
+}
+
+#[test]
+fn a_shape_that_fails_validation_is_not_cached_again() {
+    // `v` is `b` but for bit 5, flipped when bit 1 is set and bit 2 clear:
+    // linear wherever the probes of `b = 0` look — at 1 and at 0xff — and
+    // wrong at 2, where only validation sees it.
+    let mut sources = sleigh::SourceDb::new();
+    let root = sources.add_file(
+        "nonlinear.slaspec",
+        "define endian=little;
+         define space ram type=ram_space size=4 default;
+         define space register type=register_space size=4;
+         define register offset=0 size=4 [ r0 ];
+         define token instr(8) op=(0,7);
+         define token imm(8) b=(0,7);
+         :f v is op=1 ; b [ v = b ^ ((((b >> 1) & ~(b >> 2)) & 1) << 5); ] { r0 = v; }"
+            .to_string(),
+    );
+    let spec: &'static _ = Box::leak(Box::new(
+        sleigh::Compiler::new(&mut sources).compile(root).unwrap(),
+    ));
+    let lifter = SleighLifter::new(spec);
+    let cache = Arc::new(LiftCache::new(spec).validating(true));
+    let mut session = ScratchSession::new(&lifter).with_cache(Arc::clone(&cache));
+    session.lift(0x1000, &[1, 0]).unwrap();
+    session.lift(0x1000, &[1, 2]).unwrap();
+    let stats = cache.stats();
+    assert_eq!(stats.validation_failures, 1, "{stats:?}");
+    // The shape is known bad: no instance of it is probed or served again.
+    session.lift(0x1000, &[1, 0]).unwrap();
+    session.lift(0x1000, &[1, 2]).unwrap();
+    let after = cache.stats();
+    assert_eq!(after.misses, stats.misses, "{after:?}");
+    assert_eq!(after.validation_failures, 1, "{after:?}");
+    assert_eq!(after.entries, 1, "{after:?}");
 }

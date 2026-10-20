@@ -69,6 +69,64 @@ fn decode_for<'spec, 'b>(
     })
 }
 
+impl LiftCache {
+    /// Lifts the instruction at `address` from `bytes` into `target` through
+    /// the cache, as [`LiftSession::lift`] does, for a caller that binds its
+    /// own target: replayed without a decode when its shape is known, else
+    /// decoded with `decoder`, lowered by `lifter` and remembered.
+    ///
+    /// A hit is refused what a miss is: a `target` not of the lifter's
+    /// specification, or a `decoder` of another, since the template names
+    /// the lifter's registers.
+    pub fn lift_into<'spec>(
+        &self,
+        lifter: &SleighLifter<'spec>,
+        decoder: &FixedDecoder<'spec>,
+        target: &mut LiftTarget<'_, 'static>,
+        address: u64,
+        bytes: &[u8],
+        scratch: &mut ReplayScratch,
+    ) -> Result<Lifted, LiftError> {
+        lifter.check_fingerprint(decoder.fingerprint())?;
+        lifter.check_compatible(target.context())?;
+        let how = Lowering {
+            lifter,
+            decoder,
+            flat: lifter.flat_control_flow(),
+        };
+        if let Some((template, instance)) = self.find_undecoded(how, address, bytes)? {
+            return template.replay(target, &instance, scratch);
+        }
+        let (instruction, shape) = decode_for(self, decoder, address, bytes)?;
+        self.lower(how, target, &instruction, shape, scratch)
+    }
+}
+
+/// Brings `addresses` up to `ctx`, if a change to the addresses the context
+/// covers was made without it: through [`LiftSession::context_mut`], the one
+/// way the context moves without the session. Instruction-level edits do not
+/// move it, so a caller that only rewrites instructions never pays for this.
+fn catch_up(ctx: &Context<'static>, addresses: &mut AddressIndex) {
+    if !addresses.is_current(ctx) {
+        addresses.refresh(ctx);
+    }
+}
+
+/// The target a session lifts into, naming its values or not.
+fn bind<'a>(
+    ctx: &'a mut Context<'static>,
+    addresses: &'a mut AddressIndex,
+    function: FunctionId,
+    naming: bool,
+) -> Result<LiftTarget<'a, 'static>, TargetError> {
+    let target = LiftTarget::bind_indexed(ctx, addresses, function)?;
+    Ok(if naming {
+        target
+    } else {
+        target.without_debug_names()
+    })
+}
+
 /// Which function a session lifts into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Host {
@@ -90,6 +148,7 @@ pub struct LiftSession<'l, 'spec> {
     function: FunctionId,
     cache: Option<Arc<LiftCache>>,
     scratch: ReplayScratch,
+    naming: bool,
 }
 
 impl<'l, 'spec> LiftSession<'l, 'spec> {
@@ -106,6 +165,7 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
             function,
             cache: None,
             scratch: ReplayScratch::default(),
+            naming: true,
         }
     }
 
@@ -131,6 +191,7 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
             function,
             cache: None,
             scratch: ReplayScratch::default(),
+            naming: true,
         })
     }
 
@@ -159,6 +220,17 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
         self
     }
 
+    /// Gives the values the session lifts no debug names: no register load
+    /// named after its register, no instruction named at all, and the table
+    /// that keeps such names unique stays empty. The IR means the same, but
+    /// prints its values by number, and a name that a pass later asks for
+    /// is made then. A body holds millions of them, so this is what a
+    /// consumer keeping a whole binary asks for.
+    pub fn without_debug_names(mut self) -> Self {
+        self.naming = false;
+        self
+    }
+
     pub fn lifter(&self) -> &'l SleighLifter<'spec> {
         self.lifter
     }
@@ -174,6 +246,30 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
         &self.ctx
     }
 
+    /// The IR so far, to change. Every [`Lifted`] this session returned
+    /// describes blocks of this context, and a change can invalidate them.
+    ///
+    /// Rewriting instructions leaves the session as it was. A change to the
+    /// addresses blocks or functions carry is noticed by the next lift,
+    /// which rebuilds the session's address index once: see
+    /// [`Context::revision`].
+    pub fn context_mut(&mut self) -> &mut Context<'static> {
+        &mut self.ctx
+    }
+
+    /// Lifts into `host` from now on, in this session's context: the
+    /// instructions lifted so far stay where they are. One session, and its
+    /// one address index, so lifting a module function by function costs
+    /// nothing per function beyond the function: a session per function
+    /// would rebuild the index of everything lifted before it.
+    ///
+    /// Returns the function selected.
+    pub fn set_host(&mut self, host: Host) -> FunctionId {
+        catch_up(&self.ctx, &mut self.addresses);
+        self.function = Self::select(&mut self.ctx, &mut self.addresses, host);
+        self.function
+    }
+
     /// Whether a failed lift left the context holding IR it could not take
     /// back. A poisoned session refuses every further lift and
     /// [`into_context`](Self::into_context); its context is still readable
@@ -182,48 +278,54 @@ impl<'l, 'spec> LiftSession<'l, 'spec> {
         self.ctx.is_poisoned()
     }
 
-    #[cfg(test)]
-    fn context_mut_for_test(&mut self) -> &mut Context<'static> {
-        &mut self.ctx
-    }
-
     /// Decodes the instruction at `address` from `bytes` with the session's
     /// fixed context and lifts it. An encoding the session's cache knows is
     /// replayed without a decode.
     pub fn lift(&mut self, address: u64, bytes: &[u8]) -> Result<Lifted, LiftError> {
+        catch_up(&self.ctx, &mut self.addresses);
         let Some(cache) = &self.cache else {
             let instruction = self.decoder.decode(address, bytes)?;
             return self.lift_decoded(&instruction);
         };
-        let how = Lowering {
-            lifter: self.lifter,
-            decoder: &self.decoder,
-            flat: self.lifter.flat_control_flow(),
-        };
-        if let Some((template, instance)) = cache.find_undecoded(how, address, bytes)? {
-            let mut target =
-                LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
-            return template.replay(&mut target, &instance, &mut self.scratch);
-        }
-        let (instruction, shape) = decode_for(cache, &self.decoder, address, bytes)?;
-        let mut target =
-            LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
-        cache.lower(how, &mut target, &instruction, shape, &mut self.scratch)
+        let mut target = bind(
+            &mut self.ctx,
+            &mut self.addresses,
+            self.function,
+            self.naming,
+        )?;
+        cache.lift_into(
+            self.lifter,
+            &self.decoder,
+            &mut target,
+            address,
+            bytes,
+            &mut self.scratch,
+        )
     }
 
     /// Lifts an instruction the caller decoded, with whatever context it
     /// chose.
     pub fn lift_decoded(&mut self, instruction: &Instruction<'_, '_>) -> Result<Lifted, LiftError> {
-        let mut target =
-            LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
+        catch_up(&self.ctx, &mut self.addresses);
+        let mut target = bind(
+            &mut self.ctx,
+            &mut self.addresses,
+            self.function,
+            self.naming,
+        )?;
         self.lifter.lift_into(&mut target, instruction)
     }
 
     /// Lifts already-flattened p-code of the session's specification, for a
     /// caller inspecting or caching that intermediate.
     pub fn lift_pcode(&mut self, flat: &FlatPcode) -> Result<Lifted, LiftError> {
-        let mut target =
-            LiftTarget::bind_indexed(&mut self.ctx, &mut self.addresses, self.function)?;
+        catch_up(&self.ctx, &mut self.addresses);
+        let mut target = bind(
+            &mut self.ctx,
+            &mut self.addresses,
+            self.function,
+            self.naming,
+        )?;
         self.lifter.lift_pcode_into(&mut target, flat)
     }
 
@@ -1041,6 +1143,71 @@ mod tests {
     }
 
     #[test]
+    fn a_session_lifts_function_after_function_in_one_context() {
+        let lifter = lifter();
+        let mut session = LiftSession::new(&lifter, Host::At(0x1000));
+        let first = session.function();
+        session.lift(0x1000, b"\x48\x89\xd8").unwrap();
+        let second = session.set_host(Host::At(0x2000));
+        assert_ne!(first, second);
+        let lifted = session.lift(0x2000, b"\xc3").unwrap();
+        assert_eq!(lifted.entry().func, second);
+        // A function already in the context is selected, not made twice.
+        assert_eq!(session.set_host(Host::At(0x1000)), first);
+        let continued = session.lift(0x1003, b"\xc3").unwrap();
+        assert_eq!(continued.entry().func, first);
+        assert_eq!(session.into_context().unwrap().functions().count(), 2);
+    }
+
+    #[test]
+    fn a_session_without_debug_names_names_nothing_and_lifts_the_same() {
+        let lifter = lifter();
+        let code = [
+            (0x1000, &b"\x48\x89\xd8"[..]),
+            (0x1003, b"\x48\x01\xc3"),
+            (0x1006, b"\xc3"),
+        ];
+        let lift = |session: &mut LiftSession<'_, '_>| {
+            for (address, bytes) in code {
+                session.lift(address, bytes).unwrap();
+            }
+            let function = session.function();
+            let ctx = session.context();
+            let body = FunctionBody::from_id(ctx, function);
+            let (mut insns, mut named) = (0, 0);
+            for block in body.blocks() {
+                for insn in block.instructions() {
+                    insns += 1;
+                    named += insn.name().is_some() as usize;
+                }
+            }
+            (insns, named)
+        };
+        let (insns, named) = lift(&mut LiftSession::new(&lifter, Host::At(0x1000)));
+        let (plain_insns, plain_named) =
+            lift(&mut LiftSession::new(&lifter, Host::At(0x1000)).without_debug_names());
+        assert!(named > 0, "a lift names its register loads");
+        assert_eq!(plain_named, 0);
+        assert_eq!(plain_insns, insns);
+    }
+
+    #[test]
+    fn a_session_notices_a_change_to_addresses_made_through_its_context() {
+        let lifter = lifter();
+        let mut session = LiftSession::new(&lifter, Host::At(0x1000));
+        session.lift(0x1000, b"\x48\x89\xd8").unwrap();
+        // An address registered behind the session's back: its index is now
+        // behind the context, and the next lift catches up instead of failing.
+        let other = {
+            let ctx = session.context_mut();
+            let mut addresses = AddressIndex::analyze(ctx);
+            FunctionBody::from_addr_or_create_indexed(ctx, &mut addresses, 0x3000).id
+        };
+        session.lift(0x1003, b"\xc3").unwrap();
+        assert_eq!(session.set_host(Host::At(0x3000)), other);
+    }
+
+    #[test]
     fn a_poisoned_session_refuses_to_lift_or_publish() {
         let lifter = lifter();
         let mut session = LiftSession::new(&lifter, Host::At(0x1000));
@@ -1052,7 +1219,7 @@ mod tests {
         // because the emitter wrote into the fall-through placeholder the
         // first instruction left, which the construction does not own.
         {
-            let ctx = session.context_mut_for_test();
+            let ctx = session.context_mut();
             let mut addresses = AddressIndex::analyze(ctx);
             let placeholder = addresses.block_at(0x1003).unwrap();
             let mut target = LiftTarget::bind_or_refresh(ctx, &mut addresses, function).unwrap();

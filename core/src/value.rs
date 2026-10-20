@@ -95,9 +95,9 @@ pub use bytes::{
     render_bytes_literal,
 };
 pub use function::{
-    ArgMemKind, BodyArenaKindStats, BodyArenaStats, DerivedOutput, ExternArg, ExternArgmem,
-    ExternInterface, ExternSlot, Footprint, FunctionBody, FunctionEffects, FunctionId,
-    FunctionKind, FunctionMutRef, FunctionRef, InterfaceSlot, MemoryChannelState,
+    ArgMemKind, BodyArenaKindStats, BodyArenaStats, BodyMemory, DerivedOutput, ExternArg,
+    ExternArgmem, ExternInterface, ExternSlot, Footprint, FunctionBody, FunctionEffects,
+    FunctionId, FunctionKind, FunctionMutRef, FunctionRef, InterfaceSlot, MemoryChannelState,
     MemoryInterfaceMap, ParamAttrs, ProtoMap, ProtoOp, RamBase, RamField, RamLocations, RamObject,
     RamRegion, RegisterChannelState, RegisterEffectSets, RegisterInterfaceMap, SlotBase,
     WrittenSpaces, WrittenSpacesState,
@@ -125,6 +125,7 @@ pub mod literal;
 pub mod name;
 pub mod poison;
 pub mod registry;
+pub(crate) mod roster;
 pub mod temp;
 pub(crate) mod uses;
 pub mod util;

@@ -1,8 +1,4 @@
-use jstd::{
-    Identifier,
-    registry::{Identified, Registry},
-    stable_arena::StableArena,
-};
+use jstd::{Identifier, registry::Registry, stable_arena::StableArena};
 use rustc_hash::FxHashSet;
 use std::{
     borrow::Cow,
@@ -36,7 +32,8 @@ use crate::{
         block_param::{BlockParam, BlockParamId, LocalParamId},
         insn::{LocalInsnId, Mnemonic},
         name::{BaseId, LocalNames, Name, hex_name},
-        uses::{SharedHeads, Use, UseArena, UseId, WithUsers},
+        roster::Roster,
+        uses::{SharedHeads, UseId, UseSlab, WithUsers},
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable, update_context_name},
@@ -458,7 +455,7 @@ pub struct FunctionBody<'str> {
     /// cross-arena ownership, so every entry indexes this function's `blocks`
     /// arena. Kept in sync with each block's `parent`.
     #[serde(default)]
-    pub(crate) roster: Vec<LocalBlockId>,
+    pub(crate) roster: Roster,
 
     /// Block-parameter storage for this function.
     pub(crate) params: StableArena<LocalParamId, BlockParam<'str>>,
@@ -511,7 +508,7 @@ pub struct FunctionBody<'str> {
     /// [`replace_instruction_mnemonic`](Self::replace_instruction_mnemonic), …),
     /// which are the only ways an installed instruction's operands change.
     #[serde(skip)]
-    pub(crate) uses: UseArena,
+    pub(crate) uses: UseSlab,
 
     /// Use-list heads for the shared values this body uses — literals, bytes,
     /// varnodes, functions, poison — which cannot carry a head themselves:
@@ -606,6 +603,76 @@ impl BodyArenaStats {
         self.blocks.add_assign(other.blocks);
         self.params.add_assign(other.params);
         self.edges.add_assign(other.edges);
+    }
+}
+
+/// The memory a function body holds, in bytes, by structure.
+///
+/// Counted by capacity — what the allocator was asked for — and excluding the
+/// allocator's own bookkeeping, so a body that has been
+/// [shrunk to fit](FunctionBody::shrink_to_fit) reports what it keeps. The
+/// values a module shares between its bodies (types, literals, varnodes) are
+/// not here; they belong to the [`Context`].
+///
+/// Heap owned by an instruction's mnemonic (the argument list of a call, say)
+/// is not counted: it is absent from a lift of straight-line code, and the
+/// total over every structure is what a counting allocator checks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BodyMemory {
+    /// The [`Instruction`] records.
+    pub instructions: usize,
+    /// The instruction arena's id-to-slot index: the stable id of each
+    /// record and where it is stored.
+    pub instruction_index: usize,
+    /// The [`BasicBlock`] records, and the arena index for them.
+    pub blocks: usize,
+    /// What blocks own on the heap: parameter lists, edge sets spilled past
+    /// their inline room, extra addresses, comments.
+    pub block_heap: usize,
+    /// The block roster.
+    pub roster: usize,
+    /// Block parameters.
+    pub params: usize,
+    /// CFG edges.
+    pub edges: usize,
+    /// Use edges (the def-use relation), and the heads kept for shared values.
+    pub uses: usize,
+    /// The name table, apart from the names the values carry.
+    pub names: usize,
+    /// The set of machine-instruction addresses lifted into the body.
+    pub instruction_addrs: usize,
+    /// Temporaries and temporary spaces.
+    pub temps: usize,
+}
+
+impl BodyMemory {
+    /// The sum over every structure.
+    pub fn total(&self) -> usize {
+        self.instructions
+            + self.instruction_index
+            + self.blocks
+            + self.block_heap
+            + self.roster
+            + self.params
+            + self.edges
+            + self.uses
+            + self.names
+            + self.instruction_addrs
+            + self.temps
+    }
+
+    pub(crate) fn add_assign(&mut self, other: Self) {
+        self.instructions += other.instructions;
+        self.instruction_index += other.instruction_index;
+        self.blocks += other.blocks;
+        self.block_heap += other.block_heap;
+        self.roster += other.roster;
+        self.params += other.params;
+        self.edges += other.edges;
+        self.uses += other.uses;
+        self.names += other.names;
+        self.instruction_addrs += other.instruction_addrs;
+        self.temps += other.temps;
     }
 }
 
@@ -715,7 +782,7 @@ impl Iterator for Users<'_, '_> {
 
     fn next(&mut self) -> Option<LocalInsnId> {
         let edge = &self.body.uses[self.at?];
-        self.at = edge.next;
+        self.at = edge.next();
         Some(edge.user)
     }
 }
@@ -731,10 +798,45 @@ impl<'str> FunctionBody<'str> {
         }
     }
 
+    /// The memory this body holds, by structure. See [`BodyMemory`].
+    pub fn memory(&self) -> BodyMemory {
+        use std::mem::size_of;
+        let insns = BodyArenaKindStats::stable_arena(&self.insns);
+        let blocks = BodyArenaKindStats::stable_arena(&self.blocks);
+        // A `BTreeSet<u64>` keeps up to eleven keys in a node of their own
+        // plus two words of bookkeeping; a node is on average two thirds full.
+        let addr_nodes = (self.instruction_addrs.len() * 3).div_ceil(2 * 11);
+        BodyMemory {
+            instructions: insns.capacity * size_of::<Instruction<'str>>(),
+            instruction_index: insns.structural_bytes
+                - insns.capacity * size_of::<Instruction<'str>>(),
+            blocks: blocks.structural_bytes,
+            block_heap: self
+                .blocks
+                .iter()
+                .map(|b| {
+                    b.params.capacity() * size_of::<LocalParamId>()
+                        + b.edges.heap_bytes()
+                        + b.extra_addresses.capacity() * size_of::<u64>()
+                        + b.comment_bytes()
+                })
+                .sum(),
+            roster: self.roster.heap_bytes(),
+            params: BodyArenaKindStats::stable_arena(&self.params).structural_bytes,
+            edges: BodyArenaKindStats::stable_arena(&self.edges).structural_bytes,
+            uses: self.uses.heap_bytes() + self.shared_first_use.heap_bytes(),
+            names: self.names.heap_bytes(),
+            instruction_addrs: self.instruction_addrs.len() * size_of::<u64>()
+                + addr_nodes * (2 * size_of::<usize>() + size_of::<u64>() / 2),
+            temps: self.temps.len() * size_of::<Temp<'str>>()
+                + self.temp_spaces.len() * size_of::<TempSpace>(),
+        }
+    }
+
     /// Releases structural capacity retained from peak analysis churn.
     ///
     /// Covers the four body arenas plus the block-owned instruction/parameter/
-    /// edge collections, the roster, and the use edges. IDs, liveness,
+    /// edge collections, the roster, the use edges and the name table. IDs, liveness,
     /// ordering, and every semantic invariant are unchanged — this is an
     /// allocator hint for explicit end-of-mutation boundaries, never a
     /// correctness barrier.
@@ -750,6 +852,7 @@ impl<'str> FunctionBody<'str> {
         }
         self.uses.shrink_to_fit();
         self.shared_first_use.shrink_to_fit();
+        self.names.shrink_to_fit();
     }
 
     /// Install a registry ID onto a freshly [`detached`](Self::detached) body at
@@ -802,14 +905,14 @@ impl<'str> FunctionBody<'str> {
             root: None,
             insns: StableArena::default(),
             blocks: StableArena::default(),
-            roster: Vec::new(),
+            roster: Roster::default(),
             params: StableArena::default(),
             edges: StableArena::default(),
             temp_spaces: Registry::default(),
             temps: Registry::default(),
             instruction_addrs: BTreeSet::new(),
             names: LocalNames::default(),
-            uses: UseArena::default(),
+            uses: UseSlab::default(),
             shared_first_use: SharedHeads::default(),
             clock: crate::context::ShapeClock::default(),
         }
@@ -828,14 +931,14 @@ impl<'str> FunctionBody<'str> {
             root: None,
             insns: StableArena::default(),
             blocks: StableArena::default(),
-            roster: Vec::new(),
+            roster: Roster::default(),
             params: StableArena::default(),
             edges: StableArena::default(),
             temp_spaces: Registry::default(),
             temps: Registry::default(),
             instruction_addrs: BTreeSet::new(),
             names: LocalNames::default(),
-            uses: UseArena::default(),
+            uses: UseSlab::default(),
             shared_first_use: SharedHeads::default(),
             clock: crate::context::ShapeClock::default(),
         }
@@ -1236,6 +1339,7 @@ impl<'str> FunctionBody<'str> {
         insn.prev.set(None);
         insn.next.set(None);
         insn.first_use.set(None);
+        insn.use_run.set(None);
         let local = self.insns.push(insn);
         self.add_operand_uses(local);
         local
@@ -1256,6 +1360,7 @@ impl<'str> FunctionBody<'str> {
         insn.prev.set(last);
         insn.next.set(None);
         insn.first_use.set(None);
+        insn.use_run.set(None);
         let local = self.insns.push(insn);
         self.add_operand_uses(local);
         match last {
@@ -1652,39 +1757,32 @@ impl<'str> FunctionBody<'str> {
         let new_has_home = self.has_use_home(new);
         let mut new_head = self.first_use_of(new);
         let mut old_head = self.first_use_of(old);
-        let mut prev: Option<UseId> = None;
+        // The last edge kept: what the next one moved comes out after.
+        let mut kept: Option<UseId> = None;
         let mut at = old_head;
         while let Some(edge) = at {
-            let Use {
-                user,
-                operand_index,
-                next,
-                ..
-            } = self.uses[edge];
+            let (user, next) = {
+                let edge = &self.uses[edge];
+                (edge.user, edge.next())
+            };
             at = next;
-            if !select(
-                self,
-                InstructionId::new(func, user),
-                usize::from(operand_index),
-            ) {
-                prev = Some(edge);
+            let run = self.insns[user].use_run.get().expect("a use has a run");
+            let operand_index = UseSlab::operand_index(edge, run);
+            if !select(self, InstructionId::new(func, user), operand_index) {
+                kept = Some(edge);
                 continue;
             }
-            match prev {
-                None => old_head = next,
-                Some(prev) => self.uses[prev].next = next,
+            self.uses.unlink(edge);
+            if kept.is_none() {
+                old_head = next;
             }
             self.insns[user]
                 .mnemonic_mut()
-                .set_operand(usize::from(operand_index), new);
+                .set_operand(operand_index, new);
+            // A dangling operand records no use: its edge stays unlinked.
             if new_has_home {
-                let moved = &mut self.uses[edge];
-                moved.value = new;
-                moved.next = new_head;
+                self.uses.push_front(edge, new_head);
                 new_head = Some(edge);
-            } else {
-                // A dangling operand records no use.
-                self.uses.remove(edge);
             }
         }
         if self.has_use_home(old) {
@@ -1937,13 +2035,15 @@ impl<'str> FunctionBody<'str> {
     // ---- use edges ---------------------------------------------------------
     //
     // Every operand occurrence in this body is one `Use` edge, threaded into a
-    // singly linked list per used value whose head the value holds (or, for a
-    // shared value, `shared_first_use` holds). The verbs below are the only
-    // ones that touch the edges; the public verbs that create, delete and
-    // rewrite instructions are built on them, and an installed instruction's
-    // operands never change any other way. Prepending keeps every edge
-    // operation constant-time except for finding one edge in a list, which
-    // costs the value's fanout — small, in practice.
+    // doubly linked list per used value whose head the value holds (or, for a
+    // shared value, `shared_first_use` holds), and the edges of one
+    // instruction's operands are a run its record names. The verbs below are
+    // the only ones that touch the edges; the public verbs that create,
+    // delete and rewrite instructions are built on them, and an installed
+    // instruction's operands never change any other way. Finding an
+    // operand's edge is an addition and taking it out of its list is
+    // constant-time, so what a verb costs is what it touches, never the
+    // fanout of a value it names.
 
     /// Whether this body has storage for `value`, and so a place for its
     /// use-list head. Always true for a shared value.
@@ -1995,21 +2095,13 @@ impl<'str> FunctionBody<'str> {
         }
     }
 
-    /// Records that `user`'s operand `operand_index` names `value`, at the
-    /// front of `value`'s use list.
-    ///
-    /// `None`, and nothing recorded, when this body has no storage for
-    /// `value`: the operand is dangling, which the integrity check reports,
-    /// and which a clone into another function's arenas leaves behind until
-    /// the caller remaps the operands and rebuilds the edges.
+    /// Links `edge`, unlinked, at the front of `value`'s use list. `false`
+    /// and nothing linked when this body has no storage for `value`: the
+    /// operand is dangling, which the integrity check reports, and which a
+    /// clone into another function's arenas leaves behind until the caller
+    /// remaps the operands and rebuilds the edges.
     #[inline]
-    pub(crate) fn add_use(
-        &mut self,
-        value: LocalValueId,
-        user: LocalInsnId,
-        operand_index: usize,
-    ) -> Option<UseId> {
-        let operand_index = u16::try_from(operand_index).expect("operand index fits a use edge");
+    fn link_use(&mut self, edge: UseId, value: LocalValueId) -> bool {
         // One match, and one lookup of the value: this runs for every
         // operand of every instruction a lift emits.
         let Self {
@@ -2021,98 +2113,70 @@ impl<'str> FunctionBody<'str> {
             shared_first_use,
             ..
         } = self;
-        let mut edge = Use {
-            value,
-            user,
-            operand_index,
-            next: None,
-        };
         match value {
             LocalValueId::Instruction(id) => {
-                let holder = insns.get_mut(id)?.inner;
-                edge.next = holder.first_use.get();
-                let edge = uses.push(edge);
+                let Some(holder) = insns.get_mut(id) else {
+                    return false;
+                };
+                let holder = holder.inner;
+                uses.push_front(edge, holder.first_use.get());
                 holder.first_use.set(Some(edge));
-                Some(edge)
             }
             LocalValueId::BlockParam(id) => {
-                let holder = params.get_mut(id)?.inner;
-                edge.next = holder.first_use;
-                let edge = uses.push(edge);
+                let Some(holder) = params.get_mut(id) else {
+                    return false;
+                };
+                let holder = holder.inner;
+                uses.push_front(edge, holder.first_use);
                 holder.first_use = Some(edge);
-                Some(edge)
             }
             LocalValueId::BasicBlock(id) => {
-                let holder = blocks.get_mut(id)?.inner;
-                edge.next = holder.first_use();
-                let edge = uses.push(edge);
+                let Some(holder) = blocks.get_mut(id) else {
+                    return false;
+                };
+                let holder = holder.inner;
+                uses.push_front(edge, holder.first_use());
                 holder.set_first_use(Some(edge));
-                Some(edge)
             }
             LocalValueId::Temp(id) => {
                 if usize::from(id) >= temps.len() {
-                    return None;
+                    return false;
                 }
                 let holder = &mut temps[id];
-                edge.next = holder.first_use;
-                let edge = uses.push(edge);
+                uses.push_front(edge, holder.first_use);
                 holder.first_use = Some(edge);
-                Some(edge)
             }
             LocalValueId::Literal(_)
             | LocalValueId::Bytes(_)
             | LocalValueId::Varnode(_)
             | LocalValueId::Function(_)
             | LocalValueId::Poison(_) => {
-                edge.next = shared_first_use.get(value);
-                let edge = uses.push(edge);
-                shared_first_use.set(value, Some(edge));
-                Some(edge)
+                shared_first_use.push_front(value, edge, uses);
             }
         }
-    }
-
-    /// Finds the edge recording that `user`'s operand `operand_index` names
-    /// `value`, with the edge before it in `value`'s list (`None` at the
-    /// head).
-    fn find_use(
-        &self,
-        value: LocalValueId,
-        user: LocalInsnId,
-        operand_index: usize,
-    ) -> Option<(Option<UseId>, UseId)> {
-        let mut prev = None;
-        let mut at = self.first_use_of(value);
-        while let Some(edge) = at {
-            let Use {
-                user: u,
-                operand_index: i,
-                next,
-                ..
-            } = self.uses[edge];
-            if u == user && usize::from(i) == operand_index {
-                return Some((prev, edge));
-            }
-            prev = Some(edge);
-            at = next;
-        }
-        None
-    }
-
-    /// Takes down the edge recording that `user`'s operand `operand_index`
-    /// names `value`. Returns whether there was one.
-    pub(crate) fn remove_use(
-        &mut self,
-        value: LocalValueId,
-        user: LocalInsnId,
-        operand_index: usize,
-    ) -> bool {
-        let Some((prev, edge)) = self.find_use(value, user, operand_index) else {
-            return false;
-        };
-        self.unlink_use(value, prev, edge);
-        self.uses.remove(edge);
         true
+    }
+
+    /// Takes `edge`, which names `value`, out of `value`'s use list. Returns
+    /// whether it was in one: an edge of a dangling operand is not.
+    #[inline]
+    fn unlink_use(&mut self, edge: UseId, value: LocalValueId) -> bool {
+        // An edge with no `prev` is the head of its value's list, or in no
+        // list at all; the head tells which.
+        if self.uses[edge].prev().is_none() && self.first_use_of(value) != Some(edge) {
+            return false;
+        }
+        let (prev, next) = self.uses.unlink(edge);
+        if prev.is_none() {
+            self.set_first_use_of(value, next);
+        }
+        true
+    }
+
+    /// The run of `user`'s operand edges.
+    #[inline]
+    fn use_run_of(&self, user: LocalInsnId) -> Option<UseId> {
+        self.insns[user].use_run.get()
     }
 
     /// Rewrites `user`'s operand `operand_index` from `old` to `new`, moving
@@ -2135,41 +2199,11 @@ impl<'str> FunctionBody<'str> {
         self.insns[user]
             .mnemonic_mut()
             .set_operand(operand_index, new);
-        match self.find_use(old, user, operand_index) {
-            Some((prev, edge)) => {
-                self.unlink_use(old, prev, edge);
-                self.relink_use(edge, new);
-            }
-            // A dangling operand had no edge to move; it may have a home now.
-            None => {
-                self.add_use(new, user, operand_index);
-            }
-        }
-    }
-
-    /// Unlinks `edge` from `value`'s list, `prev` being the edge before it
-    /// (`None` at the head). The edge stays allocated for the caller to free
-    /// or relink.
-    fn unlink_use(&mut self, value: LocalValueId, prev: Option<UseId>, edge: UseId) {
-        let next = self.uses[edge].next;
-        match prev {
-            None => self.set_first_use_of(value, next),
-            Some(prev) => self.uses[prev].next = next,
-        }
-    }
-
-    /// Points the unlinked `edge` at `new` and prepends it to `new`'s list —
-    /// or frees it, when this body has no storage for `new`.
-    fn relink_use(&mut self, edge: UseId, new: LocalValueId) {
-        if !self.has_use_home(new) {
-            self.uses.remove(edge);
-            return;
-        }
-        let head = self.first_use_of(new);
-        let use_ = &mut self.uses[edge];
-        use_.value = new;
-        use_.next = head;
-        self.set_first_use_of(new, Some(edge));
+        let run = self.use_run_of(user).expect("an operand has a run");
+        let edge = UseSlab::at(run, operand_index);
+        self.unlink_use(edge, old);
+        // A dangling operand had no edge to move; it may have a home now.
+        self.link_use(edge, new);
     }
 
     /// Records a use edge for each operand of `insn`: on creation, and after
@@ -2179,28 +2213,44 @@ impl<'str> FunctionBody<'str> {
         // so the operands are read out first: inline for up to two, which
         // covers most instructions.
         let operands = self.insns[insn].mnemonic().args();
+        self.add_uses_of(insn, &operands);
+    }
+
+    /// Records a use edge for each of `operands`, which are those of `insn`:
+    /// for a caller that has them already.
+    pub(crate) fn add_uses_of(&mut self, insn: LocalInsnId, operands: &[LocalValueId]) {
+        if operands.is_empty() {
+            return;
+        }
+        let run = self.uses.alloc_run(insn, operands.len());
+        self.insns[insn].use_run.set(Some(run));
         for (index, &value) in operands.iter().enumerate() {
-            self.add_use(value, insn, index);
+            self.link_use(UseSlab::at(run, index), value);
         }
     }
 
     /// Takes down the use edges of every operand of `insn`: before it is
     /// deleted, or its mnemonic swapped.
     fn remove_operand_uses(&mut self, insn: LocalInsnId) {
+        let Some(run) = self.insns[insn].use_run.take() else {
+            return;
+        };
         let operands = self.insns[insn].mnemonic().args();
-        for (index, value) in operands.into_iter().enumerate() {
-            self.remove_use(value, insn, index);
+        for (index, &value) in operands.iter().enumerate() {
+            self.unlink_use(UseSlab::at(run, index), value);
         }
+        self.uses.free_run(run, operands.len());
     }
 
-    /// Frees every edge in `value`'s use list, for a value about to lose its
-    /// storage. Its users, if any are left, keep naming it: they are dangling
-    /// operands, allowed while a transformation is in progress and reported
-    /// by the integrity check once it is not.
+    /// Takes every edge out of `value`'s use list, for a value about to lose
+    /// its storage. Its users, if any are left, keep naming it: they are
+    /// dangling operands, allowed while a transformation is in progress and
+    /// reported by the integrity check once it is not.
     fn drop_uses_of(&mut self, value: LocalValueId) {
         let mut at = self.first_use_of(value);
         while let Some(edge) = at {
-            at = self.uses.remove(edge).next;
+            at = self.uses[edge].next();
+            self.uses.detach(edge);
         }
         if self.has_use_home(value) {
             self.set_first_use_of(value, None);
@@ -2210,55 +2260,59 @@ impl<'str> FunctionBody<'str> {
     /// Takes down every use edge in and out of the instructions in `dead`,
     /// which are about to be deleted.
     ///
-    /// The bulk path: rather than finding each dead instruction's edge in
-    /// each of its operands' lists — a walk per dead user — this walks the
-    /// list of each operand any dead instruction names once, freeing the
-    /// edges whose user is dead. A lifted block deletes hundreds of
-    /// instructions sharing a few operands, and that product mattered. An
-    /// operand that is itself dead is not walked: its whole list goes with
-    /// it.
+    /// The bulk path, which costs what `dead` and the uses of it cost and
+    /// nothing for the length of any use list it touches: each dead
+    /// instruction's edges come out of the lists of the live values it names
+    /// in constant time, and a dead value's list goes as a whole, its
+    /// surviving users left dangling.
     pub(crate) fn remove_uses_of_dead_instructions(&mut self, dead: &FxHashSet<LocalInsnId>) {
-        let mut operands: FxHashSet<LocalValueId> = FxHashSet::default();
+        // A dead value's list is dropped below, with the edges of the dead
+        // that are in it, so those are not taken out one by one.
+        let mut runs = Vec::with_capacity(dead.len());
         for &id in dead {
-            self.insns[id].mnemonic().for_each_operand(|value| {
-                if let LocalValueId::Instruction(user) = value
-                    && dead.contains(&user)
+            let Some(run) = self.insns[id].use_run.take() else {
+                continue;
+            };
+            let operands = self.insns[id].mnemonic().args();
+            for (index, &value) in operands.iter().enumerate() {
+                if let LocalValueId::Instruction(operand) = value
+                    && dead.contains(&operand)
                 {
-                    return;
+                    continue;
                 }
-                operands.insert(value);
-            });
-        }
-        for value in operands {
-            // The head is written back once, not once per edge unlinked
-            // at the front — which, the lists being prepended to, is where
-            // the edges of the newest users are.
-            let mut head = self.first_use_of(value);
-            let mut prev: Option<UseId> = None;
-            let mut at = head;
-            while let Some(edge) = at {
-                let Use { user, next, .. } = self.uses[edge];
-                at = next;
-                if dead.contains(&user) {
-                    match prev {
-                        None => head = next,
-                        Some(prev) => self.uses[prev].next = next,
-                    }
-                    self.uses.remove(edge);
-                } else {
-                    prev = Some(edge);
-                }
+                self.unlink_use(UseSlab::at(run, index), value);
             }
-            self.set_first_use_of(value, head);
+            runs.push((run, operands.len()));
         }
         for &id in dead {
             self.drop_uses_of(LocalValueId::Instruction(id));
         }
+        for (run, len) in runs {
+            self.uses.free_run(run, len);
+        }
     }
 
-    /// Rebuilds every use edge from the operands of this body's live
-    /// instructions: after deserialization, which does not carry the edges,
-    /// and after a relocation that rewrote operands wholesale.
+    /// Every edge in a use list, as the value it names, its user and its
+    /// operand number: for tests.
+    #[cfg(test)]
+    pub(crate) fn linked_uses(&self) -> Vec<(LocalValueId, LocalInsnId, usize)> {
+        let mut linked = Vec::new();
+        for insn in self.insns.iter() {
+            let Some(run) = insn.use_run.get() else {
+                continue;
+            };
+            let mut index = 0;
+            insn.mnemonic().for_each_operand(|value| {
+                let edge = UseSlab::at(run, index);
+                if self.uses[edge].prev().is_some() || self.first_use_of(value) == Some(edge) {
+                    linked.push((value, insn.id, index));
+                }
+                index += 1;
+            });
+        }
+        linked
+    }
+
     /// Rebuilds the name table from the values' names, after
     /// deserialization: the wire carries the names and the bases they index,
     /// not the table.
@@ -2308,6 +2362,7 @@ impl<'str> FunctionBody<'str> {
         self.shared_first_use.clear();
         for mut insn in self.insns.iter_mut() {
             insn.set_first_use(None);
+            insn.use_run.set(None);
         }
         for mut param in self.params.iter_mut() {
             param.set_first_use(None);
@@ -2324,11 +2379,6 @@ impl<'str> FunctionBody<'str> {
         }
     }
 
-    /// Every live use edge in this body, for the integrity check.
-    pub(crate) fn use_edges(&self) -> impl Iterator<Item = Identified<UseId, &Use>> + '_ {
-        self.uses.iter()
-    }
-
     /// Set `block`'s name and register it in this body's local name table, over a
     /// **body-local** block id (id-free; the twin of
     /// [`BaseRef::rename_local`](crate::value::util::base_ref::BaseRef::rename_local)
@@ -2338,17 +2388,15 @@ impl<'str> FunctionBody<'str> {
         self.set_local_name(LocalValueId::BasicBlock(block), &name)
     }
 
-    /// Whether `block`, body-local, is on this body's roster. A block is
-    /// rostered when it is pushed, so the newest is checked first: that is
-    /// the common question, and it costs nothing.
+    /// Whether `block`, body-local, is on this body's roster.
     pub(crate) fn is_rostered(&self, block: LocalBlockId) -> bool {
-        self.roster.last() == Some(&block) || self.roster.contains(&block)
+        self.roster.contains(block)
     }
 
     /// Drop `block` from this body's ownership roster. Ownership is derived from
     /// the storing arena (`block.func`).
     pub fn unroster_block(&mut self, block: BlockId) {
-        self.roster.retain(|&b| b != block.localize(block.func));
+        self.roster.remove(block.localize(block.func));
     }
 
     /// Remove `block` from this body: unlink every incident CFG edge, remove its
@@ -3081,7 +3129,6 @@ where
         self.inner()
             .roster
             .iter()
-            .copied()
             .map(|local| BlockId::new(func, local))
             .collect()
     }
@@ -3640,8 +3687,14 @@ mod tests {
 
         assert_eq!(ctx.bodies[a].root_id(), Some(a_root.local));
         assert_eq!(ctx.bodies[b].root_id(), Some(b_root.local));
-        assert_eq!(ctx.bodies[a].roster, vec![a_root.local]);
-        assert_eq!(ctx.bodies[b].roster, vec![b_root.local]);
+        assert_eq!(
+            ctx.bodies[a].roster.iter().collect::<Vec<_>>(),
+            vec![a_root.local]
+        );
+        assert_eq!(
+            ctx.bodies[b].roster.iter().collect::<Vec<_>>(),
+            vec![b_root.local]
+        );
         assert_eq!(
             FunctionBody::from_id(&ctx, a).root().map(|root| root.id),
             Some(a_root)
@@ -3934,6 +3987,35 @@ mod tests {
         let ids: Vec<_> = f.iter().map(|b| b.id).collect();
         assert!(ids.contains(&root));
         assert!(ids.contains(&extra));
+    }
+
+    #[test]
+    fn deleting_blocks_keeps_the_roster_in_order_and_whole() {
+        use crate::value::QCodeMut;
+
+        let mut ctx = Context::new();
+        let f = ctx.anon_function();
+        let blocks: Vec<BlockId> = (0..200)
+            .map(|k| ctx.get_or_make_block(0x1000 + k, f))
+            .collect();
+        let (gone, kept): (Vec<_>, Vec<_>) =
+            blocks.iter().partition(|b| usize::from(b.local) % 3 != 1);
+        for &&block in &gone {
+            ctx.delete_block(block);
+        }
+        assert_eq!(
+            crate::arena_integrity::verify_body_arena_integrity(&ctx),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            ctx.function_ref(f).block_ids(),
+            kept.into_iter().copied().collect::<Vec<_>>()
+        );
+        // A block pushed afterwards goes to the end, and is on the roster.
+        let fresh = ctx.get_or_make_block(0x9000, f);
+        assert_eq!(ctx.function_ref(f).block_ids().last(), Some(&fresh));
+        assert!(ctx.bodies[f].is_rostered(fresh.local));
+        assert!(!ctx.bodies[f].is_rostered(gone[0].local));
     }
 
     #[test]

@@ -144,9 +144,7 @@ impl<'str> FunctionBody<'str> {
             tail = Some(local);
             added += 1;
 
-            for (index, &value) in operands.iter().enumerate() {
-                self.add_use(value, local, index);
-            }
+            self.add_uses_of(local, &operands);
             if let Some(base) = op.base
                 && naming
             {

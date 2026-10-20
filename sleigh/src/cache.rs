@@ -176,7 +176,7 @@ pub struct CacheStats {
     pub exact: u64,
     /// Hits whose validation lift disagreed with the template. Only counted
     /// when [validating](LiftCache::validating); each such hit was discarded,
-    /// lifted for real, and its entry evicted.
+    /// lifted for real, and its shape marked uncacheable.
     pub validation_failures: u64,
     /// Shapes held, as templates or as uncacheable.
     pub entries: usize,
@@ -320,7 +320,6 @@ impl Node {
     }
 }
 
-/// The answer of [`LiftCache::find`].
 /// How a cache lowers: the lifter and the decoder it lowers with, and
 /// whether control flow is flattened. One instruction's worth of context,
 /// which the key and every probe need.
@@ -331,6 +330,7 @@ pub(crate) struct Lowering<'a, 'spec> {
     pub(crate) flat: bool,
 }
 
+/// The answer of [`LiftCache::find`].
 pub(crate) enum Lookup {
     /// The shape's template, instantiated for the instruction.
     Hit(Arc<Template>, Instance),
@@ -422,7 +422,7 @@ impl LiftCache {
     }
 
     /// Lifts every hit for real as well and compares the two, discarding
-    /// the replay and evicting the entry when they differ. For measuring
+    /// the replay and marking the shape uncacheable when they differ. For measuring
     /// the cache's exactness over a corpus; it costs every hit a full lift.
     pub fn validating(mut self, validating: bool) -> Self {
         self.validating = validating;
@@ -447,10 +447,35 @@ impl LiftCache {
 
     /// Forgets every shape; the counters stay.
     pub fn clear(&self) {
-        for shard in &self.shards {
-            shard.write().unwrap().clear();
+        // Every shard is held while the count is reset: an insert counts
+        // its entry under its shard's lock, so none lands between a
+        // shard's clearing and the reset, uncounted.
+        let mut guards: Vec<_> = self.shards.iter().map(|s| s.write().unwrap()).collect();
+        for shard in &mut guards {
+            shard.clear();
         }
         self.entries.store(0, Ordering::Relaxed);
+    }
+
+    /// The length of the instruction at `address`, at the front of `bytes`:
+    /// its shape's when the cache knows it, else decoded with `decoder`.
+    pub fn decode_len<'spec>(
+        &self,
+        lifter: &SleighLifter<'spec>,
+        decoder: &FixedDecoder<'spec>,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<usize, LiftError> {
+        lifter.check_fingerprint(decoder.fingerprint())?;
+        let how = Lowering {
+            lifter,
+            decoder,
+            flat: lifter.flat_control_flow(),
+        };
+        Ok(match self.find_undecoded(how, address, bytes)? {
+            Some((template, _)) => template.length,
+            None => decoder.decode(address, bytes)?.len(),
+        })
     }
 
     /// The shard of an instruction whose leading byte is `first`.
@@ -591,15 +616,25 @@ impl LiftCache {
             .leaf;
         match leaf {
             None => {
-                *leaf = Some(entry);
-                self.entries.fetch_add(1, Ordering::Relaxed);
+                // The check above is a fast path; the count is claimed
+                // here, so racing inserts cannot take the cache past its
+                // capacity. A claim past it is handed back.
+                if self.entries.fetch_add(1, Ordering::Relaxed) < self.capacity {
+                    *leaf = Some(entry);
+                } else {
+                    self.entries.fetch_sub(1, Ordering::Relaxed);
+                }
             }
             // The shape is known: a new way its registers coincide joins
-            // the entry, once.
+            // the entry, once. Masks that differ only in trailing unmasked
+            // bytes share a leaf, so another shape can land here too — one
+            // the decoder takes where this one's exclusions or length turn
+            // it away. Its templates are not this entry's to serve.
             Some(Entry {
+                len,
+                exclusions,
                 kind: Kind::Templates(known),
-                ..
-            }) => {
+            }) if *len == entry.len && *exclusions == entry.exclusions => {
                 if let Kind::Templates(new) = entry.kind
                     && let Some(template) = new.into_iter().next()
                 {
@@ -615,7 +650,8 @@ impl LiftCache {
         }
     }
 
-    fn evict(&self, prefix: &[u8], template: &Template) {
+    /// Marks the shape of `template`, which failed validation, uncacheable.
+    fn condemn(&self, prefix: &[u8], template: &Template) {
         let keys = &template.keys;
         let Some(&first) = keys.masked.first() else {
             return;
@@ -625,16 +661,14 @@ impl LiftCache {
         if let Some(node) = shard
             .get_mut(prefix)
             .and_then(|root| root.get_mut(&keys.mask[..depth], &keys.masked[..depth]))
-            && let Some(Entry {
-                kind: Kind::Templates(templates),
-                ..
-            }) = &mut node.leaf
+            && let Some(entry) = &mut node.leaf
+            && let Kind::Templates(templates) = &entry.kind
+            && templates.iter().any(|t| std::ptr::eq(&**t, template))
         {
-            templates.retain(|t| !std::ptr::eq(&**t, template));
-            if templates.is_empty() {
-                node.leaf = None;
-                self.entries.fetch_sub(1, Ordering::Relaxed);
-            }
+            // The probes missed how the shape moves, so another instance
+            // would probe it as wrongly: the shape is uncacheable, and stays
+            // an entry.
+            entry.kind = Kind::Uncacheable;
         }
     }
 
@@ -663,8 +697,8 @@ impl LiftCache {
     }
 
     /// What the cache holds for `instruction`. A hit is counted here, and
-    /// validated when the cache validates; a hit that fails validation is
-    /// evicted and reported uncacheable. Whatever the answer, the
+    /// validated when the cache validates; a hit that fails validation
+    /// marks its shape uncacheable and is reported so. Whatever the answer, the
     /// instruction is not lifted.
     pub(crate) fn find(
         &self,
@@ -690,7 +724,7 @@ impl LiftCache {
                     && !self.validate(lifter, &template, &instance, instruction, decoder, flat)?
                 {
                     self.validation_failures.fetch_add(1, Ordering::Relaxed);
-                    self.evict(prefix, &template);
+                    self.condemn(prefix, &template);
                     return Ok(Lookup::Uncacheable);
                 }
                 Lookup::Hit(template, instance)

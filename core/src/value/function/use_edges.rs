@@ -350,13 +350,9 @@ fn a_removed_use_slot_is_reused() {
     assert_eq!(users(&ctx, f, c), vec![ids[0], ids[3], fresh, again]);
 }
 
-/// The highest use slot in use, plus one: how far the slab has grown.
+/// How far the slab has grown.
 fn issued(ctx: &Context<'_>, f: FunctionId) -> usize {
-    ctx.bodies[f]
-        .use_edges()
-        .map(|edge| usize::from(edge.id) + 1)
-        .max()
-        .unwrap_or(0)
+    ctx.bodies[f].uses.slots()
 }
 
 #[test]
@@ -391,7 +387,7 @@ fn churning_a_block_does_not_grow_the_slab_past_its_peak() {
 }
 
 #[test]
-fn use_edges_iterate_over_the_holes_left_by_deletion() {
+fn the_slab_is_the_live_runs_and_the_free_ones() {
     let mut ctx = Context::new();
     let f = ctx.anon_function();
     let block = ctx.get_or_make_block(0x1000, f);
@@ -404,18 +400,20 @@ fn use_edges_iterate_over_the_holes_left_by_deletion() {
     ctx.remove_instruction(ids[3]);
     assert_clean(&ctx);
 
-    let edges: Vec<(usize, InstructionId)> = ctx.bodies[f]
-        .use_edges()
-        .map(|edge| (usize::from(edge.id), InstructionId::new(f, edge.user)))
+    let mut edges: Vec<InstructionId> = ctx.bodies[f]
+        .linked_uses()
+        .into_iter()
+        .map(|(_, user, _)| InstructionId::new(f, user))
         .collect();
-    assert_eq!(edges, vec![(0, ids[0]), (2, ids[2]), (4, ids[4])]);
+    edges.sort();
+    assert_eq!(edges, vec![ids[0], ids[2], ids[4]]);
     assert_eq!(ctx.bodies[f].uses.len(), 3);
-    assert!(!ctx.bodies[f].uses.contains(UseId::from(1)));
-    assert!(!ctx.bodies[f].uses.contains(UseId::from(3)));
+    assert_eq!(ctx.bodies[f].uses.slots(), 5);
+    assert_eq!(ctx.bodies[f].uses.free_slots(), 2);
 }
 
 #[test]
-fn rebuilding_forgets_the_holes_and_restarts_the_slab() {
+fn rebuilding_forgets_the_free_runs_and_restarts_the_slab() {
     let mut ctx = Context::new();
     let f = ctx.anon_function();
     let block = ctx.get_or_make_block(0x1000, f);
@@ -427,21 +425,17 @@ fn rebuilding_forgets_the_holes_and_restarts_the_slab() {
     for &id in &ids[..4] {
         ctx.remove_instruction(id);
     }
-    assert_eq!(issued(&ctx, f), 6, "the freed slots are still issued");
+    assert_eq!(issued(&ctx, f), 6, "the freed runs are still issued");
     let before = users(&ctx, f, c);
 
     ctx.bodies[f].rebuild_uses();
     assert_clean(&ctx);
     assert_eq!(users(&ctx, f, c), before);
     assert_eq!(issued(&ctx, f), 2, "the rebuilt slab is dense");
-    let slots: Vec<usize> = ctx.bodies[f]
-        .use_edges()
-        .map(|edge| usize::from(edge.id))
-        .collect();
-    assert_eq!(slots, vec![0, 1]);
+    assert_eq!(ctx.bodies[f].uses.free_slots(), 0);
 
     // The next edge takes the slot after the rebuilt ones, not one of the
-    // ids that were free before the rebuild.
+    // runs that were free before the rebuild.
     let fresh = ctx.builder(block).push_bit_negate(c).id;
     assert_clean(&ctx);
     assert_eq!(issued(&ctx, f), 3);
@@ -484,8 +478,90 @@ fn a_freed_slot_is_never_reachable_from_a_use_list() {
     assert_eq!(users(&ctx, f, ValueId::BlockParam(x)), vec![a, b, d]);
     assert_eq!(users(&ctx, f, ValueId::Instruction(b)), vec![d]);
     assert_eq!(
-        ctx.bodies[f].use_edges().count(),
-        ctx.bodies[f].uses.len(),
+        ctx.bodies[f].uses.slots(),
+        ctx.bodies[f].uses.len() + ctx.bodies[f].uses.free_slots(),
         "every slot is either live or on the free list"
     );
+}
+
+/// What `linked_uses` holds, sorted, to compare two bodies' edges.
+fn edges_of(ctx: &Context<'_>, f: FunctionId) -> Vec<(String, LocalInsnId, usize)> {
+    let mut edges: Vec<_> = ctx.bodies[f]
+        .linked_uses()
+        .into_iter()
+        .map(|(value, user, index)| (format!("{value:?}"), user, index))
+        .collect();
+    edges.sort();
+    edges
+}
+
+/// A deterministic stream of numbers, so the stress below is the same on
+/// every run.
+fn next_random(state: &mut u64) -> usize {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    (*state >> 11) as usize
+}
+
+#[test]
+fn removing_sets_of_instructions_keeps_the_edges_what_a_rebuild_derives() {
+    let mut state = 0x9e37_79b9_7f4a_7c15;
+    let mut ctx = Context::new();
+    let f = ctx.anon_function();
+    let block = ctx.get_or_make_block(0x1000, f);
+    let shared = [ctx.get_const(3, 8).id(), ctx.get_const(5, 8).id()];
+    let mut live: Vec<InstructionId> = Vec::new();
+    for round in 0..40 {
+        // Grow: each new instruction names two earlier values, so the
+        // values have long lists and the dead have live and dead users.
+        for _ in 0..24 {
+            let pick = |state: &mut u64, live: &[InstructionId]| match next_random(state) % 3 {
+                0 => shared[next_random(state) % shared.len()],
+                _ if live.is_empty() => shared[0],
+                _ => ValueId::Instruction(live[next_random(state) % live.len()]),
+            };
+            let lhs = pick(&mut state, &live);
+            let rhs = pick(&mut state, &live);
+            let id = ctx
+                .builder(block)
+                .push_binop(
+                    crate::value::insn::Binop::Int(crate::value::insn::IntBinop::Add),
+                    lhs,
+                    rhs,
+                )
+                .id;
+            live.push(id);
+        }
+        // Shrink: a few at random, with every user of them, so no operand
+        // is left dangling.
+        let mut dead: FxHashSet<LocalInsnId> = FxHashSet::default();
+        let mut work: Vec<InstructionId> = (0..1 + next_random(&mut state) % 6)
+            .map(|_| live[next_random(&mut state) % live.len()])
+            .collect();
+        while let Some(id) = work.pop() {
+            if dead.insert(id.local) {
+                work.extend(ctx.bodies[f].users_of(ValueId::Instruction(id)));
+            }
+        }
+        if round % 2 == 0 {
+            ctx.bodies[f].remove_block_instructions(block, &dead);
+        } else {
+            // Users first: removing a value leaves its users dangling until
+            // they go too, which is fine here, one at a time.
+            let mut ids: Vec<_> = dead.iter().copied().collect();
+            ids.sort_unstable_by(|a, b| b.cmp(a));
+            for id in ids {
+                ctx.remove_instruction(InstructionId::new(f, id));
+            }
+        }
+        live.retain(|id| !dead.contains(&id.local));
+        assert_clean(&ctx);
+
+        let maintained = edges_of(&ctx, f);
+        let mut rebuilt = ctx.clone();
+        rebuilt.bodies[f].rebuild_uses();
+        assert_eq!(edges_of(&rebuilt, f), maintained, "round {round}");
+        assert_eq!(ctx.bodies[f].uses.len(), maintained.len());
+    }
 }

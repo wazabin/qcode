@@ -18,7 +18,7 @@
 
 use qcode::{
     address_index::AddressIndex,
-    context::Context,
+    context::{Context, ContextIdentity},
     lift::LiftTarget,
     value::{FunctionBody, FunctionId},
 };
@@ -49,7 +49,19 @@ pub struct SleighCodeSource<'spec> {
     /// would collide with the function that owns that address. One function for
     /// the whole guest keeps every branch target local, which is what makes
     /// loops work.
-    function: Option<FunctionId>,
+    ///
+    /// It is remembered with the context it is of and its entry, since the
+    /// source can be handed another context: a clone or a restored copy,
+    /// which holds the function under the same entry, or an unrelated one.
+    function: Option<Host>,
+}
+
+/// The function a [`SleighCodeSource`] lifts into, in one context.
+#[derive(Clone, Copy)]
+struct Host {
+    context: ContextIdentity,
+    entry: u64,
+    function: FunctionId,
 }
 
 impl<'spec> SleighCodeSource<'spec> {
@@ -116,10 +128,22 @@ impl CodeSource for SleighCodeSource<'_> {
             .map_err(|error| CodeError::Decode(error.to_string().into()))?;
 
         let function = match self.function {
-            Some(function) => function,
-            None => {
-                let function = FunctionBody::from_addr_or_create_indexed(ctx, index, addr).id;
-                self.function = Some(function);
+            Some(host) if host.context == ctx.identity() => host.function,
+            known => {
+                let (entry, function) = match known
+                    .and_then(|host| Some((host.entry, index.function_at(host.entry)?)))
+                {
+                    Some(found) => found,
+                    None => (
+                        addr,
+                        FunctionBody::from_addr_or_create_indexed(ctx, index, addr).id,
+                    ),
+                };
+                self.function = Some(Host {
+                    context: ctx.identity(),
+                    entry,
+                    function,
+                });
                 function
             }
         };
@@ -482,5 +506,49 @@ mod tests {
             matches!(exit, VmExit::Unlifted { .. } | VmExit::Fault(_)),
             "expected a fault-shaped exit, got {exit:?}"
         );
+    }
+
+    #[test]
+    fn a_source_handed_another_context_lifts_into_that_context() {
+        // The source remembers the function it lifts into; handed a context
+        // that function is not of, it must find or make one there.
+        use qcode::{
+            address_index::AddressTarget,
+            value::{BasicBlock, ValueId},
+        };
+        let mut source = SleighCodeSource::new(spec());
+        let mut memory = VmMemory::new();
+        memory
+            .mmu
+            .write_unchecked(0x1000, &[0x90, 0x90], perm::READ | perm::EXEC);
+        let mut stats = Stats::default();
+        let mut lift = |source: &mut SleighCodeSource<'_>, ctx: &mut Context<'static>, addr| {
+            let mut index = AddressIndex::analyze(ctx);
+            source.lift(ctx, &memory, &mut index, addr, &mut stats)?;
+            // The function an address is in: its own, at an entry.
+            let host = match index.get(addr).expect("the address was lifted") {
+                AddressTarget::Function(function) => Some(ValueId::from(function)),
+                AddressTarget::Block(block) => {
+                    BasicBlock::from_id(ctx, block).function().map(|f| f.id())
+                }
+            };
+            Ok::<_, CodeError>((host, index.function_at(0x1000).map(ValueId::from)))
+        };
+
+        let mut first = source.new_context();
+        let (host, _) = lift(&mut source, &mut first, 0x1000).unwrap();
+        assert!(host.is_some());
+
+        // A clone keeps the ids: the clone's copy of the function hosts.
+        let mut clone = first.clone();
+        let (host, entry) = lift(&mut source, &mut clone, 0x1001).unwrap();
+        assert_eq!(host, entry);
+
+        // A fresh context has no such function.
+        let mut other = source.new_context();
+        lift(&mut source, &mut other, 0x1000).unwrap();
+        let (host, entry) = lift(&mut source, &mut other, 0x1001).unwrap();
+        assert!(host.is_some());
+        assert_eq!(host, entry);
     }
 }

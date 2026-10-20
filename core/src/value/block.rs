@@ -140,6 +140,11 @@ pub struct InsnList {
 }
 
 impl<'str> BasicBlock<'str> {
+    /// The bytes the comment holds on the heap.
+    pub(crate) fn comment_bytes(&self) -> usize {
+        self.comment.as_ref().map_or(0, String::capacity)
+    }
+
     /// The machine address this block starts at, if any.
     pub fn address(&self) -> Option<u64> {
         self.address

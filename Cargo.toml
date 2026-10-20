@@ -1,6 +1,5 @@
 [workspace]
 members = ["book/gen", "core", "emulator", "jit", "macro", "parser", "passes", "sleigh", "vm"]
-exclude = ["analysis"]
 resolver = "2"
 
 [workspace.package]

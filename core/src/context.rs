@@ -1181,6 +1181,16 @@ impl<'str> Context<'str> {
         total
     }
 
+    /// The memory every function body holds, by structure, summed. See
+    /// [`BodyMemory`](crate::value::BodyMemory).
+    pub fn body_memory(&self) -> crate::value::BodyMemory {
+        let mut total = crate::value::BodyMemory::default();
+        for body in self.bodies.iter() {
+            total.add_assign(body.memory());
+        }
+        total
+    }
+
     /// Releases body-arena capacity retained from peak analysis churn in every
     /// function (see [`FunctionBody::shrink_to_fit`](crate::value::FunctionBody::shrink_to_fit)).
     ///
@@ -2255,8 +2265,7 @@ impl<'str> Context<'str> {
     }
 
     pub fn push_block_param(&mut self, func: FunctionId, param: BlockParam<'str>) -> BlockParamId {
-        let local = self.bodies[func].params.push(param);
-        BlockParamId::new(func, local)
+        self.bodies[func].push_block_param(param)
     }
 
     pub fn push_edge(&mut self, func: FunctionId, edge: EdgeData) -> EdgeId {
@@ -3500,6 +3509,64 @@ mod tests {
 
         let count = ctx.instructions().count();
         assert!(count >= 1, "expected at least one instruction, got {count}");
+    }
+
+    #[test]
+    fn a_block_is_rebuilt_from_its_own_instructions_through_either_host() {
+        use crate::value::QCodeMut;
+
+        fn rebuild(host: &mut impl QCodeMut<'static>, block: BlockId) -> Vec<InstructionId> {
+            let mut all = host.take_insns(block);
+            all.reverse();
+            for &insn in &all {
+                host.link_last(block, insn);
+            }
+            all
+        }
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+                <entry>
+                    %a = i64 0x1 + i64 0x2;
+                    %b = i64 0x3 + i64 0x4;
+                    %c = %a + %b;
+                    return %c;
+            "
+        );
+        let before: Vec<_> = BasicBlock::from_id(&ctx, entry)
+            .iter_instruction_ids()
+            .collect();
+        assert_eq!(before, [a, b, c, before[3]]);
+
+        // Through the module: the block comes back reversed, in one move
+        // out and four links in, and the uses are untouched.
+        let reversed = rebuild(&mut ctx, entry);
+        assert_eq!(
+            BasicBlock::from_id(&ctx, entry)
+                .iter_instruction_ids()
+                .collect::<Vec<_>>(),
+            reversed
+        );
+        assert_eq!(reversed[0], before[3]);
+        assert!(ctx.users(a).contains(&c));
+        assert_eq!(
+            crate::arena_integrity::verify_body_arena_integrity(&ctx),
+            Vec::<String>::new()
+        );
+
+        // Through a checked-out body, back the way it was.
+        let mut host = ctx.body_mut(f);
+        let again = rebuild(&mut host, entry);
+        assert_eq!(again, before);
+        assert_eq!(
+            BasicBlock::from_id(&ctx, entry)
+                .iter_instruction_ids()
+                .collect::<Vec<_>>(),
+            before
+        );
     }
 
     #[test]

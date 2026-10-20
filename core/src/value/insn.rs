@@ -104,6 +104,13 @@ pub struct Instruction<'str> {
     #[serde(skip)]
     pub(crate) first_use: Link<UseId>,
 
+    /// The run of use edges of this instruction's operands, one per operand
+    /// in operand order (see [`crate::value::uses`]); `None` while it has no
+    /// operands or is in no body. Derived bookkeeping, rebuilt after
+    /// deserialization.
+    #[serde(skip)]
+    pub(crate) use_run: Link<UseId>,
+
     // Address of the binary instruction
     address: PackedAddress,
 
@@ -128,6 +135,7 @@ impl<'str> Instruction<'str> {
             prev: Link::none(),
             next: Link::none(),
             first_use: Link::none(),
+            use_run: Link::none(),
             type_id,
             mnemonic,
             address: PackedAddress::none(),
@@ -151,6 +159,7 @@ impl<'str> Instruction<'str> {
             prev: Link::from(prev),
             next: Link::none(),
             first_use: Link::none(),
+            use_run: Link::none(),
             type_id,
             mnemonic,
             address: PackedAddress::from(address),

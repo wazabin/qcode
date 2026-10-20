@@ -77,8 +77,8 @@ pub fn dead_insns<'a, 'str: 'a>(
     dead
 }
 
-/// Removes dead pure instructions from `block_id` iteratively until fixed point,
-/// updating the users reverse map after each round.
+/// Removes dead pure instructions from `block_id`, whole dead chains at once,
+/// updating the users reverse map.
 pub fn remove_dead_insns(ctx: &mut Context, block_id: BlockId) -> bool {
     with_body_mut(ctx, block_id.func, |body, cx| {
         remove_dead_insns_body(body, cx, block_id)
@@ -91,14 +91,11 @@ pub fn remove_dead_insns_body<'a, 'str>(
     cx: PassCtx<'a, 'str>,
     block_id: BlockId,
 ) -> bool {
-    let mut changed = false;
-    loop {
-        let dead = dead_insns(cx.body_view(body), block_id);
-        if dead.is_empty() {
-            break;
-        }
-
-        changed = true;
+    // One reverse walk reaches the fixed point (see [`dead_insns`]): what
+    // survives it keeps a live user, which removing the rest leaves alone.
+    let dead = dead_insns(cx.body_view(body), block_id);
+    let changed = !dead.is_empty();
+    if changed {
         // One pass over the block's instruction list however many go: removing
         // them one at a time is quadratic in the size of the block, and lifted
         // guest basic blocks are large.
@@ -107,6 +104,10 @@ pub fn remove_dead_insns_body<'a, 'str>(
             .map(|id| id.localize(block_id.func))
             .collect();
         body.remove_block_instructions(block_id, &dead);
+        debug_assert!(
+            dead_insns(cx.body_view(body), block_id).is_empty(),
+            "one reverse walk leaves nothing dead"
+        );
     }
 
     let params_changed = remove_unused_no_pred_block_params(body, cx, block_id);
